@@ -68,6 +68,7 @@ class ConversationContext(BaseModel):
     creator_persona: Persona
     similar_exchanges: list[ExchangeExample]
     conversation_stage: StageType
+    creator_name: str = "a creator"
 
 
 class SuggestionRequest(BaseModel):
