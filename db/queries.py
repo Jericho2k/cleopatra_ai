@@ -125,7 +125,7 @@ async def save_embedding(creator_id: str, fan_message: str, creator_response: st
             "creator_id": creator_id,
             "fan_message": fan_message,
             "creator_response": creator_response,
-            "stage": stage,
+            "conversation_stage": stage,
             "embedding": embedding,
         }).execute()
 
