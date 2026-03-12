@@ -130,3 +130,19 @@ async def save_embedding(creator_id: str, fan_message: str, creator_response: st
         }).execute()
 
     await asyncio.to_thread(_save)
+
+
+async def update_fan_memory(
+    fan_id: str,
+    notes: str,
+    preferences: list[str],
+    spend_tier: str,
+) -> None:
+    def _update():
+        get_supabase().table("fans").update({
+            "notes": notes,
+            "preferences": preferences,
+            "spend_tier": spend_tier,
+        }).eq("id", fan_id).execute()
+
+    await asyncio.to_thread(_update)
