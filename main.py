@@ -9,9 +9,24 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from ai.generator import generate_replies
+from ai.prompt_builder import build_prompt
+from ai.rag import find_similar_exchanges
+from ai.stage_classifier import classify_stage
 from core.supabase import get_supabase
-from db.queries import save_message
-from models.schemas import SuggestionRequest, SuggestionResponse
+from db.queries import (
+    get_conversation_history,
+    get_creator_persona,
+    get_fan,
+    save_message,
+)
+from models.schemas import (
+    ConversationContext,
+    Fan,
+    Persona,
+    SuggestionRequest,
+    SuggestionResponse,
+)
 from services.suggestions import get_suggestions
 
 
@@ -73,19 +88,33 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
     message_id = record.get("id")
     if not all([fan_id, creator_id, message_content, message_id]):
         return {"status": "skipped"}
-    result = await get_suggestions(
-        fan_id=fan_id,
-        creator_id=creator_id,
+    conversation_history = await get_conversation_history(fan_id)
+    fan_profile = await get_fan(creator_id, fan_id)
+    if fan_profile is None:
+        fan_profile = Fan(id=fan_id, display_name=fan_id)
+    creator_persona = await get_creator_persona(creator_id)
+    if creator_persona is None:
+        creator_persona = Persona()
+    conversation_stage = classify_stage(conversation_history, fan_profile)
+    similar_exchanges = await find_similar_exchanges(message_content, creator_id)
+    ctx = ConversationContext(
         fan_message=message_content,
+        conversation_history=conversation_history,
+        fan_profile=fan_profile,
+        creator_persona=creator_persona,
+        similar_exchanges=similar_exchanges,
+        conversation_stage=conversation_stage,
         creator_name="a creator",
     )
+    prompt = build_prompt(ctx)
+    replies = await generate_replies(prompt, creator_persona)
     db = get_supabase()
     await asyncio.to_thread(
         lambda: db.table("suggestions").insert({
             "fan_id": fan_id,
             "creator_id": creator_id,
             "message_id": message_id,
-            "suggestions": result.suggestions,
+            "suggestions": replies,
         }).execute()
     )
     return {"status": "ok"}
