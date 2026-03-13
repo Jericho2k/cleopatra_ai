@@ -4,6 +4,7 @@ Routes are thin and delegate all logic to services.
 """
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from db.queries import save_message
@@ -19,6 +20,14 @@ class ReplyRequest(BaseModel):
 
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.post("/suggestions", response_model=SuggestionResponse)
