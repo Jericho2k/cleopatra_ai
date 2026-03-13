@@ -43,6 +43,7 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
             f"- Capitalization: {persona.capitalization}",
             f"- Punctuation: {punctuation}",
             f"- Use these words and phrases naturally: {vocabulary}",
+            '- Not every message needs a full reply. If the fan says something simple, playful or one-liner, respond with just an emoji, "xoxo", "💕", "😏", or a single short reaction. Match the energy.',
             "",
         ]
     )
