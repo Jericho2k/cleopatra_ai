@@ -108,6 +108,9 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
     )
     prompt = build_prompt(ctx)
     replies = await generate_replies(prompt, creator_persona)
+    from services.suggestions import _should_update_memory, _update_fan_memory
+    if _should_update_memory(conversation_history):
+        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
     db = get_supabase()
     await asyncio.to_thread(
         lambda: db.table("suggestions").insert({
