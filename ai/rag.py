@@ -30,6 +30,9 @@ async def find_similar_exchanges(
     creator_id: str,
     limit: int = 5,
 ) -> list[ExchangeExample]:
-    embedding = await get_embedding(fan_message)
-    return await get_similar_exchanges(embedding, creator_id, limit)
+    try:
+        embedding = await get_embedding(fan_message)
+        return await get_similar_exchanges(embedding, creator_id, limit)
+    except Exception:
+        return []
 
