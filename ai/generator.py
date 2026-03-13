@@ -31,6 +31,13 @@ async def generate_replies(
         "great question",
         "absolutely",
         "i apologize",
+        "hehe",
+        "too sweet",
+        "ur too sweet",
+        "u r too sweet",
+        "making me blush",
+        "u make me blush",
+        "ur making me blush",
     ]
 
     def _is_valid(reply: str) -> bool:
