@@ -118,6 +118,7 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
             "creator_id": creator_id,
             "message_id": message_id,
             "suggestions": replies,
+            "stage": conversation_stage.value,
         }).execute()
     )
     return {"status": "ok"}

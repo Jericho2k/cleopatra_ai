@@ -83,6 +83,7 @@ class SuggestionResponse(BaseModel):
     """Response: exactly 3 reply options."""
 
     suggestions: list[str]
+    stage: StageType = StageType.WARMING_UP
 
     @field_validator("suggestions")
     @classmethod
