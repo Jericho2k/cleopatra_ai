@@ -112,7 +112,10 @@ async def get_similar_exchanges(embedding: list[float], creator_id: str, limit: 
         }).execute()
         data = r.data or []
         return [
-            ExchangeExample(fan_message=row["fan_message"], creator_reply=row["creator_response"])
+            ExchangeExample(
+                fan_message=row["fan_message"],
+                creator_reply=row["creator_reply"],
+            )
             for row in data
         ]
 
