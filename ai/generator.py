@@ -17,6 +17,20 @@ client = AsyncOpenAI(
     api_key=get_settings().TOGETHER_API_KEY,
 )
 
+BANNED_PHRASES = [
+    "hehe", "making me blush", "ur too sweet", "aww that's so sweet",
+    "you're so sweet", "wired", "$500 yet", "too sweet",
+]
+
+
+def filter_suggestions(suggestions: list[str]) -> list[str]:
+    filtered = []
+    for s in suggestions:
+        lower = s.lower()
+        if not any(phrase in lower for phrase in BANNED_PHRASES):
+            filtered.append(s)
+    return filtered if filtered else suggestions  # fallback to unfiltered if all banned
+
 
 async def generate_replies(
     prompt_messages: list[dict],
@@ -76,7 +90,7 @@ async def generate_replies(
             valid = [r for r in replies if _is_valid(r)]
             if len(valid) >= 2:
                 if len(valid) >= 3:
-                    return valid[:3]
+                    return filter_suggestions(valid[:3])
                 # Pad to 3 with any other replies (even if invalid)
                 result = list(valid)
                 for r in replies:
@@ -85,10 +99,10 @@ async def generate_replies(
                     if len(result) == 3:
                         break
                 if len(result) == 3:
-                    return result
+                    return filter_suggestions(result)
         except Exception:
             continue
 
     # Fallback if all attempts fail
-    return ["hey 😘", "omg haha", "tell me more"]
+    return filter_suggestions(["hey 😘", "omg haha", "tell me more"])
 
