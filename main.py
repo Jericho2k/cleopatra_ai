@@ -4,6 +4,8 @@ Routes are thin and delegate all logic to services.
 """
 
 import asyncio
+import os
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +29,8 @@ from models.schemas import (
     SuggestionRequest,
     SuggestionResponse,
 )
+from services.fansly_poller import FanslyPoller
+from services.fansly_session_store import SessionStore
 from services.suggestions import get_suggestions
 
 
@@ -42,7 +46,48 @@ class WebhookPayload(BaseModel):
     record: dict
 
 
-app = FastAPI()
+async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
+    """
+    Fires when a fan sends a message to a model account we're polling.
+
+    account_id  = Fansly ID of the model (e.g. "707604041756061697")
+    group_id    = Fansly conversation ID (e.g. "813798181052637184")
+    message     = raw Fansly message dict with keys:
+                  id, senderId, content, createdAt, attachments, etc.
+    """
+    fan_id = message["senderId"]
+    content = message.get("content", "")
+    print(f"[NEW MESSAGE] model={account_id} fan={fan_id}: {content[:80]}")
+
+
+session_store: SessionStore = None
+fansly_poller: FanslyPoller = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global session_store, fansly_poller
+
+    supabase = get_supabase()
+    session_store = SessionStore(
+        supabase=supabase,
+        encryption_key=os.environ["FANSLY_SESSION_KEY"],
+    )
+    await session_store.load_all()
+
+    fansly_poller = FanslyPoller(
+        session_store=session_store,
+        on_new_message=handle_new_fan_message,
+    )
+    await fansly_poller.start_all()
+
+    yield
+
+    if fansly_poller:
+        await fansly_poller.stop_all()
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -127,4 +172,9 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
+
+
+from routes.fansly import fansly_router
+
+app.include_router(fansly_router)
 
