@@ -16,7 +16,7 @@ def classify_stage(
     fan_text_all = " ".join(m.content for m in fan_messages).lower()
 
     # ── HIGH VALUE: big spender ──
-    if fan_profile.total_spent > 500:
+    if fan_profile.total_spent > 300:
         return StageType.HIGH_VALUE
 
     # ── HIGH VALUE: findom signals in ANY fan message ──
@@ -27,6 +27,13 @@ def classify_stage(
         "just tell me what to send", "how much do you want",
         "i would pay anything", "i owe you", "i'll do anything",
         "ill do anything", "you deserve everything", "spoil me please",
+        "i would honestly pay whatever",
+        "pay whatever you want",
+        "you deserve it all",
+        "whatever you ask",
+        "i'll pay whatever",
+        "ill pay whatever",
+        "pay anything for you",
     ]
     if any(phrase in fan_text_all for phrase in findom_keywords):
         return StageType.HIGH_VALUE
