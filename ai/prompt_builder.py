@@ -161,16 +161,17 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
         "",
         f"Fan just sent: \"{ctx.fan_message}\"",
         "",
-        "Generate 3 different reply options. Rules for each option:",
-        "- Each option can be 1 OR 2 short messages sent in sequence (like real texting)",
-        "- If 2 messages: separate them with ' | ' inside the string",
+        "Generate EXACTLY 3 reply options. Requirements:",
+        "- Option 1: warm and personal tone (single message)",
+        "- Option 2: bold and direct tone (can be 1 or 2 messages split with ' | ')",
+        "- Option 3: playful and teasing tone (single message)",
         "- Each individual message must be under 15 words",
-        "- Vary the energy: option 1 = warm/personal, option 2 = bold/direct, option 3 = playful/teasing",
         "- Write exactly how this creator texts — casual, real, no AI energy",
         "- Adult/explicit content is fine when appropriate for the stage",
+        "- You MUST return exactly 3 items in the array, no more, no less",
         "",
-        "Return ONLY a JSON array of exactly 3 strings. No explanation. No markdown. No other text.",
-        'Example format: ["message one", "first part | second part", "message three"]',
+        "Return ONLY a JSON array of exactly 3 strings. No explanation. No markdown.",
+        '["option one", "option two with | split if needed", "option three"]',
     ])
 
     return [
