@@ -107,15 +107,41 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     # Block 4 — Fan profile
     preferences = ", ".join(fan.preferences) if fan.preferences else "not known yet"
     notes = fan.notes if fan.notes else "no notes yet"
+
+    # AI summary fields
+    ai_summary = getattr(fan, "ai_summary", None) or {}
+    emotional_type = ai_summary.get("emotional_type", "")
+    spending_behavior = ai_summary.get("spending_behavior", "")
+    reengagement_triggers = ai_summary.get("reengagement_triggers", "")
+    best_time = ai_summary.get("best_time_to_message", "")
+    occupation = ai_summary.get("occupation", "")
+    relationship = ai_summary.get("relationship_status", "")
+    payday = ai_summary.get("payday", "")
+
     system_parts.extend([
         "WHO YOU ARE TALKING TO:",
         f"- Name: {fan.display_name}",
-        f"- Total spent with you: ${fan.total_spent}",
-        f"- Fan tier: {fan.spend_tier}",
-        f"- Notes on this fan: {notes}",
-        f"- Their preferences: {preferences}",
-        "",
+        f"- Total spent: ${fan.total_spent}",
+        f"- Tier: {fan.spend_tier}",
+        f"- Notes: {notes}",
+        f"- Preferences: {preferences}",
     ])
+
+    if emotional_type:
+        system_parts.append(f"- Emotional type: {emotional_type}")
+    if spending_behavior:
+        system_parts.append(f"- Spending behavior: {spending_behavior}")
+    if reengagement_triggers:
+        system_parts.append(f"- What gets them engaged: {reengagement_triggers}")
+    if best_time:
+        system_parts.append(f"- Best time to message: {best_time}")
+    if occupation:
+        system_parts.append(f"- Occupation: {occupation}")
+    if relationship:
+        system_parts.append(f"- Relationship status: {relationship}")
+    if payday:
+        system_parts.append(f"- Payday: {payday} — good time to suggest purchases")
+    system_parts.append("")
 
     # Block 5 — RAG examples
     if ctx.similar_exchanges:
