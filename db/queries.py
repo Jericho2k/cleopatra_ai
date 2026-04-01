@@ -149,3 +149,12 @@ async def update_fan_memory(
         }).eq("id", fan_id).execute()
 
     await asyncio.to_thread(_update)
+
+
+async def update_fan_ai_summary(fan_id: str, summary: dict) -> None:
+    def _update():
+        get_supabase().table("fans").update({
+            "ai_summary": summary,
+        }).eq("id", fan_id).execute()
+
+    await asyncio.to_thread(_update)
