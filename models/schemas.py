@@ -24,6 +24,7 @@ class Fan(BaseModel):
     last_active: datetime | None = None
     preferences: list[str] = []
     notes: str = ""
+    ai_summary: dict | None = None
 
 
 class Creator(BaseModel):

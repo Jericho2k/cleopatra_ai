@@ -19,6 +19,7 @@ def _row_to_fan(row: dict) -> Fan:
         last_active=last_active,
         preferences=row.get("preferences") or [],
         notes=row.get("notes", ""),
+        ai_summary=row.get("ai_summary"),
     )
 
 
