@@ -190,6 +190,5 @@ async def _update_fan_ai_summary(
 
 
 def _should_update_memory(conversation_history: list[Message]) -> bool:
-    count = len([m for m in conversation_history if m.role == 'fan'])
-    return count > 0 and count % 10 == 0
+    return True
 
