@@ -16,6 +16,7 @@ from db.queries import (
     get_fan,
     save_message,
     update_fan_memory,
+    update_fan_ai_summary,
 )
 from models.schemas import (
     ConversationContext,
@@ -63,6 +64,7 @@ async def get_suggestions(
 
     if _should_update_memory(conversation_history):
         asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
+        asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
 
     return SuggestionResponse(suggestions=replies)
 
@@ -126,6 +128,64 @@ async def _update_fan_memory(
         )
     except Exception:
         # Silent failure; this runs in the background
+        return
+
+
+async def _update_fan_ai_summary(
+    fan_id: str,
+    conversation_history: list[Message],
+) -> None:
+    try:
+        convo_lines = []
+        for msg in conversation_history[-40:]:
+            speaker = "Fan" if msg.role == "fan" else "Creator"
+            convo_lines.append(f"{speaker}: {msg.content}")
+        convo_text = "\n".join(convo_lines)
+
+        system_prompt = (
+            "You are an expert fan relationship analyst for an OnlyFans agency. "
+            "Analyze this conversation and extract a detailed psychological and behavioral profile of the fan. "
+            "Return only valid JSON, no markdown, no explanation."
+        )
+        user_prompt = (
+            "Analyze this conversation and return a JSON object with these fields:\n"
+            "{\n"
+            '  "real_name": "their real name if mentioned, otherwise null",\n'
+            '  "location": "city/country if mentioned, otherwise null",\n'
+            '  "occupation": "job or income signals if mentioned, otherwise null",\n'
+            '  "relationship_status": "single/relationship/married/unknown",\n'
+            '  "payday": "when they get paid if mentioned, otherwise null",\n'
+            '  "kinks": ["list of explicit kinks, fetishes, or sexual preferences mentioned or clearly implied"],\n'
+            '  "emotional_type": "one of: romantic | submissive | dominant | transactional | playful | mixed",\n'
+            '  "spending_behavior": "description of how they spend — e.g. tips spontaneously, haggles on price, pays without hesitation",\n'
+            '  "best_time_to_message": "time of day or days they seem most active, or null",\n'
+            '  "reengagement_triggers": "what topics or messages get them most responsive",\n'
+            '  "risk_signals": "any red flags like money problems, about to cancel, frustration — or null",\n'
+            '  "summary": "3-4 sentence psychological profile of this fan — who they are, what they want, how to handle them"\n'
+            "}\n\n"
+            "Conversation:\n"
+            f"{convo_text}"
+        )
+
+        response = await together_client.chat.completions.create(
+            model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+        )
+
+        content = response.choices[0].message.content or ""
+        lines = content.splitlines()
+        cleaned = "\n".join(
+            line for line in lines if not line.lstrip().startswith("```")
+        ).strip()
+
+        data = json.loads(cleaned)
+        await update_fan_ai_summary(fan_id=fan_id, summary=data)
+
+    except Exception:
         return
 
 
