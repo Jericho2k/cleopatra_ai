@@ -185,8 +185,10 @@ async def _update_fan_ai_summary(
         data = json.loads(cleaned)
         await update_fan_ai_summary(fan_id=fan_id, summary=data)
 
-    except Exception:
-        return
+    except Exception as e:
+        print(f"[AI SUMMARY ERROR] fan={fan_id} error={e}")
+        import traceback
+        traceback.print_exc()
 
 
 def _should_update_memory(conversation_history: list[Message]) -> bool:
