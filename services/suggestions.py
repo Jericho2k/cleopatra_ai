@@ -99,7 +99,7 @@ async def _update_fan_memory(
         )
 
         response = await together_client.chat.completions.create(
-            model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8-Turbo",
+            model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -168,7 +168,7 @@ async def _update_fan_ai_summary(
         )
 
         response = await together_client.chat.completions.create(
-            model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+            model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
