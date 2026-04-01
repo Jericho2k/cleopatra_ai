@@ -99,7 +99,7 @@ async def _update_fan_memory(
         )
 
         response = await together_client.chat.completions.create(
-            model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+            model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8-Turbo",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -137,7 +137,7 @@ async def _update_fan_ai_summary(
 ) -> None:
     try:
         convo_lines = []
-        for msg in conversation_history[-40:]:
+        for msg in conversation_history[-20:]:
             speaker = "Fan" if msg.role == "fan" else "Creator"
             convo_lines.append(f"{speaker}: {msg.content}")
         convo_text = "\n".join(convo_lines)
@@ -174,6 +174,7 @@ async def _update_fan_ai_summary(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
+            max_tokens=1000,
         )
 
         content = response.choices[0].message.content or ""
