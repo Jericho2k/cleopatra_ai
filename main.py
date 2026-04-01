@@ -19,7 +19,7 @@ from core.supabase import get_supabase
 from db.queries import (
     get_conversation_history,
     get_creator_persona,
-    get_fan,
+    get_fan_by_id,
     save_message,
 )
 from models.schemas import (
@@ -134,7 +134,7 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
     if not all([fan_id, creator_id, message_content, message_id]):
         return {"status": "skipped"}
     conversation_history = await get_conversation_history(fan_id)
-    fan_profile = await get_fan(creator_id, fan_id)
+    fan_profile = await get_fan_by_id(fan_id)
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
     creator_persona = await get_creator_persona(creator_id)

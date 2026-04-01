@@ -44,6 +44,16 @@ async def get_fan(creator_id: str, platform_fan_id: str) -> Fan | None:
     return await asyncio.to_thread(_get)
 
 
+async def get_fan_by_id(fan_id: str) -> Fan | None:
+    def _get():
+        r = get_supabase().table("fans").select("*").eq("id", fan_id).execute()
+        if not r.data or len(r.data) == 0:
+            return None
+        return _row_to_fan(r.data[0])
+
+    return await asyncio.to_thread(_get)
+
+
 async def create_fan(creator_id: str, platform_fan_id: str, display_name: str) -> Fan:
     def _create():
         r = get_supabase().table("fans").insert({
