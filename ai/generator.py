@@ -32,6 +32,18 @@ def filter_suggestions(suggestions: list[str]) -> list[str]:
     return filtered if filtered else suggestions  # fallback to unfiltered if all banned
 
 
+def _clean_reply(reply: str) -> str:
+    """Fix malformed split messages."""
+    if "|" not in reply:
+        return reply.strip()
+    parts = [p.strip() for p in reply.split("|")]
+    # Remove empty parts
+    parts = [p for p in parts if p]
+    if len(parts) == 0:
+        return ""
+    return " | ".join(parts)
+
+
 async def generate_replies(
     prompt_messages: list[dict],
     creator_persona: Persona,
@@ -83,7 +95,8 @@ async def generate_replies(
                 continue
 
             # Ensure list of strings
-            replies = [r for r in replies if isinstance(r, str)]
+            replies = [_clean_reply(r) for r in replies if isinstance(r, str)]
+            replies = [r for r in replies if r]  # remove any that became empty
             if not replies:
                 continue
 
