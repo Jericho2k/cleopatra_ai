@@ -66,7 +66,7 @@ async def generate_replies(
     for _ in range(3):
         try:
             response = await client.chat.completions.create(
-                model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+                model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
                 messages=prompt_messages,
                 temperature=0.8,
                 max_tokens=300,
