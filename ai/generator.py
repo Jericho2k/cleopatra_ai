@@ -100,7 +100,8 @@ async def generate_replies(
                         break
                 if len(result) == 3:
                     return filter_suggestions(result)
-        except Exception:
+        except Exception as e:
+            print(f"[GENERATOR ERROR] attempt failed: {e}")
             continue
 
     # Fallback if all attempts fail
