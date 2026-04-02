@@ -142,8 +142,6 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     if payday:
         system_parts.append(f"- Payday: {payday} — good time to suggest purchases")
     system_parts.append("")
-    print(f"[PROMPT DEBUG] fan={fan.display_name} ai_summary={bool(fan.ai_summary)} stage={stage.value}")
-
     # Block 5 — RAG examples
     if ctx.similar_exchanges:
         system_parts.extend([
