@@ -5,6 +5,7 @@ Coordinates DB, stage classification, RAG, prompt building, and generation.
 
 import asyncio
 import json
+import random
 
 from ai.generator import client as together_client, generate_replies
 from ai.prompt_builder import build_prompt
@@ -190,6 +191,30 @@ async def _update_fan_ai_summary(
         print(f"[AI SUMMARY ERROR] fan={fan_id} error={e}")
         import traceback
         traceback.print_exc()
+
+
+async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
+    try:
+        # Human-like delay: 45-90 seconds
+        delay = random.randint(45, 90)
+        await asyncio.sleep(delay)
+
+        # Handle split messages — send as separate messages with small gap
+        parts = [p.strip() for p in reply.split("|") if p.strip()]
+
+        for i, part in enumerate(parts):
+            if i > 0:
+                # Small gap between split messages (5-15 seconds)
+                await asyncio.sleep(random.randint(5, 15))
+            await save_message(
+                fan_id=fan_id,
+                creator_id=creator_id,
+                role="creator",
+                content=part,
+                was_ai_suggested=True,
+            )
+    except Exception as e:
+        print(f"[AUTO REPLY ERROR] fan={fan_id} error={e}")
 
 
 def _should_update_memory(conversation_history: list[Message]) -> bool:

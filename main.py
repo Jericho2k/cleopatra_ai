@@ -140,6 +140,13 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
     creator_persona = await get_creator_persona(creator_id)
     if creator_persona is None:
         creator_persona = Persona()
+
+    db = get_supabase()
+    creator_row = await asyncio.to_thread(
+        lambda: db.table("creators").select("auto_mode").eq("id", creator_id).single().execute()
+    )
+    auto_mode = (creator_row.data or {}).get("auto_mode", False)
+
     conversation_stage = classify_stage(conversation_history, fan_profile)
     similar_exchanges = await find_similar_exchanges(message_content, creator_id)
     ctx = ConversationContext(
@@ -153,21 +160,32 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
     )
     prompt = build_prompt(ctx)
     replies = await generate_replies(prompt, creator_persona)
-    from services.suggestions import _should_update_memory, _update_fan_memory, _update_fan_ai_summary
+    from services.suggestions import (
+        _send_auto_reply,
+        _should_update_memory,
+        _update_fan_ai_summary,
+        _update_fan_memory,
+    )
     if _should_update_memory(conversation_history):
         asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
         asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
-    db = get_supabase()
-    await asyncio.to_thread(
-        lambda: db.table("suggestions").insert({
-            "fan_id": fan_id,
-            "creator_id": creator_id,
-            "message_id": message_id,
-            "suggestions": replies,
-            "stage": conversation_stage.value,
-        }).execute()
-    )
-    return {"status": "ok"}
+
+    if auto_mode:
+        best_reply = replies[0] if replies else None
+        if best_reply:
+            asyncio.create_task(_send_auto_reply(fan_id, creator_id, best_reply))
+        return {"status": "ok"}
+    else:
+        await asyncio.to_thread(
+            lambda: db.table("suggestions").insert({
+                "fan_id": fan_id,
+                "creator_id": creator_id,
+                "message_id": message_id,
+                "suggestions": replies,
+                "stage": conversation_stage.value,
+            }).execute()
+        )
+        return {"status": "ok"}
 
 
 @app.get("/health")
