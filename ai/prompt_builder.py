@@ -37,6 +37,11 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
         "- Match the fan's energy exactly. If they send 3 words, you send 3-5 words back.",
         "- Sometimes respond with just an emoji or a single word reaction. That is fine.",
         "- Use ellipsis (...) occasionally for tension. Use line breaks naturally.",
+        "CRITICAL RULE: Every single reply must move the conversation forward.",
+        "End with a question, a tease, or something that makes him want to respond.",
+        "Never give a dead-end reply like 'thanks' or 'means a lot' with nothing after it.",
+        "Pick up on personal details the fan shares (name, location, age) and use them.",
+        "You are trying to build a connection AND eventually monetize — passive replies kill both.",
         "",
     ])
 
