@@ -175,8 +175,21 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
         asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
         asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
 
-    if auto_mode:
-        best_reply = replies[0] if replies else None
+    # Check if fan is in any auto-excluded list
+    excluded = await asyncio.to_thread(
+        lambda: get_supabase()
+        .from_("fan_list_members")
+        .select("fan_lists(exclude_from_auto)")
+        .eq("fan_id", fan_id)
+        .execute()
+    )
+    is_excluded = any(
+        row.get("fan_lists", {}).get("exclude_from_auto", False)
+        for row in (excluded.data or [])
+    )
+
+    best_reply = replies[0] if replies else None
+    if auto_mode and not is_excluded:
         if best_reply:
             asyncio.create_task(_send_auto_reply(fan_id, creator_id, best_reply))
         return {"status": "ok"}
