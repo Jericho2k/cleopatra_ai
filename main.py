@@ -137,15 +137,20 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
     fan_profile = await get_fan_by_id(fan_id)
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
-    creator_persona = await get_creator_persona(creator_id)
-    if creator_persona is None:
-        creator_persona = Persona()
 
+    # Check auto mode EARLY — right after getting fan profile
     db = get_supabase()
     creator_row = await asyncio.to_thread(
         lambda: db.table("creators").select("auto_mode").eq("id", creator_id).single().execute()
     )
     auto_mode = (creator_row.data or {}).get("auto_mode", False)
+
+    # If auto mode, still need to generate a reply but skip saving to suggestions
+    # If NOT auto mode, run full suggestions pipeline
+
+    creator_persona = await get_creator_persona(creator_id)
+    if creator_persona is None:
+        creator_persona = Persona()
 
     conversation_stage = classify_stage(conversation_history, fan_profile)
     similar_exchanges = await find_similar_exchanges(message_content, creator_id)
