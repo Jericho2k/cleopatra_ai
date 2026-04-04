@@ -7,7 +7,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -32,77 +32,13 @@ from models.schemas import (
 )
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
-from services.suggestions import _send_auto_reply, get_suggestions
-
-
-_debounce_tasks: dict[str, asyncio.Task] = {}
-
-
-async def _delayed_auto_reply(fan_id: str, creator_id: str, delay: int = 90) -> None:
-    """Wait for delay seconds, then generate and send auto reply."""
-    try:
-        await asyncio.sleep(delay)
-
-        # Fetch latest conversation history (includes all messages sent during delay)
-        conversation_history = await get_conversation_history(fan_id)
-
-        # Get the latest fan message
-        fan_messages = [m for m in conversation_history if m.role == "fan"]
-        if not fan_messages:
-            return
-
-        latest_fan_message = fan_messages[-1].content
-
-        # Now run the full AI pipeline with complete context
-        fan_profile = await get_fan_by_id(fan_id)
-        if fan_profile is None:
-            fan_profile = Fan(id=fan_id, display_name=fan_id)
-
-        creator_persona = await get_creator_persona(creator_id)
-        if creator_persona is None:
-            creator_persona = Persona()
-
-        conversation_stage = classify_stage(conversation_history, fan_profile)
-        similar_exchanges = await find_similar_exchanges(latest_fan_message, creator_id)
-
-        ctx_without_situation = ConversationContext(
-            fan_message=latest_fan_message,
-            conversation_history=conversation_history,
-            fan_profile=fan_profile,
-            creator_persona=creator_persona,
-            similar_exchanges=similar_exchanges,
-            conversation_stage=conversation_stage,
-            creator_name="a creator",
-        )
-
-        situation = await analyze_situation(ctx_without_situation)
-
-        ctx = ConversationContext(
-            fan_message=latest_fan_message,
-            conversation_history=conversation_history,
-            fan_profile=fan_profile,
-            creator_persona=creator_persona,
-            similar_exchanges=similar_exchanges,
-            conversation_stage=conversation_stage,
-            creator_name="a creator",
-            situation=situation,
-        )
-
-        prompt = build_prompt(ctx)
-        replies = await generate_replies(prompt, creator_persona)
-
-        if replies:
-            best_reply = replies[0]
-            asyncio.create_task(
-                _send_auto_reply(fan_id, creator_id, best_reply)
-            )
-
-    except asyncio.CancelledError:
-        raise
-    finally:
-        current = asyncio.current_task()
-        if current is not None and _debounce_tasks.get(fan_id) is current:
-            _debounce_tasks.pop(fan_id, None)
+from services.suggestions import (
+    _send_auto_reply,
+    _should_update_memory,
+    _update_fan_ai_summary,
+    _update_fan_memory,
+    get_suggestions,
+)
 
 
 class ReplyRequest(BaseModel):
@@ -203,7 +139,10 @@ async def save_reply(req: ReplyRequest) -> dict:
 
 
 @app.post("/generate-suggestions")
-async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
+async def generate_suggestions_webhook(
+    payload: WebhookPayload,
+    background_tasks: BackgroundTasks,
+) -> dict:
     if payload.type != "INSERT":
         return {"status": "skipped"}
     record = payload.record
@@ -248,28 +187,6 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
         for row in (excluded.data or [])
     )
 
-    from services.suggestions import (
-        _should_update_memory,
-        _update_fan_ai_summary,
-        _update_fan_memory,
-    )
-
-    if auto_mode and not is_excluded:
-        # Cancel existing debounce for this fan if any
-        existing = _debounce_tasks.get(fan_id)
-        if existing and not existing.done():
-            existing.cancel()
-
-        # Schedule new debounced reply
-        task = asyncio.create_task(_delayed_auto_reply(fan_id, creator_id, delay=60))
-        _debounce_tasks[fan_id] = task
-
-        if _should_update_memory(conversation_history):
-            asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
-            asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
-
-        return {"status": "queued"}
-
     conversation_stage = classify_stage(conversation_history, fan_profile)
     similar_exchanges = await find_similar_exchanges(message_content, creator_id)
 
@@ -299,9 +216,10 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
     prompt = build_prompt(ctx)
     replies = await generate_replies(prompt, creator_persona)
 
-    if _should_update_memory(conversation_history):
-        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
-        asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
+    if auto_mode and not is_excluded:
+        if replies:
+            background_tasks.add_task(_send_auto_reply, fan_id, creator_id, replies[0])
+        return {"status": "ok"}
 
     await asyncio.to_thread(
         lambda: db.table("suggestions").insert({
@@ -312,6 +230,11 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
             "stage": conversation_stage.value,
         }).execute()
     )
+
+    if _should_update_memory(conversation_history):
+        background_tasks.add_task(_update_fan_memory, fan_id, creator_id, conversation_history)
+        background_tasks.add_task(_update_fan_ai_summary, fan_id, conversation_history)
+
     return {"status": "ok"}
 
 
