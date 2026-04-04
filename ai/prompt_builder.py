@@ -13,12 +13,20 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     ai_summary = getattr(fan, "ai_summary", None) or {}
 
     # ── Character description ──
-    character = getattr(persona, "character", "") or "A flirtatious, confident OnlyFans creator. Eastern European. Direct and playful, not overly sweet."
-    comm_style = getattr(persona, "communication_style", "") or "Texts like a real girl — casual, short messages, occasional incomplete sentences, not robotic."
-    example_phrases = getattr(persona, "example_phrases", "") or "aren't you afraid? | could you give me a ride? | what did you do? | tell me more about that | i know what would make me feel good"
-    upsell_style = getattr(persona, "upsell_style", "") or "Teases first, builds curiosity, then suggests paid content naturally — never jumps straight to price."
-    hard_limits = getattr(persona, "hard_limits", "") or "Never confess love or strong feelings. Never say hehe. Never be a pushover."
-    emoji_style = getattr(persona, "emoji_style", "") or "Uses emojis sparingly — 😏 😋 🥵 occasionally. Never overuses them."
+    # Pull all available persona fields
+    character = getattr(persona, "character", "") or "Confident, playful Eastern European creator."
+    comm_style = getattr(persona, "communication_style", "") or "Short casual texts, mirrors energy."
+    example_phrases = getattr(persona, "example_phrases", "") or ""
+    upsell_style = getattr(persona, "upsell_style", "") or ""
+    hard_limits = getattr(persona, "hard_limits", "") or ""
+    emoji_style = getattr(persona, "emoji_style", "") or ""
+
+    # New fields from persona dict (since Persona model may not have them as attributes)
+    persona_dict = persona.model_dump() if hasattr(persona, "model_dump") else {}
+    vocabulary = persona_dict.get("vocabulary", [])
+    example_flirts = persona_dict.get("example_flirts", [])
+    example_greetings = persona_dict.get("example_greetings", [])
+    dont_list = persona_dict.get("dont_list", [])
 
     # ── Fan context ──
     fan_name = fan.display_name
@@ -86,6 +94,18 @@ HARD RULES — NEVER break:
 - Every reply must move the conversation forward — no dead ends
 - Sound like a real person texting, not a customer service bot
 - Keep replies SHORT — 1-2 sentences max per message part"""
+
+    if vocabulary:
+        system_prompt += f"\nYOUR VOCABULARY (use these words naturally):\n{', '.join(str(w) for w in vocabulary)}"
+
+    if example_flirts:
+        system_prompt += (
+            "\nEXAMPLE FLIRT LINES (use as inspiration, not word for word):\n"
+            + "\n".join(f"- {f}" for f in example_flirts)
+        )
+
+    if dont_list:
+        system_prompt += "\nNEVER SAY ANYTHING LIKE:\n" + "\n".join(f"- {d}" for d in dont_list)
 
     user_prompt = f"""FAN: {fan_name} | Spent: ${spent} | Tier: {tier}
 {f'Notes: {notes}' if notes else ''}
