@@ -45,6 +45,11 @@ class Persona(BaseModel):
     example_greetings: list[str] = []
     example_flirts: list[str] = []
     dont_list: list[str] = []
+    character: str = ""
+    communication_style: str = ""
+    example_phrases: str = ""
+    hard_limits: str = ""
+    emoji_style: str = ""
 
 
 class Message(BaseModel):
@@ -70,6 +75,7 @@ class ConversationContext(BaseModel):
     similar_exchanges: list[ExchangeExample]
     conversation_stage: StageType
     creator_name: str = "a creator"
+    situation: dict | None = None
 
 
 class SuggestionRequest(BaseModel):

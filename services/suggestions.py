@@ -9,6 +9,7 @@ import random
 
 from ai.generator import client as together_client, generate_replies
 from ai.prompt_builder import build_prompt
+from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from db.queries import (
@@ -49,6 +50,18 @@ async def get_suggestions(
 
     similar_exchanges = await find_similar_exchanges(fan_message, creator_id)
 
+    ctx_without_situation = ConversationContext(
+        fan_message=fan_message,
+        conversation_history=conversation_history,
+        fan_profile=fan_profile,
+        creator_persona=creator_persona,
+        similar_exchanges=similar_exchanges,
+        conversation_stage=conversation_stage,
+        creator_name=creator_name,
+    )
+
+    situation = await analyze_situation(ctx_without_situation)
+
     ctx = ConversationContext(
         fan_message=fan_message,
         conversation_history=conversation_history,
@@ -57,6 +70,7 @@ async def get_suggestions(
         similar_exchanges=similar_exchanges,
         conversation_stage=conversation_stage,
         creator_name=creator_name,
+        situation=situation,
     )
 
     prompt = build_prompt(ctx)

@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from ai.generator import generate_replies
 from ai.prompt_builder import build_prompt
+from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from core.supabase import get_supabase
@@ -64,6 +65,18 @@ async def _delayed_auto_reply(fan_id: str, creator_id: str, delay: int = 90) -> 
         conversation_stage = classify_stage(conversation_history, fan_profile)
         similar_exchanges = await find_similar_exchanges(latest_fan_message, creator_id)
 
+        ctx_without_situation = ConversationContext(
+            fan_message=latest_fan_message,
+            conversation_history=conversation_history,
+            fan_profile=fan_profile,
+            creator_persona=creator_persona,
+            similar_exchanges=similar_exchanges,
+            conversation_stage=conversation_stage,
+            creator_name="a creator",
+        )
+
+        situation = await analyze_situation(ctx_without_situation)
+
         ctx = ConversationContext(
             fan_message=latest_fan_message,
             conversation_history=conversation_history,
@@ -72,6 +85,7 @@ async def _delayed_auto_reply(fan_id: str, creator_id: str, delay: int = 90) -> 
             similar_exchanges=similar_exchanges,
             conversation_stage=conversation_stage,
             creator_name="a creator",
+            situation=situation,
         )
 
         prompt = build_prompt(ctx)
@@ -257,7 +271,8 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
 
     conversation_stage = classify_stage(conversation_history, fan_profile)
     similar_exchanges = await find_similar_exchanges(message_content, creator_id)
-    ctx = ConversationContext(
+
+    ctx_without_situation = ConversationContext(
         fan_message=message_content,
         conversation_history=conversation_history,
         fan_profile=fan_profile,
@@ -266,6 +281,20 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
         conversation_stage=conversation_stage,
         creator_name="a creator",
     )
+
+    situation = await analyze_situation(ctx_without_situation)
+
+    ctx = ConversationContext(
+        fan_message=message_content,
+        conversation_history=conversation_history,
+        fan_profile=fan_profile,
+        creator_persona=creator_persona,
+        similar_exchanges=similar_exchanges,
+        conversation_stage=conversation_stage,
+        creator_name="a creator",
+        situation=situation,
+    )
+
     prompt = build_prompt(ctx)
     replies = await generate_replies(prompt, creator_persona)
 
