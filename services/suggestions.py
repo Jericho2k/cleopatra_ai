@@ -211,16 +211,14 @@ async def _update_fan_ai_summary(
 
 async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
     try:
-        # Human-like delay: 45-90 seconds
-        delay = random.randint(45, 90)
+        print(f"[AUTO REPLY] Starting delay for fan={fan_id} reply={reply[:50]}")
+        delay = random.randint(3, 5)  # temp for testing
         await asyncio.sleep(delay)
-
-        # Handle split messages — send as separate messages with small gap
+        print(f"[AUTO REPLY] Delay done, sending for fan={fan_id}")
         parts = [p.strip() for p in reply.split("|") if p.strip()]
 
         for i, part in enumerate(parts):
             if i > 0:
-                # Small gap between split messages (5-15 seconds)
                 await asyncio.sleep(random.randint(5, 15))
             await save_message(
                 fan_id=fan_id,
@@ -229,8 +227,11 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
                 content=part,
                 was_ai_suggested=True,
             )
+            print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]}")
     except Exception as e:
         print(f"[AUTO REPLY ERROR] fan={fan_id} error={e}")
+        import traceback
+        traceback.print_exc()
 
 
 def _should_update_memory(conversation_history: list[Message]) -> bool:
