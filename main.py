@@ -226,6 +226,7 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
         lambda: db.table("creators").select("auto_mode").eq("id", creator_id).single().execute()
     )
     auto_mode = (creator_row.data or {}).get("auto_mode", False)
+    print(f"[AUTO MODE] creator={creator_id} auto_mode={auto_mode} fan={fan_id}")
 
     # If auto mode, still need to generate a reply but skip saving to suggestions
     # If NOT auto mode, run full suggestions pipeline
