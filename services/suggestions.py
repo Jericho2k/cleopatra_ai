@@ -8,6 +8,7 @@ import json
 import random
 
 from ai.generator import client as together_client, generate_replies
+from core.config import PRIMARY_MODEL
 from ai.prompt_builder import build_prompt
 from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
@@ -116,7 +117,7 @@ async def _update_fan_memory(
         )
 
         response = await together_client.chat.completions.create(
-            model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            model=PRIMARY_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -185,7 +186,7 @@ async def _update_fan_ai_summary(
         )
 
         response = await together_client.chat.completions.create(
-            model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            model=PRIMARY_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

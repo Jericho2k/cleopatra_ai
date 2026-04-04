@@ -7,7 +7,7 @@ import json
 
 from openai import AsyncOpenAI
 
-from core.config import get_settings
+from core.config import FALLBACK_MODEL, PRIMARY_MODEL, get_settings
 from models.schemas import Persona
 
 
@@ -75,10 +75,11 @@ async def generate_replies(
                 return False
         return True
 
-    for _ in range(3):
+    for attempt in range(3):
+        model = PRIMARY_MODEL if attempt < 2 else FALLBACK_MODEL
         try:
             response = await client.chat.completions.create(
-                model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                model=model,
                 messages=prompt_messages,
                 temperature=0.8,
                 max_tokens=300,
@@ -114,7 +115,7 @@ async def generate_replies(
                 if len(result) == 3:
                     return filter_suggestions(result)
         except Exception as e:
-            print(f"[GENERATOR ERROR] attempt failed: {e}")
+            print(f"[GENERATOR ERROR] attempt {attempt + 1} model={model} error={e}")
             continue
 
     # Fallback if all attempts fail

@@ -6,6 +6,7 @@ Analyzes the conversation situation before generating replies.
 import json
 
 from ai.generator import client
+from core.config import PRIMARY_MODEL
 from models.schemas import ConversationContext
 
 
@@ -19,7 +20,7 @@ async def analyze_situation(ctx: ConversationContext) -> dict:
     ])
 
     response = await client.chat.completions.create(
-        model="meta-llama/Meta-Llama-3.3-70B-Instruct-Turbo",
+        model=PRIMARY_MODEL,
         messages=[{
             "role": "user",
             "content": f"""Analyze this OnlyFans chat conversation.
