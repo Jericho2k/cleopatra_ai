@@ -165,6 +165,17 @@ async def suggestions(req: SuggestionRequest) -> SuggestionResponse:
     )
 
 
+@app.post("/regenerate-suggestions", response_model=SuggestionResponse)
+async def regenerate_suggestions(req: SuggestionRequest) -> SuggestionResponse:
+    return await get_suggestions(
+        fan_id=req.fan_id,
+        creator_id=req.creator_id,
+        fan_message=req.message,
+        creator_name="a creator",
+        save_fan_message=False,
+    )
+
+
 @app.post("/reply")
 async def save_reply(req: ReplyRequest) -> dict:
     await save_message(
