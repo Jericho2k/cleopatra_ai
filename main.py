@@ -31,7 +31,64 @@ from models.schemas import (
 )
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
-from services.suggestions import get_suggestions
+from services.suggestions import _send_auto_reply, get_suggestions
+
+
+_debounce_tasks: dict[str, asyncio.Task] = {}
+
+
+async def _delayed_auto_reply(fan_id: str, creator_id: str, delay: int = 90) -> None:
+    """Wait for delay seconds, then generate and send auto reply."""
+    try:
+        await asyncio.sleep(delay)
+
+        # Fetch latest conversation history (includes all messages sent during delay)
+        conversation_history = await get_conversation_history(fan_id)
+
+        # Get the latest fan message
+        fan_messages = [m for m in conversation_history if m.role == "fan"]
+        if not fan_messages:
+            return
+
+        latest_fan_message = fan_messages[-1].content
+
+        # Now run the full AI pipeline with complete context
+        fan_profile = await get_fan_by_id(fan_id)
+        if fan_profile is None:
+            fan_profile = Fan(id=fan_id, display_name=fan_id)
+
+        creator_persona = await get_creator_persona(creator_id)
+        if creator_persona is None:
+            creator_persona = Persona()
+
+        conversation_stage = classify_stage(conversation_history, fan_profile)
+        similar_exchanges = await find_similar_exchanges(latest_fan_message, creator_id)
+
+        ctx = ConversationContext(
+            fan_message=latest_fan_message,
+            conversation_history=conversation_history,
+            fan_profile=fan_profile,
+            creator_persona=creator_persona,
+            similar_exchanges=similar_exchanges,
+            conversation_stage=conversation_stage,
+            creator_name="a creator",
+        )
+
+        prompt = build_prompt(ctx)
+        replies = await generate_replies(prompt, creator_persona)
+
+        if replies:
+            best_reply = replies[0]
+            asyncio.create_task(
+                _send_auto_reply(fan_id, creator_id, best_reply)
+            )
+
+    except asyncio.CancelledError:
+        raise
+    finally:
+        current = asyncio.current_task()
+        if current is not None and _debounce_tasks.get(fan_id) is current:
+            _debounce_tasks.pop(fan_id, None)
 
 
 class ReplyRequest(BaseModel):
@@ -152,29 +209,6 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
     if creator_persona is None:
         creator_persona = Persona()
 
-    conversation_stage = classify_stage(conversation_history, fan_profile)
-    similar_exchanges = await find_similar_exchanges(message_content, creator_id)
-    ctx = ConversationContext(
-        fan_message=message_content,
-        conversation_history=conversation_history,
-        fan_profile=fan_profile,
-        creator_persona=creator_persona,
-        similar_exchanges=similar_exchanges,
-        conversation_stage=conversation_stage,
-        creator_name="a creator",
-    )
-    prompt = build_prompt(ctx)
-    replies = await generate_replies(prompt, creator_persona)
-    from services.suggestions import (
-        _send_auto_reply,
-        _should_update_memory,
-        _update_fan_ai_summary,
-        _update_fan_memory,
-    )
-    if _should_update_memory(conversation_history):
-        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
-        asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
-
     # Check if fan is in any auto-excluded list
     excluded = await asyncio.to_thread(
         lambda: get_supabase()
@@ -188,22 +222,56 @@ async def generate_suggestions_webhook(payload: WebhookPayload) -> dict:
         for row in (excluded.data or [])
     )
 
-    best_reply = replies[0] if replies else None
+    from services.suggestions import (
+        _should_update_memory,
+        _update_fan_ai_summary,
+        _update_fan_memory,
+    )
+
     if auto_mode and not is_excluded:
-        if best_reply:
-            asyncio.create_task(_send_auto_reply(fan_id, creator_id, best_reply))
-        return {"status": "ok"}
-    else:
-        await asyncio.to_thread(
-            lambda: db.table("suggestions").insert({
-                "fan_id": fan_id,
-                "creator_id": creator_id,
-                "message_id": message_id,
-                "suggestions": replies,
-                "stage": conversation_stage.value,
-            }).execute()
-        )
-        return {"status": "ok"}
+        # Cancel existing debounce for this fan if any
+        existing = _debounce_tasks.get(fan_id)
+        if existing and not existing.done():
+            existing.cancel()
+
+        # Schedule new debounced reply
+        task = asyncio.create_task(_delayed_auto_reply(fan_id, creator_id, delay=60))
+        _debounce_tasks[fan_id] = task
+
+        if _should_update_memory(conversation_history):
+            asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
+            asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
+
+        return {"status": "queued"}
+
+    conversation_stage = classify_stage(conversation_history, fan_profile)
+    similar_exchanges = await find_similar_exchanges(message_content, creator_id)
+    ctx = ConversationContext(
+        fan_message=message_content,
+        conversation_history=conversation_history,
+        fan_profile=fan_profile,
+        creator_persona=creator_persona,
+        similar_exchanges=similar_exchanges,
+        conversation_stage=conversation_stage,
+        creator_name="a creator",
+    )
+    prompt = build_prompt(ctx)
+    replies = await generate_replies(prompt, creator_persona)
+
+    if _should_update_memory(conversation_history):
+        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
+        asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
+
+    await asyncio.to_thread(
+        lambda: db.table("suggestions").insert({
+            "fan_id": fan_id,
+            "creator_id": creator_id,
+            "message_id": message_id,
+            "suggestions": replies,
+            "stage": conversation_stage.value,
+        }).execute()
+    )
+    return {"status": "ok"}
 
 
 @app.get("/health")
