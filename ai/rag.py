@@ -28,8 +28,11 @@ async def get_embedding(text: str) -> list[float]:
 async def find_similar_exchanges(
     fan_message: str,
     creator_id: str,
-    limit: int = 5,
+    limit: int = 3,
+    enabled: bool = True,
 ) -> list[ExchangeExample]:
+    if not enabled:
+        return []
     try:
         embedding = await get_embedding(fan_message)
         return await get_similar_exchanges(embedding, creator_id, limit)

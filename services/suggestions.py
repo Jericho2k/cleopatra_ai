@@ -49,7 +49,9 @@ async def get_suggestions(
 
     conversation_stage = classify_stage(conversation_history, fan_profile)
 
-    similar_exchanges = await find_similar_exchanges(fan_message, creator_id)
+    similar_exchanges = await find_similar_exchanges(
+        fan_message, creator_id, enabled=False
+    )
 
     ctx_without_situation = ConversationContext(
         fan_message=fan_message,

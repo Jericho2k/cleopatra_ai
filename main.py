@@ -188,7 +188,9 @@ async def generate_suggestions_webhook(
     )
 
     conversation_stage = classify_stage(conversation_history, fan_profile)
-    similar_exchanges = await find_similar_exchanges(message_content, creator_id)
+    similar_exchanges = await find_similar_exchanges(
+        message_content, creator_id, enabled=False
+    )
 
     ctx_without_situation = ConversationContext(
         fan_message=message_content,
