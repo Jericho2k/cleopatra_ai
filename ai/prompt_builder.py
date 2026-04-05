@@ -49,9 +49,27 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
 
     # ── Stage instruction ──
     stage_instructions = {
-        StageType.COLD_OPEN: "First contact. Be warm but not desperate. Ask one thing about them. Don't over-compliment. Act like a real girl getting a text from a new guy.",
-        StageType.WARMING_UP: "Getting to know each other. Match their energy. Tease a little. Use any personal details they've shared. Start hinting at your content naturally.",
-        StageType.FLIRTING: "Actively flirting now. Be playful and confident. Use their name. Build sexual tension without giving everything away.",
+        StageType.COLD_OPEN: (
+            "New fan. YOU set the energy — don't wait for them to lead. "
+            "Be bold and direct immediately. Ask something provocative or personal right away. "
+            "Examples of what real chatters ask at this stage: "
+            "'do you watch porn often?', 'what are your fetishes?', 'are you shy?', 'what do you do for work?' "
+            "Pick ONE specific question and ask it confidently. "
+            "Do NOT just say hi back and wait. Take control."
+        ),
+        StageType.WARMING_UP: (
+            "Building connection. Keep escalating — each reply should move things slightly more intimate. "
+            "Ask follow-up questions based on EXACTLY what they said. "
+            "Reference their specific words back to them. "
+            "Start weaving in hints about your content naturally — not as a sales pitch, as part of the conversation. "
+            "Be genuinely curious about them while keeping the sexual tension building."
+        ),
+        StageType.FLIRTING: (
+            "Full flirt mode. Be specific and reactive to exactly what they said. "
+            "Use their words, their fantasy, their energy. "
+            "Build tension — don't give everything away. Tease. "
+            "This is where you start hinting at what they could see if they engage more."
+        ),
         StageType.PRE_UPSELL: "Good connection built. Start steering toward paid content. Tease something exclusive. Make them curious without being pushy.",
         StageType.UPSELL_ACTIVE: "Actively selling. Be specific about what they'd get. Make it feel personal and exclusive, made just for them.",
         StageType.OBJECTION: "Fan is hesitating on price or commitment. Don't pressure. Reframe the value. Offer a smaller first step.",
