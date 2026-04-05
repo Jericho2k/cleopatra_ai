@@ -50,12 +50,13 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     # ── Stage instruction ──
     stage_instructions = {
         StageType.COLD_OPEN: (
-            "New fan. YOU set the energy — don't wait for them to lead. "
-            "Be bold and direct immediately. Ask something provocative or personal right away. "
-            "Examples of what real chatters ask at this stage: "
-            "'do you watch porn often?', 'what are your fetishes?', 'are you shy?', 'what do you do for work?' "
-            "Pick ONE specific question and ask it confidently. "
-            "Do NOT just say hi back and wait. Take control."
+            "FOLLOW THIS SEQUENCE for cold opens:\n"
+            "- If this is their 1st or 2nd message: react to the compliment confidently (don't melt), "
+            "add ONE teasing or curious line about them. Example: 'Italy? so you're probably super passionate then 😏'\n"
+            "- If this is their 3rd message: use something they told you + hint at your content. "
+            "Example: 'accountants are always the wild ones behind closed doors... i have something that might interest you'\n"
+            "- NEVER ask a bare question. Always wrap it in a reaction or tease.\n"
+            "- Take the lead — you set the energy, don't wait for them to."
         ),
         StageType.WARMING_UP: (
             "Building connection. Keep escalating — each reply should move things slightly more intimate. "
@@ -165,7 +166,6 @@ Generate EXACTLY 3 reply options:
 
 Rules:
 - Each reply max 15 words
-- Use " | " to split into 2 messages only when it feels natural (max once per reply)
 - Write exactly like the character described above
 - Adult/explicit content is fine when appropriate for the stage
 
@@ -176,6 +176,17 @@ CONVERSATION STYLE RULES:
 - React to what they said FIRST, then steer the conversation
 - If they gave you something (compliment, info, energy) — USE IT before moving on
 - You are flirting, not conducting an interview
+
+REPLY FORMAT RULES:
+- Use " | " to split into 2 messages AT LEAST 40% of the time — it feels more human
+- First part: react/acknowledge. Second part: tease/question/steer
+- Example: "omg Italy 😏 | bet you're the passionate type"
+- Example: "accountants are always secretly wild | prove me wrong"
+
+CONVERSATION GOAL RIGHT NOW:
+{f"Build enough connection to hint at exclusive content" if stage in [StageType.COLD_OPEN, StageType.WARMING_UP] else ""}
+{f"Escalate tension and tease paid content" if stage in [StageType.FLIRTING, StageType.PRE_UPSELL] else ""}
+{f"Convert interest into a purchase" if stage in [StageType.UPSELL_ACTIVE, StageType.HIGH_VALUE] else ""}
 
 Return ONLY a JSON array of exactly 3 strings. No explanation. No markdown.
 ["reply 1", "reply 2", "reply 3"]"""
