@@ -217,6 +217,7 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
         await asyncio.sleep(delay)
         print(f"[AUTO REPLY] Delay done, sending for fan={fan_id}")
         parts = [p.strip() for p in reply.split("|") if p.strip()]
+        print(f"[AUTO REPLY] reply={reply} parts={parts}")
 
         for i, part in enumerate(parts):
             if i > 0:

@@ -23,20 +23,22 @@ async def analyze_situation(ctx: ConversationContext) -> dict:
         model=PRIMARY_MODEL,
         messages=[{
             "role": "user",
-            "content": f"""Analyze this OnlyFans chat conversation.
+            "content": f"""You are analyzing an OnlyFans chat to help the creator respond perfectly.
 
-Conversation:
+Conversation so far:
 {convo}
 
 Latest fan message: "{ctx.fan_message}"
 
-Return ONLY valid JSON:
+Analyze and return ONLY valid JSON:
 {{
-  "fan_mood": "one word: excited/bored/horny/lonely/curious/frustrated/romantic/testing",
-  "fan_intent": "what does this message actually want or signal in 1 sentence",
+  "fan_mood": "one of: excited/bored/horny/lonely/curious/frustrated/romantic/testing/shy",
+  "fan_intent": "what does this message signal — is he complimenting, escalating, testing, opening up, pulling back?",
   "conversation_energy": "rising/flat/dropping",
-  "strategic_move": "best move for the creator right now in 1 sentence — build connection/tease/upsell/re-engage/playful deflect/mirror energy",
-  "personal_details_mentioned": ["any names, locations, jobs, interests the fan mentioned"]
+  "strategic_move": "what should the creator do RIGHT NOW — choose one: mirror_warmth/tease_and_deflect/ask_personal_question/hint_at_content/build_tension/re_engage/push_for_ppv/acknowledge_compliment_and_redirect",
+  "tone": "what tone should the reply have — playful/warm/flirty/mysterious/direct/casual",
+  "personal_details_mentioned": ["any names, locations, jobs, interests mentioned by fan"],
+  "avoid_repeating": "flag if the creator has already used the same line recently"
 }}"""
         }],
         temperature=0.2,
@@ -53,6 +55,8 @@ Return ONLY valid JSON:
             "fan_mood": "curious",
             "fan_intent": "engaging with creator",
             "conversation_energy": "flat",
-            "strategic_move": "build connection with warmth and a question",
+            "strategic_move": "mirror_warmth",
+            "tone": "playful",
             "personal_details_mentioned": [],
+            "avoid_repeating": "",
         }

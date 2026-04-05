@@ -43,7 +43,8 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     mood = situation.get("fan_mood", "")
     intent = situation.get("fan_intent", "")
     energy = situation.get("conversation_energy", "")
-    strategy = situation.get("strategic_move", "")
+    tone = situation.get("tone", "playful")
+    strategy = situation.get("strategic_move", "build connection")
     personal_details = situation.get("personal_details_mentioned", [])
 
     # ── Stage instruction ──
@@ -107,6 +108,15 @@ HARD RULES — NEVER break:
     if dont_list:
         system_prompt += "\nNEVER SAY ANYTHING LIKE:\n" + "\n".join(f"- {d}" for d in dont_list)
 
+    # Add recent creator messages to avoid repetition
+    recent_creator_msgs = [m.content for m in ctx.conversation_history[-10:] if m.role == "creator"][-3:]
+    avoid_section = ""
+    if recent_creator_msgs:
+        avoid_section = (
+            "\nDO NOT REPEAT OR CLOSELY ECHO THESE RECENT REPLIES:\n"
+            + "\n".join(f"- {m}" for m in recent_creator_msgs)
+        )
+
     user_prompt = f"""FAN: {fan_name} | Spent: ${spent} | Tier: {tier}
 {f'Notes: {notes}' if notes else ''}
 {f'Emotional type: {emotional_type}' if emotional_type else ''}
@@ -118,12 +128,15 @@ HARD RULES — NEVER break:
 CURRENT STAGE: {stage.value}
 STAGE INSTRUCTION: {stage_instruction}
 
+TONE FOR THIS REPLY: {tone}
+STRATEGIC MOVE: {strategy}
+
 {f'SITUATION ANALYSIS:' if situation else ''}
 {f'Fan mood: {mood}' if mood else ''}
 {f'What they want: {intent}' if intent else ''}
 {f'Conversation energy: {energy}' if energy else ''}
-{f'Your move: {strategy}' if strategy else ''}
-{f'Personal details to use: {", ".join(personal_details)}' if personal_details else ''}
+{f'Personal details to use: {", ".join(str(p) for p in personal_details)}' if personal_details else ''}
+{avoid_section}
 {rag_section}
 Fan just sent: "{ctx.fan_message}"
 
