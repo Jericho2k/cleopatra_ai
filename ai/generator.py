@@ -71,6 +71,11 @@ async def generate_replies(
         "that sounds nice",
         "sounds interesting",
         "that's nice",
+        "what's your story",
+        "gorgeous back at ya",
+        "mind blowing yourself",
+        "beautiful yourself",
+        "stunning yourself",
     ]
 
     def _is_valid(reply: str) -> bool:

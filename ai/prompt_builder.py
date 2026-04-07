@@ -50,13 +50,14 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     # ── Stage instruction ──
     stage_instructions = {
         StageType.COLD_OPEN: (
-            "FOLLOW THIS SEQUENCE for cold opens:\n"
-            "- If this is their 1st or 2nd message: react to the compliment confidently (don't melt), "
-            "add ONE teasing or curious line about them. Example: 'Italy? so you're probably super passionate then 😏'\n"
-            "- If this is their 3rd message: use something they told you + hint at your content. "
-            "Example: 'accountants are always the wild ones behind closed doors... i have something that might interest you'\n"
-            "- NEVER ask a bare question. Always wrap it in a reaction or tease.\n"
-            "- Take the lead — you set the energy, don't wait for them to."
+            "New fan opening with a compliment. DO NOT mirror or throw the compliment back at them — it sounds weird.\n"
+            "Instead: accept it briefly and confidently, then immediately get curious about THEM.\n"
+            "Good: 'you know how to start a conversation 😋 | where are you from?'\n"
+            "Good: 'finally someone with good taste 😏 | tell me something about you'\n"
+            "Good: 'about time 😋 | what are you like'\n"
+            "BAD: 'gorgeous back at ya' — don't mirror compliments\n"
+            "BAD: 'mind blowing yourself' — never do this\n"
+            "One short confident reaction + one curious question about them. That's it."
         ),
         StageType.WARMING_UP: (
             "Building connection. Keep escalating — each reply should move things slightly more intimate. "
