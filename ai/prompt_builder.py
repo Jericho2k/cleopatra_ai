@@ -127,14 +127,17 @@ HARD RULES — NEVER break:
     if dont_list:
         system_prompt += "\nNEVER SAY ANYTHING LIKE:\n" + "\n".join(f"- {d}" for d in dont_list)
 
-    # Add recent creator messages to avoid repetition
-    recent_creator_msgs = [m.content for m in ctx.conversation_history[-10:] if m.role == "creator"][-3:]
-    avoid_section = ""
-    if recent_creator_msgs:
-        avoid_section = (
-            "\nDO NOT REPEAT OR CLOSELY ECHO THESE RECENT REPLIES:\n"
-            + "\n".join(f"- {m}" for m in recent_creator_msgs)
-        )
+    # Get last 5 creator messages to explicitly ban
+    recent_creator = [
+        m.content for m in ctx.conversation_history[-15:]
+        if m.role == "creator"
+    ][-5:]
+
+    avoid_block = ""
+    if recent_creator:
+        avoid_block = "\n\nYOU ALREADY SAID THESE — DO NOT REPEAT OR ECHO THEM:\n"
+        avoid_block += "\n".join(f"- {m}" for m in recent_creator)
+        avoid_block += "\nWrite something completely different."
 
     user_prompt = f"""FAN: {fan_name} | Spent: ${spent} | Tier: {tier}
 {f'Notes: {notes}' if notes else ''}
@@ -155,7 +158,7 @@ STRATEGIC MOVE: {strategy}
 {f'What they want: {intent}' if intent else ''}
 {f'Conversation energy: {energy}' if energy else ''}
 {f'Personal details to use: {", ".join(str(p) for p in personal_details)}' if personal_details else ''}
-{avoid_section}
+{avoid_block}
 {rag_section}
 Fan just sent: "{ctx.fan_message}"
 
