@@ -27,6 +27,7 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     example_flirts = persona_dict.get("example_flirts", [])
     example_greetings = persona_dict.get("example_greetings", [])
     dont_list = persona_dict.get("dont_list", [])
+    welcome_msg = getattr(persona, "welcome_message", "") or persona_dict.get("welcome_message", "")
 
     # ── Fan context ──
     fan_name = fan.display_name
@@ -127,6 +128,8 @@ HARD RULES — NEVER break:
 
     if dont_list:
         system_prompt += "\nNEVER SAY ANYTHING LIKE:\n" + "\n".join(f"- {d}" for d in dont_list)
+    if welcome_msg:
+        system_prompt += f"\n\nYOUR WELCOME MESSAGE TO NEW FANS:\n{welcome_msg}\nThis shows your opening style and what you lead with."
 
     # Get last 5 creator messages to explicitly ban
     recent_creator = [
