@@ -3,7 +3,7 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Primary and fallback models
-PRIMARY_MODEL = "openai/gpt-oss-120b"
+PRIMARY_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 FALLBACK_MODEL = "openai/gpt-oss-20b"
 
 
