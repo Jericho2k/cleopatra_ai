@@ -170,9 +170,6 @@ async def generate_suggestions_webhook(
     creator_id = record.get("creator_id")
     if not all([fan_id, creator_id, message_content, message_id]):
         return {"status": "skipped"}
-    # Save fan message FIRST
-    await save_message(fan_id, creator_id, "fan", message_content)
-
     # Then get history (now includes the message we just saved)
     conversation_history = await get_conversation_history(fan_id)
     fan_profile = await get_fan_by_id(fan_id)
