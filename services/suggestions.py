@@ -7,8 +7,9 @@ import asyncio
 import json
 import random
 
-from ai.generator import client as together_client, generate_replies
-from core.config import PRIMARY_MODEL
+from ai.generator import generate_replies
+from openai import AsyncOpenAI
+from core.config import get_settings
 from ai.prompt_builder import build_prompt
 from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
@@ -27,6 +28,11 @@ from models.schemas import (
     Message,
     Persona,
     SuggestionResponse,
+)
+
+together_client = AsyncOpenAI(
+    base_url="https://api.together.xyz/v1",
+    api_key=get_settings().TOGETHER_API_KEY,
 )
 
 
@@ -119,7 +125,7 @@ async def _update_fan_memory(
         )
 
         response = await together_client.chat.completions.create(
-            model=PRIMARY_MODEL,
+            model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -188,7 +194,7 @@ async def _update_fan_ai_summary(
         )
 
         response = await together_client.chat.completions.create(
-            model=PRIMARY_MODEL,
+            model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
