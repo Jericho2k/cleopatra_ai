@@ -5,17 +5,15 @@ Calls Together AI via the OpenAI-compatible client and returns reply options.
 
 import json
 
-from openai import AsyncOpenAI
+import anthropic
 
 from core.config import FALLBACK_MODEL, PRIMARY_MODEL, get_settings
 from models.schemas import Persona
 
 
 # Module level — create once
-client = AsyncOpenAI(
-    base_url="https://api.together.xyz/v1",
-    api_key=get_settings().TOGETHER_API_KEY,
-)
+anthropic_client = anthropic.AsyncAnthropic(api_key=get_settings().ANTHROPIC_API_KEY)
+client = anthropic_client
 
 BANNED_PHRASES = [
     "hehe", "making me blush", "ur too sweet", "aww that's so sweet",

@@ -2,8 +2,9 @@
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Primary and fallback models
-PRIMARY_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+# Switch to Anthropic
+USE_ANTHROPIC = True
+PRIMARY_MODEL = "claude-sonnet-4-20250514"
 FALLBACK_MODEL = "openai/gpt-oss-20b"
 
 
@@ -11,6 +12,7 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_KEY: str
     TOGETHER_API_KEY: str
+    ANTHROPIC_API_KEY: str
     UPSTASH_REDIS_URL: str
     UPSTASH_REDIS_TOKEN: str
     OPENAI_API_KEY: str
