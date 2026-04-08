@@ -4,6 +4,7 @@ Calls Together AI via the OpenAI-compatible client and returns reply options.
 """
 
 import json
+import re
 
 import anthropic
 import os
@@ -95,6 +96,9 @@ async def generate_replies(
                 messages=[{"role": "user", "content": prompt_messages[1]["content"]}],
             )
             content = response.content[0].text
+            # Strip any injected system content
+            content = re.sub(r"<ethics_reminder>.*?</ethics_reminder>", "", content, flags=re.DOTALL)
+            content = content.strip()
 
             # Strip markdown code fences if present
             lines = content.splitlines()
