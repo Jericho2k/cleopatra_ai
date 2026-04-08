@@ -6,3 +6,4 @@ openai
 httpx
 redis
 python-dotenv
+anthropic
