@@ -41,6 +41,9 @@ from services.suggestions import (
 )
 
 
+_processed_messages: set = set()
+
+
 class ReplyRequest(BaseModel):
     fan_id: str
     creator_id: str
@@ -148,10 +151,22 @@ async def generate_suggestions_webhook(
     record = payload.record
     if record.get("role") != "fan":
         return {"status": "skipped"}
+    # Dedup check — ignore if we already processed this message recently
+    message_id = record.get("id")
+    cache_key = f"processed:{message_id}"
+
+    # Use a simple in-memory set (resets on restart, good enough)
+    if message_id in _processed_messages:
+        return {"status": "duplicate"}
+    _processed_messages.add(message_id)
+
+    # Cleanup old entries to prevent memory leak
+    if len(_processed_messages) > 1000:
+        _processed_messages.clear()
+
     fan_id = record.get("fan_id")
     creator_id = record.get("creator_id")
     message_content = record.get("content")
-    message_id = record.get("id")
     if not all([fan_id, creator_id, message_content, message_id]):
         return {"status": "skipped"}
     # Save fan message FIRST
