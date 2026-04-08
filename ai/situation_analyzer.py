@@ -4,10 +4,12 @@ Analyzes the conversation situation before generating replies.
 """
 
 import json
+import os
 
-from ai.generator import client
-from core.config import PRIMARY_MODEL
+from anthropic import AsyncAnthropic
 from models.schemas import ConversationContext
+
+client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 
 async def analyze_situation(ctx: ConversationContext) -> dict:
@@ -19,11 +21,7 @@ async def analyze_situation(ctx: ConversationContext) -> dict:
         for m in recent
     ])
 
-    response = await client.chat.completions.create(
-        model=PRIMARY_MODEL,
-        messages=[{
-            "role": "user",
-            "content": f"""You are analyzing an OnlyFans chat to help the creator respond perfectly.
+    user_content = f"""You are analyzing an OnlyFans chat to help the creator respond perfectly.
 
 Conversation so far:
 {convo}
@@ -40,12 +38,14 @@ Analyze and return ONLY valid JSON:
   "personal_details_mentioned": ["any names, locations, jobs, interests mentioned by fan"],
   "avoid_repeating": "flag if the creator has already used the same line recently"
 }}"""
-        }],
-        temperature=0.2,
-        max_tokens=200,
+
+    response = await client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=300,
+        messages=[{"role": "user", "content": user_content}],
     )
 
-    content = response.choices[0].message.content or ""
+    content = response.content[0].text
     content = content.replace("```json", "").replace("```", "").strip()
 
     try:

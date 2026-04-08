@@ -6,14 +6,14 @@ Calls Together AI via the OpenAI-compatible client and returns reply options.
 import json
 
 import anthropic
+import os
 
-from core.config import FALLBACK_MODEL, PRIMARY_MODEL, get_settings
+from core.config import get_settings
 from models.schemas import Persona
 
 
 # Module level — create once
-anthropic_client = anthropic.AsyncAnthropic(api_key=get_settings().ANTHROPIC_API_KEY)
-client = anthropic_client
+anthropic_client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 BANNED_PHRASES = [
     "hehe", "making me blush", "ur too sweet", "aww that's so sweet",
@@ -86,15 +86,15 @@ async def generate_replies(
         return True
 
     for attempt in range(3):
-        model = PRIMARY_MODEL if attempt < 2 else FALLBACK_MODEL
+        model = "claude-sonnet-4-20250514"
         try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=prompt_messages,
-                temperature=0.8,
-                max_tokens=300,
+            response = await anthropic_client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1000,
+                system=prompt_messages[0]["content"],
+                messages=[{"role": "user", "content": prompt_messages[1]["content"]}],
             )
-            content = response.choices[0].message.content or ""
+            content = response.content[0].text
 
             # Strip markdown code fences if present
             lines = content.splitlines()
