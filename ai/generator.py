@@ -96,8 +96,8 @@ async def generate_replies(
                 messages=[{"role": "user", "content": prompt_messages[1]["content"]}],
             )
             content = response.content[0].text
-            # Strip any injected system content
-            content = re.sub(r"<ethics_reminder>.*?</ethics_reminder>", "", content, flags=re.DOTALL)
+            # Strip ALL injected system blocks before parsing
+            content = re.sub(r"<[a-z_]+_reminder>.*?</[a-z_]+_reminder>", "", content, flags=re.DOTALL)
             content = content.strip()
 
             # Strip markdown code fences if present
