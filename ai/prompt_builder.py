@@ -43,16 +43,6 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     }
     stage_instruction = stage_instructions.get(stage, "")
 
-    if stage in [StageType.UPSELL_ACTIVE, StageType.HIGH_VALUE]:
-        length_rule = (
-            "Message length is flexible here — short teases AND longer "
-            "descriptive messages both work. Match the energy. "
-            "When describing actions or scenes, 2-3 sentences is fine. "
-            "When teasing, keep it short. Read the moment."
-        )
-    else:
-        length_rule = "Keep replies SHORT — 1-2 sentences max per message part."
-
     rag_section = ""
     if ctx.similar_exchanges:
         examples = "\n".join([
@@ -92,7 +82,6 @@ YOUR HARD LIMITS — these are non-negotiable:
 - Never promise to meet in person or anything outside this platform
 - Never say hehe, "making me blush", "you're too sweet"
 - Never repeat something you just said
-- {length_rule}
 
 YOUR PHRASES (use naturally, not every message):
 {example_phrases}
@@ -135,8 +124,10 @@ SITUATION: {strategy} (fan mood: {mood}, energy: {energy})
 Fan just said: "{ctx.fan_message}"
 
 Write 3 reply options. Each should feel like a different side of the same person — not 3 different characters.
-Use " | " to split into 2 messages when it feels natural (aim for at least 1 split across the 3 options).
-Max 12 words per message part.
+Write naturally — sometimes one word is right, sometimes three sentences.
+Match the energy and context. Don't pad, don't truncate.
+Use " | " to split into 2 separate messages when it feels natural.
+Think about how a real girl texts her favorite fans.
 Use " | " to split into 2 messages at least once across your 3 options.
 NEVER mirror a compliment back — don't say "gorgeous back at you" or anything similar.
 
