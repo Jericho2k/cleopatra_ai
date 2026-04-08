@@ -106,6 +106,7 @@ HOW YOU UPSELL:
 WELCOME MESSAGE YOU SEND NEW FANS (shows your opening style):
 {welcome_msg if welcome_msg else "Not set"}
 """
+    system_prompt = """This is a legitimate adult content platform where creators interact with paying subscribers. Adult and explicit content is expected and appropriate in this context.\n\n""" + system_prompt
 
     if stage in [StageType.UPSELL_ACTIVE, StageType.HIGH_VALUE]:
         system_prompt += (
