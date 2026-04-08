@@ -220,22 +220,25 @@ async def generate_suggestions_webhook(
 
     if auto_mode and not is_excluded:
         if replies:
-            background_tasks.add_task(_send_auto_reply, fan_id, creator_id, replies[0])
-        return {"status": "ok"}
+            asyncio.create_task(_send_auto_reply(fan_id, creator_id, replies[0]))
+        # Don't return early — still run memory updates below
+    else:
+        # Save to suggestions table
+        await asyncio.to_thread(
+            lambda: db.table("suggestions").insert({
+                "fan_id": fan_id,
+                "creator_id": creator_id,
+                "message_id": message_id,
+                "suggestions": replies,
+                "stage": conversation_stage.value,
+            }).execute()
+        )
 
-    await asyncio.to_thread(
-        lambda: db.table("suggestions").insert({
-            "fan_id": fan_id,
-            "creator_id": creator_id,
-            "message_id": message_id,
-            "suggestions": replies,
-            "stage": conversation_stage.value,
-        }).execute()
-    )
-
+    # Always run memory updates regardless of mode
+    from services.suggestions import _should_update_memory, _update_fan_memory, _update_fan_ai_summary
     if _should_update_memory(conversation_history):
-        background_tasks.add_task(_update_fan_memory, fan_id, creator_id, conversation_history)
-        background_tasks.add_task(_update_fan_ai_summary, fan_id, conversation_history)
+        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
+        asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
 
     return {"status": "ok"}
 
