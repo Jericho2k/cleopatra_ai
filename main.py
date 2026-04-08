@@ -149,10 +149,12 @@ async def generate_suggestions_webhook(
     if payload.type != "INSERT":
         return {"status": "skipped"}
     record = payload.record
+    message_id = record.get("id")
+    message_content = record.get("content")
+    print(f"[WEBHOOK] message_id={message_id} role={record.get('role')} content={message_content[:30]}")
     if record.get("role") != "fan":
         return {"status": "skipped"}
     # Dedup check — ignore if we already processed this message recently
-    message_id = record.get("id")
     cache_key = f"processed:{message_id}"
 
     # Use a simple in-memory set (resets on restart, good enough)
@@ -166,7 +168,6 @@ async def generate_suggestions_webhook(
 
     fan_id = record.get("fan_id")
     creator_id = record.get("creator_id")
-    message_content = record.get("content")
     if not all([fan_id, creator_id, message_content, message_id]):
         return {"status": "skipped"}
     # Save fan message FIRST
