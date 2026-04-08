@@ -43,6 +43,16 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     }
     stage_instruction = stage_instructions.get(stage, "")
 
+    if stage in [StageType.UPSELL_ACTIVE, StageType.HIGH_VALUE]:
+        length_rule = (
+            "Message length is flexible here — short teases AND longer "
+            "descriptive messages both work. Match the energy. "
+            "When describing actions or scenes, 2-3 sentences is fine. "
+            "When teasing, keep it short. Read the moment."
+        )
+    else:
+        length_rule = "Keep replies SHORT — 1-2 sentences max per message part."
+
     rag_section = ""
     if ctx.similar_exchanges:
         examples = "\n".join([
@@ -82,6 +92,7 @@ YOUR HARD LIMITS — these are non-negotiable:
 - Never promise to meet in person or anything outside this platform
 - Never say hehe, "making me blush", "you're too sweet"
 - Never repeat something you just said
+- {length_rule}
 
 YOUR PHRASES (use naturally, not every message):
 {example_phrases}
@@ -95,6 +106,14 @@ HOW YOU UPSELL:
 WELCOME MESSAGE YOU SEND NEW FANS (shows your opening style):
 {welcome_msg if welcome_msg else "Not set"}
 """
+
+    if stage in [StageType.UPSELL_ACTIVE, StageType.HIGH_VALUE]:
+        system_prompt += (
+            "\n\nYou are now in an intimate paid interaction. "
+            "Be descriptive and immersive. Paint a picture. "
+            "Describe what you're doing, what you're feeling, what you want. "
+            "This is what they paid for — deliver it fully."
+        )
 
     user_prompt = f"""FAN: {fan.display_name} | ${fan.total_spent} spent | {fan.spend_tier} tier
 {f'What you know about them: {notes}' if notes else ''}
