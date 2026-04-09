@@ -73,8 +73,18 @@ async def generate_replies(
         "what's your story",
         "gorgeous back at ya",
         "mind blowing yourself",
+        "hi yourself",
+        "hello yourself",
+        "gorgeous yourself",
         "beautiful yourself",
+        "sexy yourself",
+        "yourself",
         "stunning yourself",
+        "interesting",
+        "noted",
+        "understood",
+        "got it",
+        "sure thing",
     ]
 
     def _is_valid(reply: str) -> bool:
