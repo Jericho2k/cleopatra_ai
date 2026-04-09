@@ -260,7 +260,7 @@ async def generate_suggestions_webhook(
     fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
     print(f"[MEMORY CHECK] fan={fan_id} fan_messages={fan_msg_count} should_update={_should_update_memory(conversation_history)}")
     if _should_update_memory(conversation_history):
-        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
+        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent))
         asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
 
     return {"status": "ok"}

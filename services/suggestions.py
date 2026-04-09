@@ -93,7 +93,7 @@ async def get_suggestions(
         await save_message(fan_id, creator_id, "fan", fan_message)
 
     if _should_update_memory(conversation_history):
-        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history))
+        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent))
         asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
 
     return SuggestionResponse(suggestions=replies)
@@ -103,6 +103,7 @@ async def _update_fan_memory(
     fan_id: str,
     creator_id: str,
     conversation_history: list[Message],
+    fan_total_spent: int,
 ) -> None:
     try:
         recent_messages = conversation_history[-20:]
@@ -145,16 +146,24 @@ async def _update_fan_memory(
         data = json.loads(cleaned)
         notes = data.get("notes", "")
         preferences = data.get("preferences") or []
-        spend_tier = data.get("spend_tier", "cold")
 
         if not isinstance(preferences, list):
             preferences = []
+
+        # Override AI's spend_tier with actual spend data
+        actual_tier = "cold"
+        if fan_total_spent >= 500:
+            actual_tier = "whale"
+        elif fan_total_spent >= 100:
+            actual_tier = "active"
+        elif fan_total_spent > 0:
+            actual_tier = "casual"
 
         await update_fan_memory(
             fan_id=fan_id,
             notes=notes,
             preferences=preferences,
-            spend_tier=spend_tier,
+            spend_tier=actual_tier,  # use actual spend, not AI guess
         )
     except Exception:
         # Silent failure; this runs in the background
