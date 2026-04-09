@@ -55,6 +55,7 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
         m.content for m in ctx.conversation_history[-15:]
         if m.role == "creator"
     ][-5:]
+    ppv_offers = ctx.ppv_offers
 
     avoid_block = ""
     if recent_creator:
@@ -133,6 +134,13 @@ NEVER mirror a compliment back — don't say "gorgeous back at you" or anything 
 
 Return ONLY a JSON array of 3 strings. No markdown.
 ["reply 1", "reply 2", "reply 3"]"""
+
+    if ppv_offers:
+        offers_text = "\n".join([
+            f"- {o['title']}: ${o['price']} — {o.get('description', '')}"
+            for o in ppv_offers
+        ])
+        user_prompt += f"\n\nCONTENT YOU CAN SELL RIGHT NOW:\n{offers_text}\nWhen the moment is right, reference these naturally — don't list them, just mention one that fits."
 
     return [
         {"role": "system", "content": system_prompt},

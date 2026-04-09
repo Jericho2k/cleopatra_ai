@@ -21,6 +21,7 @@ from db.queries import (
     get_conversation_history,
     get_creator_persona,
     get_fan_by_id,
+    get_ppv_offers,
     save_message,
 )
 from models.schemas import (
@@ -190,6 +191,7 @@ async def generate_suggestions_webhook(
     creator_persona = await get_creator_persona(creator_id)
     if creator_persona is None:
         creator_persona = Persona()
+    ppv_offers = await get_ppv_offers(creator_id)
 
     # Check if fan is in any auto-excluded list
     excluded = await asyncio.to_thread(
@@ -217,6 +219,7 @@ async def generate_suggestions_webhook(
         similar_exchanges=similar_exchanges,
         conversation_stage=conversation_stage,
         creator_name="a creator",
+        ppv_offers=ppv_offers,
     )
 
     situation = await analyze_situation(ctx_without_situation)
@@ -230,6 +233,7 @@ async def generate_suggestions_webhook(
         conversation_stage=conversation_stage,
         creator_name="a creator",
         situation=situation,
+        ppv_offers=ppv_offers,
     )
 
     prompt = build_prompt(ctx)

@@ -76,6 +76,7 @@ class ConversationContext(BaseModel):
     conversation_stage: StageType
     creator_name: str = "a creator"
     situation: dict | None = None
+    ppv_offers: list[dict] = []
 
 
 class SuggestionRequest(BaseModel):

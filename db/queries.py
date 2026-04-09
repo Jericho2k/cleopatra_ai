@@ -107,6 +107,14 @@ async def get_creator_persona(creator_id: str) -> Persona | None:
     return await asyncio.to_thread(_get)
 
 
+async def get_ppv_offers(creator_id: str) -> list[dict]:
+    def _get():
+        r = get_supabase().table("ppv_offers").select("title, description, price").eq("creator_id", creator_id).execute()
+        return r.data or []
+
+    return await asyncio.to_thread(_get)
+
+
 async def save_persona(creator_id: str, persona: Persona) -> None:
     def _save():
         get_supabase().table("creators").update({"persona": persona.model_dump()}).eq("id", creator_id).execute()

@@ -18,6 +18,7 @@ from db.queries import (
     get_conversation_history,
     get_creator_persona,
     get_fan,
+    get_ppv_offers,
     save_message,
     update_fan_memory,
     update_fan_ai_summary,
@@ -52,6 +53,7 @@ async def get_suggestions(
     creator_persona = await get_creator_persona(creator_id)
     if creator_persona is None:
         creator_persona = Persona()
+    ppv_offers = await get_ppv_offers(creator_id)
 
     conversation_stage = classify_stage(conversation_history, fan_profile)
 
@@ -67,6 +69,7 @@ async def get_suggestions(
         similar_exchanges=similar_exchanges,
         conversation_stage=conversation_stage,
         creator_name=creator_name,
+        ppv_offers=ppv_offers,
     )
 
     situation = await analyze_situation(ctx_without_situation)
@@ -80,6 +83,7 @@ async def get_suggestions(
         conversation_stage=conversation_stage,
         creator_name=creator_name,
         situation=situation,
+        ppv_offers=ppv_offers,
     )
 
     prompt = build_prompt(ctx)
