@@ -15,6 +15,13 @@ def classify_stage(
     fan_text_recent = " ".join(m.content for m in fan_messages[-10:]).lower()
     fan_text_all = " ".join(m.content for m in fan_messages).lower()
 
+    # Never upsell before 10 fan messages regardless of signals
+    fan_message_count = len(fan_messages)
+    if fan_message_count < 10:
+        if message_count <= 2:
+            return StageType.COLD_OPEN
+        return StageType.WARMING_UP
+
     # ── HIGH VALUE: big spender ──
     if fan_profile.total_spent > 300:
         return StageType.HIGH_VALUE
