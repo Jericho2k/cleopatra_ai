@@ -157,25 +157,6 @@ async def process_incoming_fan_message(
         asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
 
 
-async def handle_fan_message(
-    fan_id: str,
-    creator_id: str,
-    message_content: str,
-    auto_mode: bool,
-    message_id: str | None = None,
-) -> None:
-    await save_message(
-        fan_id,
-        creator_id,
-        "fan",
-        message_content,
-        fansly_message_id=message_id,
-    )
-    await process_incoming_fan_message(
-        fan_id, creator_id, message_content, auto_mode, message_id,
-    )
-
-
 class ReplyRequest(BaseModel):
     fan_id: str
     creator_id: str
@@ -286,6 +267,9 @@ async def generate_suggestions_webhook(
     print(f"[WEBHOOK] message_id={message_id} role={record.get('role')} content={message_content[:30]}")
     if record.get("role") != "fan":
         return {"status": "skipped"}
+    fansly_msg_id = record.get("fansly_message_id")
+    if fansly_msg_id:
+        return {"status": "skipped - handled by fansly webhook"}
     if message_id in _processed_messages:
         return {"status": "duplicate"}
     _processed_messages.add(message_id)
@@ -382,12 +366,28 @@ async def fansly_webhook(payload: dict) -> dict:
             .execute()
         )
 
-    await handle_fan_message(
+    mid = str(message_id) if message_id else ""
+    if mid:
+        await asyncio.to_thread(
+            lambda: db.table("messages")
+            .insert({
+                "fan_id": fan.id,
+                "creator_id": creator_id,
+                "role": "fan",
+                "content": message_content,
+                "fansly_message_id": mid,
+            })
+            .execute()
+        )
+    else:
+        await save_message(fan.id, creator_id, "fan", message_content)
+
+    await process_incoming_fan_message(
         fan.id,
         creator_id,
         message_content,
         auto_mode,
-        str(message_id) if message_id else None,
+        mid if mid else None,
     )
 
     return {"status": "ok"}
