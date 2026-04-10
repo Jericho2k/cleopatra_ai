@@ -14,6 +14,7 @@ def _row_to_fan(row: dict) -> Fan:
     return Fan(
         id=str(row["id"]),
         display_name=row["display_name"],
+        platform_fan_id=str(row["platform_fan_id"]) if row.get("platform_fan_id") is not None else None,
         total_spent=row.get("total_spent", 0),
         spend_tier=row.get("spend_tier", "cold"),
         last_active=last_active,
@@ -73,6 +74,19 @@ async def update_fan_spend(fan_id: str, total_spent: int, spend_tier: str) -> No
     await asyncio.to_thread(_update)
 
 
+async def increment_fan_total_spent(fan_id: str, amount: int) -> None:
+    def _update():
+        get_supabase().rpc(
+            "increment_fan_spent",
+            {
+                "fan_id_input": fan_id,
+                "amount_input": amount,
+            },
+        ).execute()
+
+    await asyncio.to_thread(_update)
+
+
 async def get_conversation_history(fan_id: str, limit: int = 40) -> list[Message]:
     def _get():
         r = get_supabase().table("messages").select("role, content, sent_at").eq("fan_id", fan_id).order("sent_at", desc=False).limit(limit).execute()
@@ -92,6 +106,24 @@ async def save_message(fan_id: str, creator_id: str, role: str, content: str, wa
         }).execute()
 
     await asyncio.to_thread(_save)
+
+
+async def get_creator_fansly_account_id(creator_id: str) -> str | None:
+    def _get():
+        r = (
+            get_supabase()
+            .table("creators")
+            .select("fansly_account_id")
+            .eq("id", creator_id)
+            .limit(1)
+            .execute()
+        )
+        if not r.data:
+            return None
+        v = r.data[0].get("fansly_account_id")
+        return str(v) if v is not None else None
+
+    return await asyncio.to_thread(_get)
 
 
 async def get_creator_persona(creator_id: str) -> Persona | None:
