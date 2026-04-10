@@ -25,6 +25,7 @@ from db.queries import (
     get_fan,
     get_fan_by_id,
     get_ppv_offers,
+    increment_fan_total_spent,
     save_message,
 )
 from models.schemas import (
@@ -305,57 +306,90 @@ async def generate_suggestions_webhook(
 @app.post("/webhook/fansly")
 async def fansly_webhook(payload: dict) -> dict:
     event = payload.get("event")
-    if event != "messages.received":
-        return {"status": "skipped"}
-
     account_id = payload.get("account_id")
     data = payload.get("payload") or {}
-    from_user = data.get("fromUser") or {}
 
-    if from_user.get("isPerformer"):
-        return {"status": "skipped"}
+    if event == "messages.received":
+        from_user = data.get("fromUser") or {}
 
-    platform_fan_id = str(from_user.get("id"))
-    fan_name = from_user.get("name", "Fan")
-    message_content = data.get("text", "")
-    message_id = data.get("id")
+        if from_user.get("isPerformer"):
+            return {"status": "skipped"}
 
-    if not message_content or not account_id:
-        return {"status": "skipped"}
+        platform_fan_id = str(from_user.get("id"))
+        fan_name = from_user.get("name", "Fan")
+        message_content = data.get("text", "")
+        message_id = data.get("id")
 
-    if message_id is not None:
-        mid = str(message_id)
-        if mid in _processed_messages:
-            return {"status": "duplicate"}
-        _processed_messages.add(mid)
-        if len(_processed_messages) > 1000:
-            _processed_messages.clear()
+        if not message_content or not account_id:
+            return {"status": "skipped"}
 
-    db = get_supabase()
-    creator_row = await asyncio.to_thread(
-        lambda: db.table("creators")
-        .select("id, auto_mode")
-        .eq("fansly_account_id", str(account_id))
-        .limit(1)
-        .execute()
-    )
-    if not creator_row.data:
-        return {"status": "creator_not_found"}
+        if message_id is not None:
+            mid = str(message_id)
+            if mid in _processed_messages:
+                return {"status": "duplicate"}
+            _processed_messages.add(mid)
+            if len(_processed_messages) > 1000:
+                _processed_messages.clear()
 
-    creator_id = creator_row.data[0]["id"]
-    auto_mode = creator_row.data[0].get("auto_mode", False)
+        db = get_supabase()
+        creator_row = await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("id, auto_mode")
+            .eq("fansly_account_id", str(account_id))
+            .limit(1)
+            .execute()
+        )
+        if not creator_row.data:
+            return {"status": "creator_not_found"}
 
-    fan = await get_fan(creator_id, platform_fan_id)
-    if not fan:
-        fan = await create_fan(creator_id, platform_fan_id, fan_name)
+        creator_id = creator_row.data[0]["id"]
+        auto_mode = creator_row.data[0].get("auto_mode", False)
 
-    await handle_fan_message(
-        fan.id,
-        creator_id,
-        message_content,
-        auto_mode,
-        str(message_id) if message_id is not None else None,
-    )
+        fan = await get_fan(creator_id, platform_fan_id)
+        if not fan:
+            fan = await create_fan(creator_id, platform_fan_id, fan_name)
+
+        await handle_fan_message(
+            fan.id,
+            creator_id,
+            message_content,
+            auto_mode,
+            str(message_id) if message_id is not None else None,
+        )
+
+        return {"status": "ok"}
+
+    if event == "tips.received":
+        from_user = data.get("fromUser") or {}
+        fan_id_platform = str(from_user.get("id")) if from_user.get("id") is not None else ""
+        amount = data.get("netAmount", 0)
+        print(f"[TIP] account={account_id} fan={fan_id_platform} amount={amount}")
+        if account_id and fan_id_platform:
+            db = get_supabase()
+            creator_row = await asyncio.to_thread(
+                lambda: db.table("creators")
+                .select("id")
+                .eq("fansly_account_id", str(account_id))
+                .limit(1)
+                .execute()
+            )
+            if creator_row.data:
+                creator_id = creator_row.data[0]["id"]
+                fan = await get_fan(creator_id, fan_id_platform)
+                if fan:
+                    await increment_fan_total_spent(fan.id, amount)
+        return {"status": "ok"}
+
+    if event == "subscriptions.new":
+        from_user = data.get("fromUser") or {}
+        fan_id_platform = str(from_user.get("id")) if from_user.get("id") is not None else ""
+        fan_name = from_user.get("name", "Fan")
+        print(f"[NEW SUB] account={account_id} fan={fan_id_platform} name={fan_name}")
+        # TODO: send welcome message
+        return {"status": "ok"}
+
+    if event == "users.typing":
+        pass
 
     return {"status": "ok"}
 
