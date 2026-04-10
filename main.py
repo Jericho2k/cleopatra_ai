@@ -7,7 +7,6 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -49,19 +48,23 @@ _processed_messages: set = set()
 
 
 async def send_fansly_message(account_id: str, group_id: str, text: str) -> bool:
+    import httpx
+
     api_key = os.environ.get("APIFANSLY_API_KEY")
-    base_url = os.environ.get("APIFANSLY_BASE_URL", "https://app.apifansly.com/api")
 
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"{base_url.rstrip('/')}/{account_id}/chats/{group_id}/messages",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={"text": text},
+                f"https://v1.apifansly.com/api/fansly/{account_id}/chats/{group_id}/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "Content-Type": "application/json",
+                },
+                json={"content": text},
                 timeout=10,
             )
-            print(f"[SEND] status={response.status_code} body={response.text[:100]}")
-            return response.status_code == 200
+            print(f"[SEND] status={response.status_code} body={response.text[:200]}")
+            return response.status_code == 201
     except Exception as e:
         print(f"[SEND ERROR] {e}")
         return False
