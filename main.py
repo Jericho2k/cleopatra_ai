@@ -331,6 +331,7 @@ async def fansly_webhook(payload: dict) -> dict:
     )
 
     db = get_supabase()
+    print(f"[DEBUG] looking up creator with fansly_account_id='{creator_platform_id}' len={len(creator_platform_id)}")
     creator_row = await asyncio.to_thread(
         lambda: db.table("creators")
         .select("id, auto_mode")
