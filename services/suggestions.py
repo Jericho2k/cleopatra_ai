@@ -10,6 +10,7 @@ import random
 from ai.generator import generate_replies
 from openai import AsyncOpenAI
 from core.config import get_settings
+from core.supabase import get_supabase
 from ai.prompt_builder import build_prompt
 from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
@@ -234,15 +235,35 @@ async def _update_fan_ai_summary(
 async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
     try:
         print(f"[AUTO REPLY] Starting delay for fan={fan_id} reply={reply[:50]}")
-        delay = random.randint(3, 5)  # temp for testing
+        delay = random.randint(45, 90)
         await asyncio.sleep(delay)
-        print(f"[AUTO REPLY] Delay done, sending for fan={fan_id}")
+
         parts = [p.strip() for p in reply.split("|") if p.strip()]
-        print(f"[AUTO REPLY] reply={reply} parts={parts}")
+
+        db = get_supabase()
+        fan_row = await asyncio.to_thread(
+            lambda: db.table("fans")
+            .select("fansly_group_id, platform_fan_id, creator_id")
+            .eq("id", fan_id)
+            .single()
+            .execute()
+        )
+
+        creator_row = await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("fansly_account_id")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+
+        group_id = (fan_row.data or {}).get("fansly_group_id")
+        fansly_account_id = (creator_row.data or {}).get("fansly_account_id")
 
         for i, part in enumerate(parts):
             if i > 0:
                 await asyncio.sleep(random.randint(5, 15))
+
             await save_message(
                 fan_id=fan_id,
                 creator_id=creator_id,
@@ -250,7 +271,15 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
                 content=part,
                 was_ai_suggested=True,
             )
-            print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]}")
+
+            if group_id and fansly_account_id:
+                from main import send_fansly_message
+
+                sent = await send_fansly_message(fansly_account_id, str(group_id), part)
+                print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]} fansly_sent={sent}")
+            else:
+                print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]} (no fansly config)")
+
     except Exception as e:
         print(f"[AUTO REPLY ERROR] fan={fan_id} error={e}")
         import traceback

@@ -164,7 +164,13 @@ async def handle_fan_message(
     auto_mode: bool,
     message_id: str | None = None,
 ) -> None:
-    await save_message(fan_id, creator_id, "fan", message_content)
+    await save_message(
+        fan_id,
+        creator_id,
+        "fan",
+        message_content,
+        fansly_message_id=message_id,
+    )
     await process_incoming_fan_message(
         fan_id, creator_id, message_content, auto_mode, message_id,
     )
@@ -337,14 +343,6 @@ async def fansly_webhook(payload: dict) -> dict:
         f"creator_platform={creator_platform_id} content={message_content[:50]}"
     )
 
-    if message_id:
-        mid = str(message_id)
-        if mid in _processed_messages:
-            return {"status": "duplicate"}
-        _processed_messages.add(mid)
-        if len(_processed_messages) > 1000:
-            _processed_messages.clear()
-
     db = get_supabase()
     creator_row = await asyncio.to_thread(
         lambda: db.table("creators")
@@ -363,6 +361,18 @@ async def fansly_webhook(payload: dict) -> dict:
     fan = await get_fan(creator_id, platform_fan_id)
     if not fan:
         fan = await create_fan(creator_id, platform_fan_id, f"Fan_{platform_fan_id[-6:]}")
+
+    if message_id:
+        mid = str(message_id)
+        existing = await asyncio.to_thread(
+            lambda: db.table("messages")
+            .select("id")
+            .eq("fansly_message_id", mid)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            return {"status": "duplicate"}
 
     if group_id:
         await asyncio.to_thread(

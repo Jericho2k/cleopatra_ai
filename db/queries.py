@@ -15,6 +15,7 @@ def _row_to_fan(row: dict) -> Fan:
         id=str(row["id"]),
         display_name=row["display_name"],
         platform_fan_id=str(row["platform_fan_id"]) if row.get("platform_fan_id") is not None else None,
+        fansly_group_id=str(row["fansly_group_id"]) if row.get("fansly_group_id") is not None else None,
         total_spent=row.get("total_spent", 0),
         spend_tier=row.get("spend_tier", "cold"),
         last_active=last_active,
@@ -95,15 +96,25 @@ async def get_conversation_history(fan_id: str, limit: int = 40) -> list[Message
     return await asyncio.to_thread(_get)
 
 
-async def save_message(fan_id: str, creator_id: str, role: str, content: str, was_ai_suggested: bool = False) -> None:
+async def save_message(
+    fan_id: str,
+    creator_id: str,
+    role: str,
+    content: str,
+    was_ai_suggested: bool = False,
+    fansly_message_id: str | None = None,
+) -> None:
     def _save():
-        get_supabase().table("messages").insert({
+        row = {
             "fan_id": fan_id,
             "creator_id": creator_id,
             "role": role,
             "content": content,
             "was_ai_suggested": was_ai_suggested,
-        }).execute()
+        }
+        if fansly_message_id is not None:
+            row["fansly_message_id"] = fansly_message_id
+        get_supabase().table("messages").insert(row).execute()
 
     await asyncio.to_thread(_save)
 
