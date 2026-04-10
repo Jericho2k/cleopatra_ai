@@ -305,6 +305,7 @@ async def generate_suggestions_webhook(
 
 @app.post("/webhook/fansly")
 async def fansly_webhook(payload: dict) -> dict:
+    print(f"[FANSLY WEBHOOK RAW] {payload}")
     event = payload.get("event")
     account_id = payload.get("account_id")
     data = payload.get("payload") or {}
@@ -362,9 +363,13 @@ async def fansly_webhook(payload: dict) -> dict:
     if event == "tips.received":
         from_user = data.get("fromUser") or {}
         fan_id_platform = str(from_user.get("id")) if from_user.get("id") is not None else ""
-        amount = data.get("netAmount", 0)
-        print(f"[TIP] account={account_id} fan={fan_id_platform} amount={amount}")
-        if account_id and fan_id_platform:
+        raw_amount = data.get("netAmount", 0)
+        try:
+            tip_amount = int(round(float(raw_amount)))
+        except (TypeError, ValueError):
+            tip_amount = 0
+        print(f"[TIP] account={account_id} fan={fan_id_platform} amount={raw_amount}")
+        if account_id and fan_id_platform and tip_amount:
             db = get_supabase()
             creator_row = await asyncio.to_thread(
                 lambda: db.table("creators")
@@ -377,7 +382,7 @@ async def fansly_webhook(payload: dict) -> dict:
                 creator_id = creator_row.data[0]["id"]
                 fan = await get_fan(creator_id, fan_id_platform)
                 if fan:
-                    await increment_fan_total_spent(fan.id, amount)
+                    await increment_fan_total_spent(fan.id, tip_amount)
         return {"status": "ok"}
 
     if event == "subscriptions.new":
