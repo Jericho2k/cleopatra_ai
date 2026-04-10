@@ -7,6 +7,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,8 +19,10 @@ from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from core.supabase import get_supabase
 from db.queries import (
+    create_fan,
     get_conversation_history,
     get_creator_persona,
+    get_fan,
     get_fan_by_id,
     get_ppv_offers,
     save_message,
@@ -43,6 +46,127 @@ from services.suggestions import (
 
 
 _processed_messages: set = set()
+
+
+async def send_fansly_message(account_id: str, fan_platform_id: str, text: str) -> bool:
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+    base_url = os.environ.get("APIFANSLY_BASE_URL", "https://app.apifansly.com/api")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{base_url.rstrip('/')}/{account_id}/chats/{fan_platform_id}/messages",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"text": text},
+                timeout=10,
+            )
+            return response.status_code == 200
+    except Exception as e:
+        print(f"[SEND ERROR] {e}")
+        return False
+
+
+async def process_incoming_fan_message(
+    fan_id: str,
+    creator_id: str,
+    message_content: str,
+    auto_mode: bool,
+    message_id: str | None,
+) -> None:
+    """Shared pipeline: history already includes the new fan message."""
+    conversation_history = await get_conversation_history(fan_id)
+    fan_profile = await get_fan_by_id(fan_id)
+    if fan_profile is None:
+        fan_profile = Fan(id=fan_id, display_name=fan_id)
+
+    print(f"[AUTO MODE] creator={creator_id} auto_mode={auto_mode} fan={fan_id}")
+
+    creator_persona = await get_creator_persona(creator_id)
+    if creator_persona is None:
+        creator_persona = Persona()
+    ppv_offers = await get_ppv_offers(creator_id)
+
+    excluded = await asyncio.to_thread(
+        lambda: get_supabase()
+        .from_("fan_list_members")
+        .select("fan_lists(exclude_from_auto)")
+        .eq("fan_id", fan_id)
+        .execute()
+    )
+    is_excluded = any(
+        row.get("fan_lists", {}).get("exclude_from_auto", False)
+        for row in (excluded.data or [])
+    )
+
+    conversation_stage = classify_stage(conversation_history, fan_profile)
+    similar_exchanges = await find_similar_exchanges(
+        message_content, creator_id, enabled=False
+    )
+
+    ctx_without_situation = ConversationContext(
+        fan_message=message_content,
+        conversation_history=conversation_history,
+        fan_profile=fan_profile,
+        creator_persona=creator_persona,
+        similar_exchanges=similar_exchanges,
+        conversation_stage=conversation_stage,
+        creator_name="a creator",
+        ppv_offers=ppv_offers,
+    )
+
+    situation = await analyze_situation(ctx_without_situation)
+
+    ctx = ConversationContext(
+        fan_message=message_content,
+        conversation_history=conversation_history,
+        fan_profile=fan_profile,
+        creator_persona=creator_persona,
+        similar_exchanges=similar_exchanges,
+        conversation_stage=conversation_stage,
+        creator_name="a creator",
+        situation=situation,
+        ppv_offers=ppv_offers,
+    )
+
+    prompt = build_prompt(ctx)
+    replies = await generate_replies(prompt, creator_persona)
+
+    db = get_supabase()
+    if auto_mode and not is_excluded:
+        if replies:
+            asyncio.create_task(_send_auto_reply(fan_id, creator_id, replies[0]))
+    elif message_id:
+        await asyncio.to_thread(
+            lambda: db.table("suggestions").insert({
+                "fan_id": fan_id,
+                "creator_id": creator_id,
+                "message_id": message_id,
+                "suggestions": replies,
+                "stage": conversation_stage.value,
+            }).execute()
+        )
+
+    fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
+    print(
+        f"[MEMORY CHECK] fan={fan_id} fan_messages={fan_msg_count} "
+        f"should_update={_should_update_memory(conversation_history)}"
+    )
+    if _should_update_memory(conversation_history):
+        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent))
+        asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
+
+
+async def handle_fan_message(
+    fan_id: str,
+    creator_id: str,
+    message_content: str,
+    auto_mode: bool,
+    message_id: str | None = None,
+) -> None:
+    await save_message(fan_id, creator_id, "fan", message_content)
+    await process_incoming_fan_message(
+        fan_id, creator_id, message_content, auto_mode, message_id,
+    )
 
 
 class ReplyRequest(BaseModel):
@@ -155,15 +279,9 @@ async def generate_suggestions_webhook(
     print(f"[WEBHOOK] message_id={message_id} role={record.get('role')} content={message_content[:30]}")
     if record.get("role") != "fan":
         return {"status": "skipped"}
-    # Dedup check — ignore if we already processed this message recently
-    cache_key = f"processed:{message_id}"
-
-    # Use a simple in-memory set (resets on restart, good enough)
     if message_id in _processed_messages:
         return {"status": "duplicate"}
     _processed_messages.add(message_id)
-
-    # Cleanup old entries to prevent memory leak
     if len(_processed_messages) > 1000:
         _processed_messages.clear()
 
@@ -171,97 +289,73 @@ async def generate_suggestions_webhook(
     creator_id = record.get("creator_id")
     if not all([fan_id, creator_id, message_content, message_id]):
         return {"status": "skipped"}
-    # Then get history (now includes the message we just saved)
-    conversation_history = await get_conversation_history(fan_id)
-    fan_profile = await get_fan_by_id(fan_id)
-    if fan_profile is None:
-        fan_profile = Fan(id=fan_id, display_name=fan_id)
 
-    # Check auto mode EARLY — right after getting fan profile
     db = get_supabase()
     creator_row = await asyncio.to_thread(
         lambda: db.table("creators").select("auto_mode").eq("id", creator_id).single().execute()
     )
     auto_mode = (creator_row.data or {}).get("auto_mode", False)
-    print(f"[AUTO MODE] creator={creator_id} auto_mode={auto_mode} fan={fan_id}")
 
-    # If auto mode, still need to generate a reply but skip saving to suggestions
-    # If NOT auto mode, run full suggestions pipeline
+    await process_incoming_fan_message(
+        str(fan_id), str(creator_id), str(message_content), auto_mode, str(message_id),
+    )
+    return {"status": "ok"}
 
-    creator_persona = await get_creator_persona(creator_id)
-    if creator_persona is None:
-        creator_persona = Persona()
-    ppv_offers = await get_ppv_offers(creator_id)
 
-    # Check if fan is in any auto-excluded list
-    excluded = await asyncio.to_thread(
-        lambda: get_supabase()
-        .from_("fan_list_members")
-        .select("fan_lists(exclude_from_auto)")
-        .eq("fan_id", fan_id)
+@app.post("/webhook/fansly")
+async def fansly_webhook(payload: dict) -> dict:
+    event = payload.get("event")
+    if event != "messages.received":
+        return {"status": "skipped"}
+
+    account_id = payload.get("account_id")
+    data = payload.get("payload") or {}
+    from_user = data.get("fromUser") or {}
+
+    if from_user.get("isPerformer"):
+        return {"status": "skipped"}
+
+    platform_fan_id = str(from_user.get("id"))
+    fan_name = from_user.get("name", "Fan")
+    message_content = data.get("text", "")
+    message_id = data.get("id")
+
+    if not message_content or not account_id:
+        return {"status": "skipped"}
+
+    if message_id is not None:
+        mid = str(message_id)
+        if mid in _processed_messages:
+            return {"status": "duplicate"}
+        _processed_messages.add(mid)
+        if len(_processed_messages) > 1000:
+            _processed_messages.clear()
+
+    db = get_supabase()
+    creator_row = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("id, auto_mode")
+        .eq("fansly_account_id", str(account_id))
+        .limit(1)
         .execute()
     )
-    is_excluded = any(
-        row.get("fan_lists", {}).get("exclude_from_auto", False)
-        for row in (excluded.data or [])
+    if not creator_row.data:
+        return {"status": "creator_not_found"}
+
+    creator_id = creator_row.data[0]["id"]
+    auto_mode = creator_row.data[0].get("auto_mode", False)
+
+    fan = await get_fan(creator_id, platform_fan_id)
+    if not fan:
+        fan = await create_fan(creator_id, platform_fan_id, fan_name)
+
+    await handle_fan_message(
+        fan.id,
+        creator_id,
+        message_content,
+        auto_mode,
+        str(message_id) if message_id is not None else None,
     )
-
-    conversation_stage = classify_stage(conversation_history, fan_profile)
-    similar_exchanges = await find_similar_exchanges(
-        message_content, creator_id, enabled=False
-    )
-
-    ctx_without_situation = ConversationContext(
-        fan_message=message_content,
-        conversation_history=conversation_history,
-        fan_profile=fan_profile,
-        creator_persona=creator_persona,
-        similar_exchanges=similar_exchanges,
-        conversation_stage=conversation_stage,
-        creator_name="a creator",
-        ppv_offers=ppv_offers,
-    )
-
-    situation = await analyze_situation(ctx_without_situation)
-
-    ctx = ConversationContext(
-        fan_message=message_content,
-        conversation_history=conversation_history,
-        fan_profile=fan_profile,
-        creator_persona=creator_persona,
-        similar_exchanges=similar_exchanges,
-        conversation_stage=conversation_stage,
-        creator_name="a creator",
-        situation=situation,
-        ppv_offers=ppv_offers,
-    )
-
-    prompt = build_prompt(ctx)
-    replies = await generate_replies(prompt, creator_persona)
-
-    if auto_mode and not is_excluded:
-        if replies:
-            asyncio.create_task(_send_auto_reply(fan_id, creator_id, replies[0]))
-        # Don't return early — still run memory updates below
-    else:
-        # Save to suggestions table
-        await asyncio.to_thread(
-            lambda: db.table("suggestions").insert({
-                "fan_id": fan_id,
-                "creator_id": creator_id,
-                "message_id": message_id,
-                "suggestions": replies,
-                "stage": conversation_stage.value,
-            }).execute()
-        )
-
-    # Always run memory updates regardless of mode
-    from services.suggestions import _should_update_memory, _update_fan_memory, _update_fan_ai_summary
-    fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
-    print(f"[MEMORY CHECK] fan={fan_id} fan_messages={fan_msg_count} should_update={_should_update_memory(conversation_history)}")
-    if _should_update_memory(conversation_history):
-        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent))
-        asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
 
     return {"status": "ok"}
 
