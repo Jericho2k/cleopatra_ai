@@ -103,7 +103,10 @@ async def save_message(
     content: str,
     was_ai_suggested: bool = False,
     fansly_message_id: str | None = None,
+    media_context: dict | None = None,
 ) -> None:
+    """media_context: e.g. {"attachments": [...]} for fan, {"ppv": {...}} for creator PPV."""
+
     def _save():
         row = {
             "fan_id": fan_id,
@@ -114,6 +117,8 @@ async def save_message(
         }
         if fansly_message_id is not None:
             row["fansly_message_id"] = fansly_message_id
+        if media_context is not None:
+            row["media_context"] = media_context
         get_supabase().table("messages").insert(row).execute()
 
     await asyncio.to_thread(_save)

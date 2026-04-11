@@ -273,8 +273,16 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
                 text_out = part[: ppv_match.start()].strip()
                 media_id = ppv_match.group(1)
                 price = float(ppv_match.group(2))
+                ppv_media_context = {
+                    "ppv": {
+                        "media_id": media_id,
+                        "price": price,
+                        "access_type": "ppv",
+                    }
+                }
             else:
                 text_out = part
+                ppv_media_context = None
 
             await save_message(
                 fan_id=fan_id,
@@ -282,6 +290,7 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
                 role="creator",
                 content=text_out,
                 was_ai_suggested=True,
+                media_context=ppv_media_context,
             )
 
             if group_id and apifansly_account_id:

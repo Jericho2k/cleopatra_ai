@@ -414,7 +414,16 @@ async def fansly_webhook(payload: dict) -> dict:
     group_id = data.get("groupId", "")
     message_id = data.get("id", "")
 
-    if not message_content or not platform_fan_id:
+    attachments_raw = data.get("attachments")
+    if attachments_raw is None:
+        attachments_raw = []
+    elif not isinstance(attachments_raw, list):
+        attachments_raw = [attachments_raw]
+    has_attachments = len(attachments_raw) > 0
+
+    if not platform_fan_id:
+        return {"status": "skipped"}
+    if not message_content and not has_attachments:
         return {"status": "skipped"}
 
     interactions = data.get("interactions") or []
@@ -474,20 +483,25 @@ async def fansly_webhook(payload: dict) -> dict:
         )
 
     mid = str(message_id) if message_id else ""
+    fan_media_context = {"attachments": attachments_raw} if has_attachments else None
+
     if mid:
-        await asyncio.to_thread(
-            lambda: db.table("messages")
-            .insert({
-                "fan_id": fan.id,
-                "creator_id": creator_id,
-                "role": "fan",
-                "content": message_content,
-                "fansly_message_id": mid,
-            })
-            .execute()
+        await save_message(
+            fan.id,
+            creator_id,
+            "fan",
+            message_content,
+            fansly_message_id=mid,
+            media_context=fan_media_context,
         )
     else:
-        await save_message(fan.id, creator_id, "fan", message_content)
+        await save_message(
+            fan.id,
+            creator_id,
+            "fan",
+            message_content,
+            media_context=fan_media_context,
+        )
 
     await process_incoming_fan_message(
         fan.id,
