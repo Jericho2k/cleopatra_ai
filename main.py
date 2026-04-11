@@ -71,47 +71,41 @@ async def send_fansly_message(account_id: str, group_id: str, text: str) -> bool
 
 
 async def resolve_attachment_urls(
-    apifansly_account_id: str, group_id: str, message_id: str
+    apifansly_account_id: str, group_id: str, message_id: str, content_ids: list[str]
 ) -> list[dict]:
     import httpx
 
     api_key = os.environ.get("APIFANSLY_API_KEY")
 
+    result: list[dict] = []
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"https://v1.apifansly.com/api/fansly/{apifansly_account_id}/chats/{group_id}/messages",
-                headers={"x-api-key": api_key},
-                timeout=10,
-            )
-            print(f"[MEDIA DEBUG] status={response.status_code} body={response.text[:800]}")
-            data = response.json()
-            messages = data.get("data", {}).get("data", {}).get("response", {}).get("data", [])
+            for content_id in content_ids:
+                response = await client.get(
+                    f"https://v1.apifansly.com/api/fansly/{apifansly_account_id}/media/{content_id}",
+                    headers={"x-api-key": api_key},
+                    timeout=10,
+                )
+                print(
+                    f"[MEDIA FETCH] content_id={content_id} status={response.status_code} "
+                    f"body={response.text[:300]}"
+                )
 
-            for msg in messages:
-                if str(msg.get("id")) != str(message_id):
-                    continue
-                attachments = msg.get("attachments", [])
-                aggregation_media = msg.get("aggregationData", {}).get("media", [])
-                result: list[dict] = []
-                for att in attachments:
-                    content_id = att.get("contentId")
-                    for m in aggregation_media:
-                        if str(m.get("id")) == str(content_id):
-                            locations = m.get("locations", [])
-                            if locations:
-                                result.append(
-                                    {
-                                        "contentId": content_id,
-                                        "url": locations[0].get("location"),
-                                        "type": m.get("type", 1),
-                                    }
-                                )
-                            break
-                return result
+                if response.status_code == 200:
+                    data = response.json()
+                    media = data.get("data", {}).get("data", {}).get("response", {})
+                    locations = media.get("locations", [])
+                    if locations:
+                        result.append(
+                            {
+                                "contentId": content_id,
+                                "url": locations[0].get("location"),
+                                "type": media.get("type", 1),
+                            }
+                        )
     except Exception as e:
         print(f"[MEDIA RESOLVE ERROR] {e}")
-    return []
+    return result
 
 
 async def process_incoming_fan_message(
@@ -547,10 +541,13 @@ async def fansly_webhook(payload: dict) -> dict:
     resolved_attachments: list[dict] = []
     if attachments_raw:
         creator_apifansly_id = (creator_row.data[0].get("apifansly_account_id") or "") if creator_row.data else ""
-        gid = str(group_id) if group_id else ""
-        if creator_apifansly_id and gid and mid:
+        content_ids = [str(a.get("contentId")) for a in attachments_raw if a.get("contentId")]
+        if content_ids and creator_apifansly_id and group_id:
             resolved_attachments = await resolve_attachment_urls(
-                creator_apifansly_id, gid, mid
+                creator_apifansly_id,
+                str(group_id),
+                str(message_id) if message_id else "",
+                content_ids,
             )
             print(f"[ATTACHMENTS] resolved={resolved_attachments}")
 
