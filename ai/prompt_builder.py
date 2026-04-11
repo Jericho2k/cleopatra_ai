@@ -172,10 +172,16 @@ Return ONLY a JSON array of 3 strings. No markdown.
 
     if ppv_offers:
         offers_text = "\n".join([
-            f"- {o['title']}: ${o['price']} — {o.get('description', '')}"
+            f"- [{o.get('media_id', '')}] {o['title']}: ${o.get('price', 0)} — {o.get('description', '')}"
             for o in ppv_offers
+            if o.get("media_id")
         ])
-        user_prompt += f"\n\nCONTENT YOU CAN SELL RIGHT NOW:\n{offers_text}\nWhen the moment is right, reference these naturally — don't list them, just mention one that fits."
+        if offers_text:
+            user_prompt += (
+                f"\n\nCONTENT YOU CAN SELL:\n{offers_text}\n"
+                "When sending a PPV, end your message with [PPV:media_id:price] tag. "
+                "Example: 'I made this just for you 😏 [PPV:8745xxx:20]'"
+            )
 
     return [
         {"role": "system", "content": system_prompt},

@@ -152,8 +152,41 @@ async def get_creator_persona(creator_id: str) -> Persona | None:
 
 async def get_ppv_offers(creator_id: str) -> list[dict]:
     def _get():
-        r = get_supabase().table("ppv_offers").select("title, description, price").eq("creator_id", creator_id).execute()
-        return r.data or []
+        ppv = (
+            get_supabase()
+            .table("ppv_offers")
+            .select("title, description, price")
+            .eq("creator_id", creator_id)
+            .execute()
+        )
+        vault = (
+            get_supabase()
+            .table("creator_vault_media")
+            .select("title, description, price, fansly_media_id, account_media_id")
+            .eq("creator_id", creator_id)
+            .eq("is_active", True)
+            .execute()
+        )
+
+        offers: list[dict] = []
+        for row in ppv.data or []:
+            offers.append(
+                {
+                    "title": row["title"],
+                    "description": row.get("description", ""),
+                    "price": row["price"],
+                }
+            )
+        for row in vault.data or []:
+            offers.append(
+                {
+                    "title": row["title"],
+                    "description": row.get("description", ""),
+                    "price": row.get("price", 0),
+                    "media_id": row.get("account_media_id") or row.get("fansly_media_id"),
+                }
+            )
+        return offers
 
     return await asyncio.to_thread(_get)
 

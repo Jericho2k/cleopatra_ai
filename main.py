@@ -261,9 +261,9 @@ async def save_reply(req: ReplyRequest) -> dict:
 async def sync_vault(creator_id: str) -> dict:
     import httpx
 
-    db = get_supabase()
     creator_row = await asyncio.to_thread(
-        lambda: db.table("creators")
+        lambda: get_supabase()
+        .table("creators")
         .select("apifansly_account_id")
         .eq("id", creator_id)
         .single()
@@ -276,14 +276,88 @@ async def sync_vault(creator_id: str) -> dict:
 
     api_key = os.environ.get("APIFANSLY_API_KEY")
 
+    synced = 0
     async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault",
+        albums_resp = await client.get(
+            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums",
             headers={"x-api-key": api_key},
             timeout=30,
         )
-        print(f"[VAULT SYNC] status={response.status_code} body={response.text[:500]}")
-        return {"status": "ok", "raw": response.json()}
+        try:
+            albums_data = albums_resp.json()
+        except Exception:
+            albums_data = {}
+        albums = (
+            albums_data.get("data", {})
+            .get("data", {})
+            .get("response", {})
+            .get("albums", [])
+        )
+
+        for album in albums:
+            album_id = album.get("id")
+            album_title = album.get("title", "")
+            if album_id is None:
+                continue
+
+            media_resp = await client.get(
+                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums/{album_id}/media",
+                headers={"x-api-key": api_key},
+                timeout=30,
+            )
+            try:
+                media_data = media_resp.json()
+            except Exception:
+                media_data = {}
+            items = (
+                media_data.get("data", {})
+                .get("data", {})
+                .get("response", {})
+                .get("accountMedia", [])
+            )
+
+            for item in items:
+                media_id = item.get("mediaId") or item.get("id")
+                account_media_id = item.get("id")
+                media = item.get("media", {}) or {}
+
+                thumbnail_url = None
+                variants = media.get("variants", [])
+                locations = media.get("locations", [])
+                if locations:
+                    thumbnail_url = locations[0].get("location")
+                elif variants:
+                    variant_locs = variants[0].get("locations", [])
+                    if variant_locs:
+                        thumbnail_url = variant_locs[0].get("location")
+
+                media_type = media.get("type", 1)
+
+                if not media_id:
+                    continue
+
+                row_payload = {
+                    "creator_id": creator_id,
+                    "fansly_media_id": str(media_id),
+                    "account_media_id": str(account_media_id) if account_media_id else None,
+                    "title": f"{album_title} content",
+                    "description": "",
+                    "price": 0,
+                    "media_type": media_type,
+                    "thumbnail_url": thumbnail_url,
+                    "is_active": True,
+                }
+
+                await asyncio.to_thread(
+                    lambda p=row_payload: get_supabase()
+                    .table("creator_vault_media")
+                    .upsert(p, on_conflict="creator_id,fansly_media_id")
+                    .execute()
+                )
+                synced += 1
+
+        print(f"[VAULT SYNC] albums={len(albums)} synced_rows={synced}")
+        return {"status": "ok", "synced": synced}
 
 
 @app.post("/generate-suggestions")

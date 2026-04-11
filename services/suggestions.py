@@ -5,7 +5,11 @@ Coordinates DB, stage classification, RAG, prompt building, and generation.
 
 import asyncio
 import json
+import os
 import random
+import re
+
+import httpx
 
 from ai.generator import generate_replies
 from openai import AsyncOpenAI
@@ -264,19 +268,48 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
             if i > 0:
                 await asyncio.sleep(random.randint(5, 15))
 
+            ppv_match = re.search(r"\[PPV:([^:]+):(\d+(?:\.\d+)?)\]", part)
+            if ppv_match:
+                text_out = part[: ppv_match.start()].strip()
+                media_id = ppv_match.group(1)
+                price = float(ppv_match.group(2))
+            else:
+                text_out = part
+
             await save_message(
                 fan_id=fan_id,
                 creator_id=creator_id,
                 role="creator",
-                content=part,
+                content=text_out,
                 was_ai_suggested=True,
             )
 
             if group_id and apifansly_account_id:
-                from main import send_fansly_message
+                if ppv_match:
+                    async with httpx.AsyncClient() as hc:
+                        resp = await hc.post(
+                            f"https://v1.apifansly.com/api/fansly/{apifansly_account_id}/chats/{group_id}/messages",
+                            headers={
+                                "x-api-key": os.environ.get("APIFANSLY_API_KEY"),
+                                "Content-Type": "application/json",
+                            },
+                            json={
+                                "content": text_out,
+                                "mediaId": media_id,
+                                "access_type": "ppv",
+                                "price": price,
+                            },
+                            timeout=10,
+                        )
+                    print(
+                        f"[AUTO REPLY] Sent part {i+1} PPV media={media_id} "
+                        f"fansly status={resp.status_code} body={resp.text[:200]}"
+                    )
+                else:
+                    from main import send_fansly_message
 
-                sent = await send_fansly_message(apifansly_account_id, str(group_id), part)
-                print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]} fansly_sent={sent}")
+                    sent = await send_fansly_message(apifansly_account_id, str(group_id), part)
+                    print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]} fansly_sent={sent}")
             else:
                 print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]} (no fansly config)")
 
