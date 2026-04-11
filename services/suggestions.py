@@ -251,14 +251,14 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
 
         creator_row = await asyncio.to_thread(
             lambda: db.table("creators")
-            .select("fansly_account_id")
+            .select("fansly_account_id, apifansly_account_id")
             .eq("id", creator_id)
             .single()
             .execute()
         )
 
         group_id = (fan_row.data or {}).get("fansly_group_id")
-        fansly_account_id = (creator_row.data or {}).get("fansly_account_id")
+        apifansly_account_id = (creator_row.data or {}).get("apifansly_account_id")
 
         for i, part in enumerate(parts):
             if i > 0:
@@ -272,10 +272,10 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
                 was_ai_suggested=True,
             )
 
-            if group_id and fansly_account_id:
+            if group_id and apifansly_account_id:
                 from main import send_fansly_message
 
-                sent = await send_fansly_message(fansly_account_id, str(group_id), part)
+                sent = await send_fansly_message(apifansly_account_id, str(group_id), part)
                 print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]} fansly_sent={sent}")
             else:
                 print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]} (no fansly config)")
