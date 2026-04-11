@@ -84,6 +84,7 @@ async def resolve_attachment_urls(
                 headers={"x-api-key": api_key},
                 timeout=10,
             )
+            print(f"[MEDIA DEBUG] status={response.status_code} body={response.text[:800]}")
             data = response.json()
             messages = data.get("data", {}).get("data", {}).get("response", {}).get("data", [])
 
