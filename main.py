@@ -70,6 +70,49 @@ async def send_fansly_message(account_id: str, group_id: str, text: str) -> bool
         return False
 
 
+async def resolve_attachment_urls(
+    apifansly_account_id: str, group_id: str, message_id: str
+) -> list[dict]:
+    import httpx
+
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://v1.apifansly.com/api/fansly/{apifansly_account_id}/chats/{group_id}/messages",
+                headers={"x-api-key": api_key},
+                timeout=10,
+            )
+            data = response.json()
+            messages = data.get("data", {}).get("data", {}).get("response", {}).get("data", [])
+
+            for msg in messages:
+                if str(msg.get("id")) != str(message_id):
+                    continue
+                attachments = msg.get("attachments", [])
+                aggregation_media = msg.get("aggregationData", {}).get("media", [])
+                result: list[dict] = []
+                for att in attachments:
+                    content_id = att.get("contentId")
+                    for m in aggregation_media:
+                        if str(m.get("id")) == str(content_id):
+                            locations = m.get("locations", [])
+                            if locations:
+                                result.append(
+                                    {
+                                        "contentId": content_id,
+                                        "url": locations[0].get("location"),
+                                        "type": m.get("type", 1),
+                                    }
+                                )
+                            break
+                return result
+    except Exception as e:
+        print(f"[MEDIA RESOLVE ERROR] {e}")
+    return []
+
+
 async def process_incoming_fan_message(
     fan_id: str,
     creator_id: str,
@@ -462,7 +505,7 @@ async def fansly_webhook(payload: dict) -> dict:
     print(f"[DEBUG] looking up creator with fansly_account_id='{creator_platform_id}' len={len(creator_platform_id)}")
     creator_row = await asyncio.to_thread(
         lambda: db.table("creators")
-        .select("id, auto_mode")
+        .select("id, auto_mode, apifansly_account_id")
         .eq("fansly_account_id", creator_platform_id)
         .limit(1)
         .execute()
@@ -499,7 +542,26 @@ async def fansly_webhook(payload: dict) -> dict:
         )
 
     mid = str(message_id) if message_id else ""
-    fan_media_context = {"attachments": attachments_raw} if has_attachments else None
+
+    resolved_attachments: list[dict] = []
+    if attachments_raw:
+        creator_apifansly_id = (creator_row.data[0].get("apifansly_account_id") or "") if creator_row.data else ""
+        gid = str(group_id) if group_id else ""
+        if creator_apifansly_id and gid and mid:
+            resolved_attachments = await resolve_attachment_urls(
+                creator_apifansly_id, gid, mid
+            )
+            print(f"[ATTACHMENTS] resolved={resolved_attachments}")
+
+    fan_media_context = (
+        {"attachments": resolved_attachments}
+        if resolved_attachments
+        else (
+            {"attachments": [{"contentId": a.get("contentId")} for a in attachments_raw]}
+            if attachments_raw
+            else None
+        )
+    )
 
     if mid:
         await save_message(
