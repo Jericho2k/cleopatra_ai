@@ -305,6 +305,7 @@ async def sync_vault(creator_id: str) -> dict:
                 headers={"x-api-key": api_key},
                 timeout=30,
             )
+            print(f"[VAULT] album={album_id} media_resp={media_resp.text[:500]}")
             try:
                 media_data = media_resp.json()
             except Exception:
@@ -358,6 +359,21 @@ async def sync_vault(creator_id: str) -> dict:
 
         print(f"[VAULT SYNC] albums={len(albums)} synced_rows={synced}")
         return {"status": "ok", "synced": synced}
+
+
+@app.get("/media/{account_id}/{content_id}")
+async def get_media_url(account_id: str, content_id: str) -> dict:
+    import httpx
+
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://v1.apifansly.com/api/fansly/{account_id}/media/{content_id}",
+            headers={"x-api-key": api_key},
+            timeout=10,
+        )
+        print(f"[MEDIA] status={response.status_code} body={response.text[:300]}")
+        return response.json()
 
 
 @app.post("/generate-suggestions")

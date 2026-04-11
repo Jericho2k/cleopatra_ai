@@ -33,6 +33,7 @@ def _row_to_message(row: dict) -> Message:
         role=row["role"],
         content=row["content"],
         sent_at=sent_at,
+        media_context=row.get("media_context"),
     )
 
 
@@ -90,7 +91,7 @@ async def increment_fan_total_spent(fan_id: str, amount: int) -> None:
 
 async def get_conversation_history(fan_id: str, limit: int = 40) -> list[Message]:
     def _get():
-        r = get_supabase().table("messages").select("role, content, sent_at").eq("fan_id", fan_id).order("sent_at", desc=False).limit(limit).execute()
+        r = get_supabase().table("messages").select("role, content, sent_at, media_context").eq("fan_id", fan_id).order("sent_at", desc=False).limit(limit).execute()
         return [_row_to_message(row) for row in (r.data or [])]
 
     return await asyncio.to_thread(_get)

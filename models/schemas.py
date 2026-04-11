@@ -19,6 +19,8 @@ class StageType(str, Enum):
 class Fan(BaseModel):
     id: str
     display_name: str
+    platform_fan_id: str | None = None
+    fansly_group_id: str | None = None
     total_spent: int = 0
     spend_tier: str = "cold"  # whale | active | casual | cold
     last_active: datetime | None = None
@@ -56,6 +58,7 @@ class Message(BaseModel):
     role: str  # "fan" | "creator"
     content: str
     sent_at: datetime | None = None
+    media_context: dict | None = None
 
 
 class ExchangeExample(BaseModel):

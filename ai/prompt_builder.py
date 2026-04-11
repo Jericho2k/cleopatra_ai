@@ -63,6 +63,27 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
         avoid_block += "\n".join(f"- {m}" for m in recent_creator)
         avoid_block += "\nWrite something completely different."
 
+    latest_fan_msg = None
+    if ctx.conversation_history:
+        last = ctx.conversation_history[-1]
+        if last.role == "fan":
+            latest_fan_msg = last
+        else:
+            for m in reversed(ctx.conversation_history):
+                if m.role == "fan":
+                    latest_fan_msg = m
+                    break
+    has_fan_attachments = bool(
+        latest_fan_msg
+        and latest_fan_msg.media_context
+        and latest_fan_msg.media_context.get("attachments")
+    )
+    text_empty = not (ctx.fan_message or "").strip()
+    if text_empty and has_fan_attachments:
+        fan_message = "[Fan sent an image/attachment]"
+    else:
+        fan_message = (ctx.fan_message or "").strip()
+
     system_prompt = f"""You are {fan_name}'s favorite creator. Your name is Eliza.
 
 WHO YOU ARE:
@@ -157,7 +178,7 @@ SITUATION: {strategy} (fan mood: {mood}, energy: {energy})
 
 {rag_section}
 
-Fan just said: "{ctx.fan_message}"
+Fan just said: "{fan_message}"
 
 Write 3 reply options. Each should feel like a different side of the same person — not 3 different characters.
 Write naturally — sometimes one word is right, sometimes three sentences.
