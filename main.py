@@ -257,6 +257,35 @@ async def save_reply(req: ReplyRequest) -> dict:
     return {"status": "ok"}
 
 
+@app.post("/sync-vault/{creator_id}")
+async def sync_vault(creator_id: str) -> dict:
+    import httpx
+
+    db = get_supabase()
+    creator_row = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("apifansly_account_id")
+        .eq("id", creator_id)
+        .single()
+        .execute()
+    )
+
+    apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+    if not apifansly_id:
+        return {"status": "error", "message": "no apifansly account id"}
+
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault",
+            headers={"x-api-key": api_key},
+            timeout=30,
+        )
+        print(f"[VAULT SYNC] status={response.status_code} body={response.text[:500]}")
+        return {"status": "ok", "raw": response.json()}
+
+
 @app.post("/generate-suggestions")
 async def generate_suggestions_webhook(
     payload: WebhookPayload,
