@@ -429,10 +429,44 @@ async def fansly_webhook(payload: dict) -> dict:
     print(f"[FANSLY WEBHOOK RAW] {payload}")
 
     event = payload.get("event")
+    data = payload.get("data") or {}
+
+    if event == "tips.received":
+        sender_id = str(data.get("fromUser", {}).get("id", ""))
+        amount = data.get("netAmount", 0) or data.get("grossAmount", 0)
+
+        print(f"[TIP] sender={sender_id} amount={amount}")
+
+        if sender_id and amount:
+            try:
+                amt = float(amount)
+            except (TypeError, ValueError):
+                amt = 0.0
+            if amt:
+                db = get_supabase()
+                fan_row = await asyncio.to_thread(
+                    lambda: db.table("fans")
+                    .select("id, total_spent")
+                    .eq("platform_fan_id", sender_id)
+                    .limit(1)
+                    .execute()
+                )
+                rows = fan_row.data or []
+                if rows:
+                    r = rows[0]
+                    new_total = int((r.get("total_spent") or 0) + round(amt))
+                    fid = str(r["id"])
+                    await asyncio.to_thread(
+                        lambda: db.table("fans")
+                        .update({"total_spent": new_total})
+                        .eq("id", fid)
+                        .execute()
+                    )
+                    print(f"[TIP] Updated total_spent={new_total} for fan={fid}")
+        return {"status": "ok"}
+
     if event != "messages.received":
         return {"status": "skipped"}
-
-    data = payload.get("data") or {}
 
     platform_fan_id = str(data.get("senderId", ""))
     message_content = (data.get("content") or "").strip()
