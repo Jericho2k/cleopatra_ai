@@ -245,13 +245,26 @@ async def suggestions(req: SuggestionRequest) -> SuggestionResponse:
 
 @app.post("/regenerate-suggestions", response_model=SuggestionResponse)
 async def regenerate_suggestions(req: SuggestionRequest) -> SuggestionResponse:
-    return await get_suggestions(
+    result = await get_suggestions(
         fan_id=req.fan_id,
         creator_id=req.creator_id,
         fan_message=req.message,
         creator_name="a creator",
         save_fan_message=False,
     )
+
+    if result.suggestions:
+        db = get_supabase()
+        await asyncio.to_thread(
+            lambda: db.table("suggestions").insert({
+                "fan_id": req.fan_id,
+                "creator_id": req.creator_id,
+                "suggestions": result.suggestions,
+                "stage": result.stage.value,
+            }).execute()
+        )
+
+    return result
 
 
 @app.post("/reply")
