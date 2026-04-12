@@ -36,11 +36,11 @@ from models.schemas import (
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
 from services.suggestions import (
-    _send_auto_reply,
     _should_update_memory,
     _update_fan_ai_summary,
     _update_fan_memory,
     get_suggestions,
+    schedule_auto_reply,
 )
 
 
@@ -85,11 +85,6 @@ async def process_incoming_fan_message(
 
     print(f"[AUTO MODE] creator={creator_id} auto_mode={auto_mode} fan={fan_id}")
 
-    creator_persona = await get_creator_persona(creator_id)
-    if creator_persona is None:
-        creator_persona = Persona()
-    ppv_offers = await get_ppv_offers(creator_id)
-
     excluded = await asyncio.to_thread(
         lambda: get_supabase()
         .from_("fan_list_members")
@@ -101,6 +96,23 @@ async def process_incoming_fan_message(
         row.get("fan_lists", {}).get("exclude_from_auto", False)
         for row in (excluded.data or [])
     )
+
+    if auto_mode and not is_excluded:
+        schedule_auto_reply(fan_id, creator_id)
+        fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
+        print(
+            f"[MEMORY CHECK] fan={fan_id} fan_messages={fan_msg_count} "
+            f"should_update={_should_update_memory(conversation_history)}"
+        )
+        if _should_update_memory(conversation_history):
+            asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent))
+            asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
+        return
+
+    creator_persona = await get_creator_persona(creator_id)
+    if creator_persona is None:
+        creator_persona = Persona()
+    ppv_offers = await get_ppv_offers(creator_id)
 
     conversation_stage = classify_stage(conversation_history, fan_profile)
     similar_exchanges = await find_similar_exchanges(
@@ -136,10 +148,7 @@ async def process_incoming_fan_message(
     replies = await generate_replies(prompt, creator_persona)
 
     db = get_supabase()
-    if auto_mode and not is_excluded:
-        if replies:
-            asyncio.create_task(_send_auto_reply(fan_id, creator_id, replies[0]))
-    elif message_id:
+    if message_id:
         await asyncio.to_thread(
             lambda: db.table("suggestions").insert({
                 "fan_id": fan_id,

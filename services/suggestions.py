@@ -23,6 +23,7 @@ from db.queries import (
     get_conversation_history,
     get_creator_persona,
     get_fan,
+    get_fan_by_id,
     get_ppv_offers,
     save_message,
     update_fan_memory,
@@ -40,6 +41,8 @@ together_client = AsyncOpenAI(
     base_url="https://api.together.xyz/v1",
     api_key=get_settings().TOGETHER_API_KEY,
 )
+
+_pending_auto_replies: dict[str, asyncio.Task] = {}
 
 
 async def get_suggestions(
@@ -236,19 +239,70 @@ async def _update_fan_ai_summary(
         traceback.print_exc()
 
 
-async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
+async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
+    """Wait for fan to finish typing, then generate and send one reply."""
     try:
-        print(f"[AUTO REPLY] Starting delay for fan={fan_id} reply={reply[:50]}")
+        delay = random.randint(90, 160)
+        await asyncio.sleep(delay)
+
+        conversation_history = await get_conversation_history(fan_id)
+        fan_profile = await get_fan_by_id(fan_id)
+        if not fan_profile:
+            return
+
+        fan_messages = [m for m in conversation_history if m.role == "fan"]
+        if not fan_messages:
+            return
+        latest_message = fan_messages[-1].content
+
+        creator_persona = await get_creator_persona(creator_id)
+        if creator_persona is None:
+            creator_persona = Persona()
+
+        ppv_offers = await get_ppv_offers(creator_id)
+        similar_exchanges = await find_similar_exchanges(latest_message, creator_id, enabled=False)
+        conversation_stage = classify_stage(conversation_history, fan_profile)
+
+        ctx_without_situation = ConversationContext(
+            fan_message=latest_message,
+            conversation_history=conversation_history,
+            fan_profile=fan_profile,
+            creator_persona=creator_persona,
+            similar_exchanges=similar_exchanges,
+            conversation_stage=conversation_stage,
+            creator_name="a creator",
+            ppv_offers=ppv_offers,
+        )
+
+        situation = await analyze_situation(ctx_without_situation)
+        ctx = ConversationContext(
+            fan_message=latest_message,
+            conversation_history=conversation_history,
+            fan_profile=fan_profile,
+            creator_persona=creator_persona,
+            similar_exchanges=similar_exchanges,
+            conversation_stage=conversation_stage,
+            creator_name="a creator",
+            situation=situation,
+            ppv_offers=ppv_offers,
+        )
+
+        prompt = build_prompt(ctx)
+        replies = await generate_replies(prompt, creator_persona)
+
+        if not replies:
+            return
+
+        reply = replies[0]
 
         db = get_supabase()
         fan_row = await asyncio.to_thread(
             lambda: db.table("fans")
-            .select("fansly_group_id, platform_fan_id, creator_id")
+            .select("fansly_group_id, platform_fan_id")
             .eq("id", fan_id)
             .single()
             .execute()
         )
-
         creator_row = await asyncio.to_thread(
             lambda: db.table("creators")
             .select("fansly_account_id, apifansly_account_id")
@@ -271,8 +325,7 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
             except Exception:
                 pass
 
-        delay = random.randint(45, 90)
-        await asyncio.sleep(delay)
+        await asyncio.sleep(random.randint(3, 8))
 
         parts = [p.strip() for p in reply.split("|") if p.strip()]
 
@@ -293,7 +346,7 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
                     }
                 }
             else:
-                text_out = part
+                text_out = re.sub(r"\[PPV:[^\]]+\]", "", part).strip()
                 ppv_media_context = None
 
             await save_message(
@@ -308,8 +361,8 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
             if group_id and apifansly_account_id:
                 if ppv_match:
                     async with httpx.AsyncClient() as hc:
-                        resp = await hc.post(
-                            f"https://v1.apifansly.com/api/fansly/{apifansly_account_id}/chats/{group_id}/messages",
+                        await hc.post(
+                            f"https://v1.apifansly.com/api/fansly/{apifansly_account_id}/chats/{str(group_id)}/messages",
                             headers={
                                 "x-api-key": os.environ.get("APIFANSLY_API_KEY"),
                                 "Content-Type": "application/json",
@@ -322,22 +375,32 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
                             },
                             timeout=10,
                         )
-                    print(
-                        f"[AUTO REPLY] Sent part {i+1} PPV media={media_id} "
-                        f"fansly status={resp.status_code} body={resp.text[:200]}"
-                    )
                 else:
                     from main import send_fansly_message
 
-                    sent = await send_fansly_message(apifansly_account_id, str(group_id), part)
-                    print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]} fansly_sent={sent}")
-            else:
-                print(f"[AUTO REPLY] Sent part {i+1}: {part[:50]} (no fansly config)")
+                    await send_fansly_message(apifansly_account_id, str(group_id), text_out)
 
+            print(f"[AUTO REPLY] Sent part {i+1}: {text_out[:50]}")
+
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
-        print(f"[AUTO REPLY ERROR] fan={fan_id} error={e}")
+        print(f"[DEBOUNCED AUTO REPLY ERROR] fan={fan_id} error={e}")
         import traceback
         traceback.print_exc()
+    finally:
+        _pending_auto_replies.pop(fan_id, None)
+
+
+def schedule_auto_reply(fan_id: str, creator_id: str) -> None:
+    """Cancel any pending reply for this fan and schedule a new one."""
+    existing = _pending_auto_replies.get(fan_id)
+    if existing and not existing.done():
+        existing.cancel()
+        print(f"[AUTO REPLY] Reset timer for fan={fan_id}")
+
+    task = asyncio.create_task(_debounced_auto_reply(fan_id, creator_id))
+    _pending_auto_replies[fan_id] = task
 
 
 def _should_update_memory(conversation_history: list[Message]) -> bool:
