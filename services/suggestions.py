@@ -239,10 +239,6 @@ async def _update_fan_ai_summary(
 async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
     try:
         print(f"[AUTO REPLY] Starting delay for fan={fan_id} reply={reply[:50]}")
-        delay = random.randint(45, 90)
-        await asyncio.sleep(delay)
-
-        parts = [p.strip() for p in reply.split("|") if p.strip()]
 
         db = get_supabase()
         fan_row = await asyncio.to_thread(
@@ -263,6 +259,22 @@ async def _send_auto_reply(fan_id: str, creator_id: str, reply: str) -> None:
 
         group_id = (fan_row.data or {}).get("fansly_group_id")
         apifansly_account_id = (creator_row.data or {}).get("apifansly_account_id")
+
+        if group_id and apifansly_account_id:
+            try:
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        f"https://v1.apifansly.com/api/fansly/{apifansly_account_id}/chats/{str(group_id)}/typing",
+                        headers={"x-api-key": os.environ.get("APIFANSLY_API_KEY")},
+                        timeout=5,
+                    )
+            except Exception:
+                pass
+
+        delay = random.randint(45, 90)
+        await asyncio.sleep(delay)
+
+        parts = [p.strip() for p in reply.split("|") if p.strip()]
 
         for i, part in enumerate(parts):
             if i > 0:
