@@ -335,10 +335,14 @@ async def connect_creator(req: ConnectCreatorRequest) -> dict:
                 "fansly_account_id": str(fansly_account_id),
                 "apifansly_account_id": apifansly_account_id,
                 "auto_mode": False,
-            }).select().single().execute()
+            }).execute()
         )
 
-        return {"success": True, "creator": creator_row.data}
+        creator = creator_row.data[0] if creator_row.data else None
+        if not creator:
+            return {"success": False, "error": "Failed to create creator"}
+
+        return {"success": True, "creator": creator}
 
 
 @app.post("/connect-creator-2fa")
@@ -376,10 +380,14 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
                 "fansly_account_id": str(fansly_account_id),
                 "apifansly_account_id": apifansly_account_id,
                 "auto_mode": False,
-            }).select().single().execute()
+            }).execute()
         )
 
-        return {"success": True, "creator": creator_row.data}
+        creator = creator_row.data[0] if creator_row.data else None
+        if not creator:
+            return {"success": False, "error": "Failed to create creator"}
+
+        return {"success": True, "creator": creator}
 
 
 @app.post("/sync-vault/{creator_id}")
