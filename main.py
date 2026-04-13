@@ -347,7 +347,7 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            "https://v1.apifansly.com/api/fansly/submit-2fa",
+            "https://v1.apifansly.com/api/fansly/verify-2fa",
             headers={"x-api-key": api_key, "Content-Type": "application/json"},
             json={
                 "twofa_token": req.twofa_token,
