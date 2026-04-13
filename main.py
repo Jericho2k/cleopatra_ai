@@ -185,6 +185,7 @@ class ConnectCreatorRequest(BaseModel):
     name: str
     email: str
     password: str
+    user_id: str
     countryCode: str = "US"
 
 
@@ -194,6 +195,7 @@ class Connect2FARequest(BaseModel):
     name: str
     email: str
     password: str
+    user_id: str
 
 
 async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
@@ -343,6 +345,13 @@ async def connect_creator(req: ConnectCreatorRequest) -> dict:
         if not creator:
             return {"success": False, "error": "Failed to create creator"}
 
+        await asyncio.to_thread(
+            lambda: db.table("chatter_creators").insert({
+                "chatter_id": req.user_id,
+                "creator_id": creator["id"],
+            }).execute()
+        )
+
         return {"success": True, "creator": creator}
 
 
@@ -388,6 +397,13 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
         creator = creator_row.data[0] if creator_row.data else None
         if not creator:
             return {"success": False, "error": "Failed to create creator"}
+
+        await asyncio.to_thread(
+            lambda: db.table("chatter_creators").insert({
+                "chatter_id": req.user_id,
+                "creator_id": creator["id"],
+            }).execute()
+        )
 
         return {"success": True, "creator": creator}
 
