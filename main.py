@@ -181,6 +181,19 @@ class WebhookPayload(BaseModel):
     record: dict
 
 
+class ConnectCreatorRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+    countryCode: str = "US"
+
+
+class Connect2FARequest(BaseModel):
+    twofa_token: str
+    code: str
+    name: str
+
+
 async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
     """
     Fires when a fan sends a message to a model account we're polling.
@@ -277,6 +290,91 @@ async def save_reply(req: ReplyRequest) -> dict:
         req.was_ai_suggested
     )
     return {"status": "ok"}
+
+
+@app.post("/connect-creator")
+async def connect_creator(req: ConnectCreatorRequest) -> dict:
+    import httpx
+
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://v1.apifansly.com/api/fansly/connect",
+            headers={"x-api-key": api_key, "Content-Type": "application/json"},
+            json={
+                "username": req.email,
+                "password": req.password,
+                "name": req.name,
+                "countryCode": req.countryCode,
+            },
+            timeout=30,
+        )
+        data = response.json()
+        print(f"[CONNECT] response={data}")
+
+        if data.get("data", {}).get("requires_2fa"):
+            return {
+                "requires_2fa": True,
+                "twofa_token": data["data"]["twofa_token"],
+                "masked_email": data["data"]["masked_email"],
+            }
+
+        apifansly_account_id = data.get("data", {}).get("account_id")
+        fansly_account_id = data.get("data", {}).get("data", {}).get("response", {}).get("accountId")
+
+        if not apifansly_account_id:
+            return {"success": False, "error": "Failed to connect account"}
+
+        db = get_supabase()
+        creator_row = await asyncio.to_thread(
+            lambda: db.table("creators").insert({
+                "platform_username": req.name,
+                "fansly_account_id": str(fansly_account_id),
+                "apifansly_account_id": apifansly_account_id,
+                "auto_mode": False,
+            }).select().single().execute()
+        )
+
+        return {"success": True, "creator": creator_row.data}
+
+
+@app.post("/connect-creator-2fa")
+async def connect_creator_2fa(req: Connect2FARequest) -> dict:
+    import httpx
+
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            "https://v1.apifansly.com/api/fansly/submit-2fa",
+            headers={"x-api-key": api_key, "Content-Type": "application/json"},
+            json={
+                "twofa_token": req.twofa_token,
+                "code": req.code,
+            },
+            timeout=30,
+        )
+        data = response.json()
+        print(f"[2FA] response={data}")
+
+        apifansly_account_id = data.get("data", {}).get("account_id")
+        fansly_account_id = data.get("data", {}).get("data", {}).get("response", {}).get("accountId")
+
+        if not apifansly_account_id:
+            return {"success": False, "error": "2FA verification failed"}
+
+        db = get_supabase()
+        creator_row = await asyncio.to_thread(
+            lambda: db.table("creators").insert({
+                "platform_username": req.name,
+                "fansly_account_id": str(fansly_account_id),
+                "apifansly_account_id": apifansly_account_id,
+                "auto_mode": False,
+            }).select().single().execute()
+        )
+
+        return {"success": True, "creator": creator_row.data}
 
 
 @app.post("/sync-vault/{creator_id}")
