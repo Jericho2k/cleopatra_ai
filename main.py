@@ -192,6 +192,8 @@ class Connect2FARequest(BaseModel):
     twofa_token: str
     code: str
     name: str
+    email: str
+    password: str
 
 
 async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
@@ -350,8 +352,11 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
             "https://v1.apifansly.com/api/fansly/verify-2fa",
             headers={"x-api-key": api_key, "Content-Type": "application/json"},
             json={
-                "twofa_token": req.twofa_token,
-                "code": req.code,
+                "username": req.email,
+                "password": req.password,
+                "name": req.name,
+                "twoFactorToken": req.twofa_token,
+                "twoFactorCode": req.code,
             },
             timeout=30,
         )
