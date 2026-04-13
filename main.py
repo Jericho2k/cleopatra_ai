@@ -293,6 +293,25 @@ async def save_reply(req: ReplyRequest) -> dict:
         req.content,
         req.was_ai_suggested
     )
+
+    db = get_supabase()
+    fan_row = await asyncio.to_thread(
+        lambda: db.table("fans")
+        .select("fansly_group_id")
+        .eq("id", req.fan_id).single().execute()
+    )
+    creator_row = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("apifansly_account_id")
+        .eq("id", req.creator_id).single().execute()
+    )
+
+    group_id = (fan_row.data or {}).get("fansly_group_id")
+    apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+
+    if group_id and apifansly_id:
+        await send_fansly_message(apifansly_id, group_id, req.content)
+
     return {"status": "ok"}
 
 
