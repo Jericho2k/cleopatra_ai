@@ -332,6 +332,7 @@ async def connect_creator(req: ConnectCreatorRequest) -> dict:
         creator_row = await asyncio.to_thread(
             lambda: db.table("creators").insert({
                 "platform_username": req.name,
+                "platform": "fansly",
                 "fansly_account_id": str(fansly_account_id),
                 "apifansly_account_id": apifansly_account_id,
                 "auto_mode": False,
@@ -377,6 +378,7 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
         creator_row = await asyncio.to_thread(
             lambda: db.table("creators").insert({
                 "platform_username": req.name,
+                "platform": "fansly",
                 "fansly_account_id": str(fansly_account_id),
                 "apifansly_account_id": apifansly_account_id,
                 "auto_mode": False,
