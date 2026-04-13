@@ -6,6 +6,7 @@ Routes are thin and delegate all logic to services.
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -313,6 +314,47 @@ async def save_reply(req: ReplyRequest) -> dict:
         await send_fansly_message(apifansly_id, group_id, req.content)
 
     return {"status": "ok"}
+
+
+@app.post("/reengagement/{creator_id}")
+async def send_reengagement(creator_id: str) -> dict:
+    db = get_supabase()
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+
+    fans_row = await asyncio.to_thread(
+        lambda: db.table("fans")
+        .select("id, display_name, fansly_group_id")
+        .eq("creator_id", creator_id)
+        .execute()
+    )
+
+    reengaged = 0
+    for fan in (fans_row.data or []):
+        fan_id = fan["id"]
+        last_msg = await asyncio.to_thread(
+            lambda fid=fan_id: db.table("messages")
+            .select("role, sent_at")
+            .eq("fan_id", fid)
+            .eq("creator_id", creator_id)
+            .order("sent_at", desc=True)
+            .limit(1)
+            .maybe_single()
+            .execute()
+        )
+
+        if not last_msg.data:
+            continue
+
+        if last_msg.data["role"] != "creator":
+            continue
+        if last_msg.data["sent_at"] > cutoff:
+            continue
+
+        schedule_auto_reply(fan_id, creator_id)
+        reengaged += 1
+
+    return {"status": "ok", "reengaged": reengaged}
 
 
 @app.post("/connect-creator")
