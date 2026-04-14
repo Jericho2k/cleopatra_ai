@@ -84,7 +84,16 @@ async def process_incoming_fan_message(
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
 
-    print(f"[AUTO MODE] creator={creator_id} auto_mode={auto_mode} fan={fan_id}")
+    fan_auto = fan_profile.auto_mode
+    if fan_auto is None:
+        effective_auto = auto_mode
+    else:
+        effective_auto = fan_auto
+
+    print(
+        f"[AUTO MODE] creator={creator_id} creator_auto={auto_mode} "
+        f"fan_auto={fan_auto} effective_auto={effective_auto} fan={fan_id}"
+    )
 
     excluded = await asyncio.to_thread(
         lambda: get_supabase()
@@ -98,7 +107,7 @@ async def process_incoming_fan_message(
         for row in (excluded.data or [])
     )
 
-    if auto_mode and not is_excluded:
+    if effective_auto and not is_excluded:
         schedule_auto_reply(fan_id, creator_id)
         fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
         print(
