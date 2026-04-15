@@ -325,45 +325,87 @@ async def save_reply(req: ReplyRequest) -> dict:
     return {"status": "ok"}
 
 
-@app.post("/reengagement/{creator_id}")
-async def send_reengagement(creator_id: str) -> dict:
+@app.post("/reengagement")
+async def run_reengagement() -> dict:
     db = get_supabase()
 
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
-
-    fans_row = await asyncio.to_thread(
-        lambda: db.table("fans")
-        .select("id, display_name, fansly_group_id")
-        .eq("creator_id", creator_id)
+    settings_rows = await asyncio.to_thread(
+        lambda: db.table("reengagement_settings")
+        .select("*, creators(id, apifansly_account_id)")
+        .eq("enabled", True)
         .execute()
     )
 
-    reengaged = 0
-    for fan in (fans_row.data or []):
-        fan_id = fan["id"]
-        last_msg = await asyncio.to_thread(
-            lambda fid=fan_id: db.table("messages")
-            .select("role, sent_at")
-            .eq("fan_id", fid)
-            .eq("creator_id", creator_id)
-            .order("sent_at", desc=True)
-            .limit(1)
-            .maybe_single()
+    total = 0
+    for setting in (settings_rows.data or []):
+        creator_id = setting["creator_id"]
+        hours = setting.get("hours_threshold", 48)
+        max_per_week = setting.get("max_per_week", 2)
+        use_ai = setting.get("use_ai", True)
+        template = setting.get("template", "")
+        ai_instructions = setting.get("ai_instructions", "")
+        _ = ai_instructions  # Placeholder for future prompt customization.
+
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(hours=hours)).isoformat()
+        week_ago = (now - timedelta(days=7)).isoformat()
+
+        fans = await asyncio.to_thread(
+            lambda cid=creator_id: db.table("fans")
+            .select("id, display_name, fansly_group_id, auto_mode")
+            .eq("creator_id", cid)
             .execute()
         )
 
-        if not last_msg.data:
-            continue
+        for fan in (fans.data or []):
+            if fan.get("auto_mode") is False:
+                continue
 
-        if last_msg.data["role"] != "creator":
-            continue
-        if last_msg.data["sent_at"] > cutoff:
-            continue
+            fan_id = fan["id"]
+            last_msg = await asyncio.to_thread(
+                lambda fid=fan_id, cid=creator_id: db.table("messages")
+                .select("role, sent_at")
+                .eq("fan_id", fid)
+                .eq("creator_id", cid)
+                .order("sent_at", desc=True)
+                .limit(1)
+                .maybe_single()
+                .execute()
+            )
 
-        schedule_auto_reply(fan_id, creator_id)
-        reengaged += 1
+            if not last_msg.data:
+                continue
+            if last_msg.data["role"] != "creator":
+                continue
+            if last_msg.data["sent_at"] > cutoff:
+                continue
 
-    return {"status": "ok", "reengaged": reengaged}
+            sent_this_week = await asyncio.to_thread(
+                lambda fid=fan_id, cid=creator_id: db.table("messages")
+                .select("id", count="exact")
+                .eq("fan_id", fid)
+                .eq("creator_id", cid)
+                .eq("role", "creator")
+                .gte("sent_at", week_ago)
+                .execute()
+            )
+
+            if (sent_this_week.count or 0) >= max_per_week:
+                continue
+
+            if use_ai:
+                schedule_auto_reply(fan_id, creator_id)
+            else:
+                msg = template.replace("{name}", fan.get("display_name") or "")
+                apifansly_id = (setting.get("creators") or {}).get("apifansly_account_id")
+                group_id = fan.get("fansly_group_id")
+                if msg and apifansly_id and group_id:
+                    await send_fansly_message(apifansly_id, group_id, msg)
+                    await save_message(fan_id, creator_id, "creator", msg, False)
+
+            total += 1
+
+    return {"status": "ok", "reengaged": total}
 
 
 @app.post("/connect-creator")
