@@ -373,7 +373,20 @@ async def run_reengagement() -> dict:
             .execute()
         )
 
-        for fan in (fans.data or []):
+        if setting.get("apply_to") == "list" and setting.get("list_id"):
+            list_id = setting["list_id"]
+            list_members = await asyncio.to_thread(
+                lambda lid=list_id: db.table("fan_list_members")
+                .select("fan_id")
+                .eq("list_id", lid)
+                .execute()
+            )
+            member_ids = {m["fan_id"] for m in (list_members.data or [])}
+            fans_data = [f for f in (fans.data or []) if f["id"] in member_ids]
+        else:
+            fans_data = fans.data or []
+
+        for fan in fans_data:
             if fan.get("auto_mode") is False:
                 continue
 
