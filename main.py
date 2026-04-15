@@ -224,11 +224,24 @@ async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
 
 session_store: SessionStore = None
 fansly_poller: FanslyPoller = None
+reengagement_task: asyncio.Task | None = None
+
+
+async def reengagement_scheduler():
+    """Runs re-engagement check every 6 hours."""
+    while True:
+        await asyncio.sleep(6 * 60 * 60)
+        try:
+            print("[CRON] Running re-engagement check...")
+            result = await run_reengagement()
+            print(f"[CRON] Re-engagement done: {result}")
+        except Exception as e:
+            print(f"[CRON ERROR] {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global session_store, fansly_poller
+    global session_store, fansly_poller, reengagement_task
 
     supabase = get_supabase()
     session_store = SessionStore(
@@ -242,11 +255,14 @@ async def lifespan(app: FastAPI):
         on_new_message=handle_new_fan_message,
     )
     await fansly_poller.start_all()
+    reengagement_task = asyncio.create_task(reengagement_scheduler())
 
     yield
 
     if fansly_poller:
         await fansly_poller.stop_all()
+    if reengagement_task:
+        reengagement_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
