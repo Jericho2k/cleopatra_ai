@@ -344,7 +344,6 @@ async def save_reply(req: ReplyRequest) -> dict:
 @app.post("/reengagement")
 async def run_reengagement() -> dict:
     db = get_supabase()
-
     settings_rows = await asyncio.to_thread(
         lambda: db.table("reengagement_settings")
         .select("*, creators(id, apifansly_account_id)")
@@ -356,15 +355,23 @@ async def run_reengagement() -> dict:
     for setting in (settings_rows.data or []):
         creator_id = setting["creator_id"]
         hours = setting.get("hours_threshold", 48)
-        max_per_week = setting.get("max_per_week", 2)
         use_ai = setting.get("use_ai", True)
-        template = setting.get("template", "")
+        templates = setting.get("templates", [])
         ai_instructions = setting.get("ai_instructions", "")
         _ = ai_instructions  # Placeholder for future prompt customization.
+        exclude_list_id = setting.get("exclude_list_id")
 
-        now = datetime.now(timezone.utc)
-        cutoff = (now - timedelta(hours=hours)).isoformat()
-        week_ago = (now - timedelta(days=7)).isoformat()
+        excluded_ids = set()
+        if exclude_list_id:
+            excl = await asyncio.to_thread(
+                lambda lid=exclude_list_id: db.table("fan_list_members")
+                .select("fan_id")
+                .eq("list_id", lid)
+                .execute()
+            )
+            excluded_ids = {m["fan_id"] for m in (excl.data or [])}
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
 
         fans = await asyncio.to_thread(
             lambda cid=creator_id: db.table("fans")
@@ -373,24 +380,14 @@ async def run_reengagement() -> dict:
             .execute()
         )
 
-        if setting.get("apply_to") == "list" and setting.get("list_id"):
-            list_id = setting["list_id"]
-            list_members = await asyncio.to_thread(
-                lambda lid=list_id: db.table("fan_list_members")
-                .select("fan_id")
-                .eq("list_id", lid)
-                .execute()
-            )
-            member_ids = {m["fan_id"] for m in (list_members.data or [])}
-            fans_data = [f for f in (fans.data or []) if f["id"] in member_ids]
-        else:
-            fans_data = fans.data or []
+        for fan in (fans.data or []):
+            fan_id = fan["id"]
 
-        for fan in fans_data:
+            if fan_id in excluded_ids:
+                continue
             if fan.get("auto_mode") is False:
                 continue
 
-            fan_id = fan["id"]
             last_msg = await asyncio.to_thread(
                 lambda fid=fan_id, cid=creator_id: db.table("messages")
                 .select("role, sent_at")
@@ -409,30 +406,50 @@ async def run_reengagement() -> dict:
             if last_msg.data["sent_at"] > cutoff:
                 continue
 
-            sent_this_week = await asyncio.to_thread(
-                lambda fid=fan_id, cid=creator_id: db.table("messages")
-                .select("id", count="exact")
+            last_log = await asyncio.to_thread(
+                lambda fid=fan_id, cid=creator_id: db.table("reengagement_log")
+                .select("template_index, sent_at")
                 .eq("fan_id", fid)
                 .eq("creator_id", cid)
-                .eq("role", "creator")
-                .gte("sent_at", week_ago)
+                .order("sent_at", desc=True)
+                .limit(1)
+                .maybe_single()
                 .execute()
             )
 
-            if (sent_this_week.count or 0) >= max_per_week:
-                continue
+            if last_log.data:
+                last_sent = last_log.data["sent_at"]
+                if last_sent > cutoff:
+                    continue
 
             if use_ai:
                 schedule_auto_reply(fan_id, creator_id)
+                total += 1
             else:
+                if not templates:
+                    continue
+
+                last_index = last_log.data["template_index"] if last_log.data else -1
+                next_index = last_index + 1
+                if next_index >= len(templates):
+                    continue
+
+                template = templates[next_index]
                 msg = template.replace("{name}", fan.get("display_name") or "")
                 apifansly_id = (setting.get("creators") or {}).get("apifansly_account_id")
                 group_id = fan.get("fansly_group_id")
+
                 if msg and apifansly_id and group_id:
                     await send_fansly_message(apifansly_id, group_id, msg)
                     await save_message(fan_id, creator_id, "creator", msg, False)
-
-            total += 1
+                    await asyncio.to_thread(
+                        lambda fid=fan_id, cid=creator_id, idx=next_index: db.table("reengagement_log").insert({
+                            "fan_id": fid,
+                            "creator_id": cid,
+                            "template_index": idx,
+                        }).execute()
+                    )
+                    total += 1
 
     return {"status": "ok", "reengaged": total}
 
