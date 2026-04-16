@@ -883,6 +883,61 @@ async def fansly_webhook(payload: dict) -> dict:
     return {"status": "ok"}
 
 
+@app.delete("/creators/{creator_id}")
+async def delete_creator(creator_id: str) -> dict:
+    db = get_supabase()
+
+    await asyncio.to_thread(
+        lambda cid=creator_id: db.table("reengagement_log").delete().eq("creator_id", cid).execute()
+    )
+    await asyncio.to_thread(
+        lambda cid=creator_id: db.table("reengagement_settings").delete().eq("creator_id", cid).execute()
+    )
+    await asyncio.to_thread(
+        lambda cid=creator_id: db.table("creator_vault_media").delete().eq("creator_id", cid).execute()
+    )
+    await asyncio.to_thread(
+        lambda cid=creator_id: db.table("fan_lists").delete().eq("creator_id", cid).execute()
+    )
+    await asyncio.to_thread(
+        lambda cid=creator_id: db.table("blocked_words").delete().eq("creator_id", cid).execute()
+    )
+    await asyncio.to_thread(
+        lambda cid=creator_id: db.table("scripts").delete().eq("creator_id", cid).execute()
+    )
+    await asyncio.to_thread(
+        lambda cid=creator_id: db.table("ppv_offers").delete().eq("creator_id", cid).execute()
+    )
+
+    fans = await asyncio.to_thread(
+        lambda cid=creator_id: db.table("fans").select("id").eq("creator_id", cid).execute()
+    )
+    fan_ids = [f["id"] for f in (fans.data or [])]
+
+    for fan_id in fan_ids:
+        await asyncio.to_thread(
+            lambda fid=fan_id: db.table("suggestions").delete().eq("fan_id", fid).execute()
+        )
+        await asyncio.to_thread(
+            lambda fid=fan_id: db.table("messages").delete().eq("fan_id", fid).execute()
+        )
+        await asyncio.to_thread(
+            lambda fid=fan_id: db.table("fan_list_members").delete().eq("fan_id", fid).execute()
+        )
+
+    await asyncio.to_thread(
+        lambda cid=creator_id: db.table("fans").delete().eq("creator_id", cid).execute()
+    )
+    await asyncio.to_thread(
+        lambda cid=creator_id: db.table("chatter_creators").delete().eq("creator_id", cid).execute()
+    )
+    await asyncio.to_thread(
+        lambda cid=creator_id: db.table("creators").delete().eq("id", cid).execute()
+    )
+
+    return {"status": "ok"}
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
