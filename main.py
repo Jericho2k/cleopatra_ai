@@ -5,6 +5,7 @@ Routes are thin and delegate all logic to services.
 
 import asyncio
 import os
+import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -372,6 +373,10 @@ async def run_reengagement() -> dict:
             excluded_ids = {m["fan_id"] for m in (excl.data or [])}
 
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        jitter_hours = random.uniform(-2, 2)
+        jitter_cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=hours + jitter_hours)
+        ).isoformat()
 
         fans = await asyncio.to_thread(
             lambda cid=creator_id: db.table("fans")
@@ -403,7 +408,7 @@ async def run_reengagement() -> dict:
                 continue
             if last_msg.data["role"] != "creator":
                 continue
-            if last_msg.data["sent_at"] > cutoff:
+            if last_msg.data["sent_at"] > jitter_cutoff:
                 continue
 
             last_log = await asyncio.to_thread(
