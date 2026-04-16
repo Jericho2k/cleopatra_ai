@@ -483,8 +483,9 @@ async def connect_creator(req: ConnectCreatorRequest) -> dict:
         if data.get("data", {}).get("requires_2fa"):
             return {
                 "requires_2fa": True,
-                "twofa_token": data["data"]["twofa_token"],
-                "masked_email": data["data"]["masked_email"],
+                "twofa_token": data["data"].get("twofa_token", ""),
+                "masked_email": data["data"].get("masked_email", ""),
+                "message": data["data"].get("message", ""),
             }
 
         apifansly_account_id = data.get("data", {}).get("account_id")
