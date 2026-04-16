@@ -206,7 +206,8 @@ class Connect2FARequest(BaseModel):
     name: str
     email: str
     password: str
-    user_id: str
+    countryCode: str = "US"
+    user_id: str = ""
 
 
 async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
@@ -535,6 +536,7 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
                 "name": req.name,
                 "twoFactorToken": req.twofa_token,
                 "twoFactorCode": req.code,
+                "countryCode": req.countryCode,
             },
             timeout=30,
         )
