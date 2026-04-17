@@ -462,6 +462,7 @@ async def run_reengagement() -> dict:
 
 @app.post("/connect-creator")
 async def connect_creator(req: ConnectCreatorRequest) -> dict:
+    print(f"[CONNECT] req={req.dict()}")
     import httpx
 
     api_key = os.environ.get("APIFANSLY_API_KEY")
