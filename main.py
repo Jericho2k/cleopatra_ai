@@ -942,6 +942,28 @@ async def delete_creator(creator_id: str) -> dict:
     return {"status": "ok"}
 
 
+@app.get("/my-creators")
+async def get_my_creators(user_id: str) -> dict:
+    db = get_supabase()
+    links = await asyncio.to_thread(
+        lambda: db.table("chatter_creators")
+        .select("creator_id")
+        .eq("chatter_id", user_id)
+        .execute()
+    )
+    creator_ids = [r["creator_id"] for r in (links.data or [])]
+    if not creator_ids:
+        return {"creators": []}
+
+    creators = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("id, platform_username, fansly_account_id, apifansly_account_id, persona, auto_mode")
+        .in_("id", creator_ids)
+        .execute()
+    )
+    return {"creators": creators.data or []}
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
