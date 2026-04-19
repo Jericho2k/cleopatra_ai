@@ -651,6 +651,7 @@ async def sync_chats(creator_id: str) -> dict:
             )
             synced += 1
 
+        print(f"[SYNC CHATS] total_chats={len(all_chats)} synced={synced}")
         return {"status": "ok", "synced": synced}
 
 
