@@ -702,13 +702,30 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
     api_key = os.environ.get("APIFANSLY_API_KEY")
 
     async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats/{group_id}/messages",
-            headers={"x-api-key": api_key},
-            timeout=30,
-        )
-        data = response.json()
-        messages = data.get("data", {}).get("data", {}).get("response", {}).get("messages", [])
+        all_messages = []
+        offset = 0
+
+        while True:
+            response = await client.get(
+                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats/{group_id}/messages",
+                headers={"x-api-key": api_key},
+                params={"offset": offset},
+                timeout=30,
+            )
+            data = response.json()
+            messages = data.get("data", {}).get("data", {}).get("response", {}).get("messages", [])
+
+            if not messages:
+                break
+
+            all_messages.extend(messages)
+
+            if len(messages) < 20:
+                break
+
+            offset += len(messages)
+
+    messages = all_messages
 
     if not messages:
         return {"status": "ok", "imported": 0}
