@@ -608,38 +608,38 @@ async def sync_chats(creator_id: str) -> dict:
 
     async with httpx.AsyncClient() as client:
         all_chats = []
-        next_cursor = None
+        seen_group_ids = set()
+        offset = 0
+        max_chats = 2000
 
-        while True:
-            params = {}
-            if next_cursor:
-                params["cursor"] = next_cursor
-            else:
-                params["offset"] = len(all_chats)
-
+        while len(all_chats) < max_chats:
             response = await client.get(
                 f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats",
                 headers={"x-api-key": api_key},
-                params=params,
+                params={"offset": offset},
                 timeout=30,
             )
             data = response.json()
             response_data = data.get("data", {}).get("data", {}).get("response", {})
             chats = response_data.get("data", [])
 
-            next_cursor = response_data.get("nextCursor") or response_data.get("next_cursor")
-
-            print(
-                f"[SYNC CHATS] batch={len(chats)} total={len(all_chats) + len(chats)} "
-                f"nextCursor={next_cursor}"
-            )
-
             if not chats:
                 break
 
-            all_chats.extend(chats)
+            new_chats = [c for c in chats if c.get("groupId") not in seen_group_ids]
+            if not new_chats:
+                print(f"[SYNC CHATS] No new chats at offset={offset}, stopping")
+                break
 
-            if not next_cursor and len(chats) < 20:
+            for c in new_chats:
+                seen_group_ids.add(c.get("groupId"))
+
+            all_chats.extend(new_chats)
+            offset += len(chats)
+
+            print(f"[SYNC CHATS] batch={len(new_chats)} total={len(all_chats)} offset={offset}")
+
+            if len(chats) < 20:
                 break
 
         synced = 0
