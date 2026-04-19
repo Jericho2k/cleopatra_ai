@@ -654,6 +654,118 @@ async def sync_chats(creator_id: str) -> dict:
         return {"status": "ok", "synced": synced}
 
 
+def _fansly_created_at_iso(created_at) -> str | None:
+    if created_at is None:
+        return None
+    try:
+        t = float(created_at)
+    except (TypeError, ValueError):
+        return None
+    if t > 1e12:
+        t /= 1000.0
+    return datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
+
+
+@app.post("/load-history/{creator_id}/{fan_id}")
+async def load_fan_history(creator_id: str, fan_id: str) -> dict:
+    import httpx
+
+    db = get_supabase()
+
+    fan_row = await asyncio.to_thread(
+        lambda: db.table("fans")
+        .select("fansly_group_id, platform_fan_id")
+        .eq("id", fan_id)
+        .eq("creator_id", creator_id)
+        .maybe_single()
+        .execute()
+    )
+    creator_row = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("apifansly_account_id, fansly_account_id")
+        .eq("id", creator_id)
+        .single()
+        .execute()
+    )
+
+    if not fan_row.data:
+        return {"status": "error", "message": "missing fan or creator info"}
+
+    group_id = (fan_row.data or {}).get("fansly_group_id")
+    apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+    fansly_account_id = (creator_row.data or {}).get("fansly_account_id")
+
+    if not group_id or not apifansly_id:
+        return {"status": "error", "message": "missing fan or creator info"}
+
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats/{group_id}/messages",
+            headers={"x-api-key": api_key},
+            timeout=30,
+        )
+        data = response.json()
+        messages = data.get("data", {}).get("data", {}).get("response", {}).get("messages", [])
+
+    if not messages:
+        return {"status": "ok", "imported": 0}
+
+    existing = await asyncio.to_thread(
+        lambda: db.table("messages")
+        .select("fansly_message_id")
+        .eq("fan_id", fan_id)
+        .eq("creator_id", creator_id)
+        .execute()
+    )
+    existing_ids = {r["fansly_message_id"] for r in (existing.data or []) if r.get("fansly_message_id")}
+
+    imported = 0
+    fansly_creator = str(fansly_account_id) if fansly_account_id is not None else ""
+
+    for msg in reversed(messages):
+        msg_id = str(msg.get("id", ""))
+        if not msg_id or msg_id in existing_ids:
+            continue
+
+        content = msg.get("content", "")
+        sender_id = str(msg.get("senderId", ""))
+        role = "fan" if sender_id != fansly_creator else "creator"
+
+        if not content:
+            continue
+
+        sent_at = _fansly_created_at_iso(msg.get("createdAt"))
+        row = {
+            "fan_id": fan_id,
+            "creator_id": creator_id,
+            "role": role,
+            "content": content,
+            "fansly_message_id": msg_id,
+        }
+        if sent_at is not None:
+            row["sent_at"] = sent_at
+
+        await asyncio.to_thread(
+            lambda r=row: db.table("messages").insert(r).execute()
+        )
+        existing_ids.add(msg_id)
+        imported += 1
+
+    if imported > 0:
+        conversation_history = await get_conversation_history(fan_id)
+        fan_profile = await get_fan_by_id(fan_id)
+
+        if fan_profile and len(conversation_history) >= 10:
+            asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
+            asyncio.create_task(
+                _update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent)
+            )
+
+    return {"status": "ok", "imported": imported}
+
+
 @app.post("/sync-vault/{creator_id}")
 async def sync_vault(creator_id: str) -> dict:
     import httpx
