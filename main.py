@@ -607,18 +607,31 @@ async def sync_chats(creator_id: str) -> dict:
     api_key = os.environ.get("APIFANSLY_API_KEY")
 
     async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats",
-            headers={"x-api-key": api_key},
-            timeout=30,
-        )
-        data = response.json()
-        print(f"[SYNC CHATS] status={response.status_code} body={str(data)[:300]}")
+        all_chats = []
+        offset = 0
+        limit = 50
 
-        chats = data.get("data", {}).get("data", {}).get("response", {}).get("data", [])
+        while True:
+            response = await client.get(
+                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats",
+                headers={"x-api-key": api_key},
+                params={"limit": limit, "offset": offset},
+                timeout=30,
+            )
+            data = response.json()
+            if offset == 0:
+                print(f"[SYNC CHATS] status={response.status_code} body={str(data)[:300]}")
+
+            chats = data.get("data", {}).get("data", {}).get("response", {}).get("data", [])
+            if not chats:
+                break
+            all_chats.extend(chats)
+            if len(chats) < limit:
+                break
+            offset += limit
 
         synced = 0
-        for chat in chats:
+        for chat in all_chats:
             platform_fan_id = str(chat.get("partnerAccountId", ""))
             fan_name = chat.get("partnerUsername", f"Fan_{platform_fan_id[-6:]}")
             group_id = str(chat.get("groupId", ""))
