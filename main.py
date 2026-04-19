@@ -518,6 +518,8 @@ async def connect_creator(req: ConnectCreatorRequest) -> dict:
             }).execute()
         )
 
+        asyncio.create_task(sync_chats_background(creator["id"]))
+
         return {"success": True, "creator": creator}
 
 
@@ -572,7 +574,71 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
             }).execute()
         )
 
+        asyncio.create_task(sync_chats_background(creator["id"]))
+
         return {"success": True, "creator": creator}
+
+
+async def sync_chats_background(creator_id: str) -> None:
+    try:
+        await sync_chats(creator_id)
+        print(f"[SYNC] Chats synced for creator={creator_id}")
+    except Exception as e:
+        print(f"[SYNC ERROR] {e}")
+
+
+@app.post("/sync-chats/{creator_id}")
+async def sync_chats(creator_id: str) -> dict:
+    import httpx
+
+    db = get_supabase()
+    creator_row = await asyncio.to_thread(
+        lambda cid=creator_id: db.table("creators")
+        .select("apifansly_account_id, fansly_account_id")
+        .eq("id", cid)
+        .single()
+        .execute()
+    )
+
+    apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+    if not apifansly_id:
+        return {"status": "error", "message": "no apifansly account"}
+
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats",
+            headers={"x-api-key": api_key},
+            timeout=30,
+        )
+        data = response.json()
+        print(f"[SYNC CHATS] status={response.status_code} body={str(data)[:300]}")
+
+        chats = data.get("data", {}).get("data", {}).get("response", {}).get("data", [])
+
+        synced = 0
+        for chat in chats:
+            platform_fan_id = str(chat.get("partnerAccountId", ""))
+            fan_name = chat.get("partnerUsername", f"Fan_{platform_fan_id[-6:]}")
+            group_id = str(chat.get("groupId", ""))
+
+            if not platform_fan_id or not group_id:
+                continue
+
+            fan = await get_fan(creator_id, platform_fan_id)
+            if not fan:
+                fan = await create_fan(creator_id, platform_fan_id, fan_name)
+
+            await asyncio.to_thread(
+                lambda fid=fan.id, gid=group_id: db.table("fans")
+                .update({"fansly_group_id": gid})
+                .eq("id", fid)
+                .execute()
+            )
+            synced += 1
+
+        return {"status": "ok", "synced": synced}
 
 
 @app.post("/sync-vault/{creator_id}")
