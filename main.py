@@ -606,15 +606,16 @@ async def sync_chats(creator_id: str) -> dict:
 
     api_key = os.environ.get("APIFANSLY_API_KEY")
 
-    # Pagination: confirm with Apifansly whether chats use `before`, offset, cursor, or page.
     async with httpx.AsyncClient() as client:
         all_chats = []
-        last_id = None
+        next_cursor = None
 
         while True:
-            params = {"limit": 50}
-            if last_id:
-                params["before"] = last_id
+            params = {}
+            if next_cursor:
+                params["cursor"] = next_cursor
+            else:
+                params["offset"] = len(all_chats)
 
             response = await client.get(
                 f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats",
@@ -623,19 +624,22 @@ async def sync_chats(creator_id: str) -> dict:
                 timeout=30,
             )
             data = response.json()
-            chats = data.get("data", {}).get("data", {}).get("response", {}).get("data", [])
+            response_data = data.get("data", {}).get("data", {}).get("response", {})
+            chats = response_data.get("data", [])
+
+            next_cursor = response_data.get("nextCursor") or response_data.get("next_cursor")
+
+            print(
+                f"[SYNC CHATS] batch={len(chats)} total={len(all_chats) + len(chats)} "
+                f"nextCursor={next_cursor}"
+            )
 
             if not chats:
                 break
 
             all_chats.extend(chats)
-            print(f"[SYNC CHATS] fetched {len(all_chats)} so far...")
 
-            if len(chats) < 50:
-                break
-
-            last_id = chats[-1].get("lastMessageId") or chats[-1].get("groupId")
-            if not last_id:
+            if not next_cursor and len(chats) < 20:
                 break
 
         synced = 0
