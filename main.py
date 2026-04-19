@@ -654,18 +654,6 @@ async def sync_chats(creator_id: str) -> dict:
         return {"status": "ok", "synced": synced}
 
 
-def _fansly_created_at_iso(created_at) -> str | None:
-    if created_at is None:
-        return None
-    try:
-        t = float(created_at)
-    except (TypeError, ValueError):
-        return None
-    if t > 1e12:
-        t /= 1000.0
-    return datetime.fromtimestamp(t, tz=timezone.utc).isoformat()
-
-
 @app.post("/load-history/{creator_id}/{fan_id}")
 async def load_fan_history(creator_id: str, fan_id: str) -> dict:
     import httpx
@@ -736,16 +724,23 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
         if not content:
             continue
 
-        sent_at = _fansly_created_at_iso(msg.get("createdAt"))
+        created_at = msg.get("createdAt")
+        if created_at and created_at > 0:
+            ts = float(created_at)
+            if ts > 1e12:
+                ts /= 1000.0
+            sent_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        else:
+            sent_at = datetime.now(timezone.utc).isoformat()
+
         row = {
             "fan_id": fan_id,
             "creator_id": creator_id,
             "role": role,
             "content": content,
             "fansly_message_id": msg_id,
+            "sent_at": sent_at,
         }
-        if sent_at is not None:
-            row["sent_at"] = sent_at
 
         await asyncio.to_thread(
             lambda r=row: db.table("messages").insert(r).execute()
@@ -764,6 +759,32 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             )
 
     return {"status": "ok", "imported": imported}
+
+
+@app.post("/mark-all-read/{creator_id}")
+async def mark_all_read(creator_id: str) -> dict:
+    import httpx
+
+    db = get_supabase()
+    creator_row = await asyncio.to_thread(
+        lambda cid=creator_id: db.table("creators")
+        .select("apifansly_account_id")
+        .eq("id", cid)
+        .single()
+        .execute()
+    )
+    apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+    if not apifansly_id:
+        return {"status": "error"}
+
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats/mark-as-read",
+            headers={"x-api-key": api_key},
+            timeout=10,
+        )
+    return {"status": "ok"}
 
 
 @app.post("/sync-vault/{creator_id}")
