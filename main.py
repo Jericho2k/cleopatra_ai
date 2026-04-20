@@ -729,6 +729,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             messages = response_data.get("messages", [])
             account_media_batch = response_data.get("accountMedia", [])
             cursor = response_data.get("nextCursor")
+            print(f"[CURSOR CHECK] keys={list(response_data.keys())} cursor={cursor}")
             if not all_messages:
                 print(f"[HISTORY END] {str(response_data)[-500:]}")
 
