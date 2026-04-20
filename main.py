@@ -625,6 +625,8 @@ async def sync_chats(creator_id: str) -> dict:
             response_data = data.get("data", {}).get("data", {}).get("response", {})
             chats = response_data.get("data", [])
             cursor = response_data.get("nextCursor")
+            if not all_chats:
+                print(f"[SYNC RAW] {str(response_data)[:500]}")
 
             print(f"[SYNC CHATS] batch={len(chats)} total={len(all_chats)+len(chats)} nextCursor={cursor}")
 
@@ -725,6 +727,8 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             messages = response_data.get("messages", [])
             account_media_batch = response_data.get("accountMedia", [])
             cursor = response_data.get("nextCursor")
+            if not all_messages:
+                print(f"[HISTORY RAW] {str(response_data)[:500]}")
 
             print(f"[LOAD HISTORY] batch={len(messages)} total={len(all_messages)+len(messages)} nextCursor={cursor}")
 
