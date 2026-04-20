@@ -714,7 +714,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
 
     async with httpx.AsyncClient() as client:
         while True:
-            params = {"limit": 50}
+            params = {"limit": 10}
             if cursor:
                 params["cursor"] = cursor
 
