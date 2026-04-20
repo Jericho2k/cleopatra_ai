@@ -730,6 +730,8 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             messages = response_data.get("messages", [])
             account_media = response_data.get("accountMedia", [])
             cursor = response_data.get("cursor")
+            print(f"[LOAD HISTORY RAW] full_response={str(response_data)[:2000]}")
+            print(f"[LOAD HISTORY] messages={len(messages)} cursor={cursor} accountMedia={len(account_media)}")
 
             for am in account_media:
                 content_id = am.get("id") or am.get("mediaId")
