@@ -625,8 +625,8 @@ async def sync_chats(creator_id: str) -> dict:
             response_data = data.get("data", {}).get("data", {}).get("response", {})
             chats = response_data.get("data", [])
             cursor = response_data.get("nextCursor") or response_data.get("Nextcursor")
-            if not all_chats:
-                print(f"[SYNC CHATS RAW] {str(response_data)[:500]}")
+            if not all_chats:  # first call only
+                print(f"[SYNC CHATS FULL RESPONSE] {str(response_data)[:1000]}")
 
             print(
                 f"[SYNC CHATS] batch={len(chats)} total={len(all_chats) + len(chats)} "
