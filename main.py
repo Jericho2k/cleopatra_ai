@@ -612,7 +612,7 @@ async def sync_chats(creator_id: str) -> dict:
 
         while True:
             params = {}
-            if cursor:
+            if cursor is not None:
                 params["cursor"] = cursor
 
             response = await client.get(
@@ -624,14 +624,9 @@ async def sync_chats(creator_id: str) -> dict:
             data = response.json()
             response_data = data.get("data", {}).get("data", {}).get("response", {})
             chats = response_data.get("data", [])
-            cursor = response_data.get("nextCursor") or response_data.get("Nextcursor")
-            if not all_chats:  # first call only
-                print(f"[SYNC CHATS FULL RESPONSE] {str(response_data)[:1000]}")
+            cursor = response_data.get("nextCursor")
 
-            print(
-                f"[SYNC CHATS] batch={len(chats)} total={len(all_chats) + len(chats)} "
-                f"cursor={cursor}"
-            )
+            print(f"[SYNC CHATS] batch={len(chats)} total={len(all_chats)+len(chats)} nextCursor={cursor}")
 
             if not chats:
                 break
@@ -715,7 +710,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
 
     async with httpx.AsyncClient() as client:
         while True:
-            params = {}
+            params = {"limit": 50}
             if cursor:
                 params["cursor"] = cursor
 
@@ -728,13 +723,13 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             data = response.json()
             response_data = data.get("data", {}).get("data", {}).get("response", {})
             messages = response_data.get("messages", [])
-            account_media = response_data.get("accountMedia", [])
-            cursor = response_data.get("cursor")
-            print(f"[LOAD HISTORY RAW] full_response={str(response_data)[:2000]}")
-            print(f"[LOAD HISTORY] messages={len(messages)} cursor={cursor} accountMedia={len(account_media)}")
+            account_media_batch = response_data.get("accountMedia", [])
+            cursor = response_data.get("nextCursor")
 
-            for am in account_media:
-                content_id = am.get("id") or am.get("mediaId")
+            print(f"[LOAD HISTORY] batch={len(messages)} total={len(all_messages)+len(messages)} nextCursor={cursor}")
+
+            for am in account_media_batch:
+                content_id = str(am.get("id", ""))
                 media = am.get("media", {})
                 locations = media.get("locations", [])
                 variants = media.get("variants", [])
@@ -744,10 +739,9 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
                 elif variants and variants[0].get("locations"):
                     url = variants[0]["locations"][0].get("location")
                 if content_id and url:
-                    all_media[str(content_id)] = url
+                    all_media[content_id] = url
 
             all_messages.extend(messages)
-            print(f"[LOAD HISTORY] batch={len(messages)} total={len(all_messages)} cursor={cursor}")
 
             if not cursor or not messages:
                 break
