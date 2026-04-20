@@ -625,6 +625,8 @@ async def sync_chats(creator_id: str) -> dict:
             response_data = data.get("data", {}).get("data", {}).get("response", {})
             chats = response_data.get("data", [])
             cursor = response_data.get("nextCursor") or response_data.get("Nextcursor")
+            if not all_chats:
+                print(f"[SYNC CHATS RAW] {str(response_data)[:500]}")
 
             print(
                 f"[SYNC CHATS] batch={len(chats)} total={len(all_chats) + len(chats)} "
@@ -679,8 +681,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
         lambda: db.table("fans")
         .select("fansly_group_id, platform_fan_id")
         .eq("id", fan_id)
-        .eq("creator_id", creator_id)
-        .maybe_single()
+        .single()
         .execute()
     )
     creator_row = await asyncio.to_thread(
@@ -691,70 +692,73 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
         .execute()
     )
 
-    if not fan_row.data:
-        return {"status": "error", "message": "missing fan or creator info"}
-
     group_id = (fan_row.data or {}).get("fansly_group_id")
     apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
-    fansly_account_id = (creator_row.data or {}).get("fansly_account_id")
+    fansly_account_id = str((creator_row.data or {}).get("fansly_account_id", ""))
 
     if not group_id or not apifansly_id:
         return {"status": "error", "message": "missing fan or creator info"}
 
     api_key = os.environ.get("APIFANSLY_API_KEY")
 
-    async with httpx.AsyncClient() as client:
-        all_messages = []
-        offset = 0
-
-        while True:
-            response = await client.get(
-                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats/{group_id}/messages",
-                headers={"x-api-key": api_key},
-                params={"offset": offset},
-                timeout=30,
-            )
-            data = response.json()
-            messages = data.get("data", {}).get("data", {}).get("response", {}).get("messages", [])
-
-            if not messages:
-                break
-
-            all_messages.extend(messages)
-
-            if len(messages) < 20:
-                break
-
-            offset += len(messages)
-
-    messages = all_messages
-
-    if not messages:
-        return {"status": "ok", "imported": 0}
-
     existing = await asyncio.to_thread(
         lambda: db.table("messages")
         .select("fansly_message_id")
         .eq("fan_id", fan_id)
-        .eq("creator_id", creator_id)
         .execute()
     )
     existing_ids = {r["fansly_message_id"] for r in (existing.data or []) if r.get("fansly_message_id")}
 
-    imported = 0
-    fansly_creator = str(fansly_account_id) if fansly_account_id is not None else ""
+    all_messages = []
+    all_media = {}
+    cursor = None
 
-    for msg in reversed(messages):
+    async with httpx.AsyncClient() as client:
+        while True:
+            params = {}
+            if cursor:
+                params["cursor"] = cursor
+
+            response = await client.get(
+                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats/{group_id}/messages",
+                headers={"x-api-key": api_key},
+                params=params,
+                timeout=30,
+            )
+            data = response.json()
+            response_data = data.get("data", {}).get("data", {}).get("response", {})
+            messages = response_data.get("messages", [])
+            account_media = response_data.get("accountMedia", [])
+            cursor = response_data.get("cursor")
+
+            for am in account_media:
+                content_id = am.get("id") or am.get("mediaId")
+                media = am.get("media", {})
+                locations = media.get("locations", [])
+                variants = media.get("variants", [])
+                url = None
+                if locations:
+                    url = locations[0].get("location")
+                elif variants and variants[0].get("locations"):
+                    url = variants[0]["locations"][0].get("location")
+                if content_id and url:
+                    all_media[str(content_id)] = url
+
+            all_messages.extend(messages)
+            print(f"[LOAD HISTORY] batch={len(messages)} total={len(all_messages)} cursor={cursor}")
+
+            if not cursor or not messages:
+                break
+
+    imported = 0
+    for msg in reversed(all_messages):
         msg_id = str(msg.get("id", ""))
         if not msg_id or msg_id in existing_ids:
             continue
 
         content = msg.get("content", "")
         sender_id = str(msg.get("senderId", ""))
-        role = "fan" if sender_id != fansly_creator else "creator"
-
-        if not content:
-            continue
+        role = "fan" if sender_id != fansly_account_id else "creator"
 
         created_at = msg.get("createdAt")
         if created_at and created_at > 0:
@@ -765,6 +769,23 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
         else:
             sent_at = datetime.now(timezone.utc).isoformat()
 
+        attachments = msg.get("attachments", [])
+        media_context = None
+        if attachments:
+            resolved = []
+            for att in attachments:
+                content_id = str(att.get("contentId", ""))
+                url = all_media.get(content_id)
+                resolved.append({
+                    "contentId": content_id,
+                    "url": url,
+                    "type": att.get("contentType", 1),
+                })
+            media_context = {"attachments": resolved}
+
+        if not content and not attachments:
+            continue
+
         row = {
             "fan_id": fan_id,
             "creator_id": creator_id,
@@ -772,6 +793,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             "content": content,
             "fansly_message_id": msg_id,
             "sent_at": sent_at,
+            "media_context": media_context,
         }
 
         await asyncio.to_thread(
