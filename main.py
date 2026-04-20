@@ -710,6 +710,8 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
     all_media = {}
     cursor = None
 
+    print(f"[LOAD HISTORY URL] apifansly_id={apifansly_id} group_id={group_id}")
+
     async with httpx.AsyncClient() as client:
         while True:
             params = {"limit": 50}
