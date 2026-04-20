@@ -608,38 +608,35 @@ async def sync_chats(creator_id: str) -> dict:
 
     async with httpx.AsyncClient() as client:
         all_chats = []
-        seen_group_ids = set()
-        offset = 0
-        max_chats = 2000
+        cursor = None
 
-        while len(all_chats) < max_chats:
+        while True:
+            params = {}
+            if cursor:
+                params["cursor"] = cursor
+
             response = await client.get(
                 f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats",
                 headers={"x-api-key": api_key},
-                params={"offset": offset},
+                params=params,
                 timeout=30,
             )
             data = response.json()
             response_data = data.get("data", {}).get("data", {}).get("response", {})
             chats = response_data.get("data", [])
+            cursor = response_data.get("nextCursor") or response_data.get("Nextcursor")
+
+            print(
+                f"[SYNC CHATS] batch={len(chats)} total={len(all_chats) + len(chats)} "
+                f"cursor={cursor}"
+            )
 
             if not chats:
                 break
 
-            new_chats = [c for c in chats if c.get("groupId") not in seen_group_ids]
-            if not new_chats:
-                print(f"[SYNC CHATS] No new chats at offset={offset}, stopping")
-                break
+            all_chats.extend(chats)
 
-            for c in new_chats:
-                seen_group_ids.add(c.get("groupId"))
-
-            all_chats.extend(new_chats)
-            offset += len(chats)
-
-            print(f"[SYNC CHATS] batch={len(new_chats)} total={len(all_chats)} offset={offset}")
-
-            if len(chats) < 20:
+            if not cursor:
                 break
 
         synced = 0
@@ -647,6 +644,8 @@ async def sync_chats(creator_id: str) -> dict:
             platform_fan_id = str(chat.get("partnerAccountId", ""))
             fan_name = chat.get("partnerUsername", f"Fan_{platform_fan_id[-6:]}")
             group_id = str(chat.get("groupId", ""))
+            fan_avatar = chat.get("partnerAvatar") or chat.get("partnerImage") or None
+            _ = fan_avatar
 
             if not platform_fan_id or not group_id:
                 continue
@@ -656,8 +655,11 @@ async def sync_chats(creator_id: str) -> dict:
                 fan = await create_fan(creator_id, platform_fan_id, fan_name)
 
             await asyncio.to_thread(
-                lambda fid=fan.id, gid=group_id: db.table("fans")
-                .update({"fansly_group_id": gid})
+                lambda fid=fan.id, gid=group_id, name=fan_name: db.table("fans")
+                .update({
+                    "fansly_group_id": gid,
+                    "display_name": name,
+                })
                 .eq("id", fid)
                 .execute()
             )
