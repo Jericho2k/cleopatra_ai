@@ -608,6 +608,7 @@ async def sync_chats(creator_id: str) -> dict:
 
     async with httpx.AsyncClient() as client:
         all_chats = []
+        account_lookup: dict[str, dict] = {}
         cursor = None
 
         while True:
@@ -622,9 +623,16 @@ async def sync_chats(creator_id: str) -> dict:
                 timeout=30,
             )
             data = response.json()
-            response_data = data.get("data", {}).get("data", {}).get("response", {})
+            data_inner = data.get("data", {}).get("data", {})
+            response_data = data_inner.get("response", {})
+            cursor = data_inner.get("nextCursor")
             chats = response_data.get("data", [])
-            cursor = response_data.get("nextCursor")
+            accounts = response_data.get("aggregationData", {}).get("accounts", [])
+            for a in accounts:
+                aid = str(a.get("id", ""))
+                if aid:
+                    account_lookup[aid] = a
+
             if not all_chats:
                 print(f"[SYNC RAW] {str(response_data)[:500]}")
 
@@ -641,10 +649,17 @@ async def sync_chats(creator_id: str) -> dict:
         synced = 0
         for chat in all_chats:
             platform_fan_id = str(chat.get("partnerAccountId", ""))
-            fan_name = chat.get("partnerUsername", f"Fan_{platform_fan_id[-6:]}")
+            account_data = account_lookup.get(platform_fan_id, {})
+            fan_name = (
+                account_data.get("displayName")
+                or account_data.get("username")
+                or chat.get("partnerUsername", f"Fan_{platform_fan_id[-6:]}")
+            )
+            avatar_url = None
+            avatar = account_data.get("avatar", {})
+            if avatar and avatar.get("locations"):
+                avatar_url = avatar["locations"][0].get("location")
             group_id = str(chat.get("groupId", ""))
-            fan_avatar = chat.get("partnerAvatar") or chat.get("partnerImage") or None
-            _ = fan_avatar
 
             if not platform_fan_id or not group_id:
                 continue
@@ -653,14 +668,15 @@ async def sync_chats(creator_id: str) -> dict:
             if not fan:
                 fan = await create_fan(creator_id, platform_fan_id, fan_name)
 
+            update_payload = {
+                "fansly_group_id": group_id,
+                "display_name": fan_name,
+            }
+            if avatar_url:
+                update_payload["avatar_url"] = avatar_url
+
             await asyncio.to_thread(
-                lambda fid=fan.id, gid=group_id, name=fan_name: db.table("fans")
-                .update({
-                    "fansly_group_id": gid,
-                    "display_name": name,
-                })
-                .eq("id", fid)
-                .execute()
+                lambda fid=fan.id, p=update_payload: db.table("fans").update(p).eq("id", fid).execute()
             )
             synced += 1
 
