@@ -937,6 +937,7 @@ async def sync_vault(creator_id: str) -> dict:
                     timeout=30,
                 )
                 media_data = media_resp.json()
+                print(f"[VAULT ALBUM RAW] {str(media_data)[:500]}")
                 data_inner = media_data.get("data", {}).get("data", {})
                 response_data = data_inner.get("response", {}) if isinstance(data_inner, dict) else {}
 
