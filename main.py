@@ -770,6 +770,8 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             if not cursor or not messages:
                 break
 
+    print(f"[MEDIA LOOKUP] keys={list(all_media.keys())[:5]}")
+
     imported = 0
     for msg in reversed(all_messages):
         msg_id = str(msg.get("id", ""))
@@ -795,6 +797,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             resolved = []
             for att in attachments:
                 content_id = str(att.get("contentId", ""))
+                print(f"[ATT RESOLVE] contentId={content_id} found={content_id in all_media}")
                 url = all_media.get(content_id)
                 resolved.append({
                     "contentId": content_id,
