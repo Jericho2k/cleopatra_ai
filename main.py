@@ -939,6 +939,7 @@ async def sync_vault(creator_id: str) -> dict:
                 media_data = media_resp.json()
                 print(f"[VAULT ALBUM RAW] {str(media_data)[:500]}")
                 data_inner = media_data.get("data", {}).get("data", {})
+                print(f"[VAULT CURSOR] data_inner keys={list(data_inner.keys()) if isinstance(data_inner, dict) else 'list'}")
                 response_data = data_inner.get("response", [])
 
                 if isinstance(response_data, list):
@@ -976,6 +977,7 @@ async def sync_vault(creator_id: str) -> dict:
                         lambda cid=creator_id, mid=media_id, u=url, mt=mimetype, fn=media.get("filename", ""), aid=album_id, at=album_title, pr=price: db.table("creator_vault_media").upsert({
                             "creator_id": cid,
                             "media_id": mid,
+                            "fansly_media_id": mid,
                             "url": u,
                             "mimetype": mt,
                             "filename": fn,
