@@ -939,16 +939,14 @@ async def sync_vault(creator_id: str) -> dict:
                 media_data = media_resp.json()
                 print(f"[VAULT ALBUM RAW] {str(media_data)[:500]}")
                 data_inner = media_data.get("data", {}).get("data", {})
-                response_data = data_inner.get("response", {}) if isinstance(data_inner, dict) else {}
+                response_data = data_inner.get("response", [])
 
-                # Try different response structures
-                items = (
-                    response_data.get("media")
-                    or response_data.get("data")
-                    or response_data.get("items")
-                    or []
-                )
-                cursor = data_inner.get("nextCursor") or response_data.get("nextCursor")
+                if isinstance(response_data, list):
+                    items = response_data
+                    cursor = data_inner.get("nextCursor")
+                else:
+                    items = response_data.get("data") or response_data.get("media") or []
+                    cursor = data_inner.get("nextCursor") or response_data.get("nextCursor")
 
                 print(f"[VAULT] album={album_title} batch={len(items)} cursor={cursor}")
 
@@ -958,11 +956,12 @@ async def sync_vault(creator_id: str) -> dict:
                     break
 
                 for item in items:
-                    media = item.get("media") or item
+                    media = item.get("media", {})
                     media_id = str(media.get("id", ""))
                     mimetype = media.get("mimetype", "")
                     locations = media.get("locations", [])
                     variants = media.get("variants", [])
+                    price = item.get("price", 0)
 
                     url = None
                     if locations:
@@ -974,7 +973,7 @@ async def sync_vault(creator_id: str) -> dict:
                         continue
 
                     await asyncio.to_thread(
-                        lambda cid=creator_id, mid=media_id, u=url, mt=mimetype, fn=media.get("filename", ""), aid=album_id, at=album_title: db.table("creator_vault_media").upsert({
+                        lambda cid=creator_id, mid=media_id, u=url, mt=mimetype, fn=media.get("filename", ""), aid=album_id, at=album_title, pr=price: db.table("creator_vault_media").upsert({
                             "creator_id": cid,
                             "media_id": mid,
                             "url": u,
@@ -982,6 +981,7 @@ async def sync_vault(creator_id: str) -> dict:
                             "filename": fn,
                             "album_id": aid,
                             "album_title": at,
+                            "price": pr,
                         }, on_conflict="creator_id,media_id").execute()
                     )
                     total_synced += 1
