@@ -753,7 +753,8 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             print(f"[LOAD HISTORY] batch={len(messages)} total={len(all_messages)+len(messages)} nextCursor={cursor}")
 
             for am in account_media_batch:
-                content_id = str(am.get("id", ""))
+                content_id_1 = str(am.get("id", ""))
+                content_id_2 = str(am.get("mediaId", ""))
                 media = am.get("media", {})
                 locations = media.get("locations", [])
                 variants = media.get("variants", [])
@@ -762,8 +763,20 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
                     url = locations[0].get("location")
                 elif variants and variants[0].get("locations"):
                     url = variants[0]["locations"][0].get("location")
-                if content_id and url:
-                    all_media[content_id] = url
+                price = int(am.get("price") or 0)
+                purchased = bool(am.get("purchased", am.get("isPurchased", False)))
+                access = am.get("access")
+                media_info = {
+                    "url": url,
+                    "price": price / 100 if price > 100 else price,
+                    "is_ppv": price > 0,
+                    "purchased": purchased,
+                    "access": access,
+                }
+                if content_id_1:
+                    all_media[content_id_1] = media_info
+                if content_id_2 and content_id_2 != content_id_1:
+                    all_media[content_id_2] = media_info
 
             all_messages.extend(messages)
 
@@ -798,12 +811,23 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             for att in attachments:
                 content_id = str(att.get("contentId", ""))
                 print(f"[ATT RESOLVE] contentId={content_id} found={content_id in all_media}")
-                url = all_media.get(content_id)
-                resolved.append({
-                    "contentId": content_id,
-                    "url": url,
-                    "type": att.get("contentType", 1),
-                })
+                info = all_media.get(content_id)
+                if isinstance(info, dict):
+                    resolved.append({
+                        "contentId": content_id,
+                        "url": info.get("url"),
+                        "type": att.get("contentType", 1),
+                        "price": info.get("price"),
+                        "is_ppv": info.get("is_ppv"),
+                        "purchased": info.get("purchased"),
+                        "access": info.get("access"),
+                    })
+                else:
+                    resolved.append({
+                        "contentId": content_id,
+                        "url": info,
+                        "type": att.get("contentType", 1),
+                    })
             media_context = {"attachments": resolved}
 
         if not content and not attachments:
