@@ -902,75 +902,93 @@ async def sync_vault(creator_id: str) -> dict:
     )
 
     apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
-    if not apifansly_id:
-        return {"status": "error", "message": "no apifansly account id"}
-
     api_key = os.environ.get("APIFANSLY_API_KEY")
 
-    synced = 0
-    cursor = None
-
     async with httpx.AsyncClient() as client:
-        while True:
-            params = {}
-            if cursor:
-                params["cursor"] = cursor
+        # Step 1: Get all albums
+        resp = await client.get(
+            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums",
+            headers={"x-api-key": api_key},
+            timeout=30,
+        )
+        albums_data = resp.json()
+        albums = albums_data.get("data", {}).get("data", {}).get("response", {}).get("albums", [])
+        print(f"[VAULT] found {len(albums)} albums")
 
-            response = await client.get(
-                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/media",
-                headers={"x-api-key": api_key},
-                params=params,
-                timeout=30,
-            )
-            data = response.json()
-            print(f"[VAULT] status={response.status_code} keys={list(data.get('data', {}).keys())}")
+        total_synced = 0
 
-            data_inner = data.get("data", {}).get("data", {})
+        # Step 2: For each album, fetch media
+        for album in albums:
+            album_id = album.get("id")
+            album_title = album.get("title") or f"Album_{album_id}"
+            item_count = album.get("itemCount", 0)
+            print(f"[VAULT] album={album_title} items={item_count}")
 
-            if isinstance(data_inner, list):
-                media_items = data_inner
-                cursor = None
-            else:
-                media_items = data_inner.get("data", []) or data_inner.get("media", [])
-                cursor = data_inner.get("nextCursor")
+            cursor = None
+            while True:
+                params = {"limit": 10}
+                if cursor:
+                    params["cursor"] = cursor
 
-            print(f"[VAULT] batch={len(media_items)} cursor={cursor}")
-
-            if not media_items:
-                break
-
-            for item in media_items:
-                media_id = str(item.get("id", ""))
-                mimetype = item.get("mimetype", "")
-                locations = item.get("locations", [])
-                variants = item.get("variants", [])
-
-                url = None
-                if locations:
-                    url = locations[0].get("location")
-                elif variants and variants[0].get("locations"):
-                    url = variants[0]["locations"][0].get("location")
-
-                if not media_id or not url:
-                    continue
-
-                await asyncio.to_thread(
-                    lambda cid=creator_id, mid=media_id, u=url, mt=mimetype, fn=item.get("filename", ""): db.table("creator_vault_media")
-                    .upsert({
-                        "creator_id": cid,
-                        "media_id": mid,
-                        "url": u,
-                        "mimetype": mt,
-                        "filename": fn,
-                    }, on_conflict="creator_id,media_id")
-                    .execute()
+                media_resp = await client.get(
+                    f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums/{album_id}/media",
+                    headers={"x-api-key": api_key},
+                    params=params,
+                    timeout=30,
                 )
-                synced += 1
+                media_data = media_resp.json()
+                data_inner = media_data.get("data", {}).get("data", {})
+                response_data = data_inner.get("response", {}) if isinstance(data_inner, dict) else {}
 
-            if not cursor:
-                break
+                # Try different response structures
+                items = (
+                    response_data.get("media")
+                    or response_data.get("data")
+                    or response_data.get("items")
+                    or []
+                )
+                cursor = data_inner.get("nextCursor") or response_data.get("nextCursor")
 
-    return {"status": "ok", "synced": synced}
+                print(f"[VAULT] album={album_title} batch={len(items)} cursor={cursor}")
+
+                if not items:
+                    # Log raw to debug structure
+                    print(f"[VAULT RAW] {str(media_data)[:300]}")
+                    break
+
+                for item in items:
+                    media = item.get("media") or item
+                    media_id = str(media.get("id", ""))
+                    mimetype = media.get("mimetype", "")
+                    locations = media.get("locations", [])
+                    variants = media.get("variants", [])
+
+                    url = None
+                    if locations:
+                        url = locations[0].get("location")
+                    elif variants and variants[0].get("locations"):
+                        url = variants[0]["locations"][0].get("location")
+
+                    if not media_id or not url:
+                        continue
+
+                    await asyncio.to_thread(
+                        lambda cid=creator_id, mid=media_id, u=url, mt=mimetype, fn=media.get("filename", ""), aid=album_id, at=album_title: db.table("creator_vault_media").upsert({
+                            "creator_id": cid,
+                            "media_id": mid,
+                            "url": u,
+                            "mimetype": mt,
+                            "filename": fn,
+                            "album_id": aid,
+                            "album_title": at,
+                        }, on_conflict="creator_id,media_id").execute()
+                    )
+                    total_synced += 1
+
+                if not cursor:
+                    break
+
+        return {"status": "ok", "synced": total_synced}
 
 
 @app.get("/media/{account_id}/{content_id}")
