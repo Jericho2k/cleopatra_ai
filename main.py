@@ -938,17 +938,18 @@ async def sync_vault(creator_id: str) -> dict:
                 )
                 media_data = media_resp.json()
                 print(f"[VAULT ALBUM RAW] {str(media_data)[:500]}")
-                outer = media_data.get("data", {}).get("data", {})
-                data_inner = outer
-                print(f"[VAULT CURSOR] data_inner keys={list(data_inner.keys()) if isinstance(data_inner, dict) else 'list'}")
+                outer = media_data.get("data", {})
+                print(f"[VAULT CURSOR CHECK] outer keys={list(outer.keys())}")
+                data_inner = outer.get("data", {})
+                print(f"[VAULT CURSOR CHECK2] data_inner keys={list(data_inner.keys()) if isinstance(data_inner, dict) else 'list'}")
                 response_data = data_inner.get("response", [])
+                cursor = outer.get("nextCursor") or data_inner.get("nextCursor")
 
                 if isinstance(response_data, list):
                     items = response_data
-                    cursor = outer.get("nextCursor")
                 else:
                     items = response_data.get("data") or response_data.get("media") or []
-                    cursor = outer.get("nextCursor") or response_data.get("nextCursor")
+                    cursor = cursor or response_data.get("nextCursor")
 
                 print(f"[VAULT] album={album_title} batch={len(items)} cursor={cursor}")
 
