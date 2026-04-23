@@ -1074,11 +1074,13 @@ async def _run_vault_sync(creator_id: str) -> None:
                         break
 
                     batch = []
+                    all_dupes = True
                     for item in items:
                         media = item.get("media", {})
                         media_id = str(media.get("id", ""))
                         if not media_id or media_id in existing_ids:
                             continue
+                        all_dupes = False
 
                         mimetype = media.get("mimetype", "")
                         locations = media.get("locations", [])
@@ -1118,7 +1120,7 @@ async def _run_vault_sync(creator_id: str) -> None:
                     _vault_sync_state[creator_id] = {"status": "running", "synced": synced, "total": new_total, "album": album_title}
                     print(f"[VAULT SYNC] album={album_title} synced={synced}/{new_total} cursor={cursor}")
 
-                    if not cursor:
+                    if not cursor or all_dupes:
                         break
 
         _vault_sync_state[creator_id] = {"status": "done", "synced": synced, "total": new_total, "album": ""}
