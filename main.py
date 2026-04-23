@@ -1129,7 +1129,9 @@ async def _run_vault_sync(creator_id: str) -> None:
         print(f"[VAULT SYNC] done synced={synced}")
 
     except Exception as e:
+        import traceback
         print(f"[VAULT SYNC ERROR] {e}")
+        print(traceback.format_exc())
         _vault_sync_state[creator_id] = {"status": "error", "synced": 0, "total": 0, "album": str(e)}
 
 
