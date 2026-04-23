@@ -1208,6 +1208,7 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
         if not media_id or not url:
             return {"status": "error", "message": "upload timed out or no media URL"}
 
+        ai_description = str(form.get("ai_description") or "")
         row = {
             "creator_id": creator_id,
             "media_id": media_id,
@@ -1219,6 +1220,8 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
             "album_title": album_title,
             "price": 0,
         }
+        if ai_description:
+            row["ai_description"] = ai_description
         db_result = await asyncio.to_thread(
             lambda: db.table("creator_vault_media")
             .upsert(row, on_conflict="creator_id,media_id")
