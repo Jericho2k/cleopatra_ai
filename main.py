@@ -1045,7 +1045,7 @@ async def _run_vault_sync(creator_id: str) -> None:
             new_total = max(total - already, 0)
             synced = 0
 
-            _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": new_total, "album": "Starting..."}
+            _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": 0, "album": "Starting..."}
 
             for album in albums:
                 album_id = album.get("id")
