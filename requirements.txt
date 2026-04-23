@@ -7,3 +7,4 @@ httpx
 redis
 python-dotenv
 anthropic
+sse-starlette

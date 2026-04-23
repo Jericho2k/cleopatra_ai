@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
 from ai.generator import generate_replies
 from ai.prompt_builder import build_prompt
@@ -989,6 +990,105 @@ async def sync_vault(creator_id: str) -> dict:
                     break
 
         return {"status": "ok", "synced": total_synced}
+
+
+@app.get("/sync-vault-stream/{creator_id}")
+async def sync_vault_stream(creator_id: str):
+    import httpx
+
+    async def event_generator():
+        db = get_supabase()
+        creator_row = await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("apifansly_account_id")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+        apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+        api_key = os.environ.get("APIFANSLY_API_KEY")
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums",
+                headers={"x-api-key": api_key},
+                timeout=30,
+            )
+            albums_data = resp.json()
+            albums = albums_data.get("data", {}).get("data", {}).get("response", {}).get("albums", [])
+
+            total = sum(a.get("itemCount", 0) for a in albums)
+            synced = 0
+
+            yield {"data": f'{{"type":"start","total":{total}}}'}
+
+            for album in albums:
+                album_id = album.get("id")
+                album_title = album.get("title") or f"Album_{album_id}"
+                cursor = None
+
+                while True:
+                    params = {"limit": 50}
+                    if cursor:
+                        params["cursor"] = cursor
+
+                    media_resp = await client.get(
+                        f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums/{album_id}/media",
+                        headers={"x-api-key": api_key},
+                        params=params,
+                        timeout=30,
+                    )
+                    media_data = media_resp.json()
+                    data_l1 = media_data.get("data", {})
+                    cursor = data_l1.get("nextCursor")
+                    outer = data_l1.get("data", {})
+                    response_data = outer.get("response", {})
+                    items = response_data if isinstance(response_data, list) else []
+
+                    if not items:
+                        break
+
+                    for item in items:
+                        media = item.get("media", {})
+                        media_id = str(media.get("id", ""))
+                        mimetype = media.get("mimetype", "")
+                        locations = media.get("locations", [])
+                        variants = media.get("variants", [])
+                        price = item.get("price", 0)
+
+                        url = None
+                        if locations:
+                            url = locations[0].get("location")
+                        elif variants and variants[0].get("locations"):
+                            url = variants[0]["locations"][0].get("location")
+
+                        if not media_id or not url:
+                            continue
+
+                        await asyncio.to_thread(
+                            lambda cid=creator_id, mid=media_id, u=url, mt=mimetype, fn=media.get("filename", ""), aid=album_id, at=album_title, pr=price: db.table("creator_vault_media").upsert({
+                                "creator_id": cid,
+                                "media_id": mid,
+                                "fansly_media_id": mid,
+                                "url": u,
+                                "mimetype": mt,
+                                "filename": fn,
+                                "album_id": aid,
+                                "album_title": at,
+                                "price": pr,
+                            }, on_conflict="creator_id,media_id").execute()
+                        )
+                        synced += 1
+
+                    import json as _json
+                    yield {"data": _json.dumps({"type": "progress", "synced": synced, "total": total, "album": album_title})}
+
+                    if not cursor:
+                        break
+
+            yield {"data": f'{{"type":"done","synced":{synced},"total":{total}}}'}
+
+    return EventSourceResponse(event_generator())
 
 
 @app.get("/media/{account_id}/{content_id}")
