@@ -1082,7 +1082,6 @@ async def _run_vault_sync(creator_id: str) -> None:
                         if not media_id or media_id in existing_ids:
                             continue
                         all_dupes = False
-                    consecutive_dupe_batches = consecutive_dupe_batches + 1 if all_dupes else 0
 
                         mimetype = media.get("mimetype", "")
                         locations = media.get("locations", [])
@@ -1110,6 +1109,7 @@ async def _run_vault_sync(creator_id: str) -> None:
                             "price": price,
                         })
                         existing_ids.add(media_id)
+                    consecutive_dupe_batches = consecutive_dupe_batches + 1 if all_dupes else 0
 
                     if batch:
                         await asyncio.to_thread(
