@@ -48,6 +48,7 @@ from services.suggestions import (
 
 
 _processed_messages: set = set()
+_vault_sync_state: dict = {}
 
 
 async def send_fansly_message(account_id: str, group_id: str, text: str) -> bool:
@@ -992,13 +993,26 @@ async def sync_vault(creator_id: str) -> dict:
         return {"status": "ok", "synced": total_synced}
 
 
-@app.get("/sync-vault-stream/{creator_id}")
-async def sync_vault_stream(creator_id: str):
-    import httpx
-    import json as _json
+@app.post("/sync-vault-start/{creator_id}")
+async def sync_vault_start(creator_id: str) -> dict:
+    if creator_id in _vault_sync_state and _vault_sync_state[creator_id].get("status") == "running":
+        return {"status": "already_running"}
+    _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": 0, "album": ""}
+    asyncio.create_task(_run_vault_sync(creator_id))
+    return {"status": "started"}
 
-    async def event_generator():
-        db = get_supabase()
+
+@app.get("/sync-vault-status/{creator_id}")
+async def sync_vault_status(creator_id: str) -> dict:
+    state = _vault_sync_state.get(creator_id, {"status": "idle", "synced": 0, "total": 0, "album": ""})
+    return state
+
+
+async def _run_vault_sync(creator_id: str) -> None:
+    import httpx
+
+    db = get_supabase()
+    try:
         creator_row = await asyncio.to_thread(
             lambda: db.table("creators")
             .select("apifansly_account_id")
@@ -1009,7 +1023,6 @@ async def sync_vault_stream(creator_id: str):
         apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
         api_key = os.environ.get("APIFANSLY_API_KEY")
 
-        # Fetch already-synced media_ids to skip them
         existing_rows = await asyncio.to_thread(
             lambda: db.table("creator_vault_media")
             .select("media_id")
@@ -1028,12 +1041,11 @@ async def sync_vault_stream(creator_id: str):
             albums = albums_data.get("data", {}).get("data", {}).get("response", {}).get("albums", [])
 
             total = sum(a.get("itemCount", 0) for a in albums)
-            # Subtract already-synced so progress bar reflects only new work
             already = len(existing_ids)
             new_total = max(total - already, 0)
             synced = 0
 
-            yield {"data": _json.dumps({"type": "start", "total": new_total, "already": already})}
+            _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": new_total, "album": "Starting..."}
 
             for album in albums:
                 album_id = album.get("id")
@@ -1061,7 +1073,6 @@ async def sync_vault_stream(creator_id: str):
                     if not items:
                         break
 
-                    # Build batch of only new items
                     batch = []
                     for item in items:
                         media = item.get("media", {})
@@ -1096,7 +1107,6 @@ async def sync_vault_stream(creator_id: str):
                         })
                         existing_ids.add(media_id)
 
-                    # Single batch upsert instead of N individual calls
                     if batch:
                         await asyncio.to_thread(
                             lambda b=batch: db.table("creator_vault_media")
@@ -1105,14 +1115,18 @@ async def sync_vault_stream(creator_id: str):
                         )
                         synced += len(batch)
 
-                    yield {"data": _json.dumps({"type": "progress", "synced": synced, "total": new_total, "album": album_title})}
+                    _vault_sync_state[creator_id] = {"status": "running", "synced": synced, "total": new_total, "album": album_title}
+                    print(f"[VAULT SYNC] album={album_title} synced={synced}/{new_total} cursor={cursor}")
 
                     if not cursor:
                         break
 
-        yield {"data": _json.dumps({"type": "done", "synced": synced, "total": new_total})}
+        _vault_sync_state[creator_id] = {"status": "done", "synced": synced, "total": new_total, "album": ""}
+        print(f"[VAULT SYNC] done synced={synced}")
 
-    return EventSourceResponse(event_generator(), ping=15)
+    except Exception as e:
+        print(f"[VAULT SYNC ERROR] {e}")
+        _vault_sync_state[creator_id] = {"status": "error", "synced": 0, "total": 0, "album": str(e)}
 
 
 @app.get("/media/{account_id}/{content_id}")
