@@ -926,7 +926,7 @@ async def sync_vault(creator_id: str) -> dict:
 
             cursor = None
             while True:
-                params = {"limit": 10}
+                params = {"limit": 50}
                 if cursor:
                     params["cursor"] = cursor
 
@@ -938,12 +938,13 @@ async def sync_vault(creator_id: str) -> dict:
                 )
                 media_data = media_resp.json()
                 print(f"[VAULT ALBUM RAW] {str(media_data)[:500]}")
-                outer = media_data.get("data", {}).get("data", {})
+                data_l1 = media_data.get("data", {})
+                cursor = data_l1.get("nextCursor")
+                outer = data_l1.get("data", {})
                 response_data = outer.get("response", {})
                 items = response_data if isinstance(response_data, list) else (
                     response_data.get("data") or response_data.get("media") or []
                 )
-                cursor = outer.get("nextCursor")
 
                 print(f"[VAULT] album={album_title} batch={len(items)} cursor={cursor}")
 
