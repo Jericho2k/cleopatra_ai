@@ -1051,6 +1051,7 @@ async def _run_vault_sync(creator_id: str) -> None:
                 album_id = album.get("id")
                 album_title = album.get("title") or f"Album_{album_id}"
                 cursor = None
+                consecutive_dupe_batches = 0
 
                 while True:
                     params = {"limit": 50}
@@ -1081,6 +1082,7 @@ async def _run_vault_sync(creator_id: str) -> None:
                         if not media_id or media_id in existing_ids:
                             continue
                         all_dupes = False
+                    consecutive_dupe_batches = consecutive_dupe_batches + 1 if all_dupes else 0
 
                         mimetype = media.get("mimetype", "")
                         locations = media.get("locations", [])
@@ -1120,7 +1122,7 @@ async def _run_vault_sync(creator_id: str) -> None:
                     _vault_sync_state[creator_id] = {"status": "running", "synced": synced, "total": new_total, "album": album_title}
                     print(f"[VAULT SYNC] album={album_title} synced={synced}/{new_total} cursor={cursor}")
 
-                    if not cursor or all_dupes:
+                    if not cursor or consecutive_dupe_batches >= 3:
                         break
 
         _vault_sync_state[creator_id] = {"status": "done", "synced": synced, "total": new_total, "album": ""}
