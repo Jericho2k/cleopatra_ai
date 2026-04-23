@@ -995,6 +995,7 @@ async def sync_vault(creator_id: str) -> dict:
 @app.get("/sync-vault-stream/{creator_id}")
 async def sync_vault_stream(creator_id: str):
     import httpx
+    import json as _json
 
     async def event_generator():
         db = get_supabase()
@@ -1008,6 +1009,15 @@ async def sync_vault_stream(creator_id: str):
         apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
         api_key = os.environ.get("APIFANSLY_API_KEY")
 
+        # Fetch already-synced media_ids to skip them
+        existing_rows = await asyncio.to_thread(
+            lambda: db.table("creator_vault_media")
+            .select("media_id")
+            .eq("creator_id", creator_id)
+            .execute()
+        )
+        existing_ids = {r["media_id"] for r in (existing_rows.data or [])}
+
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums",
@@ -1018,9 +1028,12 @@ async def sync_vault_stream(creator_id: str):
             albums = albums_data.get("data", {}).get("data", {}).get("response", {}).get("albums", [])
 
             total = sum(a.get("itemCount", 0) for a in albums)
+            # Subtract already-synced so progress bar reflects only new work
+            already = len(existing_ids)
+            new_total = max(total - already, 0)
             synced = 0
 
-            yield {"data": f'{{"type":"start","total":{total}}}'}
+            yield {"data": _json.dumps({"type": "start", "total": new_total, "already": already})}
 
             for album in albums:
                 album_id = album.get("id")
@@ -1048,9 +1061,14 @@ async def sync_vault_stream(creator_id: str):
                     if not items:
                         break
 
+                    # Build batch of only new items
+                    batch = []
                     for item in items:
                         media = item.get("media", {})
                         media_id = str(media.get("id", ""))
+                        if not media_id or media_id in existing_ids:
+                            continue
+
                         mimetype = media.get("mimetype", "")
                         locations = media.get("locations", [])
                         variants = media.get("variants", [])
@@ -1062,31 +1080,37 @@ async def sync_vault_stream(creator_id: str):
                         elif variants and variants[0].get("locations"):
                             url = variants[0]["locations"][0].get("location")
 
-                        if not media_id or not url:
+                        if not url:
                             continue
 
-                        await asyncio.to_thread(
-                            lambda cid=creator_id, mid=media_id, u=url, mt=mimetype, fn=media.get("filename", ""), aid=album_id, at=album_title, pr=price: db.table("creator_vault_media").upsert({
-                                "creator_id": cid,
-                                "media_id": mid,
-                                "fansly_media_id": mid,
-                                "url": u,
-                                "mimetype": mt,
-                                "filename": fn,
-                                "album_id": aid,
-                                "album_title": at,
-                                "price": pr,
-                            }, on_conflict="creator_id,media_id").execute()
-                        )
-                        synced += 1
+                        batch.append({
+                            "creator_id": creator_id,
+                            "media_id": media_id,
+                            "fansly_media_id": media_id,
+                            "url": url,
+                            "mimetype": mimetype,
+                            "filename": media.get("filename", ""),
+                            "album_id": album_id,
+                            "album_title": album_title,
+                            "price": price,
+                        })
+                        existing_ids.add(media_id)
 
-                    import json as _json
-                    yield {"data": _json.dumps({"type": "progress", "synced": synced, "total": total, "album": album_title})}
+                    # Single batch upsert instead of N individual calls
+                    if batch:
+                        await asyncio.to_thread(
+                            lambda b=batch: db.table("creator_vault_media")
+                            .upsert(b, on_conflict="creator_id,media_id")
+                            .execute()
+                        )
+                        synced += len(batch)
+
+                    yield {"data": _json.dumps({"type": "progress", "synced": synced, "total": new_total, "album": album_title})}
 
                     if not cursor:
                         break
 
-            yield {"data": f'{{"type":"done","synced":{synced},"total":{total}}}'}
+        yield {"data": _json.dumps({"type": "done", "synced": synced, "total": new_total})}
 
     return EventSourceResponse(event_generator())
 
