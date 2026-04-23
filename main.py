@@ -9,7 +9,7 @@ import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import BackgroundTasks, FastAPI
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -1133,6 +1133,102 @@ async def _run_vault_sync(creator_id: str) -> None:
         print(f"[VAULT SYNC ERROR] {e}")
         print(traceback.format_exc())
         _vault_sync_state[creator_id] = {"status": "error", "synced": 0, "total": 0, "album": str(e)}
+
+
+@app.post("/upload-vault-media/{creator_id}")
+async def upload_vault_media(creator_id: str, request: Request) -> dict:
+    import httpx
+
+    db = get_supabase()
+    creator_row = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("apifansly_account_id")
+        .eq("id", creator_id)
+        .single()
+        .execute()
+    )
+    apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+
+    form = await request.form()
+    file = form.get("file")
+    album_title = str(form.get("album_title") or "Uncategorized")
+    album_id = str(form.get("album_id") or "")
+
+    if not file:
+        return {"status": "error", "message": "no file"}
+
+    file_bytes = await file.read()
+    filename = file.filename
+    mimetype = file.content_type
+
+    async with httpx.AsyncClient() as client:
+        upload_resp = await client.post(
+            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/media/upload",
+            headers={"x-api-key": api_key},
+            files={"file": (filename, file_bytes, mimetype)},
+            timeout=60,
+        )
+        upload_data = upload_resp.json()
+        print(f"[UPLOAD] initiate response: {upload_data}")
+
+        job_id = upload_data.get("data", {}).get("jobId")
+        if not job_id:
+            return {"status": "error", "message": "no jobId returned", "raw": str(upload_data)}
+
+        media_id = None
+        url = None
+        for attempt in range(30):
+            await asyncio.sleep(2)
+            status_resp = await client.get(
+                f"https://v1.apifansly.com/api/fansly/media/upload/{job_id}/status",
+                headers={"x-api-key": api_key},
+                timeout=15,
+            )
+            status_data = status_resp.json()
+            state = status_data.get("data", {}).get("state")
+            print(f"[UPLOAD] job={job_id} attempt={attempt+1} state={state}")
+
+            if state == "completed":
+                result = status_data.get("data", {}).get("result", {})
+                media_id = str(result.get("mediaId", ""))
+                account_media = result.get("accountMedia", [])
+                if account_media:
+                    media_obj = account_media[0].get("media", {})
+                    locations = media_obj.get("locations", [])
+                    variants = media_obj.get("variants", [])
+                    if locations:
+                        url = locations[0].get("location")
+                    elif variants and variants[0].get("locations"):
+                        url = variants[0]["locations"][0].get("location")
+                break
+            elif state == "failed":
+                return {"status": "error", "message": "upload job failed"}
+
+        if not media_id or not url:
+            return {"status": "error", "message": "upload timed out or no media URL"}
+
+        row = {
+            "creator_id": creator_id,
+            "media_id": media_id,
+            "fansly_media_id": media_id,
+            "url": url,
+            "mimetype": mimetype,
+            "filename": filename,
+            "album_id": album_id,
+            "album_title": album_title,
+            "price": 0,
+        }
+        db_result = await asyncio.to_thread(
+            lambda: db.table("creator_vault_media")
+            .upsert(row, on_conflict="creator_id,media_id")
+            .select()
+            .single()
+            .execute()
+        )
+        saved = db_result.data or row
+        print(f"[UPLOAD] saved to DB media_id={media_id}")
+        return {"status": "ok", "item": saved}
 
 
 @app.get("/media/{account_id}/{content_id}")
