@@ -1112,7 +1112,7 @@ async def sync_vault_stream(creator_id: str):
 
         yield {"data": _json.dumps({"type": "done", "synced": synced, "total": new_total})}
 
-    return EventSourceResponse(event_generator())
+    return EventSourceResponse(event_generator(), ping=15)
 
 
 @app.get("/media/{account_id}/{content_id}")
