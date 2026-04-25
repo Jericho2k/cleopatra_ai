@@ -1251,6 +1251,10 @@ async def _categorize_single_item_and_save(item: dict) -> None:
                 "explicitness_level": result.get("explicitness", 3),
                 "good_for": result.get("good_for", "standalone"),
                 "tags": result.get("tags", []),
+                "scene_id": result.get("scene_id", ""),
+                "scene_location": result.get("scene_location", ""),
+                "scene_outfit": result.get("scene_outfit", ""),
+                "scene_lighting": result.get("scene_lighting", ""),
             }).eq("id", item["id"]).execute()
         )
         print(f"[UPLOAD CATEGORIZE] item={item['id']} category={result['content_category']}")
@@ -1359,10 +1363,21 @@ async def _categorize_single_item(item: dict) -> dict:
         tags = data.get("tags", [])
         if not isinstance(tags, list):
             tags = []
+        scene = data.get("scene", {})
+        if not isinstance(scene, dict):
+            scene = {}
+        scene_id = scene.get("scene_id", "")
+        location = scene.get("location", "")
+        outfit = scene.get("outfit", "")
+        lighting = scene.get("lighting", "")
 
         full_description = f"[{mood}|{good_for}|explicit:{explicitness}] {description}"
+        if outfit:
+            full_description += f" Outfit: {outfit}."
+        if location:
+            full_description += f" Location: {location}."
         if tags:
-            full_description += f" Tags: {', '.join(tags)}"
+            full_description += f" Tags: {', '.join(tags)}."
 
         return {
             "id": item_id,
@@ -1373,6 +1388,10 @@ async def _categorize_single_item(item: dict) -> dict:
             "explicitness": explicitness,
             "good_for": good_for,
             "tags": tags,
+            "scene_id": scene_id,
+            "scene_location": location,
+            "scene_outfit": outfit,
+            "scene_lighting": lighting,
         }
 
     except Exception as e:
@@ -1452,6 +1471,10 @@ async def _run_vault_categorization(creator_id: str) -> None:
                         "explicitness_level": r.get("explicitness", 3),
                         "good_for": r.get("good_for", "standalone"),
                         "tags": r.get("tags", []),
+                        "scene_id": r.get("scene_id", ""),
+                        "scene_location": r.get("scene_location", ""),
+                        "scene_outfit": r.get("scene_outfit", ""),
+                        "scene_lighting": r.get("scene_lighting", ""),
                     }).eq("id", r["id"]).execute()
                 )
                 done += 1
