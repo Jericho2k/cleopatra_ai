@@ -4,6 +4,7 @@ Routes are thin and delegate all logic to services.
 """
 
 import asyncio
+import json
 import os
 import random
 from contextlib import asynccontextmanager
@@ -1231,7 +1232,212 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
         )
         saved = db_result.data or row
         print(f"[UPLOAD] saved to DB media_id={media_id}")
+        # Auto-categorize in background
+        if saved.get("id"):
+            asyncio.create_task(_categorize_single_item_and_save(saved))
         return {"status": "ok", "item": saved}
+
+
+async def _categorize_single_item_and_save(item: dict) -> None:
+    try:
+        result = await _categorize_single_item(item)
+        db = get_supabase()
+        await asyncio.to_thread(
+            lambda: db.table("creator_vault_media").update({
+                "content_category": result["content_category"],
+                "ai_description": result["ai_description"],
+                "price_min": result["price_min"],
+                "price_max": result["price_max"],
+            }).eq("id", item["id"]).execute()
+        )
+        print(f"[UPLOAD CATEGORIZE] item={item['id']} category={result['content_category']}")
+    except Exception as e:
+        print(f"[UPLOAD CATEGORIZE ERROR] {e}")
+
+
+VAULT_CATEGORIES = {
+    "teaser_clothed":   {"min": 0,   "max": 0,   "label": "Clothed teaser (free)"},
+    "teaser_bundle":    {"min": 0,   "max": 0,   "label": "Teaser bundle no nudity (free)"},
+    "legs_feet":        {"min": 15,  "max": 70,  "label": "Legs / feet / armpits"},
+    "lingerie_photo":   {"min": 10,  "max": 80,  "label": "Lingerie photo"},
+    "lingerie_video":   {"min": 15,  "max": 90,  "label": "Lingerie video"},
+    "nude_photo":       {"min": 15,  "max": 80,  "label": "Nude photo"},
+    "striptease_video": {"min": 15,  "max": 100, "label": "Striptease video"},
+    "closeup_photo":    {"min": 25,  "max": 130, "label": "Closeup photo"},
+    "closeup_video":    {"min": 25,  "max": 130, "label": "Closeup video"},
+    "dictate_video":    {"min": 15,  "max": 50,  "label": "Dictate / dirty talk video"},
+    "solo_toy_video":   {"min": 30,  "max": 150, "label": "Solo / toy / orgasm video"},
+    "solo_toy_photo":   {"min": 20,  "max": 80,  "label": "Solo / toy photo"},
+    "bg_content":       {"min": 50,  "max": 300, "label": "BG (boy-girl) content"},
+    "task":             {"min": 10,  "max": 50,  "label": "Task / custom request"},
+    "other":            {"min": 0,   "max": 0,   "label": "Other / unclear"},
+}
+
+CATEGORY_LIST = "\n".join([
+    f"- {k}: {v['label']} (price range ${v['min']}-${v['max']})"
+    for k, v in VAULT_CATEGORIES.items()
+])
+
+
+async def _categorize_single_item(item: dict) -> dict:
+    """Run Claude Vision on one vault item and return category + description."""
+    from anthropic import AsyncAnthropic
+    import httpx
+
+    client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    url = item.get("url", "")
+    mimetype = item.get("mimetype", "")
+    item_id = item.get("id", "")
+    is_video = mimetype.startswith("video") if mimetype else False
+
+    try:
+        if is_video:
+            # For videos we can't send frames easily — use filename + album as context
+            filename = item.get("filename", "")
+            album = item.get("album_title", "")
+            prompt = (
+                f"This is a video file. Filename: '{filename}'. Album: '{album}'.\n"
+                f"Based on the filename and album name only, classify this into one of these categories:\n{CATEGORY_LIST}\n\n"
+                "Return ONLY valid JSON:\n"
+                '{"category": "category_key", "description": "one sentence description of likely content", "mood": "playful|intimate|explicit|teasing"}'
+            )
+            response = await client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=150,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        else:
+            # Fetch image and send to Claude Vision
+            async with httpx.AsyncClient() as hc:
+                img_resp = await hc.get(url, timeout=15)
+                img_bytes = img_resp.content
+                img_b64 = __import__("base64").b64encode(img_bytes).decode()
+
+            media_type = mimetype if mimetype in ["image/jpeg", "image/png", "image/webp", "image/gif"] else "image/jpeg"
+
+            response = await client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=150,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": img_b64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                f"Classify this OnlyFans creator image into one of these categories:\n{CATEGORY_LIST}\n\n"
+                                "Return ONLY valid JSON:\n"
+                                '{"category": "category_key", "description": "one sentence description of what is shown", "mood": "playful|intimate|explicit|teasing"}'
+                            ),
+                        },
+                    ],
+                }],
+            )
+
+        content = response.content[0].text.strip()
+        content = content.replace("```json", "").replace("```", "").strip()
+        data = json.loads(content)
+        category = data.get("category", "other")
+        if category not in VAULT_CATEGORIES:
+            category = "other"
+        description = data.get("description", "")
+        mood = data.get("mood", "")
+        price_info = VAULT_CATEGORIES[category]
+
+        return {
+            "id": item_id,
+            "content_category": category,
+            "ai_description": f"[{mood}] {description}".strip(" []") if mood else description,
+            "price_min": price_info["min"],
+            "price_max": price_info["max"],
+        }
+
+    except Exception as e:
+        print(f"[CATEGORIZE] item={item_id} error={e}")
+        return {
+            "id": item_id,
+            "content_category": "other",
+            "ai_description": "",
+            "price_min": 0,
+            "price_max": 0,
+        }
+
+
+_categorize_state: dict = {}
+
+
+@app.post("/categorize-vault/{creator_id}")
+async def categorize_vault(creator_id: str) -> dict:
+    if _categorize_state.get(creator_id, {}).get("status") == "running":
+        return {"status": "already_running", "state": _categorize_state[creator_id]}
+    _categorize_state[creator_id] = {"status": "running", "done": 0, "total": 0, "errors": 0}
+    asyncio.create_task(_run_vault_categorization(creator_id))
+    return {"status": "started"}
+
+
+@app.get("/categorize-vault-status/{creator_id}")
+async def categorize_vault_status(creator_id: str) -> dict:
+    return _categorize_state.get(creator_id, {"status": "idle", "done": 0, "total": 0})
+
+
+async def _run_vault_categorization(creator_id: str) -> None:
+    db = get_supabase()
+    try:
+        # Fetch only uncategorized items
+        rows = await asyncio.to_thread(
+            lambda: db.table("creator_vault_media")
+            .select("id, url, mimetype, filename, album_title")
+            .eq("creator_id", creator_id)
+            .or_("content_category.is.null,content_category.eq.")
+            .execute()
+        )
+        items = rows.data or []
+        total = len(items)
+        _categorize_state[creator_id]["total"] = total
+        print(f"[CATEGORIZE] creator={creator_id} uncategorized={total}")
+
+        done = 0
+        errors = 0
+        # Process in batches of 5 concurrently to stay fast but not hammer the API
+        batch_size = 5
+        for i in range(0, total, batch_size):
+            batch = items[i:i + batch_size]
+            results = await asyncio.gather(
+                *[_categorize_single_item(item) for item in batch],
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    errors += 1
+                    continue
+                await asyncio.to_thread(
+                    lambda r=result: db.table("creator_vault_media").update({
+                        "content_category": r["content_category"],
+                        "ai_description": r["ai_description"],
+                        "price_min": r["price_min"],
+                        "price_max": r["price_max"],
+                    }).eq("id", r["id"]).execute()
+                )
+                done += 1
+            _categorize_state[creator_id].update({"done": done, "errors": errors})
+            print(f"[CATEGORIZE] done={done}/{total} errors={errors}")
+            await asyncio.sleep(0.5)  # small pause between batches
+
+        _categorize_state[creator_id]["status"] = "done"
+        print(f"[CATEGORIZE] complete done={done} errors={errors}")
+
+    except Exception as e:
+        import traceback
+        print(f"[CATEGORIZE ERROR] {e}")
+        traceback.print_exc()
+        _categorize_state[creator_id]["status"] = "error"
 
 
 @app.get("/media/{account_id}/{content_id}")
