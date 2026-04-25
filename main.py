@@ -1390,27 +1390,37 @@ async def categorize_vault_status(creator_id: str) -> dict:
 async def _run_vault_categorization(creator_id: str) -> None:
     db = get_supabase()
     try:
-        # Fetch only uncategorized items
-        rows = await asyncio.to_thread(
-            lambda: db.table("creator_vault_media")
-            .select("id, url, mimetype, filename, album_title")
-            .eq("creator_id", creator_id)
-            .or_("content_category.is.null,content_category.eq.")
-            .execute()
-        )
-        items = rows.data or []
-        total = len(items)
+        # Paginate to get ALL uncategorized items past 1000 limit
+        all_items = []
+        page_size = 1000
+        from_idx = 0
+        while True:
+            rows = await asyncio.to_thread(
+                lambda f=from_idx: db.table("creator_vault_media")
+                .select("id, url, mimetype, filename, album_title")
+                .eq("creator_id", creator_id)
+                .or_("content_category.is.null,content_category.eq.")
+                .range(f, f + page_size - 1)
+                .execute()
+            )
+            batch = rows.data or []
+            all_items.extend(batch)
+            if len(batch) < page_size:
+                break
+            from_idx += page_size
+
+        total = len(all_items)
         _categorize_state[creator_id]["total"] = total
         print(f"[CATEGORIZE] creator={creator_id} uncategorized={total}")
 
         done = 0
         errors = 0
-        # Process in batches of 5 concurrently to stay fast but not hammer the API
-        batch_size = 5
+        # 2 concurrent max to respect 30k token/min rate limit
+        batch_size = 2
         for i in range(0, total, batch_size):
-            batch = items[i:i + batch_size]
+            batch = all_items[i:i + batch_size]
             results = await asyncio.gather(
-                *[_categorize_single_item(item) for item in batch],
+                *[_categorize_single_item_with_retry(item) for item in batch],
                 return_exceptions=True,
             )
             for result in results:
@@ -1428,7 +1438,7 @@ async def _run_vault_categorization(creator_id: str) -> None:
                 done += 1
             _categorize_state[creator_id].update({"done": done, "errors": errors})
             print(f"[CATEGORIZE] done={done}/{total} errors={errors}")
-            await asyncio.sleep(0.5)  # small pause between batches
+            await asyncio.sleep(1.5)  # respect rate limit between batches
 
         _categorize_state[creator_id]["status"] = "done"
         print(f"[CATEGORIZE] complete done={done} errors={errors}")
@@ -1438,6 +1448,21 @@ async def _run_vault_categorization(creator_id: str) -> None:
         print(f"[CATEGORIZE ERROR] {e}")
         traceback.print_exc()
         _categorize_state[creator_id]["status"] = "error"
+
+
+async def _categorize_single_item_with_retry(item: dict, max_retries: int = 3) -> dict:
+    """Wrap _categorize_single_item with exponential backoff on 429."""
+    for attempt in range(max_retries):
+        try:
+            return await _categorize_single_item(item)
+        except Exception as e:
+            if "429" in str(e) and attempt < max_retries - 1:
+                wait = 10 * (attempt + 1)
+                print(f"[CATEGORIZE] rate limited, waiting {wait}s before retry")
+                await asyncio.sleep(wait)
+            else:
+                raise
+    return await _categorize_single_item(item)
 
 
 @app.get("/media/{account_id}/{content_id}")
