@@ -104,7 +104,7 @@ async def get_suggestions(
         asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent))
         asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
 
-    return SuggestionResponse(suggestions=replies)
+    return SuggestionResponse(suggestions=replies, stage=conversation_stage)
 
 
 async def _update_fan_memory(
@@ -114,7 +114,7 @@ async def _update_fan_memory(
     fan_total_spent: int,
 ) -> None:
     try:
-        recent_messages = conversation_history[-20:]
+        recent_messages = conversation_history[-30:]
         convo_lines: list[str] = []
         for msg in recent_messages:
             speaker = "Fan" if msg.role == "fan" else "Creator"
@@ -122,16 +122,19 @@ async def _update_fan_memory(
         convo_text = "\n".join(convo_lines)
 
         system_prompt = (
-            "You are a fan relationship analyst. Extract key facts about this fan "
-            "from the conversation. Return only valid JSON, no markdown."
+            "You are a fan CRM analyst for an OnlyFans agency. "
+            "Extract structured notes from conversations exactly as an experienced chatter would write them. "
+            "Return only valid JSON, no markdown, no explanation."
         )
         user_prompt = (
-            "Based on the following conversation, return a JSON object with exactly "
-            "these fields:\n"
-            '{\n'
-            '  "notes": "2-3 sentence summary of important facts about this fan",\n'
-            '  "preferences": ["list of content preferences mentioned or implied"],\n'
-            '  "spend_tier": "whale | active | casual | cold"\n'
+            "Analyze this conversation and return a JSON object with exactly these fields:\n"
+            "{\n"
+            '  "notes": "2-3 sentence internal summary of key facts about this fan",\n'
+            '  "preferences": ["list of content preferences, kinks, or fetishes mentioned or implied"],\n'
+            '  "member_note": "Fill in the Member template below with what you know. Leave fields blank if unknown.\\n'
+            'Age: \nLocation: \nInterests/hobbies: \nKinks: \nAdditional info: ",\n'
+            '  "model_note": "Fill in the Model template below — what has the creator revealed about herself to THIS fan specifically. Leave fields blank if unknown.\\n'
+            'Name used: \nLocation told: \nBackground story told: \nKinks shared: \nOther personal details told: "\n'
             "}\n\n"
             "Conversation:\n"
             f"{convo_text}"
@@ -144,21 +147,24 @@ async def _update_fan_memory(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
+            max_tokens=800,
         )
 
         content = response.choices[0].message.content or ""
         lines = content.splitlines()
-        cleaned_lines = [line for line in lines if not line.lstrip().startswith("```")]
-        cleaned = "\n".join(cleaned_lines).strip() or content.strip()
+        cleaned = "\n".join(
+            line for line in lines if not line.lstrip().startswith("```")
+        ).strip()
 
         data = json.loads(cleaned)
         notes = data.get("notes", "")
         preferences = data.get("preferences") or []
+        member_note = data.get("member_note", "")
+        model_note = data.get("model_note", "")
 
         if not isinstance(preferences, list):
             preferences = []
 
-        # Override AI's spend_tier with actual spend data
         actual_tier = "cold"
         if fan_total_spent >= 500:
             actual_tier = "whale"
@@ -171,10 +177,12 @@ async def _update_fan_memory(
             fan_id=fan_id,
             notes=notes,
             preferences=preferences,
-            spend_tier=actual_tier,  # use actual spend, not AI guess
+            spend_tier=actual_tier,
+            member_note=member_note,
+            model_note=model_note,
         )
-    except Exception:
-        # Silent failure; this runs in the background
+    except Exception as e:
+        print(f"[MEMORY ERROR] fan={fan_id} error={e}")
         return
 
 

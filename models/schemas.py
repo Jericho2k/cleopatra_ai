@@ -19,6 +19,7 @@ class StageType(str, Enum):
 class Fan(BaseModel):
     id: str
     display_name: str
+    auto_mode: bool | None = None  # None = inherit creator setting
     platform_fan_id: str | None = None
     fansly_group_id: str | None = None
     total_spent: int = 0
@@ -26,6 +27,8 @@ class Fan(BaseModel):
     last_active: datetime | None = None
     preferences: list[str] = []
     notes: str = ""
+    member_note: str = ""
+    model_note: str = ""
     ai_summary: dict | None = None
 
 

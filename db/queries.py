@@ -14,6 +14,7 @@ def _row_to_fan(row: dict) -> Fan:
     return Fan(
         id=str(row["id"]),
         display_name=row["display_name"],
+        auto_mode=row.get("auto_mode"),
         platform_fan_id=str(row["platform_fan_id"]) if row.get("platform_fan_id") is not None else None,
         fansly_group_id=str(row["fansly_group_id"]) if row.get("fansly_group_id") is not None else None,
         total_spent=row.get("total_spent", 0),
@@ -21,6 +22,8 @@ def _row_to_fan(row: dict) -> Fan:
         last_active=last_active,
         preferences=row.get("preferences") or [],
         notes=row.get("notes", ""),
+        member_note=row.get("member_note", ""),
+        model_note=row.get("model_note", ""),
         ai_summary=row.get("ai_summary"),
     )
 
@@ -241,12 +244,16 @@ async def update_fan_memory(
     notes: str,
     preferences: list[str],
     spend_tier: str,
+    member_note: str = "",
+    model_note: str = "",
 ) -> None:
     def _update():
         get_supabase().table("fans").update({
             "notes": notes,
             "preferences": preferences,
             "spend_tier": spend_tier,
+            "member_note": member_note,
+            "model_note": model_note,
         }).eq("id", fan_id).execute()
 
     await asyncio.to_thread(_update)
