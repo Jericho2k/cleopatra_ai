@@ -1248,6 +1248,9 @@ async def _categorize_single_item_and_save(item: dict) -> None:
                 "ai_description": result["ai_description"],
                 "price_min": result["price_min"],
                 "price_max": result["price_max"],
+                "explicitness_level": result.get("explicitness", 3),
+                "good_for": result.get("good_for", "standalone"),
+                "tags": result.get("tags", []),
             }).eq("id", item["id"]).execute()
         )
         print(f"[UPLOAD CATEGORIZE] item={item['id']} category={result['content_category']}")
@@ -1351,12 +1354,25 @@ async def _categorize_single_item(item: dict) -> dict:
         mood = data.get("mood", "")
         price_info = VAULT_CATEGORIES[category]
 
+        explicitness = data.get("explicitness", 3)
+        good_for = data.get("good_for", "standalone")
+        tags = data.get("tags", [])
+        if not isinstance(tags, list):
+            tags = []
+
+        full_description = f"[{mood}|{good_for}|explicit:{explicitness}] {description}"
+        if tags:
+            full_description += f" Tags: {', '.join(tags)}"
+
         return {
             "id": item_id,
             "content_category": category,
-            "ai_description": f"[{mood}] {description}".strip(" []") if mood else description,
+            "ai_description": full_description,
             "price_min": price_info["min"],
             "price_max": price_info["max"],
+            "explicitness": explicitness,
+            "good_for": good_for,
+            "tags": tags,
         }
 
     except Exception as e:
@@ -1433,6 +1449,9 @@ async def _run_vault_categorization(creator_id: str) -> None:
                         "ai_description": r["ai_description"],
                         "price_min": r["price_min"],
                         "price_max": r["price_max"],
+                        "explicitness_level": r.get("explicitness", 3),
+                        "good_for": r.get("good_for", "standalone"),
+                        "tags": r.get("tags", []),
                     }).eq("id", r["id"]).execute()
                 )
                 done += 1
