@@ -291,6 +291,25 @@ Return ONLY a JSON array of 3 strings. No markdown.
     sent_ppv = ctx.sent_ppv or []
     sent_ids = {s["media_id"] for s in sent_ppv}
     purchased_ids = {s["media_id"] for s in sent_ppv if s.get("purchased")}
+    active_session = ctx.active_session
+
+    if active_session:
+        plan = active_session.get("plan", [])
+        idx = active_session.get("current_index", 0)
+        remaining = [p for p in plan[idx:] if not p.get("sent")]
+        if remaining:
+            next_item = remaining[0]
+            next_media_id = next_item.get("media_id", "")
+            next_description = (next_item.get("description", "") or "")[:100]
+            next_price = next_item.get("price", 0)
+            next_transition = next_item.get("transition", "")
+            user_prompt += "\n\nACTIVE SEXTING SESSION - follow this plan:\n"
+            user_prompt += f"Next content to send: [{next_media_id}] {next_description}\n"
+            user_prompt += f"Suggested price: ${next_price}\n"
+            user_prompt += f'Transition line: "{next_transition}"\n'
+            user_prompt += f"Items remaining in session: {len(remaining)}\n"
+            user_prompt += f"Use the transition line naturally, then send the PPV with [PPV:{next_media_id}:{next_price}]\n"
+            user_prompt += "After sending, continue the intimate conversation - do not immediately push the next item."
 
     if ppv_offers:
         available = [o for o in ppv_offers if o.get("media_id") and o["media_id"] not in purchased_ids]

@@ -193,36 +193,74 @@ async def get_ppv_offers(creator_id: str) -> list[dict]:
             .eq("creator_id", creator_id)
             .execute()
         )
-        vault = (
-            get_supabase()
-            .table("creator_vault_media")
-            .select("title, description, price, fansly_media_id, account_media_id")
-            .eq("creator_id", creator_id)
-            .eq("is_active", True)
-            .execute()
-        )
-
         offers: list[dict] = []
         for row in ppv.data or []:
-            offers.append(
-                {
-                    "title": row["title"],
-                    "description": row.get("description", ""),
-                    "price": row["price"],
-                }
-            )
-        for row in vault.data or []:
-            offers.append(
-                {
-                    "title": row["title"],
-                    "description": row.get("description", ""),
-                    "price": row.get("price", 0),
-                    "media_id": row.get("account_media_id") or row.get("fansly_media_id"),
-                }
-            )
+            offers.append({
+                "title": row["title"],
+                "description": row.get("description", ""),
+                "price": row["price"],
+            })
         return offers
 
     return await asyncio.to_thread(_get)
+
+
+async def get_vault_for_session(
+    creator_id: str,
+    fan_kinks: list[str] = [],
+    exclude_media_ids: set = set(),
+    limit: int = 200,
+) -> list[dict]:
+    """Fetch categorized vault items suitable for session planning."""
+    def _get():
+        r = (
+            get_supabase()
+            .table("creator_vault_media")
+            .select("id, fansly_media_id, ai_description, content_category, price_min, price_max, explicitness_level, good_for, scene_id, scene_location, scene_outfit, scene_lighting, tags, filename, mimetype")
+            .eq("creator_id", creator_id)
+            .neq("content_category", "")
+            .neq("content_category", "other")
+            .not_.is_("content_category", "null")
+            .order("explicitness_level", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        items = []
+        for row in r.data or []:
+            if row.get("fansly_media_id") in exclude_media_ids:
+                continue
+            items.append({
+                "media_id": row.get("fansly_media_id", ""),
+                "db_id": row.get("id", ""),
+                "description": row.get("ai_description", ""),
+                "category": row.get("content_category", ""),
+                "price_min": row.get("price_min", 10),
+                "price_max": row.get("price_max", 50),
+                "explicitness": row.get("explicitness_level", 3),
+                "good_for": row.get("good_for", "standalone"),
+                "scene_id": row.get("scene_id", ""),
+                "scene_location": row.get("scene_location", ""),
+                "scene_outfit": row.get("scene_outfit", ""),
+                "tags": row.get("tags") or [],
+                "is_video": (row.get("mimetype") or "").startswith("video"),
+            })
+        return items
+    return await asyncio.to_thread(_get)
+
+
+async def get_fan_session(fan_id: str) -> dict | None:
+    """Get active session plan for a fan."""
+    def _get():
+        r = get_supabase().table("fans").select("active_session").eq("id", fan_id).single().execute()
+        return (r.data or {}).get("active_session")
+    return await asyncio.to_thread(_get)
+
+
+async def save_fan_session(fan_id: str, session: dict | None) -> None:
+    """Save or clear active session plan for a fan."""
+    def _save():
+        get_supabase().table("fans").update({"active_session": session}).eq("id", fan_id).execute()
+    await asyncio.to_thread(_save)
 
 
 async def save_persona(creator_id: str, persona: Persona) -> None:

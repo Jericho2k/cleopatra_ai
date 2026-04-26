@@ -84,6 +84,7 @@ class ConversationContext(BaseModel):
     situation: dict | None = None
     ppv_offers: list[dict] = []
     sent_ppv: list[dict] = []
+    active_session: dict | None = None
 
 
 class SuggestionRequest(BaseModel):

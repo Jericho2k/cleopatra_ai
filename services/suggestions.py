@@ -24,6 +24,7 @@ from db.queries import (
     get_creator_persona,
     get_fan,
     get_fan_by_id,
+    get_fan_session,
     get_ppv_offers,
     get_sent_ppv,
     save_message,
@@ -64,6 +65,7 @@ async def get_suggestions(
         creator_persona = Persona()
     ppv_offers = await get_ppv_offers(creator_id)
     sent_ppv = await get_sent_ppv(fan_id)
+    active_session = await get_fan_session(fan_id)
 
     conversation_stage = classify_stage(conversation_history, fan_profile)
 
@@ -81,6 +83,7 @@ async def get_suggestions(
         creator_name=creator_name,
         ppv_offers=ppv_offers,
         sent_ppv=sent_ppv,
+        active_session=active_session,
     )
 
     situation = await analyze_situation(ctx_without_situation)
@@ -96,6 +99,7 @@ async def get_suggestions(
         situation=situation,
         ppv_offers=ppv_offers,
         sent_ppv=sent_ppv,
+        active_session=active_session,
     )
 
     prompt = build_prompt(ctx)
@@ -273,6 +277,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
         ppv_offers = await get_ppv_offers(creator_id)
         sent_ppv = await get_sent_ppv(fan_id)
+        active_session = await get_fan_session(fan_id)
         similar_exchanges = await find_similar_exchanges(latest_message, creator_id, enabled=False)
         conversation_stage = classify_stage(conversation_history, fan_profile)
 
@@ -286,6 +291,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             creator_name="a creator",
             ppv_offers=ppv_offers,
             sent_ppv=sent_ppv,
+            active_session=active_session,
         )
 
         situation = await analyze_situation(ctx_without_situation)
@@ -300,6 +306,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             situation=situation,
             ppv_offers=ppv_offers,
             sent_ppv=sent_ppv,
+            active_session=active_session,
         )
 
         prompt = build_prompt(ctx)

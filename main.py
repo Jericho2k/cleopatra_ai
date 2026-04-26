@@ -1874,6 +1874,161 @@ async def get_my_creators(user_id: str) -> dict:
     return {"creators": creators.data or []}
 
 
+@app.post("/plan-session/{creator_id}/{fan_id}")
+async def plan_session(creator_id: str, fan_id: str) -> dict:
+    """
+    Called when a sexting session is starting.
+    Picks 5-8 vault items ordered by escalating explicitness,
+    grouped by scene continuity where possible.
+    """
+    from db.queries import get_fan_by_id, get_sent_ppv, get_vault_for_session, save_fan_session
+    import json as _json
+
+    fan = await get_fan_by_id(fan_id)
+    sent_ppv = await get_sent_ppv(fan_id)
+    purchased_ids = {s["media_id"] for s in sent_ppv if s.get("purchased")}
+    sent_ids = {s["media_id"] for s in sent_ppv}
+    exclude = purchased_ids
+
+    kinks = []
+    if fan and fan.ai_summary:
+        kinks = fan.ai_summary.get("kinks", [])
+
+    vault = await get_vault_for_session(creator_id, fan_kinks=kinks, exclude_media_ids=exclude)
+    if not vault:
+        return {"status": "no_content", "session": None}
+
+    from anthropic import AsyncAnthropic
+
+    client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    vault_summary = "\n".join(
+        [
+            f"[{i['media_id']}] cat={i['category']} explicit={i['explicitness']} scene={i['scene_id']} good_for={i['good_for']} price=${i['price_min']}-${i['price_max']} desc={i['description'][:80]}"
+            for i in vault[:80]
+        ]
+    )
+
+    fan_kinks_str = ", ".join(kinks) if kinks else "unknown"
+    fan_spent = fan.total_spent if fan else 0
+    fan_tier = fan.spend_tier if fan else "cold"
+    prompt = ""
+    prompt += "You are planning a sexting content session for an OnlyFans fan.\n\n"
+    prompt += "Fan profile:\n"
+    prompt += f"- Total spent: ${fan_spent} ({fan_tier} tier)\n"
+    prompt += f"- Known kinks/interests: {fan_kinks_str}\n"
+    prompt += f"- Already sent (not purchased): {len(sent_ids - purchased_ids)} items\n"
+    prompt += f"- Already purchased: {len(purchased_ids)} items\n\n"
+    prompt += "Available vault content (media_id | details):\n"
+    prompt += f"{vault_summary}\n\n"
+    prompt += "Select 6-8 items that would make the best escalating sexting session for this fan.\n"
+    prompt += "Rules:\n"
+    prompt += "1. Start with lower explicitness (1-3), escalate to higher (4-5)\n"
+    prompt += "2. Prefer items matching fan's known kinks\n"
+    prompt += "3. Group by scene_id where possible for continuity - avoid jumping between different scenes too quickly\n"
+    prompt += "4. Mix good_for values: start with opener, mid_session items, end with closer\n"
+    prompt += "5. Never pick the same scene_id more than 3 times in a row\n"
+    prompt += f"6. Pick realistic prices based on fan's spend tier ({fan_tier})\n\n"
+    prompt += "Return ONLY a JSON array of objects:\n"
+    prompt += '[{"media_id":"id","price":25,"reason":"why this fits here","transition":"natural line to say before sending this e.g. \'I actually took this last night...\'"}]'
+
+    response = await client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    content = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+
+    try:
+        plan = _json.loads(content)
+        vault_by_id = {i["media_id"]: i for i in vault}
+        enriched = []
+        for item in plan:
+            mid = item.get("media_id", "")
+            vault_item = vault_by_id.get(mid, {})
+            enriched.append(
+                {
+                    "media_id": mid,
+                    "price": item.get("price", vault_item.get("price_min", 15)),
+                    "reason": item.get("reason", ""),
+                    "transition": item.get("transition", ""),
+                    "category": vault_item.get("category", ""),
+                    "description": vault_item.get("description", ""),
+                    "scene_id": vault_item.get("scene_id", ""),
+                    "is_video": vault_item.get("is_video", False),
+                    "sent": False,
+                    "purchased": False,
+                }
+            )
+
+        session = {
+            "plan": enriched,
+            "current_index": 0,
+            "started_at": __import__("datetime").datetime.utcnow().isoformat(),
+            "fan_kinks": kinks,
+        }
+        await save_fan_session(fan_id, session)
+        return {"status": "ok", "session": session}
+
+    except Exception as e:
+        print(f"[SESSION PLAN ERROR] {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/session/{fan_id}")
+async def get_session(fan_id: str) -> dict:
+    from db.queries import get_fan_session
+
+    session = await get_fan_session(fan_id)
+    return {"session": session}
+
+
+@app.post("/session/{fan_id}/advance")
+async def advance_session(fan_id: str) -> dict:
+    """Mark current session item as sent and move to next."""
+    from db.queries import get_fan_session, save_fan_session
+
+    session = await get_fan_session(fan_id)
+    if not session:
+        return {"status": "no_session"}
+    plan = session.get("plan", [])
+    idx = session.get("current_index", 0)
+    if idx < len(plan):
+        plan[idx]["sent"] = True
+        session["current_index"] = idx + 1
+        await save_fan_session(fan_id, session)
+    return {
+        "status": "ok",
+        "next_index": session["current_index"],
+        "remaining": len(plan) - session["current_index"],
+    }
+
+
+@app.post("/session/{fan_id}/purchased/{media_id}")
+async def mark_session_purchased(fan_id: str, media_id: str) -> dict:
+    """Mark a session item as purchased."""
+    from db.queries import get_fan_session, save_fan_session
+
+    session = await get_fan_session(fan_id)
+    if not session:
+        return {"status": "no_session"}
+    for item in session.get("plan", []):
+        if item["media_id"] == media_id:
+            item["purchased"] = True
+            break
+    await save_fan_session(fan_id, session)
+    return {"status": "ok"}
+
+
+@app.delete("/session/{fan_id}")
+async def clear_session(fan_id: str) -> dict:
+    """End and clear the active session."""
+    from db.queries import save_fan_session
+
+    await save_fan_session(fan_id, None)
+    return {"status": "ok"}
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
