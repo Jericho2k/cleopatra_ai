@@ -1391,13 +1391,10 @@ async def _categorize_single_item(item: dict) -> dict:
         tags = data.get("tags", [])
         if not isinstance(tags, list):
             tags = []
-        scene = data.get("scene", {})
-        if not isinstance(scene, dict):
-            scene = {}
-        scene_id = scene.get("scene_id", "")
-        location = scene.get("location", "")
-        outfit = scene.get("outfit", "")
-        lighting = scene.get("lighting", "")
+        scene_id = data.get("scene_id", "")
+        location = data.get("scene_location", "")
+        outfit = data.get("scene_outfit", "")
+        lighting = data.get("scene_lighting", "")
 
         full_description = f"[{mood}|{good_for}|explicit:{explicitness}] {description}"
         if outfit:
