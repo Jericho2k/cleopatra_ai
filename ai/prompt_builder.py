@@ -288,19 +288,28 @@ If his name is known, use it naturally — especially if this is an opening mess
 Return ONLY a JSON array of 3 strings. No markdown.
 ["reply 1", "reply 2", "reply 3"]"""
 
+    sent_ppv = ctx.sent_ppv or []
+    sent_ids = {s["media_id"] for s in sent_ppv}
+    purchased_ids = {s["media_id"] for s in sent_ppv if s.get("purchased")}
+
     if ppv_offers:
+        available = [o for o in ppv_offers if o.get("media_id") and o["media_id"] not in purchased_ids]
         offers_text = "\n".join([
             f"- [{o.get('media_id', '')}] {o['title']}: ${o.get('price', 0)} — {o.get('description', '')}"
-            for o in ppv_offers
-            if o.get("media_id")
+            + (" (already sent, not purchased yet)" if o.get("media_id") in sent_ids else "")
+            for o in available
         ])
         if offers_text:
             user_prompt += (
                 f"\n\nCONTENT YOU CAN SELL RIGHT NOW:\n{offers_text}\n"
                 "When sending a PPV, end your message with [PPV:media_id:price] tag. "
                 "Example: 'I made this just for you 😏 [PPV:8745xxx:20]'\n"
-                "Only offer PPV when the conversation energy supports it — don't force it."
+                "Only offer PPV when the conversation energy supports it — don't force it.\n"
+                "Never resend content the fan already purchased."
             )
+
+    if purchased_ids:
+        user_prompt += f"\n\nFAN ALREADY PURCHASED: {len(purchased_ids)} item(s) — never offer these again."
 
     return [
         {"role": "system", "content": system_prompt},

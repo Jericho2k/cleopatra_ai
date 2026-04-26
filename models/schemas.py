@@ -83,6 +83,7 @@ class ConversationContext(BaseModel):
     creator_name: str = "a creator"
     situation: dict | None = None
     ppv_offers: list[dict] = []
+    sent_ppv: list[dict] = []
 
 
 class SuggestionRequest(BaseModel):

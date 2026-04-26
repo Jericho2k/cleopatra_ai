@@ -92,6 +92,31 @@ async def increment_fan_total_spent(fan_id: str, amount: int) -> None:
     await asyncio.to_thread(_update)
 
 
+async def get_sent_ppv(fan_id: str) -> list[dict]:
+    """Return list of PPV media already sent to this fan with purchase status."""
+    def _get():
+        r = get_supabase().table("messages") \
+            .select("media_context, sent_at") \
+            .eq("fan_id", fan_id) \
+            .eq("role", "creator") \
+            .not_.is_("media_context", "null") \
+            .order("sent_at", desc=False) \
+            .execute()
+        sent = []
+        for row in (r.data or []):
+            mc = row.get("media_context") or {}
+            ppv = mc.get("ppv")
+            if ppv and ppv.get("media_id"):
+                sent.append({
+                    "media_id": ppv["media_id"],
+                    "price": ppv.get("price", 0),
+                    "purchased": ppv.get("purchased", False),
+                    "sent_at": row.get("sent_at", ""),
+                })
+        return sent
+    return await asyncio.to_thread(_get)
+
+
 async def get_conversation_history(fan_id: str, limit: int = 40) -> list[Message]:
     def _get():
         r = get_supabase().table("messages").select("role, content, sent_at, media_context").eq("fan_id", fan_id).order("sent_at", desc=False).limit(limit).execute()
