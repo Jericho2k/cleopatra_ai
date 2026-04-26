@@ -1321,7 +1321,22 @@ async def _categorize_single_item(item: dict) -> dict:
                 async with httpx.AsyncClient() as hc:
                     img_resp = await hc.get(url, timeout=15)
                     if img_resp.status_code == 200 and len(img_resp.content) > 1000:
-                        img_b64 = __import__("base64").b64encode(img_resp.content).decode()
+                        img_data = img_resp.content
+                        # Resize if over 4MB to stay under Claude's 5MB limit
+                        if len(img_data) > 4 * 1024 * 1024:
+                            try:
+                                from PIL import Image
+                                import io
+                                img_obj = Image.open(io.BytesIO(img_data))
+                                img_obj.thumbnail((1024, 1024), Image.LANCZOS)
+                                buf = io.BytesIO()
+                                img_obj.save(buf, format="JPEG", quality=85)
+                                img_data = buf.getvalue()
+                                media_type = "image/jpeg"
+                                print(f"[CATEGORIZE] resized large image item={item_id} to {len(img_data)} bytes")
+                            except Exception as resize_err:
+                                print(f"[CATEGORIZE] resize failed item={item_id}: {resize_err}")
+                        img_b64 = __import__("base64").b64encode(img_data).decode()
             except Exception as fetch_err:
                 print(f"[CATEGORIZE] image fetch failed for item={item_id}: {fetch_err}")
 

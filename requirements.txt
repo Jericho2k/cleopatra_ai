@@ -8,3 +8,4 @@ redis
 python-dotenv
 anthropic
 sse-starlette
+Pillow
