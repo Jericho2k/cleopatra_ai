@@ -1377,6 +1377,7 @@ async def _categorize_single_item(item: dict) -> dict:
 
         content = response.content[0].text.strip()
         content = content.replace("```json", "").replace("```", "").strip()
+        print(f"[CATEGORIZE RAW] item={item_id} response={content[:300]}")
         data = json.loads(content)
         category = data.get("category", "other")
         if category not in VAULT_CATEGORIES:
