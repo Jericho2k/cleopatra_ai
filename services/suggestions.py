@@ -407,8 +407,40 @@ def schedule_auto_reply(fan_id: str, creator_id: str) -> None:
         existing.cancel()
         print(f"[AUTO REPLY] Reset timer for fan={fan_id}")
 
-    task = asyncio.create_task(_debounced_auto_reply(fan_id, creator_id))
+    task = asyncio.create_task(_debounced_auto_reply_with_sleep_check(fan_id, creator_id))
     _pending_auto_replies[fan_id] = task
+
+
+async def _debounced_auto_reply_with_sleep_check(fan_id: str, creator_id: str) -> None:
+    """Check sleep hours before firing auto reply."""
+    try:
+        from datetime import datetime, timezone
+        db = get_supabase()
+        creator_row = await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("sleep_hours_start, sleep_hours_end")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+        data = creator_row.data or {}
+        sleep_start = data.get("sleep_hours_start", 0)
+        sleep_end = data.get("sleep_hours_end", 7)
+
+        current_hour = datetime.now(timezone.utc).hour
+        if sleep_start <= sleep_end:
+            in_sleep = sleep_start <= current_hour < sleep_end
+        else:
+            in_sleep = current_hour >= sleep_start or current_hour < sleep_end
+
+        if in_sleep:
+            print(f"[AUTO REPLY] Skipping — sleep hours active (UTC {current_hour}h, sleep {sleep_start}-{sleep_end}) fan={fan_id}")
+            return
+
+        await _debounced_auto_reply(fan_id, creator_id)
+    except Exception as e:
+        print(f"[SLEEP CHECK ERROR] {e}")
+        await _debounced_auto_reply(fan_id, creator_id)
 
 
 def _should_update_memory(conversation_history: list[Message]) -> bool:
