@@ -164,7 +164,6 @@ def ingest_pairs(pairs: list[tuple[str, str]], creator_id: str, dry_run: bool = 
                 "creator_reply": creator_reply,
                 "embedding": embedding,
                 "created_at": datetime.now(timezone.utc).isoformat(),
-                "source": "real",
             }).execute()
             inserted += 1
         except Exception as e:
