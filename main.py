@@ -1328,7 +1328,7 @@ async def _categorize_single_item(item: dict) -> dict:
             if img_b64:
                 response = await client.messages.create(
                     model="claude-sonnet-4-20250514",
-                    max_tokens=150,
+                    max_tokens=400,
                     messages=[{
                         "role": "user",
                         "content": [
@@ -1343,9 +1343,9 @@ async def _categorize_single_item(item: dict) -> dict:
                             {
                                 "type": "text",
                                 "text": (
-                                    f"Classify this OnlyFans creator image into one of these categories:\n{CATEGORY_LIST}\n\n"
-                                    "Return ONLY valid JSON:\n"
-                                    '{\"category\": \"category_key\", \"description\": \"2-3 sentence description covering: what is shown, body parts visible, setting/mood, level of explicitness (teasing/suggestive/explicit)\", \"mood\": \"playful|intimate|explicit|teasing\", \"explicitness\": 1-5, \"good_for\": \"opener|mid_session|closer|standalone\", \"tags\": [\"list\", \"of\", \"relevant\", \"tags\", \"e.g. lingerie, bedroom, eye_contact, smiling\"]}'
+                                    f"Classify this OnlyFans creator image. Pick one category:\n{CATEGORY_LIST}\n\n"
+                                    "Return ONLY a single line of JSON, no newlines, no formatting:\n"
+                                    '{"category":"category_key","description":"1-2 sentences","mood":"playful","explicitness":3,"good_for":"opener","tags":["tag1"],"scene_location":"bedroom","scene_outfit":"red lingerie","scene_lighting":"dim","scene_id":"bedroom-red-lingerie"}'
                                 ),
                             },
                         ],
