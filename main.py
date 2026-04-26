@@ -1386,8 +1386,10 @@ async def _categorize_single_item(item: dict) -> dict:
         mood = data.get("mood", "")
         price_info = VAULT_CATEGORIES[category]
 
-        explicitness = data.get("explicitness", 3)
+        explicitness = min(max(int(data.get("explicitness", 3)), 1), 5)
         good_for = data.get("good_for", "standalone")
+        if good_for not in ["opener", "mid_session", "closer", "standalone"]:
+            good_for = "standalone"
         tags = data.get("tags", [])
         if not isinstance(tags, list):
             tags = []
