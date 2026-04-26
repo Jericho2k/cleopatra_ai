@@ -1315,38 +1315,65 @@ async def _categorize_single_item(item: dict) -> dict:
             )
         else:
             # Fetch image and send to Claude Vision
-            async with httpx.AsyncClient() as hc:
-                img_resp = await hc.get(url, timeout=15)
-                img_bytes = img_resp.content
-                img_b64 = __import__("base64").b64encode(img_bytes).decode()
-
+            img_b64 = None
             media_type = mimetype if mimetype in ["image/jpeg", "image/png", "image/webp", "image/gif"] else "image/jpeg"
+            try:
+                async with httpx.AsyncClient() as hc:
+                    img_resp = await hc.get(url, timeout=15)
+                    if img_resp.status_code == 200 and len(img_resp.content) > 1000:
+                        img_b64 = __import__("base64").b64encode(img_resp.content).decode()
+            except Exception as fetch_err:
+                print(f"[CATEGORIZE] image fetch failed for item={item_id}: {fetch_err}")
 
-            response = await client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=150,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": img_b64,
+            if img_b64:
+                response = await client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=150,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": media_type,
+                                    "data": img_b64,
+                                },
                             },
-                        },
-                        {
-                            "type": "text",
-                            "text": (
-                                f"Classify this OnlyFans creator image into one of these categories:\n{CATEGORY_LIST}\n\n"
-                                "Return ONLY valid JSON:\n"
-                                '{"category": "category_key", "description": "one sentence description of what is shown", "mood": "playful|intimate|explicit|teasing"}'
-                            ),
-                        },
-                    ],
-                }],
-            )
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"Classify this OnlyFans creator image into one of these categories:\n{CATEGORY_LIST}\n\n"
+                                    "Return ONLY valid JSON:\n"
+                                    '{\"category\": \"category_key\", \"description\": \"2-3 sentence description covering: what is shown, body parts visible, setting/mood, level of explicitness (teasing/suggestive/explicit)\", \"mood\": \"playful|intimate|explicit|teasing\", \"explicitness\": 1-5, \"good_for\": \"opener|mid_session|closer|standalone\", \"tags\": [\"list\", \"of\", \"relevant\", \"tags\", \"e.g. lingerie, bedroom, eye_contact, smiling\"]}'
+                                ),
+                            },
+                        ],
+                    }],
+                )
+            else:
+                # CDN URL expired or fetch failed — fall back to filename+album
+                filename = item.get("filename", "")
+                album = item.get("album_title", "")
+                print(f"[CATEGORIZE] falling back to filename analysis for item={item_id}")
+                response = await client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=300,
+                    messages=[{"role": "user", "content": (
+                        f"This is an OnlyFans image. Filename: '{filename}'. Album: '{album}'.\n"
+                        f"Based on filename and album only, classify into one of:\n{CATEGORY_LIST}\n\n"
+                        "Return ONLY valid JSON:\n"
+                        "{\n"
+                        '  "category": "category_key",\n'
+                        '  "description": "best guess description based on filename/album",\n'
+                        '  "mood": "playful|intimate|explicit|teasing",\n'
+                        '  "explicitness": 3,\n'
+                        '  "good_for": "opener|mid_session|closer|standalone",\n'
+                        '  "tags": [],\n'
+                        '  "scene": {"location": "unknown", "outfit": "unknown", "hair": "unknown", "lighting": "unknown", "scene_id": "unknown"}\n'
+                        "}"
+                    )}],
+                )
 
         content = response.content[0].text.strip()
         content = content.replace("```json", "").replace("```", "").strip()
@@ -1505,6 +1532,46 @@ async def _categorize_single_item_with_retry(item: dict, max_retries: int = 3) -
             else:
                 raise
     return await _categorize_single_item(item)
+
+
+@app.post("/recategorize-item/{item_id}")
+async def recategorize_item(item_id: str) -> dict:
+    db = get_supabase()
+    row = await asyncio.to_thread(
+        lambda: db.table("creator_vault_media")
+        .select("id, url, mimetype, filename, album_title")
+        .eq("id", item_id)
+        .single()
+        .execute()
+    )
+    item = row.data
+    if not item:
+        return {"status": "error", "message": "item not found"}
+
+    result = await _categorize_single_item(item)
+    await asyncio.to_thread(
+        lambda: db.table("creator_vault_media").update({
+            "content_category": result["content_category"],
+            "ai_description": result["ai_description"],
+            "price_min": result["price_min"],
+            "price_max": result["price_max"],
+            "explicitness_level": result.get("explicitness", 3),
+            "good_for": result.get("good_for", "standalone"),
+            "tags": result.get("tags", []),
+            "scene_id": result.get("scene_id", ""),
+            "scene_location": result.get("scene_location", ""),
+            "scene_outfit": result.get("scene_outfit", ""),
+            "scene_lighting": result.get("scene_lighting", ""),
+        }).eq("id", item_id).execute()
+    )
+    updated = await asyncio.to_thread(
+        lambda: db.table("creator_vault_media")
+        .select("*")
+        .eq("id", item_id)
+        .single()
+        .execute()
+    )
+    return {"status": "ok", "item": updated.data}
 
 
 @app.get("/media/{account_id}/{content_id}")
