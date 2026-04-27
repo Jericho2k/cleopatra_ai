@@ -36,7 +36,8 @@ Analyze and return ONLY valid JSON:
   "strategic_move": "what should the creator do RIGHT NOW — choose one: mirror_warmth/tease_and_deflect/ask_personal_question/hint_at_content/build_tension/re_engage/push_for_ppv/acknowledge_compliment_and_redirect",
   "tone": "what tone should the reply have — playful/warm/flirty/mysterious/direct/casual",
   "personal_details_mentioned": ["any names, locations, jobs, interests mentioned by fan"],
-  "avoid_repeating": "flag if the creator has already used the same line recently"
+  "avoid_repeating": "flag if the creator has already used the same line recently",
+  "purchase_signal": "none | bought | declined | uncertain — did the fan's message signal they bought recent PPV content? bought=positive reaction to content/mentions buying. declined=mentions price/cant afford/maybe later. uncertain=unclear"
 }}"""
 
     response = await client.messages.create(
@@ -59,4 +60,5 @@ Analyze and return ONLY valid JSON:
             "tone": "playful",
             "personal_details_mentioned": [],
             "avoid_repeating": "",
+            "purchase_signal": "none",
         }

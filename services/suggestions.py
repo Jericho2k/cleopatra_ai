@@ -296,6 +296,22 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
         situation = await analyze_situation(ctx_without_situation)
 
+        # Check if fan is reacting to a pending PPV
+        purchase_signal = situation.get("purchase_signal", "none")
+        if purchase_signal in ("bought", "declined"):
+            db = get_supabase()
+            fan_data = await asyncio.to_thread(
+                lambda: db.table("fans")
+                .select("pending_ppv_check")
+                .eq("id", fan_id)
+                .single()
+                .execute()
+            )
+            pending = (fan_data.data or {}).get("pending_ppv_check")
+            if pending:
+                print(f"[PPV SIGNAL] fan={fan_id} signal={purchase_signal} pending={pending}")
+                asyncio.create_task(_verify_ppv_purchase(fan_id, creator_id, pending))
+
         # Auto-trigger session planning if situation calls for it and no session active
         if not active_session and situation:
             move = situation.get("strategic_move", "")
@@ -416,6 +432,24 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 media_context=ppv_media_context,
             )
 
+            # After PPV sent: store pending check + queue reaction fishing follow-up
+            if ppv_match:
+                try:
+                    db = get_supabase()
+                    await asyncio.to_thread(
+                        lambda mid=media_id, pr=price: db.table("fans").update({
+                            "pending_ppv_check": {
+                                "media_id": mid,
+                                "price": pr,
+                                "sent_at": __import__("datetime").datetime.utcnow().isoformat(),
+                            }
+                        }).eq("id", fan_id).execute()
+                    )
+                    # Send reaction fishing follow-up after short delay
+                    asyncio.create_task(_send_reaction_fishing(fan_id, creator_id, group_id, apifansly_account_id))
+                except Exception as e:
+                    print(f"[PPV PENDING ERROR] {e}")
+
             # Advance session plan if PPV was sent
             if ppv_match and active_session:
                 try:
@@ -466,6 +500,139 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         traceback.print_exc()
     finally:
         _pending_auto_replies.pop(fan_id, None)
+
+
+_REACTION_FISHING_LINES = [
+    "let me know what you think 🙈",
+    "tell me how you feel about it...",
+    "dying to know your reaction 😏",
+    "don't leave me hanging",
+    "what do you think? 👀",
+    "hope it was worth the wait",
+    "your reaction is everything to me rn",
+]
+
+
+async def _send_reaction_fishing(
+    fan_id: str,
+    creator_id: str,
+    group_id: str | None,
+    apifansly_account_id: str | None,
+) -> None:
+    """Send a natural follow-up line after PPV to fish for purchase reaction."""
+    try:
+        await asyncio.sleep(random.randint(30, 90))
+        line = random.choice(_REACTION_FISHING_LINES)
+        await save_message(fan_id, creator_id, "creator", line, was_ai_suggested=True)
+        if group_id and apifansly_account_id:
+            from main import send_fansly_message
+            await send_fansly_message(apifansly_account_id, group_id, line)
+        print(f"[PPV REACTION] Sent fishing line to fan={fan_id}: {line}")
+    except Exception as e:
+        print(f"[PPV REACTION ERROR] {e}")
+
+
+async def _verify_ppv_purchase(
+    fan_id: str,
+    creator_id: str,
+    pending: dict,
+) -> None:
+    """Call earnings API to verify if fan purchased the PPV."""
+    import httpx
+    try:
+        db = get_supabase()
+        creator_row = await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("apifansly_account_id, fansly_account_id")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+        apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+        fan_row = await asyncio.to_thread(
+            lambda: db.table("fans")
+            .select("platform_fan_id, total_spent, not_sold_log")
+            .eq("id", fan_id)
+            .single()
+            .execute()
+        )
+        platform_fan_id = (fan_row.data or {}).get("platform_fan_id")
+        current_spent = (fan_row.data or {}).get("total_spent", 0)
+        api_key = os.environ.get("APIFANSLY_API_KEY")
+        expected_price = float(pending.get("price", 0))
+        sent_at_str = pending.get("sent_at", "")
+
+        # Convert sent_at to unix ms for the 'after' param
+        try:
+            from datetime import datetime, timezone
+            sent_dt = datetime.fromisoformat(sent_at_str.replace("Z", "+00:00"))
+            after_ms = int(sent_dt.timestamp() * 1000)
+        except Exception:
+            after_ms = 0
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/earnings/fans/{platform_fan_id}/stats",
+                headers={"x-api-key": api_key},
+                params={"after": after_ms},
+                timeout=15,
+            )
+            data = resp.json()
+            transactions = data.get("data", {}).get("data", {}).get("response", [])
+
+        # Look for media purchase (type 2110) matching expected price
+        purchased = False
+        actual_amount = 0
+        for tx in transactions:
+            if tx.get("type") == 2110:
+                gross = tx.get("totalGross", 0)
+                # Match within 10% tolerance
+                if abs(gross - expected_price) / max(expected_price, 1) < 0.1:
+                    purchased = True
+                    actual_amount = gross
+                    break
+
+        media_id = pending.get("media_id", "")
+
+        if purchased:
+            print(f"[PPV VERIFY] fan={fan_id} PURCHASED media={media_id} amount=${actual_amount}")
+            # Update total_spent
+            new_spent = current_spent + int(actual_amount)
+            await asyncio.to_thread(
+                lambda: db.table("fans").update({
+                    "total_spent": new_spent,
+                    "pending_ppv_check": None,
+                }).eq("id", fan_id).execute()
+            )
+            # Update session plan item as purchased
+            from db.queries import get_fan_session, save_fan_session
+            session = await get_fan_session(fan_id)
+            if session:
+                for item in session.get("plan", []):
+                    if item.get("media_id") == media_id:
+                        item["purchased"] = True
+                await save_fan_session(fan_id, session)
+        else:
+            print(f"[PPV VERIFY] fan={fan_id} did NOT purchase media={media_id}")
+            # Log to not_sold
+            not_sold = (fan_row.data or {}).get("not_sold_log") or []
+            from datetime import datetime
+            not_sold.append({
+                "date": datetime.utcnow().strftime("%d.%m.%Y"),
+                "item": f"PPV media {media_id}",
+                "amount": expected_price,
+                "reason": "fan indicated no purchase",
+                "chatter": "AI",
+            })
+            await asyncio.to_thread(
+                lambda: db.table("fans").update({
+                    "not_sold_log": not_sold,
+                    "pending_ppv_check": None,
+                }).eq("id", fan_id).execute()
+            )
+
+    except Exception as e:
+        print(f"[PPV VERIFY ERROR] {e}")
 
 
 def schedule_auto_reply(fan_id: str, creator_id: str) -> None:
