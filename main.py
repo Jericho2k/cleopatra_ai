@@ -52,6 +52,50 @@ _processed_messages: set = set()
 _vault_sync_state: dict = {}
 
 
+async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id: str) -> str | None:
+    """Find the group_id for a fan by scanning recent chats."""
+    import httpx
+
+    api_key = os.environ.get("APIFANSLY_API_KEY")
+    try:
+        async with httpx.AsyncClient() as client:
+            cursor = None
+            for _ in range(5):  # check up to 5 pages
+                params = {}
+                if cursor:
+                    params["cursor"] = cursor
+                resp = await client.get(
+                    f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats",
+                    headers={"x-api-key": api_key},
+                    params=params,
+                    timeout=15,
+                )
+                data = resp.json()
+                data_inner = data.get("data", {}).get("data", {})
+                response_data = data_inner.get("response", {})
+                cursor = data_inner.get("nextCursor")
+                chats = response_data.get("data", [])
+                for chat in chats:
+                    if str(chat.get("partnerAccountId", "")) == str(platform_fan_id):
+                        group_id = str(chat.get("groupId", ""))
+                        if group_id:
+                            # Save it to DB
+                            db = get_supabase()
+                            await asyncio.to_thread(
+                                lambda gid=group_id: db.table("fans")
+                                .update({"fansly_group_id": gid})
+                                .eq("id", fan_id)
+                                .execute()
+                            )
+                            print(f"[GROUP_ID] Found group_id={group_id} for fan={fan_id}")
+                            return group_id
+                if not cursor or not chats:
+                    break
+    except Exception as e:
+        print(f"[GROUP_ID ERROR] {e}")
+    return None
+
+
 async def send_fansly_message(account_id: str, group_id: str, text: str) -> bool:
     import httpx
 
