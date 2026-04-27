@@ -295,6 +295,42 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         )
 
         situation = await analyze_situation(ctx_without_situation)
+
+        # Auto-trigger session planning if situation calls for it and no session active
+        if not active_session and situation:
+            move = situation.get("strategic_move", "")
+            fan_intent = situation.get("fan_intent", "").lower()
+            session_triggers = ["push_for_ppv", "hint_at_content", "build_tension"]
+            intent_triggers = ["want", "show", "play", "buy", "see", "content", "hot", "sexy"]
+            should_plan = (
+                move in session_triggers
+                or any(t in fan_intent for t in intent_triggers)
+                or any(
+                    t in latest_message.lower()
+                    for t in ["let's play", "show me", "what do you have", "i want to see", "send me"]
+                )
+            )
+            if should_plan:
+                try:
+                    import httpx as _httpx
+                    from db.queries import get_fan_session
+
+                    async with _httpx.AsyncClient() as _hc:
+                        plan_resp = await _hc.post(
+                            f"http://localhost:8080/plan-session/{creator_id}/{fan_id}",
+                            timeout=30,
+                        )
+                        plan_data = plan_resp.json()
+                        if plan_data.get("status") == "ok":
+                            active_session = plan_data.get("session")
+                            if not active_session:
+                                active_session = await get_fan_session(fan_id)
+                            print(
+                                f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}"
+                            )
+                except Exception as e:
+                    print(f"[SESSION PLAN ERROR] {e}")
+
         ctx = ConversationContext(
             fan_message=latest_message,
             conversation_history=conversation_history,
@@ -379,6 +415,24 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 was_ai_suggested=True,
                 media_context=ppv_media_context,
             )
+
+            # Advance session plan if PPV was sent
+            if ppv_match and active_session:
+                try:
+                    from db.queries import get_fan_session, save_fan_session
+
+                    session = await get_fan_session(fan_id)
+                    if session:
+                        plan = session.get("plan", [])
+                        idx = session.get("current_index", 0)
+                        if idx < len(plan):
+                            plan[idx]["sent"] = True
+                            session["current_index"] = idx + 1
+                            await save_fan_session(fan_id, session)
+                            active_session = session
+                            print(f"[SESSION] Advanced to item {idx + 1}/{len(plan)} for fan={fan_id}")
+                except Exception as e:
+                    print(f"[SESSION ADVANCE ERROR] {e}")
 
             if group_id and apifansly_account_id:
                 if ppv_match:
