@@ -75,19 +75,30 @@ async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id:
                 response_data = data_inner.get("response", {})
                 cursor = data_inner.get("nextCursor")
                 chats = response_data.get("data", [])
+                accounts = response_data.get("aggregationData", {}).get("accounts", [])
+                account_lookup = {str(a.get("id", "")): a for a in accounts}
+
                 for chat in chats:
                     if str(chat.get("partnerAccountId", "")) == str(platform_fan_id):
                         group_id = str(chat.get("groupId", ""))
                         if group_id:
-                            # Save it to DB
                             db = get_supabase()
+                            update = {"fansly_group_id": group_id}
+                            # Also grab display name and avatar
+                            account = account_lookup.get(str(platform_fan_id), {})
+                            display_name = account.get("displayName") or account.get("username")
+                            if display_name:
+                                update["display_name"] = display_name
+                            avatar = account.get("avatar", {})
+                            if avatar and avatar.get("locations"):
+                                update["avatar_url"] = avatar["locations"][0].get("location")
                             await asyncio.to_thread(
-                                lambda gid=group_id: db.table("fans")
-                                .update({"fansly_group_id": gid})
+                                lambda u=update: db.table("fans")
+                                .update(u)
                                 .eq("id", fan_id)
                                 .execute()
                             )
-                            print(f"[GROUP_ID] Found group_id={group_id} for fan={fan_id}")
+                            print(f"[GROUP_ID] Found group_id={group_id} name={display_name} for fan={fan_id}")
                             return group_id
                 if not cursor or not chats:
                     break
@@ -1688,8 +1699,7 @@ async def generate_suggestions_webhook(
 
 
 async def _enrich_fan_profile(fan_id: str, creator_id: str, platform_fan_id: str) -> None:
-    """Fetch real username and avatar from Fansly and update fan record."""
-    import httpx
+    """Fetch real username, avatar and group_id by scanning chats list."""
     try:
         db = get_supabase()
         creator_row = await asyncio.to_thread(
@@ -1700,36 +1710,8 @@ async def _enrich_fan_profile(fan_id: str, creator_id: str, platform_fan_id: str
             .execute()
         )
         apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
-        api_key = os.environ.get("APIFANSLY_API_KEY")
-
-        async with httpx.AsyncClient() as client:
-            # Get subscriber info which includes username
-            resp = await client.get(
-                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/subscribers",
-                headers={"x-api-key": api_key},
-                timeout=15,
-            )
-            data = resp.json()
-            accounts = data.get("data", {}).get("data", {}).get("response", {}).get("aggregationData", {}).get("accounts", [])
-
-            account_lookup = {str(a.get("id", "")): a for a in accounts}
-            account = account_lookup.get(str(platform_fan_id))
-
-            if account:
-                display_name = account.get("displayName") or account.get("username") or f"Fan_{platform_fan_id[-6:]}"
-                avatar_url = None
-                avatar = account.get("avatar", {})
-                if avatar and avatar.get("locations"):
-                    avatar_url = avatar["locations"][0].get("location")
-
-                update = {"display_name": display_name}
-                if avatar_url:
-                    update["avatar_url"] = avatar_url
-
-                await asyncio.to_thread(
-                    lambda: db.table("fans").update(update).eq("id", fan_id).execute()
-                )
-                print(f"[FAN ENRICH] fan={fan_id} name={display_name}")
+        if apifansly_id:
+            await get_or_fetch_group_id(apifansly_id, platform_fan_id, fan_id)
     except Exception as e:
         print(f"[FAN ENRICH ERROR] {e}")
 
