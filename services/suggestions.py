@@ -386,7 +386,14 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         )
 
         group_id = (fan_row.data or {}).get("fansly_group_id")
+        platform_fan_id = (fan_row.data or {}).get("platform_fan_id")
         apifansly_account_id = (creator_row.data or {}).get("apifansly_account_id")
+
+        # If no group_id yet, try to find it from chats list
+        if not group_id and apifansly_account_id and platform_fan_id:
+            from main import get_or_fetch_group_id
+
+            group_id = await get_or_fetch_group_id(apifansly_account_id, str(platform_fan_id), fan_id)
 
         if group_id and apifansly_account_id:
             try:
