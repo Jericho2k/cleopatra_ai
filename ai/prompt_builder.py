@@ -23,6 +23,25 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
 
     fan_name = fan.display_name
     notes = fan.notes or ""
+
+    # Username kink detection
+    username_hints = []
+    raw_name = (fan_name or "").lower().replace("_", " ").replace("-", " ")
+    kink_keywords = {
+        "foot": "foot fetish", "feet": "foot fetish", "toe": "foot fetish",
+        "dom": "dominant tendencies", "sub": "submissive tendencies", "daddy": "daddy dynamic",
+        "slave": "submissive tendencies", "master": "dominant tendencies",
+        "muscle": "fitness/muscle interest", "gym": "fitness interest",
+        "plumb": "working class / blue collar", "finance": "financially oriented",
+        "cuck": "cuckold interest", "bbc": "specific fetish",
+        "thick": "body type preference", "bbw": "body type preference",
+        "old": "older demographic", "young": "younger demographic",
+        "shy": "shy/introverted personality", "nerd": "nerd/geek personality",
+        "horny": "high libido", "kinky": "open to kink",
+    }
+    for keyword, hint in kink_keywords.items():
+        if keyword in raw_name:
+            username_hints.append(hint)
     member_note = getattr(fan, "member_note", "") or ""
     model_note = getattr(fan, "model_note", "") or ""
     emotional_type = ai_summary.get("emotional_type", "")
@@ -238,6 +257,8 @@ PSYCHOLOGICAL TOOLS (use naturally):
 
     # Build the fan context block
     fan_context_parts = []
+    if username_hints:
+        fan_context_parts.append(f"Username hints (use subtly in cold open): {', '.join(username_hints)}")
     if notes:
         fan_context_parts.append(f"Summary: {notes}")
     if member_note:

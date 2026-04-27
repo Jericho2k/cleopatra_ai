@@ -167,7 +167,7 @@ async def process_incoming_fan_message(
             lambda: db.table("suggestions").insert({
                 "fan_id": fan_id,
                 "creator_id": creator_id,
-                "message_id": message_id,
+                "fansly_message_id": message_id,
                 "suggestions": replies,
                 "stage": conversation_stage.value,
             }).execute()
@@ -1643,6 +1643,53 @@ async def generate_suggestions_webhook(
     return {"status": "ok"}
 
 
+async def _enrich_fan_profile(fan_id: str, creator_id: str, platform_fan_id: str) -> None:
+    """Fetch real username and avatar from Fansly and update fan record."""
+    import httpx
+    try:
+        db = get_supabase()
+        creator_row = await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("apifansly_account_id")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+        apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+        api_key = os.environ.get("APIFANSLY_API_KEY")
+
+        async with httpx.AsyncClient() as client:
+            # Get subscriber info which includes username
+            resp = await client.get(
+                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/subscribers",
+                headers={"x-api-key": api_key},
+                timeout=15,
+            )
+            data = resp.json()
+            accounts = data.get("data", {}).get("data", {}).get("response", {}).get("aggregationData", {}).get("accounts", [])
+
+            account_lookup = {str(a.get("id", "")): a for a in accounts}
+            account = account_lookup.get(str(platform_fan_id))
+
+            if account:
+                display_name = account.get("displayName") or account.get("username") or f"Fan_{platform_fan_id[-6:]}"
+                avatar_url = None
+                avatar = account.get("avatar", {})
+                if avatar and avatar.get("locations"):
+                    avatar_url = avatar["locations"][0].get("location")
+
+                update = {"display_name": display_name}
+                if avatar_url:
+                    update["avatar_url"] = avatar_url
+
+                await asyncio.to_thread(
+                    lambda: db.table("fans").update(update).eq("id", fan_id).execute()
+                )
+                print(f"[FAN ENRICH] fan={fan_id} name={display_name}")
+    except Exception as e:
+        print(f"[FAN ENRICH ERROR] {e}")
+
+
 @app.post("/webhook/fansly")
 async def fansly_webhook(payload: dict) -> dict:
     print(f"[FANSLY WEBHOOK RAW] {payload}")
@@ -1739,6 +1786,8 @@ async def fansly_webhook(payload: dict) -> dict:
     fan = await get_fan(creator_id, platform_fan_id)
     if not fan:
         fan = await create_fan(creator_id, platform_fan_id, f"Fan_{platform_fan_id[-6:]}")
+        # Fetch real username in background
+        asyncio.create_task(_enrich_fan_profile(fan.id, creator_id, platform_fan_id))
 
     if message_id:
         mid = str(message_id)
