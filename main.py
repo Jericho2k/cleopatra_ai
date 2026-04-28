@@ -1799,52 +1799,60 @@ async def fansly_webhook(payload: dict) -> dict:
         .execute()
     )
     if creator_row_check.data:
-        # platform_fan_id is actually a creator — this is an outgoing message
-        outgoing_creator_id = creator_row_check.data[0]["id"]
-        fan_recipient_id = creator_platform_id  # the actual fan
-        if fan_recipient_id and group_id:
-            existing_fan = await get_fan(outgoing_creator_id, fan_recipient_id)
-            if not existing_fan:
-                existing_fan = await create_fan(
-                    outgoing_creator_id, fan_recipient_id, f"Fan_{fan_recipient_id[-6:]}"
-                )
-                asyncio.create_task(
-                    _enrich_fan_profile(existing_fan.id, outgoing_creator_id, fan_recipient_id)
-                )
-                # Set auto mode if creator has auto_mode_new_fans enabled
-                auto_new = creator_row_check.data[0].get("auto_mode_new_fans", False)
-                if auto_new:
-                    await asyncio.to_thread(
-                        lambda fid=existing_fan.id: get_supabase()
-                        .table("fans").update({"auto_mode": True}).eq("id", fid).execute()
+        # Check if recipient is also a creator — if so, skip outgoing capture
+        recipient_creator_check = await asyncio.to_thread(
+            lambda: db_check.table("creators")
+            .select("id")
+            .eq("fansly_account_id", creator_platform_id)
+            .limit(1)
+            .execute()
+        )
+        if not recipient_creator_check.data:
+            # platform_fan_id is a creator, recipient is a real fan — outgoing message
+            outgoing_creator_id = creator_row_check.data[0]["id"]
+            fan_recipient_id = creator_platform_id
+            if fan_recipient_id and group_id:
+                existing_fan = await get_fan(outgoing_creator_id, fan_recipient_id)
+                if not existing_fan:
+                    existing_fan = await create_fan(
+                        outgoing_creator_id, fan_recipient_id, f"Fan_{fan_recipient_id[-6:]}"
                     )
-            await asyncio.to_thread(
-                lambda fid=existing_fan.id, gid=str(group_id): get_supabase()
-                .table("fans")
-                .update({"fansly_group_id": gid})
-                .eq("id", fid)
-                .execute()
-            )
-            # Save outgoing message so chat appears in dashboard
-            if message_content and message_id:
-                msg_id = str(message_id)
-                existing_msg = await asyncio.to_thread(
-                    lambda: get_supabase().table("messages")
-                    .select("id")
-                    .eq("fansly_message_id", msg_id)
-                    .limit(1)
+                    asyncio.create_task(
+                        _enrich_fan_profile(existing_fan.id, outgoing_creator_id, fan_recipient_id)
+                    )
+                    auto_new = creator_row_check.data[0].get("auto_mode_new_fans", False)
+                    if auto_new:
+                        await asyncio.to_thread(
+                            lambda fid=existing_fan.id: get_supabase()
+                            .table("fans").update({"auto_mode": True}).eq("id", fid).execute()
+                        )
+                await asyncio.to_thread(
+                    lambda fid=existing_fan.id, gid=str(group_id): get_supabase()
+                    .table("fans")
+                    .update({"fansly_group_id": gid})
+                    .eq("id", fid)
                     .execute()
                 )
-                if not existing_msg.data:
-                    await save_message(
-                        existing_fan.id,
-                        outgoing_creator_id,
-                        "creator",
-                        message_content,
-                        fansly_message_id=msg_id,
+                if message_content and message_id:
+                    msg_id = str(message_id)
+                    existing_msg = await asyncio.to_thread(
+                        lambda: get_supabase().table("messages")
+                        .select("id")
+                        .eq("fansly_message_id", msg_id)
+                        .limit(1)
+                        .execute()
                     )
-            print(f"[OUTGOING] Captured creator→fan msg, fan={existing_fan.id} group={group_id}")
-        return {"status": "outgoing_captured"}
+                    if not existing_msg.data:
+                        await save_message(
+                            existing_fan.id,
+                            outgoing_creator_id,
+                            "creator",
+                            message_content,
+                            fansly_message_id=msg_id,
+                        )
+                print(f"[OUTGOING] Captured creator→fan msg, fan={existing_fan.id} group={group_id}")
+            return {"status": "outgoing_captured"}
+        # Both are creators — fall through to normal fan message handling
 
     print(
         f"[WEBHOOK] message_id={message_id} fan={platform_fan_id} "
