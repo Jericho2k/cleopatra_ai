@@ -27,6 +27,7 @@ from db.queries import (
     get_fan_session,
     get_ppv_offers,
     get_sent_ppv,
+    save_fan_session,
     save_message,
     update_fan_memory,
     update_fan_ai_summary,
@@ -459,8 +460,6 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             # Advance session plan if PPV was sent
             if ppv_match and active_session:
                 try:
-                    from db.queries import get_fan_session, save_fan_session
-
                     session = await get_fan_session(fan_id)
                     if session:
                         plan = session.get("plan", [])
@@ -611,7 +610,6 @@ async def _verify_ppv_purchase(
                 }).eq("id", fan_id).execute()
             )
             # Update session plan item as purchased
-            from db.queries import get_fan_session, save_fan_session
             session = await get_fan_session(fan_id)
             if session:
                 for item in session.get("plan", []):
