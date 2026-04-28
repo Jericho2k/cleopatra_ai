@@ -1798,7 +1798,15 @@ async def fansly_webhook(payload: dict) -> dict:
         .limit(1)
         .execute()
     )
-    if creator_row_check.data:
+    # Also check recipient is NOT a creator (avoid creator↔creator messages)
+    recipient_is_creator = await asyncio.to_thread(
+        lambda: db_check.table("creators")
+        .select("id")
+        .eq("fansly_account_id", creator_platform_id)
+        .limit(1)
+        .execute()
+    )
+    if creator_row_check.data and not recipient_is_creator.data:
         # platform_fan_id is actually a creator — this is an outgoing message
         outgoing_creator_id = creator_row_check.data[0]["id"]
         fan_recipient_id = creator_platform_id  # the actual fan
