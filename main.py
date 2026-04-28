@@ -1798,7 +1798,10 @@ async def fansly_webhook(payload: dict) -> dict:
         .limit(1)
         .execute()
     )
-    if creator_row_check.data and creator_row_check.data[0].get("fansly_account_id") != creator_platform_id:
+    # Only capture outgoing if sender is Eliz specifically (not test accounts)
+    # In production all creators will have unique non-overlapping accounts
+    ELIZ_FANSLY_ID = "707604041756061697"
+    if creator_row_check.data and platform_fan_id == ELIZ_FANSLY_ID:
         # platform_fan_id is actually a creator — this is an outgoing message
         outgoing_creator_id = creator_row_check.data[0]["id"]
         fan_recipient_id = creator_platform_id  # the actual fan
@@ -2165,6 +2168,25 @@ async def clear_session(fan_id: str) -> dict:
     from db.queries import save_fan_session
 
     await save_fan_session(fan_id, None)
+    return {"status": "ok"}
+
+
+@app.post("/enrich-fan/{fan_id}")
+async def enrich_fan_endpoint(fan_id: str) -> dict:
+    db = get_supabase()
+    fan_row = await asyncio.to_thread(
+        lambda: db.table("fans")
+        .select("platform_fan_id, creator_id")
+        .eq("id", fan_id)
+        .single()
+        .execute()
+    )
+    data = fan_row.data or {}
+    platform_fan_id = data.get("platform_fan_id")
+    creator_id = data.get("creator_id")
+    if not platform_fan_id or not creator_id:
+        return {"status": "error", "message": "fan not found"}
+    await _enrich_fan_profile(fan_id, creator_id, platform_fan_id)
     return {"status": "ok"}
 
 
