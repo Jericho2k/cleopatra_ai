@@ -1852,7 +1852,10 @@ async def fansly_webhook(payload: dict) -> dict:
                         )
                 print(f"[OUTGOING] Captured creator→fan msg, fan={existing_fan.id} group={group_id}")
             return {"status": "outgoing_captured"}
-        # Both are creators — fall through to normal fan message handling
+        # Both are creators (test scenario) — sender is fan, recipient is creator
+        # The normal webhook flow below will handle this correctly
+        # since creator_platform_id = interactions[0].userId = the real creator
+        pass
 
     print(
         f"[WEBHOOK] message_id={message_id} fan={platform_fan_id} "
@@ -1875,17 +1878,65 @@ async def fansly_webhook(payload: dict) -> dict:
     creator_id = creator_row.data[0]["id"]
     auto_mode = creator_row.data[0].get("auto_mode", False)
 
+    # If the "fan" is actually also a creator, we need to swap roles
+    # This handles test scenarios where both accounts are registered creators
+    fan_is_creator = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("id, fansly_account_id")
+        .eq("fansly_account_id", platform_fan_id)
+        .limit(1)
+        .execute()
+    )
+    if fan_is_creator.data:
+        # Sender is a creator — this is an outgoing message that fell through
+        # The real fan is creator_platform_id, real creator is platform_fan_id
+        real_creator_row = await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("id, auto_mode, auto_mode_new_fans")
+            .eq("fansly_account_id", platform_fan_id)
+            .limit(1)
+            .execute()
+        )
+        if real_creator_row.data:
+            real_creator_id = real_creator_row.data[0]["id"]
+            real_fan_platform_id = creator_platform_id
+            existing_fan = await get_fan(real_creator_id, real_fan_platform_id)
+            if not existing_fan:
+                existing_fan = await create_fan(
+                    real_creator_id, real_fan_platform_id, f"Fan_{real_fan_platform_id[-6:]}"
+                )
+                asyncio.create_task(
+                    _enrich_fan_profile(existing_fan.id, real_creator_id, real_fan_platform_id)
+                )
+                auto_new = real_creator_row.data[0].get("auto_mode_new_fans", False)
+                if auto_new:
+                    await asyncio.to_thread(
+                        lambda fid=existing_fan.id: db.table("fans")
+                        .update({"auto_mode": True}).eq("id", fid).execute()
+                    )
+            if group_id:
+                await asyncio.to_thread(
+                    lambda fid=existing_fan.id, gid=str(group_id): db.table("fans")
+                    .update({"fansly_group_id": gid}).eq("id", fid).execute()
+                )
+            if message_content and message_id:
+                mid = str(message_id)
+                existing_msg = await asyncio.to_thread(
+                    lambda: db.table("messages").select("id")
+                    .eq("fansly_message_id", mid).limit(1).execute()
+                )
+                if not existing_msg.data:
+                    await save_message(
+                        existing_fan.id, real_creator_id, "creator",
+                        message_content, fansly_message_id=mid,
+                    )
+            print(f"[SWAP] Outgoing via fallthrough, fan={existing_fan.id} group={group_id}")
+            return {"status": "outgoing_captured"}
+
     fan = await get_fan(creator_id, platform_fan_id)
     if not fan:
         fan = await create_fan(creator_id, platform_fan_id, f"Fan_{platform_fan_id[-6:]}")
         asyncio.create_task(_enrich_fan_profile(fan.id, creator_id, platform_fan_id))
-        # Set auto mode if creator has auto_mode_new_fans enabled
-        creator_auto_new = auto_mode = (creator_row.data or [{}])[0].get("auto_mode_new_fans", False)
-        if creator_auto_new:
-            await asyncio.to_thread(
-                lambda fid=fan.id: get_supabase()
-                .table("fans").update({"auto_mode": True}).eq("id", fid).execute()
-            )
 
     if message_id:
         mid = str(message_id)
