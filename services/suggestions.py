@@ -329,7 +329,6 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             if should_plan:
                 try:
                     import httpx as _httpx
-                    from db.queries import get_fan_session
 
                     async with _httpx.AsyncClient() as _hc:
                         plan_resp = await _hc.post(

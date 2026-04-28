@@ -1798,10 +1798,7 @@ async def fansly_webhook(payload: dict) -> dict:
         .limit(1)
         .execute()
     )
-    # Only capture outgoing if sender is Eliz specifically (not test accounts)
-    # In production all creators will have unique non-overlapping accounts
-    ELIZ_FANSLY_ID = "707604041756061697"
-    if creator_row_check.data and platform_fan_id == ELIZ_FANSLY_ID:
+    if creator_row_check.data:
         # platform_fan_id is actually a creator — this is an outgoing message
         outgoing_creator_id = creator_row_check.data[0]["id"]
         fan_recipient_id = creator_platform_id  # the actual fan
