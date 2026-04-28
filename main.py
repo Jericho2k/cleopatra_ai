@@ -1793,7 +1793,7 @@ async def fansly_webhook(payload: dict) -> dict:
     db_check = get_supabase()
     creator_row_check = await asyncio.to_thread(
         lambda: db_check.table("creators")
-        .select("id, auto_mode, fansly_account_id")
+        .select("id, auto_mode, fansly_account_id, auto_mode_new_fans")
         .eq("fansly_account_id", platform_fan_id)
         .limit(1)
         .execute()
@@ -1811,6 +1811,13 @@ async def fansly_webhook(payload: dict) -> dict:
                 asyncio.create_task(
                     _enrich_fan_profile(existing_fan.id, outgoing_creator_id, fan_recipient_id)
                 )
+                # Set auto mode if creator has auto_mode_new_fans enabled
+                auto_new = creator_row_check.data[0].get("auto_mode_new_fans", False)
+                if auto_new:
+                    await asyncio.to_thread(
+                        lambda fid=existing_fan.id: get_supabase()
+                        .table("fans").update({"auto_mode": True}).eq("id", fid).execute()
+                    )
             await asyncio.to_thread(
                 lambda fid=existing_fan.id, gid=str(group_id): get_supabase()
                 .table("fans")
@@ -1848,7 +1855,7 @@ async def fansly_webhook(payload: dict) -> dict:
     print(f"[DEBUG] looking up creator with fansly_account_id='{creator_platform_id}' len={len(creator_platform_id)}")
     creator_row = await asyncio.to_thread(
         lambda: db.table("creators")
-        .select("id, auto_mode")
+        .select("id, auto_mode, auto_mode_new_fans")
         .eq("fansly_account_id", creator_platform_id)
         .limit(1)
         .execute()
@@ -1863,8 +1870,14 @@ async def fansly_webhook(payload: dict) -> dict:
     fan = await get_fan(creator_id, platform_fan_id)
     if not fan:
         fan = await create_fan(creator_id, platform_fan_id, f"Fan_{platform_fan_id[-6:]}")
-        # Fetch real username in background
         asyncio.create_task(_enrich_fan_profile(fan.id, creator_id, platform_fan_id))
+        # Set auto mode if creator has auto_mode_new_fans enabled
+        creator_auto_new = auto_mode = (creator_row.data or [{}])[0].get("auto_mode_new_fans", False)
+        if creator_auto_new:
+            await asyncio.to_thread(
+                lambda fid=fan.id: get_supabase()
+                .table("fans").update({"auto_mode": True}).eq("id", fid).execute()
+            )
 
     if message_id:
         mid = str(message_id)
