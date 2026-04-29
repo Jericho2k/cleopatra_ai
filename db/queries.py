@@ -186,11 +186,27 @@ async def get_creator_persona(creator_id: str) -> Persona | None:
 
 async def get_ppv_offers(creator_id: str) -> list[dict]:
     def _get():
+        # Custom PPV offers
         ppv = (
             get_supabase()
             .table("ppv_offers")
             .select("title, description, price")
             .eq("creator_id", creator_id)
+            .execute()
+        )
+        # Vault items as sellable content
+        vault = (
+            get_supabase()
+            .table("creator_vault_media")
+            .select("id, fansly_media_id, ai_description, content_category, price_min, price_max, scene_outfit, scene_location, good_for, explicitness_level")
+            .eq("creator_id", creator_id)
+            .neq("content_category", "")
+            .neq("content_category", "other")
+            .neq("content_category", "teaser_clothed")
+            .neq("content_category", "teaser_bundle")
+            .not_.is_("content_category", "null")
+            .order("explicitness_level", desc=False)
+            .limit(30)
             .execute()
         )
         offers: list[dict] = []
@@ -199,6 +215,46 @@ async def get_ppv_offers(creator_id: str) -> list[dict]:
                 "title": row["title"],
                 "description": row.get("description", ""),
                 "price": row["price"],
+            })
+        for row in vault.data or []:
+            media_id = row.get("fansly_media_id", "")
+            if not media_id:
+                continue
+            description = row.get("ai_description", "")
+            category = row.get("content_category", "")
+            outfit = row.get("scene_outfit", "")
+            location = row.get("scene_location", "")
+            price_min = row.get("price_min") or 15
+            price_max = row.get("price_max") or 50
+            # Use midpoint price
+            price = round((price_min + price_max) / 2)
+            # Build a natural title from category + scene
+            category_labels = {
+                "lingerie_photo": "lingerie photo",
+                "lingerie_video": "lingerie video",
+                "nude_photo": "nude photo",
+                "striptease_video": "striptease video",
+                "closeup_photo": "closeup photo",
+                "closeup_video": "closeup video",
+                "solo_toy_video": "toy play video",
+                "solo_toy_photo": "toy play photo",
+                "bg_content": "BG content",
+                "legs_feet": "feet/legs photo",
+                "dictate_video": "dirty talk video",
+                "task": "custom task",
+            }
+            label = category_labels.get(category, category)
+            title = f"{label}"
+            if outfit and outfit != "unknown":
+                title += f" — {outfit}"
+            offers.append({
+                "title": title,
+                "description": description[:120] if description else f"Exclusive {label}",
+                "price": price,
+                "media_id": media_id,
+                "category": category,
+                "good_for": row.get("good_for", "standalone"),
+                "explicitness": row.get("explicitness_level", 3),
             })
         return offers
 
