@@ -55,6 +55,7 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     energy = situation.get("conversation_energy", "")
     strategy = situation.get("strategic_move", "build connection")
     personal_details = situation.get("personal_details_mentioned", [])
+    pending_tip = situation.get("pending_tip")
 
     stage_instructions = {
         StageType.COLD_OPEN: (
@@ -291,6 +292,8 @@ CONVERSATION STAGE: {stage.value}
 CURRENT SITUATION: {strategy} (fan mood: {mood}, energy: {energy})
 
 {f'PERSONAL DETAILS JUST MENTIONED: {", ".join(str(p) for p in personal_details)}' if personal_details else ''}
+
+{f"⚡ FAN JUST TIPPED ${pending_tip['amount']:.0f} — acknowledge it warmly and naturally in your reply. Don't make it the whole message, just weave it in." if pending_tip else ""}
 
 {avoid_block}
 

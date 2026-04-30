@@ -1774,10 +1774,11 @@ async def fansly_webhook(payload: dict) -> dict:
             except (TypeError, ValueError):
                 amt = 0.0
             if amt:
+                from datetime import datetime, timezone
                 db = get_supabase()
                 fan_row = await asyncio.to_thread(
                     lambda: db.table("fans")
-                    .select("id, total_spent")
+                    .select("id, total_spent, creator_id, auto_mode")
                     .eq("platform_fan_id", sender_id)
                     .limit(1)
                     .execute()
@@ -1787,13 +1788,39 @@ async def fansly_webhook(payload: dict) -> dict:
                     r = rows[0]
                     new_total = int((r.get("total_spent") or 0) + round(amt))
                     fid = str(r["id"])
+                    creator_id = str(r.get("creator_id", ""))
+
+                    # Update total_spent and store pending_tip for AI acknowledgement
                     await asyncio.to_thread(
                         lambda: db.table("fans")
-                        .update({"total_spent": new_total})
+                        .update({
+                            "total_spent": new_total,
+                            "pending_tip": {
+                                "amount": amt,
+                                "received_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        })
                         .eq("id", fid)
                         .execute()
                     )
-                    print(f"[TIP] Updated total_spent={new_total} for fan={fid}")
+                    print(f"[TIP] Updated total_spent={new_total} for fan={fid}, pending_tip queued")
+
+                    # If creator has auto_mode on, schedule an AI reply to acknowledge the tip
+                    if creator_id:
+                        creator_row = await asyncio.to_thread(
+                            lambda: db.table("creators")
+                            .select("auto_mode")
+                            .eq("id", creator_id)
+                            .single()
+                            .execute()
+                        )
+                        creator_auto = (creator_row.data or {}).get("auto_mode", False)
+                        fan_auto = r.get("auto_mode")
+                        effective_auto = fan_auto if fan_auto is not None else creator_auto
+                        if effective_auto:
+                            from services.suggestions import schedule_auto_reply
+                            schedule_auto_reply(fid, creator_id)
+                            print(f"[TIP] Scheduled auto-reply for tip acknowledgement fan={fid}")
         return {"status": "ok"}
 
     if event != "messages.received":

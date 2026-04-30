@@ -267,6 +267,30 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         if not fan_profile:
             return
 
+        # Check for a pending tip and clear it atomically before building context
+        pending_tip: dict | None = None
+        try:
+            tip_row = await asyncio.to_thread(
+                lambda: get_supabase()
+                .table("fans")
+                .select("pending_tip")
+                .eq("id", fan_id)
+                .single()
+                .execute()
+            )
+            pending_tip = (tip_row.data or {}).get("pending_tip")
+            if pending_tip:
+                await asyncio.to_thread(
+                    lambda: get_supabase()
+                    .table("fans")
+                    .update({"pending_tip": None})
+                    .eq("id", fan_id)
+                    .execute()
+                )
+                print(f"[TIP ACK] Cleared pending_tip for fan={fan_id} amount=${pending_tip.get('amount')}")
+        except Exception as e:
+            print(f"[TIP ACK ERROR] {e}")
+
         fan_messages = [m for m in conversation_history if m.role == "fan"]
         if not fan_messages:
             return
@@ -296,6 +320,10 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         )
 
         situation = await analyze_situation(ctx_without_situation)
+
+        # Inject tip context into situation so prompt builder can use it
+        if pending_tip:
+            situation["pending_tip"] = pending_tip
 
         # Check if fan is reacting to a pending PPV
         purchase_signal = situation.get("purchase_signal", "none")
