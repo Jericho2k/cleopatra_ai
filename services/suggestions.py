@@ -673,8 +673,38 @@ async def _debounced_auto_reply_with_sleep_check(fan_id: str, creator_id: str) -
             in_sleep = current_hour >= sleep_start or current_hour < sleep_end
 
         if in_sleep:
-            print(f"[AUTO REPLY] Skipping — sleep hours active (UTC {current_hour}h, sleep {sleep_start}-{sleep_end}) fan={fan_id}")
-            return
+            # Calculate seconds until sleep ends
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            wake_hour = sleep_end
+            if now.hour < wake_hour:
+                seconds_until_wake = (wake_hour - now.hour) * 3600 - now.minute * 60 - now.second
+            else:
+                seconds_until_wake = (24 - now.hour + wake_hour) * 3600 - now.minute * 60 - now.second
+            # Add small random offset so replies don't all fire at exactly wake time
+            seconds_until_wake += random.randint(60, 600)
+            print(f"[AUTO REPLY] Sleep hours active — queuing reply in {seconds_until_wake//60}min for fan={fan_id}")
+            await asyncio.sleep(seconds_until_wake)
+            # Re-check sleep hours after waking (in case settings changed)
+            creator_row2 = await asyncio.to_thread(
+                lambda: db.table("creators")
+                .select("sleep_hours_start, sleep_hours_end")
+                .eq("id", creator_id)
+                .single()
+                .execute()
+            )
+            data2 = creator_row2.data or {}
+            new_start = data2.get("sleep_hours_start", 0)
+            new_end = data2.get("sleep_hours_end", 7)
+            new_hour = datetime.now(timezone.utc).hour
+            if new_start <= new_end:
+                still_sleeping = new_start <= new_hour < new_end
+            else:
+                still_sleeping = new_hour >= new_start or new_hour < new_end
+            if still_sleeping:
+                print(f"[AUTO REPLY] Still in sleep hours after wake — skipping fan={fan_id}")
+                return
+            print(f"[AUTO REPLY] Sleep ended — sending queued reply for fan={fan_id}")
 
         await _debounced_auto_reply(fan_id, creator_id)
     except Exception as e:
