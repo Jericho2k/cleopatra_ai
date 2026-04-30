@@ -1519,6 +1519,28 @@ async def categorize_vault_status(creator_id: str) -> dict:
     return _categorize_state.get(creator_id, {"status": "idle", "done": 0, "total": 0})
 
 
+@app.get("/vault-media-url/{creator_id}/{media_id}")
+async def get_vault_media_url(creator_id: str, media_id: str) -> dict:
+    """Look up a vault media item's URL and thumbnail by fansly_media_id."""
+    db = get_supabase()
+    row = await asyncio.to_thread(
+        lambda: db.table("creator_vault_media")
+        .select("url, thumbnail_url, mimetype")
+        .eq("creator_id", creator_id)
+        .eq("fansly_media_id", media_id)
+        .limit(1)
+        .execute()
+    )
+    if not row.data:
+        return {"url": None, "thumbnail_url": None, "mimetype": None}
+    item = row.data[0]
+    return {
+        "url": item.get("url"),
+        "thumbnail_url": item.get("thumbnail_url"),
+        "mimetype": item.get("mimetype"),
+    }
+
+
 async def _run_vault_categorization(creator_id: str) -> None:
     db = get_supabase()
     try:
