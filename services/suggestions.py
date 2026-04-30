@@ -639,6 +639,63 @@ async def _verify_ppv_purchase(
         print(f"[PPV VERIFY ERROR] {e}")
 
 
+async def sweep_stale_ppv_checks() -> None:
+    """
+    Background sweep: find fans with a pending_ppv_check older than 20 minutes
+    that were never resolved by the reaction-triggered path, and verify them now.
+    Called every 15 minutes from the lifespan scheduler.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    try:
+        db = get_supabase()
+
+        # Pull all fans that still have a pending check, along with their creator_id
+        rows = await asyncio.to_thread(
+            lambda: db.table("fans")
+            .select("id, creator_id, pending_ppv_check")
+            .not_.is_("pending_ppv_check", "null")
+            .execute()
+        )
+
+        if not rows.data:
+            return
+
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(minutes=20)
+        stale = []
+
+        for row in rows.data:
+            pending = row.get("pending_ppv_check") or {}
+            sent_at_str = pending.get("sent_at", "")
+            if not sent_at_str:
+                continue
+            try:
+                sent_dt = datetime.fromisoformat(sent_at_str.replace("Z", "+00:00"))
+                # Make naive datetimes timezone-aware
+                if sent_dt.tzinfo is None:
+                    sent_dt = sent_dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+
+            if sent_dt < cutoff:
+                stale.append((str(row["id"]), str(row["creator_id"]), pending))
+
+        if not stale:
+            return
+
+        print(f"[PPV SWEEP] Found {len(stale)} stale pending check(s) to verify")
+
+        for fan_id, creator_id, pending in stale:
+            try:
+                await _verify_ppv_purchase(fan_id, creator_id, pending)
+            except Exception as e:
+                print(f"[PPV SWEEP ERROR] fan={fan_id} error={e}")
+
+    except Exception as e:
+        print(f"[PPV SWEEP FATAL] {e}")
+
+
 def schedule_auto_reply(fan_id: str, creator_id: str) -> None:
     """Cancel any pending reply for this fan and schedule a new one."""
     existing = _pending_auto_replies.get(fan_id)

@@ -285,6 +285,7 @@ async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
 session_store: SessionStore = None
 fansly_poller: FanslyPoller = None
 reengagement_task: asyncio.Task | None = None
+ppv_sweep_task: asyncio.Task | None = None
 
 
 async def reengagement_scheduler():
@@ -299,9 +300,22 @@ async def reengagement_scheduler():
             print(f"[CRON ERROR] {e}")
 
 
+async def ppv_sweep_scheduler():
+    """Runs stale PPV verification sweep every 15 minutes."""
+    while True:
+        await asyncio.sleep(15 * 60)
+        try:
+            print("[CRON] Running PPV sweep...")
+            from services.suggestions import sweep_stale_ppv_checks
+
+            await sweep_stale_ppv_checks()
+        except Exception as e:
+            print(f"[CRON PPV SWEEP ERROR] {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global session_store, fansly_poller, reengagement_task
+    global session_store, fansly_poller, reengagement_task, ppv_sweep_task
 
     supabase = get_supabase()
     session_store = SessionStore(
@@ -316,6 +330,7 @@ async def lifespan(app: FastAPI):
     )
     await fansly_poller.start_all()
     reengagement_task = asyncio.create_task(reengagement_scheduler())
+    ppv_sweep_task = asyncio.create_task(ppv_sweep_scheduler())
 
     yield
 
@@ -323,6 +338,8 @@ async def lifespan(app: FastAPI):
         await fansly_poller.stop_all()
     if reengagement_task:
         reengagement_task.cancel()
+    if ppv_sweep_task:
+        ppv_sweep_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
