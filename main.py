@@ -270,16 +270,77 @@ class Connect2FARequest(BaseModel):
 
 async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
     """
-    Fires when a fan sends a message to a model account we're polling.
+    Fires when the poller detects a new fan message.
+    Acts as a fallback to the ApiFansly webhook — same pipeline,
+    but skips any message already processed by the webhook.
 
-    account_id  = Fansly ID of the model (e.g. "707604041756061697")
-    group_id    = Fansly conversation ID (e.g. "813798181052637184")
-    message     = raw Fansly message dict with keys:
-                  id, senderId, content, createdAt, attachments, etc.
+    account_id  = Fansly account ID of the model
+    group_id    = Fansly conversation group ID
+    message     = raw Fansly message dict (id, senderId, content, createdAt, attachments, etc.)
     """
-    fan_id = message["senderId"]
-    content = message.get("content", "")
-    print(f"[NEW MESSAGE] model={account_id} fan={fan_id}: {content[:80]}")
+    message_id = str(message.get("id", ""))
+    platform_fan_id = str(message.get("senderId", ""))
+    content = (message.get("content") or "").strip()
+
+    attachments = message.get("attachments") or []
+    has_attachments = len(attachments) > 0
+
+    if not platform_fan_id:
+        return
+    if not content and not has_attachments:
+        return
+
+    # Skip if already handled by the ApiFansly webhook
+    if message_id and message_id in _processed_messages:
+        print(f"[POLLER] Skipping already-processed message_id={message_id}")
+        return
+
+    # Register in dedup set to prevent webhook double-processing this same message
+    if message_id:
+        _processed_messages.add(message_id)
+        if len(_processed_messages) > 1000:
+            _processed_messages.clear()
+
+    print(
+        f"[POLLER] New message model={account_id} fan={platform_fan_id} "
+        f"message_id={message_id} content={content[:80]}"
+    )
+
+    db = get_supabase()
+
+    # Look up creator by their Fansly account ID
+    creator_row = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("id, auto_mode")
+        .eq("fansly_account_id", account_id)
+        .limit(1)
+        .execute()
+    )
+    if not creator_row.data:
+        print(f"[POLLER] Creator not found for fansly_account_id={account_id}")
+        return
+
+    creator_id = creator_row.data[0]["id"]
+    auto_mode = creator_row.data[0].get("auto_mode", False)
+
+    # Get or create fan
+    fan = await get_fan(creator_id, platform_fan_id)
+    if not fan:
+        fan = await create_fan(creator_id, platform_fan_id, f"Fan_{platform_fan_id[-6:]}")
+        asyncio.create_task(_enrich_fan_profile(fan.id, creator_id, platform_fan_id))
+
+    # Update group_id if not already stored
+    if not fan.fansly_group_id and group_id:
+        await asyncio.to_thread(
+            lambda: db.table("fans")
+            .update({"fansly_group_id": group_id})
+            .eq("id", fan.id)
+            .execute()
+        )
+
+    await process_incoming_fan_message(
+        str(fan.id), creator_id, content, auto_mode, message_id or None,
+    )
 
 
 session_store: SessionStore = None
