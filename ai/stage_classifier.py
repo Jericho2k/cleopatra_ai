@@ -15,9 +15,9 @@ def classify_stage(
     fan_text_recent = " ".join(m.content for m in fan_messages[-10:]).lower()
     fan_text_all = " ".join(m.content for m in fan_messages).lower()
 
-    # Never upsell before 10 fan messages regardless of signals
+    # Never upsell before 6 fan messages regardless of signals
     fan_message_count = len(fan_messages)
-    if fan_message_count < 10:
+    if fan_message_count < 6:
         if message_count <= 2:
             return StageType.COLD_OPEN
         return StageType.WARMING_UP
@@ -61,6 +61,12 @@ def classify_stage(
         "can i buy", "i want to buy", "would you make",
         "how do i get", "what's the price", "whats the price",
         "can i get a custom", "do you do customs", "send me a ppv",
+        "send me something", "send me a pic", "send me a video",
+        "can you send", "please send", "i want to see",
+        "show me", "let me see", "i want to jerk", "jerk off to you",
+        "i want to cum", "help me cum", "make me cum",
+        "i need to see", "dying to see", "i want more",
+        "see your", "show me your", "send your",
     ]
     if any(phrase in fan_text_recent for phrase in upsell_keywords):
         return StageType.UPSELL_ACTIVE
