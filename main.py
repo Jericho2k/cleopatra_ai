@@ -1970,7 +1970,7 @@ async def plan_session(creator_id: str, fan_id: str) -> dict:
     if fan and fan.ai_summary:
         kinks = fan.ai_summary.get("kinks", [])
 
-    vault = await get_vault_for_session(creator_id, fan_kinks=kinks, exclude_media_ids=exclude)
+    vault = await get_vault_for_session(creator_id, fan_kinks=kinks, exclude_media_ids=exclude, min_explicitness=2)
     if not vault:
         return {"status": "no_content", "session": None}
 
@@ -1998,12 +1998,14 @@ async def plan_session(creator_id: str, fan_id: str) -> dict:
     prompt += f"{vault_summary}\n\n"
     prompt += "Select 6-8 items that would make the best escalating sexting session for this fan.\n"
     prompt += "Rules:\n"
-    prompt += "1. Start with lower explicitness (1-3), escalate to higher (4-5)\n"
-    prompt += "2. Prefer items matching fan's known kinks\n"
-    prompt += "3. Group by scene_id where possible for continuity - avoid jumping between different scenes too quickly\n"
-    prompt += "4. Mix good_for values: start with opener, mid_session items, end with closer\n"
-    prompt += "5. Never pick the same scene_id more than 3 times in a row\n"
-    prompt += f"6. Pick realistic prices based on fan's spend tier ({fan_tier})\n\n"
+    prompt += "1. ONLY pick items with price > 0 - never pick free teasers\n"
+    prompt += "2. Start with lower explicitness (2-3), escalate to higher (4-5)\n"
+    prompt += f"3. Prefer items matching fan's known kinks: {fan_kinks_str}\n"
+    prompt += "4. Group by scene_id for continuity - avoid jumping between scenes too quickly\n"
+    prompt += "5. Mix good_for values: opener -> mid_session -> closer\n"
+    prompt += "6. Never pick the same scene_id more than 3 times in a row\n"
+    prompt += f"7. Pick realistic prices based on fan's spend tier ({fan_tier}) - cold tier starts at $10-20\n"
+    prompt += "8. Select AT LEAST 2 explicit items (explicitness 4-5) in the plan\n\n"
     prompt += "Return ONLY a JSON array of objects:\n"
     prompt += '[{"media_id":"id","price":25,"reason":"why this fits here","transition":"natural line to say before sending this e.g. \'I actually took this last night...\'"}]'
 

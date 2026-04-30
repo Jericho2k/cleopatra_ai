@@ -266,6 +266,7 @@ async def get_vault_for_session(
     fan_kinks: list[str] = [],
     exclude_media_ids: set = set(),
     limit: int = 200,
+    min_explicitness: int = 1,
 ) -> list[dict]:
     """Fetch categorized vault items suitable for session planning."""
     def _get():
@@ -276,7 +277,11 @@ async def get_vault_for_session(
             .eq("creator_id", creator_id)
             .neq("content_category", "")
             .neq("content_category", "other")
+            .neq("content_category", "teaser_clothed")
+            .neq("content_category", "teaser_bundle")
             .not_.is_("content_category", "null")
+            .gte("explicitness_level", min_explicitness)
+            .gt("price_min", 0)
             .order("explicitness_level", desc=False)
             .limit(limit)
             .execute()
