@@ -37,7 +37,7 @@ Analyze and return ONLY valid JSON:
   "tone": "what tone should the reply have — playful/warm/flirty/mysterious/direct/casual",
   "personal_details_mentioned": ["any names, locations, jobs, interests mentioned by fan"],
   "avoid_repeating": "flag if the creator has already used the same line recently",
-  "purchase_signal": "none | bought | declined | uncertain — did the fan's message signal they bought recent PPV content? bought=positive reaction to content/mentions buying. declined=mentions price/cant afford/maybe later. uncertain=unclear"
+  "purchase_signal": "none | ready_to_buy | bought | declined | uncertain — none=no purchase context. ready_to_buy=fan just said yes/I want it/send it after a price was mentioned but no PPV sent yet. bought=positive reaction after PPV was already sent. declined=mentions price/can't afford/maybe later. uncertain=unclear"
 }}"""
 
     response = await client.messages.create(

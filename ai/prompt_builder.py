@@ -335,6 +335,27 @@ Return ONLY a JSON array of 3 strings. No markdown.
             user_prompt += f"Use the transition line naturally, then send the PPV with [PPV:{next_media_id}:{next_price}]\n"
             user_prompt += "After sending, continue the intimate conversation - do not immediately push the next item."
 
+    purchase_signal = situation.get("purchase_signal", "none")
+    if purchase_signal == "ready_to_buy" and ppv_offers:
+        # Fan said yes to a price — find the best matching offer and force send it
+        available = [
+            o for o in ppv_offers
+            if o.get("media_id") and o["media_id"] not in purchased_ids
+        ]
+        if available:
+            # Pick the cheapest unsent offer as the most likely one being discussed
+            unsent = [o for o in available if o["media_id"] not in sent_ids]
+            target = min(unsent or available, key=lambda o: o.get("price", 0))
+            mid = target.get("media_id", "")
+            price = target.get("price", 0)
+            desc = (target.get("description", "") or "")[:80]
+            user_prompt += (
+                f"\n\n🚨 FAN JUST SAID YES TO BUYING — send the PPV now. "
+                f"Don't tease further. Write a short natural message and end it with [PPV:{mid}:{price}]. "
+                f"Content: {desc}. "
+                f"Example: 'here it is, just for you 😏 [PPV:{mid}:{price}]'"
+            )
+
     if ppv_offers:
         available = [o for o in ppv_offers if o.get("media_id") and o["media_id"] not in purchased_ids]
         offers_text = "\n".join([
