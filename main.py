@@ -361,39 +361,17 @@ async def reengagement_scheduler():
             print(f"[CRON ERROR] {e}")
 
 
-async def ppv_sweep_cron() -> None:
-    """Single-instance PPV sweep using a DB advisory lock so only one Railway worker runs it."""
-    db = get_supabase()
-
-    # Try to acquire a Postgres advisory lock (lock id 12345 = arbitrary constant for PPV sweep)
-    # Returns true if we got the lock, false if another worker already holds it
-    lock_result = await asyncio.to_thread(
-        lambda: db.rpc("try_advisory_lock", {"lock_id": 12345}).execute()
-    )
-    acquired = (lock_result.data is True)
-    if not acquired:
-        print("[CRON] PPV sweep skipped — another worker is running it")
-        return
-
-    try:
-        print("[CRON] Running PPV sweep...")
-        from services.suggestions import sweep_stale_ppv_checks
-
-        await sweep_stale_ppv_checks()
-    except Exception as e:
-        print(f"[CRON PPV ERROR] {e}")
-    finally:
-        # Always release the lock, even if sweep errors
-        await asyncio.to_thread(
-            lambda: db.rpc("release_advisory_lock", {"lock_id": 12345}).execute()
-        )
-
-
 async def ppv_sweep_scheduler():
     """Runs stale PPV verification sweep every 15 minutes."""
     while True:
         await asyncio.sleep(15 * 60)
-        await ppv_sweep_cron()
+        try:
+            print("[CRON] Running PPV sweep...")
+            from services.suggestions import sweep_stale_ppv_checks
+
+            await sweep_stale_ppv_checks()
+        except Exception as e:
+            print(f"[CRON PPV SWEEP ERROR] {e}")
 
 
 @asynccontextmanager

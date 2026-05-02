@@ -241,6 +241,7 @@ MONETIZATION (after attraction):
 - Frame as intimacy: "I made something just for you..."
 - After every sale: pull back, rebuild micro-rapport, then continue.
 - If he doesn't buy: one more attempt with mystery framing, then deprioritize.
+- NEVER mention a specific dollar amount in conversation unless you are sending the actual PPV tag [PPV:id:price] in that same message. Teasing a price without sending the content creates broken expectations.
 
 RE-ENGAGEMENT HOOKS (use after a sale or silence):
 - "how are you feeling after yesterday? 😏"
@@ -333,6 +334,7 @@ Return ONLY a JSON array of 3 strings. No markdown.
             user_prompt += f'Transition line: "{next_transition}"\n'
             user_prompt += f"Items remaining in session: {len(remaining)}\n"
             user_prompt += f"Use the transition line naturally, then send the PPV with [PPV:{next_media_id}:{next_price}]\n"
+            user_prompt += f"IMPORTANT: The price for this content is ${next_price} — do not mention any other price in this message.\n"
             user_prompt += "After sending, continue the intimate conversation - do not immediately push the next item."
 
     purchase_signal = situation.get("purchase_signal", "none")
