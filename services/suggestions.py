@@ -259,7 +259,28 @@ async def _update_fan_ai_summary(
 async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
     """Wait for fan to finish typing, then generate and send one reply."""
     try:
-        delay = random.randint(90, 160)
+        # Adaptive delay based on conversation energy and message content
+        # High intent messages get faster replies to capitalise on the moment
+        msg_lower = latest_message.lower() if 'latest_message' in dir() else ""
+
+        # We need the latest message before the delay to assess urgency
+        # Fetch it early just for this check
+        _early_history = await get_conversation_history(fan_id)
+        _early_fan_msgs = [m for m in _early_history if m.role == "fan"]
+        _early_latest = _early_fan_msgs[-1].content.lower() if _early_fan_msgs else ""
+
+        high_intent_signals = [
+            "hot", "sexy", "more of you", "want to see", "show me",
+            "how much", "send me", "i want", "let's play", "i need",
+            "so good", "love your", "amazing", "gorgeous",
+        ]
+        is_high_intent = any(s in _early_latest for s in high_intent_signals)
+
+        if is_high_intent:
+            delay = random.randint(18, 45)   # fast — 18-45s
+        else:
+            delay = random.randint(60, 120)  # normal — 1-2 min
+
         await asyncio.sleep(delay)
 
         conversation_history = await get_conversation_history(fan_id)
