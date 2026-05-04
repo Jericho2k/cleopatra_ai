@@ -303,6 +303,17 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         ppv_offers = await get_ppv_offers(creator_id)
         sent_ppv = await get_sent_ppv(fan_id)
         active_session = await get_fan_session(fan_id)
+        # Decrement post-PPV cooldown counter on each fan message
+        if active_session and active_session.get("post_ppv_cooldown"):
+            remaining = active_session.get("cooldown_messages_remaining", 0) - 1
+            if remaining <= 0:
+                active_session["post_ppv_cooldown"] = False
+                active_session["cooldown_messages_remaining"] = 0
+                print(f"[SESSION] Cooldown lifted for fan={fan_id}")
+            else:
+                active_session["cooldown_messages_remaining"] = remaining
+                print(f"[SESSION] Cooldown active, {remaining} messages remaining for fan={fan_id}")
+            await save_fan_session(fan_id, active_session)
         similar_exchanges = await find_similar_exchanges(latest_message, creator_id, enabled=False)
         conversation_stage = classify_stage(conversation_history, fan_profile)
 
@@ -341,13 +352,59 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 print(f"[PPV SIGNAL] fan={fan_id} signal={purchase_signal} pending={pending}")
                 asyncio.create_task(_verify_ppv_purchase(fan_id, creator_id, pending))
 
+            if purchase_signal == "declined" and active_session:
+                # Fan declined — find cheapest unsent item below declined price
+                # and inject it into session as a retry at a lower price point
+                try:
+                    declined_price = (pending or {}).get("price", 999)
+                    session = await get_fan_session(fan_id)
+                    if session:
+                        plan = session.get("plan", [])
+                        idx = session.get("current_index", 0)
+                        remaining_items = [
+                            p for p in plan[idx:]
+                            if not p.get("sent") and float(p.get("price", 999)) < float(declined_price) * 0.75
+                        ]
+                        if remaining_items:
+                            # Surface cheapest alternative
+                            cheaper = min(remaining_items, key=lambda x: x.get("price", 999))
+                            # Move it to current position in plan
+                            plan.insert(idx, cheaper)
+                            plan.remove(cheaper)  # remove duplicate
+                            await save_fan_session(fan_id, session)
+                            print(f"[SESSION] Declined ${declined_price} — surfaced cheaper item ${cheaper.get('price')} for fan={fan_id}")
+                        else:
+                            # No cheaper item available — log ceiling and clear session
+                            fan_profile_row = await asyncio.to_thread(
+                                lambda: get_supabase().table("fans")
+                                .select("ai_summary")
+                                .eq("id", fan_id)
+                                .single()
+                                .execute()
+                            )
+                            summary = (fan_profile_row.data or {}).get("ai_summary") or {}
+                            # Store ceiling as just below the declined price
+                            summary["price_ceiling"] = round(float(declined_price) * 0.8)
+                            await asyncio.to_thread(
+                                lambda: get_supabase().table("fans")
+                                .update({"ai_summary": summary})
+                                .eq("id", fan_id)
+                                .execute()
+                            )
+                            print(f"[SESSION] No cheaper items — stored price_ceiling=${summary['price_ceiling']} for fan={fan_id}")
+                except Exception as e:
+                    print(f"[SESSION DECLINE HANDLER ERROR] {e}")
+
         # Auto-trigger session planning if situation calls for it and no session active
         if not active_session and situation:
             move = situation.get("strategic_move", "")
             fan_intent = situation.get("fan_intent", "").lower()
             session_triggers = ["push_for_ppv", "hint_at_content", "build_tension"]
             intent_triggers = ["want", "show", "play", "buy", "see", "content", "hot", "sexy"]
-            should_plan = (
+            # Require at least 8 fan messages before planning a session
+            # to avoid triggering on casual warmup messages
+            fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
+            should_plan = fan_msg_count >= 8 and (
                 move in session_triggers
                 or any(t in fan_intent for t in intent_triggers)
                 or any(
@@ -374,6 +431,22 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                             )
                 except Exception as e:
                     print(f"[SESSION PLAN ERROR] {e}")
+
+        # Budget qualification gate — if session exists but fan hasn't been
+        # budget-qualified yet, mark it for the prompt builder to handle
+        if active_session and not active_session.get("budget_qualified"):
+            # Check if fan has now indicated a budget in their latest message
+            budget_signals = [
+                "i have", "i got", "budget", "i can spend", "how much",
+                "what's the cheapest", "i'll pay", "send me", "i want to buy",
+                "let's do", "let's play", "yes", "sure", "okay", "yeah",
+            ]
+            fan_indicated_budget = any(s in latest_message.lower() for s in budget_signals)
+            if fan_indicated_budget:
+                # Mark as qualified so session can proceed
+                active_session["budget_qualified"] = True
+                await save_fan_session(fan_id, active_session)
+                print(f"[SESSION] Fan budget-qualified for fan={fan_id}")
 
         ctx = ConversationContext(
             fan_message=latest_message,
@@ -495,9 +568,12 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         if idx < len(plan):
                             plan[idx]["sent"] = True
                             session["current_index"] = idx + 1
+                            # Start cooldown — require 2 fan messages before next item
+                            session["post_ppv_cooldown"] = True
+                            session["cooldown_messages_remaining"] = 2
                             await save_fan_session(fan_id, session)
                             active_session = session
-                            print(f"[SESSION] Advanced to item {idx + 1}/{len(plan)} for fan={fan_id}")
+                            print(f"[SESSION] Advanced to item {idx + 1}/{len(plan)} for fan={fan_id}, cooldown started")
                 except Exception as e:
                     print(f"[SESSION ADVANCE ERROR] {e}")
 
@@ -629,12 +705,24 @@ async def _verify_ppv_purchase(
 
         if purchased:
             print(f"[PPV VERIFY] fan={fan_id} PURCHASED media={media_id} amount=${actual_amount}")
-            # Update total_spent
+            # Update price floor — we know they'll pay at least this much
             new_spent = current_spent + int(actual_amount)
+            fan_summary_row = await asyncio.to_thread(
+                lambda: db.table("fans")
+                .select("ai_summary")
+                .eq("id", fan_id)
+                .single()
+                .execute()
+            )
+            summary = (fan_summary_row.data or {}).get("ai_summary") or {}
+            existing_floor = summary.get("price_floor", 0)
+            if actual_amount > existing_floor:
+                summary["price_floor"] = int(actual_amount)
             await asyncio.to_thread(
                 lambda: db.table("fans").update({
                     "total_spent": new_spent,
                     "pending_ppv_check": None,
+                    "ai_summary": summary,
                 }).eq("id", fan_id).execute()
             )
             # Update session plan item as purchased

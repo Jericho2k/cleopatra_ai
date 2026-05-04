@@ -2114,6 +2114,9 @@ async def plan_session(creator_id: str, fan_id: str) -> dict:
     fan_kinks_str = ", ".join(kinks) if kinks else "unknown"
     fan_spent = fan.total_spent if fan else 0
     fan_tier = fan.spend_tier if fan else "cold"
+    ai_summary = (fan.ai_summary or {}) if fan else {}
+    price_ceiling = ai_summary.get("price_ceiling")
+    price_floor = ai_summary.get("price_floor")
     prompt = ""
     prompt += "You are planning a sexting content session for an OnlyFans fan.\n\n"
     prompt += "Fan profile:\n"
@@ -2132,7 +2135,13 @@ async def plan_session(creator_id: str, fan_id: str) -> dict:
     prompt += "5. Mix good_for values: opener -> mid_session -> closer\n"
     prompt += "6. Never pick the same scene_id more than 3 times in a row\n"
     prompt += f"7. Pick realistic prices based on fan's spend tier ({fan_tier}) - cold tier starts at $10-20\n"
-    prompt += "8. Select AT LEAST 2 explicit items (explicitness 4-5) in the plan\n\n"
+    if price_ceiling:
+        prompt += f"8. IMPORTANT: This fan's known price ceiling is ${price_ceiling} — never price any item above this. Start first item at 60% of ceiling.\n"
+    elif price_floor:
+        prompt += f"8. This fan has previously bought at ${price_floor} — start at that level or slightly above.\n"
+    else:
+        prompt += "8. No purchase history — start conservatively at $10-15 for first item.\n"
+    prompt += "9. Select AT LEAST 2 explicit items (explicitness 4-5) in the plan\n\n"
     prompt += "Return ONLY a JSON array of objects:\n"
     prompt += '[{"media_id":"id","price":25,"reason":"why this fits here","transition":"natural line to say before sending this e.g. \'I actually took this last night...\'"}]'
 
@@ -2171,6 +2180,9 @@ async def plan_session(creator_id: str, fan_id: str) -> dict:
             "current_index": 0,
             "started_at": __import__("datetime").datetime.utcnow().isoformat(),
             "fan_kinks": kinks,
+            "budget_qualified": False,
+            "post_ppv_cooldown": False,
+            "cooldown_messages_remaining": 0,
         }
         await save_fan_session(fan_id, session)
         return {"status": "ok", "session": session}
