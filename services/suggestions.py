@@ -259,28 +259,7 @@ async def _update_fan_ai_summary(
 async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
     """Wait for fan to finish typing, then generate and send one reply."""
     try:
-        # Adaptive delay based on conversation energy and message content
-        # High intent messages get faster replies to capitalise on the moment
-        msg_lower = latest_message.lower() if 'latest_message' in dir() else ""
-
-        # We need the latest message before the delay to assess urgency
-        # Fetch it early just for this check
-        _early_history = await get_conversation_history(fan_id)
-        _early_fan_msgs = [m for m in _early_history if m.role == "fan"]
-        _early_latest = _early_fan_msgs[-1].content.lower() if _early_fan_msgs else ""
-
-        high_intent_signals = [
-            "hot", "sexy", "more of you", "want to see", "show me",
-            "how much", "send me", "i want", "let's play", "i need",
-            "so good", "love your", "amazing", "gorgeous",
-        ]
-        is_high_intent = any(s in _early_latest for s in high_intent_signals)
-
-        if is_high_intent:
-            delay = random.randint(18, 45)   # fast — 18-45s
-        else:
-            delay = random.randint(60, 120)  # normal — 1-2 min
-
+        delay = random.randint(90, 160)
         await asyncio.sleep(delay)
 
         conversation_history = await get_conversation_history(fan_id)
@@ -324,6 +303,21 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         ppv_offers = await get_ppv_offers(creator_id)
         sent_ppv = await get_sent_ppv(fan_id)
         active_session = await get_fan_session(fan_id)
+        similar_exchanges = await find_similar_exchanges(latest_message, creator_id, enabled=False)
+        conversation_stage = classify_stage(conversation_history, fan_profile)
+
+        # Budget qualification gate (NOW safe — latest_message exists)
+        if active_session and not active_session.get("budget_qualified"):
+            budget_signals = [
+                "i have", "i got", "budget", "i can spend", "how much",
+                "what's the cheapest", "i'll pay", "send me", "i want to buy",
+                "let's do", "let's play", "yes", "sure", "okay", "yeah",
+            ]
+            if any(s in latest_message.lower() for s in budget_signals):
+                active_session["budget_qualified"] = True
+                await save_fan_session(fan_id, active_session)
+                print(f"[SESSION] Fan budget-qualified for fan={fan_id}")
+
         # Decrement post-PPV cooldown counter on each fan message
         if active_session and active_session.get("post_ppv_cooldown"):
             remaining = active_session.get("cooldown_messages_remaining", 0) - 1
@@ -335,8 +329,6 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 active_session["cooldown_messages_remaining"] = remaining
                 print(f"[SESSION] Cooldown active, {remaining} messages remaining for fan={fan_id}")
             await save_fan_session(fan_id, active_session)
-        similar_exchanges = await find_similar_exchanges(latest_message, creator_id, enabled=False)
-        conversation_stage = classify_stage(conversation_history, fan_profile)
 
         ctx_without_situation = ConversationContext(
             fan_message=latest_message,
