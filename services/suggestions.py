@@ -445,22 +445,6 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 except Exception as e:
                     print(f"[SESSION PLAN ERROR] {e}")
 
-        # Budget qualification gate — if session exists but fan hasn't been
-        # budget-qualified yet, mark it for the prompt builder to handle
-        if active_session and not active_session.get("budget_qualified"):
-            # Check if fan has now indicated a budget in their latest message
-            budget_signals = [
-                "i have", "i got", "budget", "i can spend", "how much",
-                "what's the cheapest", "i'll pay", "send me", "i want to buy",
-                "let's do", "let's play", "yes", "sure", "okay", "yeah",
-            ]
-            fan_indicated_budget = any(s in latest_message.lower() for s in budget_signals)
-            if fan_indicated_budget:
-                # Mark as qualified so session can proceed
-                active_session["budget_qualified"] = True
-                await save_fan_session(fan_id, active_session)
-                print(f"[SESSION] Fan budget-qualified for fan={fan_id}")
-
         ctx = ConversationContext(
             fan_message=latest_message,
             conversation_history=conversation_history,
@@ -833,6 +817,15 @@ def schedule_auto_reply(fan_id: str, creator_id: str) -> None:
         print(f"[AUTO REPLY] Reset timer for fan={fan_id}")
 
     task = asyncio.create_task(_debounced_auto_reply_with_sleep_check(fan_id, creator_id))
+
+    # Log any unhandled exceptions so they don't disappear silently
+    def _on_task_done(t: asyncio.Task) -> None:
+        if not t.cancelled() and t.exception():
+            import traceback
+            print(f"[AUTO REPLY TASK ERROR] fan={fan_id}")
+            traceback.print_exception(type(t.exception()), t.exception(), t.exception().__traceback__)
+
+    task.add_done_callback(_on_task_done)
     _pending_auto_replies[fan_id] = task
 
 
