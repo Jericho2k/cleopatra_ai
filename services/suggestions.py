@@ -1,6 +1,6 @@
 """Suggestion orchestration service.
 
-Coordinates DB, stage classification, RAG, prompt building, and generation.
+Coordinates DB, stage classification, RAG, prompt building, and generation
 """
 
 import asyncio
