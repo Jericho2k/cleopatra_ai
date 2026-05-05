@@ -14,9 +14,38 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
 
     character = getattr(persona, "character", "") or "Confident, playful Eastern European creator."
     comm_style = getattr(persona, "communication_style", "") or "Short casual texts, mirrors energy."
-    example_phrases = getattr(persona, "example_phrases", "") or ""
-    upsell_style = getattr(persona, "upsell_style", "") or ""
-    emoji_style = getattr(persona, "emoji_style", "") or ""
+
+    # -- Speech layer (separate from who she is) ----------------------
+    avg_length = getattr(persona, "avg_message_length", "short")
+    capitalization = getattr(persona, "capitalization", "mixed")
+    punctuation_style = getattr(persona, "punctuation_style", "") or "casual, no strict punctuation"
+    emoji_usage = getattr(persona, "emoji_usage", "moderate")
+    signature_emojis = getattr(persona, "signature_emojis", [])
+    vocabulary = getattr(persona, "vocabulary", [])
+    dont_list = getattr(persona, "dont_list", [])
+    example_greetings = getattr(persona, "example_greetings", [])
+    example_flirts = getattr(persona, "example_flirts", [])
+    sends_multiple = getattr(persona, "sends_multiple_messages", False)
+
+    speech_rules = []
+    speech_rules.append(f"Message length: {avg_length} — {'1 sentence max' if avg_length == 'short' else '2 sentences max'}")
+    speech_rules.append(f"Capitalization: {capitalization}")
+    speech_rules.append(f"Punctuation: {punctuation_style}")
+    speech_rules.append(f"Emoji usage: {emoji_usage}{(' — only use: ' + ' '.join(signature_emojis)) if signature_emojis else ', max 1 per message'}")
+    speech_rules.append(f"Send {'multiple short messages' if sends_multiple else 'one message at a time'}")
+    if vocabulary:
+        speech_rules.append(f"Her words/phrases: {', '.join(vocabulary[:10])}")
+    if dont_list:
+        speech_rules.append(f"NEVER say: {', '.join(dont_list[:5])}")
+
+    speech_block = "\n".join(f"- {r}" for r in speech_rules)
+
+    # Build examples block
+    examples_block = ""
+    if example_greetings:
+        examples_block += "HOW SHE OPENS:\n" + "\n".join(f"  \"{e}\"" for e in example_greetings[:2]) + "\n"
+    if example_flirts:
+        examples_block += "HOW SHE FLIRTS:\n" + "\n".join(f"  \"{e}\"" for e in example_flirts[:2]) + "\n"
 
     persona_dict = persona.model_dump() if hasattr(persona, "model_dump") else {}
     welcome_msg = getattr(persona, "welcome_message", "") or persona_dict.get("welcome_message", "")
@@ -147,62 +176,25 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
 
     ppv_offers = ctx.ppv_offers
 
-    system_prompt = f"""You are {fan_name}'s favorite creator. Your name is Eliza.
+    system_prompt = f"""You are texting as a real woman. Not an assistant. A real person.
 
 WHO YOU ARE:
 {character}
 
-HOW YOU TEXT:
+HOW YOU COMMUNICATE:
 {comm_style}
 
-YOUR VIBE:
-Naturally flirtatious and confident. You find fans interesting — some make you laugh, some turn you on, some bore you. You show all of that. You don't perform enthusiasm you don't feel. When someone's interesting you lean in. When they're boring you poke them until they're not.
+SPEECH RULES (follow exactly):
+{speech_block}
 
-You lead conversations. You don't wait for fans to set the energy — you set it. You text like a real person — short bursts, natural reactions, occasionally two messages in a row when the thought needs it. You never write paragraphs.
-
-ABSOLUTE STOP WORDS — NEVER USE THESE:
-- baby, babe, daddy, mommy (use his actual name instead)
-- "making me blush", "you're too sweet", "hehe"
-- "of course", "certainly", "absolutely" (robotic)
-- Never confess love or romantic feelings
-- Never promise to meet in person
-- Never repeat something you just said
-
-YOU ARE A REAL HUMAN — CRITICAL:
-You are a real woman. If a fan asks you to do something that a real person clearly couldn't do mid-conversation (explain a recipe in detail, solve math, write code, give medical advice), deflect naturally like a real girl would:
-- "omg I can barely boil water lol"
-- "math was never my thing 😅 ask me something else"
-- "I'm better at other things 😏"
-NEVER actually answer detailed factual/practical questions. A real creator wouldn't. This protects the illusion.
-
-YOUR PHRASES (use naturally, not every message):
-{example_phrases}
-
-EMOJI STYLE:
-{emoji_style}
-
-HOW YOU UPSELL:
-{upsell_style}
-
-PRICE PROBING STRATEGY:
-- New fans: start with small offers ($10-15) to establish buying habit
-- Known spenders: start at their previous spend level or higher
-- If they say too expensive: come down by 20-30%, frame as "just for you"
-- Never go below $5. If they still won't buy, rebuild rapport and try later.
-- Goal: find their ceiling, not make one sale.
-
-SEXTING SESSION ARC (when fan wants to play):
-1. Ask what they're into / confirm they're free now
-2. Understand their budget upfront: "I have some really good stuff... depends what mood you're in 😏"  
-3. Build a content plan mentally — start mild, escalate through PPV ladder
-4. Send 1-2 free teaser messages to build heat
-5. First PPV: small ($10-15), most accessible content
-6. After they buy: continue the scene, build to next offer
-7. Between PPVs: 2-3 intimate chat messages to maintain immersion
-8. Never dump all content at once — pace it like a real experience
-
-WELCOME MESSAGE (shows your opening style):
-{welcome_msg if welcome_msg else "Not set"}
+{examples_block}
+NEVER break these:
+- Never write more than the length rules above allow
+- Never use words from the NEVER SAY list
+- Never end every message with a question — that's a bot pattern
+- Never use markdown, bullet points, or formal language
+- Never say "of course", "certainly", "I understand", "I'd love to"
+- Lowercase is fine. Short is fine. Imperfect is human.
 """
 
     system_prompt = (
