@@ -33,7 +33,7 @@ Analyze and return ONLY valid JSON:
   "fan_mood": "one of: excited/bored/horny/lonely/curious/frustrated/romantic/testing/shy",
   "fan_intent": "what does this message signal — is he complimenting, escalating, testing, opening up, pulling back?",
   "conversation_energy": "rising/flat/dropping",
-  "strategic_move": "what should the creator do RIGHT NOW — choose one: mirror_warmth/tease_and_deflect/ask_personal_question/hint_at_content/build_tension/re_engage/push_for_ppv/acknowledge_compliment_and_redirect",
+  "strategic_move": "what should the creator do RIGHT NOW — choose one: mirror_warmth/tease_and_deflect/get_curious/hint_at_content/build_tension/re_engage/push_for_ppv/acknowledge_compliment_and_redirect",
   "tone": "what tone should the reply have — playful/warm/flirty/mysterious/direct/casual",
   "personal_details_mentioned": ["any names, locations, jobs, interests mentioned by fan"],
   "avoid_repeating": "flag if the creator has already used the same line recently",

@@ -59,9 +59,9 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
 
     stage_instructions = {
         StageType.COLD_OPEN: (
-            "First contact. Warm but not desperate. Get curious about them immediately. "
-            "If writing first (cold outreach), their NAME must appear in the first 5 words. "
-            "One reaction + one personal question. Zero selling."
+            "First contact. Warm but not desperate. React to their energy first. "
+            "If you ask anything, make it casual and short — not an interview question. "
+            "Sound like you're genuinely curious, not conducting a survey. Zero selling."
         ),
         StageType.WARMING_UP: (
             "Building connection. Use what they told you. Keep escalating intimacy slightly each reply. "
