@@ -259,10 +259,20 @@ async def _update_fan_ai_summary(
 async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
     """Wait for fan to finish typing, then generate and send one reply."""
     try:
-        delay = random.randint(90, 160)
+        delay = 8  # TEST MODE — slightly longer to catch fast multi-message fans
         await asyncio.sleep(delay)
 
+        # Fetch history now — after the wait — to get the most complete picture
+        # including any messages the fan sent while we were waiting
         conversation_history = await get_conversation_history(fan_id)
+
+        # Stale generation check: if another task is already pending for this fan
+        # (meaning a newer message came in during our wait and reset the timer),
+        # abort silently — the newer task will generate the reply
+        current_task = _pending_auto_replies.get(fan_id)
+        if current_task and current_task is not asyncio.current_task():
+            print(f"[AUTO REPLY] Newer task exists — aborting stale generation for fan={fan_id}")
+            return
         fan_profile = await get_fan_by_id(fan_id)
         if not fan_profile:
             return
@@ -381,9 +391,11 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         if remaining_items:
                             # Surface cheapest alternative
                             cheaper = min(remaining_items, key=lambda x: x.get("price", 999))
-                            # Move it to current position in plan
-                            plan.insert(idx, cheaper)
-                            plan.remove(cheaper)  # remove duplicate
+                            # Remove from original position first, then insert at current index
+                            original_idx = plan.index(cheaper)
+                            plan.pop(original_idx)
+                            insert_at = idx if original_idx >= idx else idx - 1
+                            plan.insert(insert_at, cheaper)
                             await save_fan_session(fan_id, session)
                             print(f"[SESSION] Declined ${declined_price} — surfaced cheaper item ${cheaper.get('price')} for fan={fan_id}")
                         else:
