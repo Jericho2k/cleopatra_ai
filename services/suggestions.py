@@ -479,6 +479,21 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
         reply = replies[0]
 
+        # Final check — abort if a new message arrived while we were generating
+        current_task = _pending_auto_replies.get(fan_id)
+        if current_task and current_task is not asyncio.current_task():
+            print(f"[AUTO REPLY] New message detected post-generation — aborting for fan={fan_id}")
+            return
+
+        # Also check DB directly — catches messages that came in during generation
+        # even if the task replacement hasn't happened yet
+        fresh_check = await get_conversation_history(fan_id)
+        fresh_fan_msgs = [m for m in fresh_check if m.role == "fan"]
+        current_fan_msgs = [m for m in conversation_history if m.role == "fan"]
+        if len(fresh_fan_msgs) > len(current_fan_msgs):
+            print(f"[AUTO REPLY] New fan message in DB post-generation — aborting for fan={fan_id}")
+            return
+
         db = get_supabase()
         fan_row = await asyncio.to_thread(
             lambda: db.table("fans")
