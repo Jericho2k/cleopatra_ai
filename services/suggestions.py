@@ -355,9 +355,12 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
         situation = await analyze_situation(ctx_without_situation)
 
-        resend_requested = situation.get("resend_requested", "false") == "true"
+        # Inject tip context into situation so prompt builder can use it
+        if pending_tip:
+            situation["pending_tip"] = pending_tip
 
-        if resend_requested:
+        # Resend handler — situation analyzer detected fan can't see sent content
+        if situation.get("resend_requested") == "true":
             db = get_supabase()
             fan_data = await asyncio.to_thread(
                 lambda: db.table("fans")
@@ -385,7 +388,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                     try:
                         async with httpx.AsyncClient() as hc:
                             ppv_resp = await hc.post(
-                                f"https://v1.apifansly.com/api/fansly/{apifansly_id_resend}/chats/{str(group_id_resend)}/messages",
+                                f"https://v1.apifansly.com/api/fansly/{apifansly_id_resend}/chats/{group_id_resend}/messages",
                                 headers={
                                     "x-api-key": os.environ.get("APIFANSLY_API_KEY"),
                                     "Content-Type": "application/json",
@@ -404,10 +407,6 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                     except Exception as e:
                         print(f"[PPV RESEND ERROR] {e}")
                         # Fall through to normal generation if resend fails
-
-        # Inject tip context into situation so prompt builder can use it
-        if pending_tip:
-            situation["pending_tip"] = pending_tip
 
         # Check if fan is reacting to a pending PPV
         purchase_signal = situation.get("purchase_signal", "none")
