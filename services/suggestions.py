@@ -306,6 +306,63 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             return
         latest_message = fan_messages[-1].content
 
+        # Resend handler — if fan is asking for a resend and there's a pending PPV
+        resend_signals = [
+            "send it again", "resend", "didn't come through", "no media",
+            "can't see it", "cannot see it", "see no media", "nothing came",
+            "didn't receive", "did not receive", "send again", "try again",
+            "not showing", "not loading",
+        ]
+        is_resend_request = any(s in latest_message.lower() for s in resend_signals)
+
+        if is_resend_request:
+            db = get_supabase()
+            fan_data = await asyncio.to_thread(
+                lambda: db.table("fans")
+                .select("pending_ppv_check, fansly_group_id, platform_fan_id")
+                .eq("id", fan_id)
+                .single()
+                .execute()
+            )
+            pending = (fan_data.data or {}).get("pending_ppv_check")
+            group_id_resend = (fan_data.data or {}).get("fansly_group_id")
+            creator_data = await asyncio.to_thread(
+                lambda: db.table("creators")
+                .select("apifansly_account_id")
+                .eq("id", creator_id)
+                .single()
+                .execute()
+            )
+            apifansly_id_resend = (creator_data.data or {}).get("apifansly_account_id")
+
+            if pending and group_id_resend and apifansly_id_resend:
+                media_id_resend = pending.get("media_id")
+                price_resend = pending.get("price")
+                if media_id_resend and price_resend:
+                    print(f"[PPV RESEND] Resending media={media_id_resend} price={price_resend} for fan={fan_id}")
+                    try:
+                        async with httpx.AsyncClient() as hc:
+                            ppv_resp = await hc.post(
+                                f"https://v1.apifansly.com/api/fansly/{apifansly_id_resend}/chats/{group_id_resend}/messages",
+                                headers={
+                                    "x-api-key": os.environ.get("APIFANSLY_API_KEY"),
+                                    "Content-Type": "application/json",
+                                },
+                                json={
+                                    "content": "sorry about that, here it is again 😏",
+                                    "mediaId": media_id_resend,
+                                    "access_type": "ppv",
+                                    "price": price_resend,
+                                },
+                                timeout=10,
+                            )
+                        print(f"[PPV RESEND] status={ppv_resp.status_code} body={ppv_resp.text[:200]}")
+                        await save_message(fan_id, creator_id, "creator", "sorry about that, here it is again 😏", was_ai_suggested=True)
+                        return  # Skip normal generation
+                    except Exception as e:
+                        print(f"[PPV RESEND ERROR] {e}")
+                        # Fall through to normal generation if resend fails
+
         creator_persona = await get_creator_persona(creator_id)
         if creator_persona is None:
             creator_persona = Persona()
