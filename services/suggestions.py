@@ -603,7 +603,14 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
             if group_id and apifansly_account_id:
                 if ppv_match:
-                    ppv_content = text_out if text_out else "here it is 😏"
+                    # Fansly requires non-empty content — use text_out if present,
+                    # otherwise fall back to a natural delivery line
+                    ppv_content = text_out if text_out else random.choice([
+                        "here it is 😏",
+                        "just for you...",
+                        "this is what I've been saving 😈",
+                        "don't say I never spoil you 💋",
+                    ])
                     async with httpx.AsyncClient() as hc:
                         ppv_resp = await hc.post(
                             f"https://v1.apifansly.com/api/fansly/{apifansly_account_id}/chats/{str(group_id)}/messages",
@@ -619,7 +626,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                             },
                             timeout=10,
                         )
-                    print(f"[PPV SEND] status={ppv_resp.status_code} media={media_id} price={price} body={ppv_resp.text[:200]}")
+                    print(f"[PPV SEND] status={ppv_resp.status_code} media={media_id} price={price} body={ppv_resp.text[:300]}")
                 else:
                     from main import send_fansly_message
 
