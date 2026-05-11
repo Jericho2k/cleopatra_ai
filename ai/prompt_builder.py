@@ -318,26 +318,36 @@ Return ONLY a JSON array of 3 strings. No markdown.
     purchased_ids = {s["media_id"] for s in sent_ppv if s.get("purchased")}
     active_session = ctx.active_session
 
+    purchase_signal = situation.get("purchase_signal", "none")
+
     if active_session:
         plan = active_session.get("plan", [])
         idx = active_session.get("current_index", 0)
         remaining = [p for p in plan[idx:] if not p.get("sent")]
+
         if not active_session.get("budget_qualified"):
             user_prompt += (
                 "\n\nSEXTING SESSION READY — but DO NOT send any content yet. "
-                "First, qualify the fan naturally:\n"
-                "1. Ask if they're free / in the mood right now\n"
-                "2. Build a tiny bit of tension\n"
-                "3. Hint you have something good: 'I have some stuff I've been saving... depends what you're into 😏'\n"
-                "DO NOT mention any prices or content yet. Just get them engaged and curious."
+                "First, qualify the fan naturally — ask if they're free and in the mood. "
+                "Hint you have something good without revealing it. DO NOT mention any prices yet."
             )
         elif active_session.get("post_ppv_cooldown"):
             messages_left = active_session.get("cooldown_messages_remaining", 2)
             user_prompt += (
-                f"\n\nPOST-PPV COOLDOWN ({messages_left} exchanges remaining before next offer): "
+                f"\n\nPOST-PPV COOLDOWN ({messages_left} exchanges remaining): "
                 "Fan just received content. DO NOT push the next item yet. "
-                "React to their energy, be playful, make them feel the intimacy. "
-                "Build micro-rapport. Let THEM escalate first."
+                "React to their energy, be playful, build micro-rapport. Let THEM escalate first."
+            )
+        elif purchase_signal == "ready_to_buy" and remaining:
+            next_item = remaining[0]
+            next_media_id = next_item.get("media_id", "")
+            next_price = next_item.get("price", 0)
+            next_description = (next_item.get("description", "") or "")[:100]
+            user_prompt += (
+                f"\n\n🚨 FAN IS READY TO BUY — send the PPV NOW. "
+                f"Do not tease further. Write one short natural line and end with [PPV:{next_media_id}:{next_price}]. "
+                f"Content: {next_description}. "
+                f"Example: 'here it is, just for you 😏 [PPV:{next_media_id}:{next_price}]'"
             )
         elif remaining:
             next_item = remaining[0]
@@ -351,7 +361,7 @@ Return ONLY a JSON array of 3 strings. No markdown.
             user_prompt += f'Transition line: "{next_transition}"\n'
             user_prompt += f"Items remaining in session: {len(remaining)}\n"
             user_prompt += f"Use the transition line naturally, then send the PPV with [PPV:{next_media_id}:{next_price}]\n"
-            user_prompt += f"IMPORTANT: The price for this content is ${next_price} — do not mention any other price.\n"
+            user_prompt += f"IMPORTANT: The price is ${next_price} — do not mention any other price.\n"
             user_prompt += "After sending, continue the intimate conversation - do not immediately push the next item."
 
     purchase_signal = situation.get("purchase_signal", "none")
@@ -388,6 +398,7 @@ Return ONLY a JSON array of 3 strings. No markdown.
                 "When sending a PPV, end your message with [PPV:media_id:price] tag. "
                 "Example: 'I made this just for you 😏 [PPV:8745xxx:20]'\n"
                 "Only offer PPV when the conversation energy supports it — don't force it.\n"
+                "NEVER mention a specific price in conversation unless you are sending the actual [PPV:id:price] tag in that same message.\n"
                 "Never resend content the fan already purchased."
             )
 

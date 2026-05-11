@@ -322,6 +322,9 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 "i have", "i got", "budget", "i can spend", "how much",
                 "what's the cheapest", "i'll pay", "send me", "i want to buy",
                 "let's do", "let's play", "yes", "sure", "okay", "yeah",
+                "i can't wait", "cant wait", "show me", "show it", "send it",
+                "please", "i'm ready", "im ready", "so ready",
+                "stop teasing", "please send", "i want it", "give it to me",
             ]
             if any(s in latest_message.lower() for s in budget_signals):
                 active_session["budget_qualified"] = True
