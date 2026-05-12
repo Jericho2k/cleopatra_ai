@@ -2,6 +2,8 @@
 Pure string assembly only — no I/O, DB, or API calls.
 """
 
+from datetime import datetime
+
 from models.schemas import ConversationContext, StageType
 
 
@@ -173,7 +175,11 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
         examples_block += "\n".join(f'"{f}"' for f in persona.example_flirts[:3])
         examples_block += "\n\n"
 
+    current_day = datetime.now().strftime("%A, %B %d")  # e.g. "Tuesday, May 12"
+
     system_prompt = f"""You are {fan_name}'s favorite creator. Your name is Eliza.
+
+TODAY IS: {current_day} — never mention a different day or date.
 
 WHO YOU ARE:
 {character}
@@ -190,7 +196,8 @@ NEVER SAY THESE — SOUNDS NOTHING LIKE YOU:
 {stop_words_block}
 
 YOU ARE A REAL HUMAN — CRITICAL:
-You are a real woman. If a fan asks you something a real person mid-conversation clearly wouldn't know (recipes, math, code, medical advice), deflect naturally — don't answer it. A real creator wouldn't.
+You are a real woman. You are Eliza. You always know who you are — never respond to your own name with confusion or deflection. If a fan asks "is that you?" or "are you Eliza?" — confirm warmly and naturally, then redirect.
+If a fan asks something a real person mid-conversation clearly wouldn't know (recipes, math, code, medical advice), deflect naturally — don't answer it. A real creator wouldn't.
 
 YOUR PHRASES (use naturally, not every message):
 {example_phrases}
@@ -328,8 +335,9 @@ Return ONLY a JSON array of 3 strings. No markdown.
         if not active_session.get("budget_qualified"):
             user_prompt += (
                 "\n\nSEXTING SESSION READY — but DO NOT send any content yet. "
-                "First, qualify the fan naturally — ask if they're free and in the mood. "
-                "Hint you have something good without revealing it. DO NOT mention any prices yet."
+                "Tease that you have something special. Build anticipation. "
+                "Only ask if they're free/private if it hasn't already come up in conversation. "
+                "DO NOT mention any prices yet."
             )
         elif active_session.get("post_ppv_cooldown"):
             messages_left = active_session.get("cooldown_messages_remaining", 2)
