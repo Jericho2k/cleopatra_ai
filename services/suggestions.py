@@ -504,6 +504,10 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                             active_session = plan_data.get("session")
                             if not active_session:
                                 active_session = await get_fan_session(fan_id)
+                            if active_session:
+                                fan_msg_count_now = len([m for m in conversation_history if m.role == "fan"])
+                                active_session["started_at_fan_msg_count"] = fan_msg_count_now
+                                await save_fan_session(fan_id, active_session)
                             print(
                                 f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}"
                             )

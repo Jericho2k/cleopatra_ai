@@ -354,16 +354,24 @@ Return ONLY a JSON array of 3 strings. No markdown.
                 "Fan just received content. DO NOT push the next item yet. "
                 "React to their energy, be playful, build micro-rapport. Let THEM escalate first."
             )
-        elif purchase_signal == "ready_to_buy" and remaining:
+        # Force send if session planned and fan has sent 3+ messages since qualification
+        fan_msg_count = len([m for m in ctx.conversation_history if m.role == "fan"])
+        session_started_at_msg = active_session.get("started_at_fan_msg_count", 0)
+        msgs_since_session = fan_msg_count - session_started_at_msg
+        should_force_send = msgs_since_session >= 3 and remaining and active_session.get("budget_qualified")
+
+        if should_force_send or (purchase_signal == "ready_to_buy" and remaining):
             next_item = remaining[0]
             next_media_id = next_item.get("media_id", "")
             next_price = next_item.get("price", 0)
             next_description = (next_item.get("description", "") or "")[:100]
+            next_transition = next_item.get("transition", "")
             user_prompt += (
-                f"\n\n🚨 FAN IS READY TO BUY — send the PPV NOW. "
-                f"Do not tease further. Write one short natural line and end with [PPV:{next_media_id}:{next_price}]. "
+                f"\n\n🚨 TIME TO SEND — stop teasing, send the PPV now. "
+                f"Use this transition naturally: \"{next_transition}\" "
+                f"then end your message with [PPV:{next_media_id}:{next_price}]. "
                 f"Content: {next_description}. "
-                f"Example: 'here it is, just for you 😏 [PPV:{next_media_id}:{next_price}]'"
+                f"Keep it short, flirty, one line max before the tag."
             )
         elif remaining:
             next_item = remaining[0]
