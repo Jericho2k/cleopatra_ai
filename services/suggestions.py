@@ -357,6 +357,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         )
 
         situation = await analyze_situation(ctx_without_situation)
+        print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} budget_qualified={active_session.get('budget_qualified') if active_session else 'no_session'}")
 
         # Inject tip context into situation so prompt builder can use it
         if pending_tip:
