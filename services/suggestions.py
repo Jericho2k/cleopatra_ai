@@ -331,6 +331,46 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 await save_fan_session(fan_id, active_session)
                 print(f"[SESSION] Fan budget-qualified for fan={fan_id}")
 
+        # If no session exists but fan is clearly ready — plan one now
+        if not active_session:
+            move = situation.get("strategic_move", "")
+            fan_intent = situation.get("fan_intent", "").lower()
+            purchase_sig = situation.get("purchase_signal", "none")
+            fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
+            session_triggers = ["push_for_ppv", "hint_at_content", "build_tension"]
+            intent_triggers = ["want", "show", "play", "buy", "see", "content", "hot", "sexy", "send", "stroke", "touch", "hard", "excited"]
+            should_plan = fan_msg_count >= 5 and (
+                purchase_sig in ("ready_to_buy",)
+                or move in session_triggers
+                or any(t in fan_intent for t in intent_triggers)
+                or any(t in latest_message.lower() for t in [
+                    "let's play", "show me", "what do you have", "i want to see",
+                    "send me", "send it", "send something", "stroke", "touch myself",
+                    "get off", "so hard", "i want u",
+                ])
+            )
+            if should_plan:
+                try:
+                    import httpx as _httpx
+                    async with _httpx.AsyncClient() as _hc:
+                        plan_resp = await _hc.post(
+                            f"http://localhost:8080/plan-session/{creator_id}/{fan_id}",
+                            timeout=30,
+                        )
+                        plan_data = plan_resp.json()
+                        if plan_data.get("status") == "ok":
+                            active_session = plan_data.get("session")
+                            if not active_session:
+                                active_session = await get_fan_session(fan_id)
+                            if active_session:
+                                fan_msg_count_now = len([m for m in conversation_history if m.role == "fan"])
+                                active_session["started_at_fan_msg_count"] = fan_msg_count_now
+                                active_session["budget_qualified"] = True
+                                await save_fan_session(fan_id, active_session)
+                            print(f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
+                except Exception as e:
+                    print(f"[SESSION PLAN ERROR] {e}")
+
         # Decrement post-PPV cooldown counter on each fan message
         if active_session and active_session.get("post_ppv_cooldown"):
             remaining = active_session.get("cooldown_messages_remaining", 0) - 1
@@ -472,47 +512,6 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                             print(f"[SESSION] No cheaper items — stored price_ceiling=${summary['price_ceiling']} for fan={fan_id}")
                 except Exception as e:
                     print(f"[SESSION DECLINE HANDLER ERROR] {e}")
-
-        # Auto-trigger session planning if situation calls for it and no session active
-        if not active_session and situation:
-            move = situation.get("strategic_move", "")
-            fan_intent = situation.get("fan_intent", "").lower()
-            session_triggers = ["push_for_ppv", "hint_at_content", "build_tension"]
-            intent_triggers = ["want", "show", "play", "buy", "see", "content", "hot", "sexy"]
-            # Require at least 8 fan messages before planning a session
-            # to avoid triggering on casual warmup messages
-            fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
-            should_plan = fan_msg_count >= 8 and (
-                move in session_triggers
-                or any(t in fan_intent for t in intent_triggers)
-                or any(
-                    t in latest_message.lower()
-                    for t in ["let's play", "show me", "what do you have", "i want to see", "send me"]
-                )
-            )
-            if should_plan:
-                try:
-                    import httpx as _httpx
-
-                    async with _httpx.AsyncClient() as _hc:
-                        plan_resp = await _hc.post(
-                            f"http://localhost:8080/plan-session/{creator_id}/{fan_id}",
-                            timeout=30,
-                        )
-                        plan_data = plan_resp.json()
-                        if plan_data.get("status") == "ok":
-                            active_session = plan_data.get("session")
-                            if not active_session:
-                                active_session = await get_fan_session(fan_id)
-                            if active_session:
-                                fan_msg_count_now = len([m for m in conversation_history if m.role == "fan"])
-                                active_session["started_at_fan_msg_count"] = fan_msg_count_now
-                                await save_fan_session(fan_id, active_session)
-                            print(
-                                f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}"
-                            )
-                except Exception as e:
-                    print(f"[SESSION PLAN ERROR] {e}")
 
         ctx = ConversationContext(
             fan_message=latest_message,
