@@ -262,6 +262,8 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         delay = 8  # TEST MODE — slightly longer to catch fast multi-message fans
         await asyncio.sleep(delay)
 
+        situation: dict | None = None  # initialized early — assigned properly later
+
         # Fetch history now — after the wait — to get the most complete picture
         # including any messages the fan sent while we were waiting
         conversation_history = await get_conversation_history(fan_id)
