@@ -333,9 +333,9 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
         # If no session exists but fan is clearly ready — plan one now
         if not active_session:
-            move = situation.get("strategic_move", "")
-            fan_intent = situation.get("fan_intent", "").lower()
-            purchase_sig = situation.get("purchase_signal", "none")
+            move = situation.get("strategic_move", "") if situation else ""
+            fan_intent = situation.get("fan_intent", "").lower() if situation else ""
+            purchase_sig = situation.get("purchase_signal", "none") if situation else "none"
             fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
             session_triggers = ["push_for_ppv", "hint_at_content", "build_tension"]
             intent_triggers = ["want", "show", "play", "buy", "see", "content", "hot", "sexy", "send", "stroke", "touch", "hard", "excited"]
