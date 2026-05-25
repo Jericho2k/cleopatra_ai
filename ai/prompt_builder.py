@@ -331,6 +331,32 @@ Return ONLY a JSON array of 3 strings. No markdown.
 
     purchase_signal = situation.get("purchase_signal", "none")
 
+    # Pre-session qualification state instructions
+    pre_qual = situation.get("pre_session_qual") if situation else None
+    if not pre_qual:
+        fan_pre_qual = getattr(fan, 'pre_session_qual', None)
+        pre_qual = fan_pre_qual
+
+    pre_qual_stage = (situation or {}).get("pre_session_qual_stage", "")
+
+    if pre_qual_stage == "ask_kinks":
+        user_prompt += (
+            "\n\nPRE-SESSION: Fan is ready to play. Before sending any content, "
+            "find out what they're into. Ask directly and naturally — "
+            "'so what are you actually into? 😏' or 'any specific things that get you going?' "
+            "If they're vague, give options based on what you have: "
+            "'do you like lingerie, more explicit stuff, or something else?' "
+            "DO NOT mention prices or send any content yet."
+        )
+    elif pre_qual_stage == "ask_budget":
+        user_prompt += (
+            "\n\nPRE-SESSION: You know what they're into. Now naturally find out their budget. "
+            "Don't ask directly — frame it as intimacy: "
+            "'I have a few things saved... depends how deep you want to go tonight 😏' "
+            "or 'I've got something for every mood — what kind of experience are you thinking?' "
+            "Listen for any number or signal they give. DO NOT send content yet."
+        )
+
     if active_session:
         plan = active_session.get("plan", [])
         idx = active_session.get("current_index", 0)

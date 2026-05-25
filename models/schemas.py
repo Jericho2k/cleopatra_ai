@@ -30,6 +30,7 @@ class Fan(BaseModel):
     member_note: str = ""
     model_note: str = ""
     ai_summary: dict | None = None
+    pre_session_qual: dict | None = None
 
 
 class Creator(BaseModel):

@@ -2078,7 +2078,13 @@ async def get_my_creators(user_id: str) -> dict:
 
 
 @app.post("/plan-session/{creator_id}/{fan_id}")
-async def plan_session(creator_id: str, fan_id: str) -> dict:
+async def plan_session(
+    creator_id: str,
+    fan_id: str,
+    body: dict = None,
+) -> dict:
+    confirmed_kinks = (body or {}).get("confirmed_kinks", [])
+    confirmed_budget = (body or {}).get("budget", None)
     """
     Called when a sexting session is starting.
     Picks 5-8 vault items ordered by escalating explicitness,
@@ -2093,8 +2099,8 @@ async def plan_session(creator_id: str, fan_id: str) -> dict:
     sent_ids = {s["media_id"] for s in sent_ppv}
     exclude = purchased_ids
 
-    kinks = []
-    if fan and fan.ai_summary:
+    kinks = confirmed_kinks or []
+    if not kinks and fan and fan.ai_summary:
         kinks = fan.ai_summary.get("kinks", [])
 
     vault = await get_vault_for_session(creator_id, fan_kinks=kinks, exclude_media_ids=exclude, min_explicitness=2)
@@ -2135,13 +2141,13 @@ async def plan_session(creator_id: str, fan_id: str) -> dict:
     prompt += "5. Mix good_for values: opener -> mid_session -> closer\n"
     prompt += "6. Never pick the same scene_id more than 3 times in a row\n"
     prompt += f"7. Pick realistic prices based on fan's spend tier ({fan_tier}) - cold tier starts at $10-20\n"
-    if price_ceiling:
-        prompt += f"8. IMPORTANT: This fan's known price ceiling is ${price_ceiling} — never price any item above this. Start first item at 60% of ceiling.\n"
-    elif price_floor:
-        prompt += f"8. This fan has previously bought at ${price_floor} — start at that level or slightly above.\n"
+    if confirmed_budget:
+        prompt += f"8. Fan's confirmed budget for this session: ${confirmed_budget} — first item must be max 30% of budget (${round(confirmed_budget * 0.3)}), last item can be up to 80% of budget (${round(confirmed_budget * 0.8)})\n"
     else:
-        prompt += "8. No purchase history — start conservatively at $10-15 for first item.\n"
-    prompt += "9. Select AT LEAST 2 explicit items (explicitness 4-5) in the plan\n\n"
+        prompt += "8. FIRST ITEM MUST be priced $10-15 maximum — establish buying habit before escalating\n"
+    prompt += "9. Price ladder should escalate gradually — never jump more than $15 between consecutive items\n"
+    if price_ceiling:
+        prompt += f"NOTE: This fan's known price ceiling is ${price_ceiling} — never exceed this for any item.\n"
     prompt += "Return ONLY a JSON array of objects:\n"
     prompt += '[{"media_id":"id","price":25,"reason":"why this fits here","transition":"natural line to say before sending this e.g. \'I actually took this last night...\'"}]'
 

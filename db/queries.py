@@ -25,6 +25,7 @@ def _row_to_fan(row: dict) -> Fan:
         member_note=row.get("member_note", ""),
         model_note=row.get("model_note", ""),
         ai_summary=row.get("ai_summary"),
+        pre_session_qual=row.get("pre_session_qual"),
     )
 
 

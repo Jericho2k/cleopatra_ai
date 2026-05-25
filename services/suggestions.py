@@ -333,30 +333,126 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 await save_fan_session(fan_id, active_session)
                 print(f"[SESSION] Fan budget-qualified for fan={fan_id}")
 
-        # If no session exists but fan is clearly ready — plan one now
+        # Pre-session qualification state machine
+        pre_qual = None
         if not active_session:
+            # Check if we have a qualification in progress
+            db_qual = await asyncio.to_thread(
+                lambda: get_supabase()
+                .table("fans")
+                .select("pre_session_qual")
+                .eq("id", fan_id)
+                .single()
+                .execute()
+            )
+            pre_qual = (db_qual.data or {}).get("pre_session_qual") or {}
+
             move = situation.get("strategic_move", "") if situation else ""
             fan_intent = situation.get("fan_intent", "").lower() if situation else ""
             purchase_sig = situation.get("purchase_signal", "none") if situation else "none"
             fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
+
             session_triggers = ["push_for_ppv", "hint_at_content", "build_tension"]
-            intent_triggers = ["want", "show", "play", "buy", "see", "content", "hot", "sexy", "send", "stroke", "touch", "hard", "excited"]
-            should_plan = fan_msg_count >= 5 and (
-                purchase_sig in ("ready_to_buy",)
-                or move in session_triggers
-                or any(t in fan_intent for t in intent_triggers)
-                or any(t in latest_message.lower() for t in [
-                    "let's play", "show me", "what do you have", "i want to see",
-                    "send me", "send it", "send something", "stroke", "touch myself",
-                    "get off", "so hard", "i want u",
-                ])
+            intent_triggers = ["want", "show", "play", "buy", "see", "send", "stroke", "touch", "hard", "excited"]
+            has_intent = (
+                fan_msg_count >= 5 and (
+                    purchase_sig in ("ready_to_buy",)
+                    or move in session_triggers
+                    or any(t in fan_intent for t in intent_triggers)
+                    or any(t in latest_message.lower() for t in [
+                        "let's play", "show me", "i want to see", "send me",
+                        "send it", "send something", "stroke", "touch myself",
+                        "get off", "so hard", "i want u", "i want you",
+                    ])
+                )
             )
-            if should_plan:
+
+            if has_intent and not pre_qual:
+                # Start qualification — mark intent detected, kinks not yet confirmed
+                pre_qual = {
+                    "stage": "ask_kinks",
+                    "kinks_confirmed": [],
+                    "budget_confirmed": None,
+                    "started_at_msg": fan_msg_count,
+                }
+                await asyncio.to_thread(
+                    lambda: get_supabase()
+                    .table("fans")
+                    .update({"pre_session_qual": pre_qual})
+                    .eq("id", fan_id)
+                    .execute()
+                )
+                print(f"[QUAL] Started pre-session qualification for fan={fan_id}")
+
+            elif pre_qual and pre_qual.get("stage") == "ask_kinks":
+                # Try to extract kinks from latest message
+                kink_confirmed = situation.get("personal_details_mentioned", []) if situation else []
+                if kink_confirmed or any(t in latest_message.lower() for t in [
+                    "tits", "ass", "feet", "legs", "pussy", "solo", "toy", "lingerie",
+                    "striptease", "blowjob", "anal", "dominant", "submissive", "outdoor",
+                    "everything", "all", "anything", "whatever you have",
+                ]):
+                    # Kinks gathered — move to budget stage
+                    existing_kinks = pre_qual.get("kinks_confirmed", [])
+                    new_kinks = list(set(existing_kinks + [latest_message[:100]]))
+                    pre_qual["kinks_confirmed"] = new_kinks
+                    pre_qual["stage"] = "ask_budget"
+                    await asyncio.to_thread(
+                        lambda: get_supabase()
+                        .table("fans")
+                        .update({"pre_session_qual": pre_qual})
+                        .eq("id", fan_id)
+                        .execute()
+                    )
+                    print(f"[QUAL] Kinks confirmed, moving to budget stage for fan={fan_id}")
+
+            elif pre_qual and pre_qual.get("stage") == "ask_budget":
+                # Try to extract budget from latest message
+                budget_signals = {
+                    "10": 10, "15": 15, "20": 20, "25": 25, "30": 30,
+                    "40": 40, "50": 50, "100": 100, "not much": 20,
+                    "a little": 15, "whatever": 50, "anything": 50,
+                    "no limit": 100, "don't mind": 50, "don't care": 50,
+                }
+                detected_budget = None
+                msg_lower = latest_message.lower()
+                for signal, amount in budget_signals.items():
+                    if signal in msg_lower:
+                        detected_budget = amount
+                        break
+                import re as _re
+                dollar_match = _re.search(r'\$?(\d+)', latest_message)
+                if dollar_match:
+                    detected_budget = min(int(dollar_match.group(1)), 300)
+
+                if detected_budget or any(s in msg_lower for s in [
+                    "yes", "sure", "okay", "ready", "let's go", "send it",
+                    "show me", "i'm ready", "let's do it",
+                ]):
+                    pre_qual["budget_confirmed"] = detected_budget or 30
+                    pre_qual["stage"] = "ready"
+                    await asyncio.to_thread(
+                        lambda: get_supabase()
+                        .table("fans")
+                        .update({"pre_session_qual": pre_qual})
+                        .eq("id", fan_id)
+                        .execute()
+                    )
+                    print(f"[QUAL] Budget confirmed=${detected_budget}, planning session for fan={fan_id}")
+
+            if pre_qual and pre_qual.get("stage") == "ready":
+                # All info gathered — plan the session now
+                confirmed_kinks = pre_qual.get("kinks_confirmed", [])
+                confirmed_budget = pre_qual.get("budget_confirmed", 30)
                 try:
                     import httpx as _httpx
                     async with _httpx.AsyncClient() as _hc:
                         plan_resp = await _hc.post(
                             f"http://localhost:8080/plan-session/{creator_id}/{fan_id}",
+                            json={
+                                "confirmed_kinks": confirmed_kinks,
+                                "budget": confirmed_budget,
+                            },
                             timeout=30,
                         )
                         plan_data = plan_resp.json()
@@ -369,7 +465,15 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                                 active_session["started_at_fan_msg_count"] = fan_msg_count_now
                                 active_session["budget_qualified"] = True
                                 await save_fan_session(fan_id, active_session)
-                            print(f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
+                            # Clear qualification state
+                            await asyncio.to_thread(
+                                lambda: get_supabase()
+                                .table("fans")
+                                .update({"pre_session_qual": None})
+                                .eq("id", fan_id)
+                                .execute()
+                            )
+                            print(f"[SESSION] Planned with kinks={confirmed_kinks} budget=${confirmed_budget} items={len((active_session or {}).get('plan', []))}")
                 except Exception as e:
                     print(f"[SESSION PLAN ERROR] {e}")
 
@@ -400,6 +504,10 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
         situation = await analyze_situation(ctx_without_situation)
         print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} budget_qualified={active_session.get('budget_qualified') if active_session else 'no_session'}")
+
+        # Inject qualification stage into situation so prompt builder can use it
+        if pre_qual:
+            situation["pre_session_qual_stage"] = pre_qual.get("stage", "")
 
         # Inject tip context into situation so prompt builder can use it
         if pending_tip:
