@@ -2265,6 +2265,15 @@ async def enrich_fan_endpoint(fan_id: str) -> dict:
     return {"status": "ok"}
 
 
+@app.post("/test/inject-message")
+async def test_inject_message(fan_id: str, creator_id: str, content: str) -> dict:
+    """Dev testing only — simulate a fan message without Fansly webhook."""
+    from db.queries import save_message
+    await save_message(fan_id, creator_id, "fan", content, was_ai_suggested=False)
+    await process_incoming_fan_message(fan_id, creator_id, content, auto_mode=True, message_id=None)
+    return {"status": "ok", "fan_id": fan_id, "content": content}
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
