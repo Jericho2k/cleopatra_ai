@@ -931,11 +931,37 @@ async def _verify_ppv_purchase(
             existing_floor = summary.get("price_floor", 0)
             if actual_amount > existing_floor:
                 summary["price_floor"] = int(actual_amount)
+            from datetime import datetime
+            sales_log_row = await asyncio.to_thread(
+                lambda: db.table("fans")
+                .select("sales_log")
+                .eq("id", fan_id)
+                .single()
+                .execute()
+            )
+            sales_log = (sales_log_row.data or {}).get("sales_log") or []
+            sales_log.append({
+                "date": datetime.utcnow().strftime("%d.%m.%Y"),
+                "item": f"PPV media {media_id}",
+                "amount": int(actual_amount),
+                "chatter": "AI",
+            })
+
+            def _calc_tier(spent: int) -> str:
+                if spent >= 500: return "whale"
+                if spent >= 100: return "active"
+                if spent >= 20: return "casual"
+                return "cold"
+
+            new_tier = _calc_tier(new_spent)
+
             await asyncio.to_thread(
                 lambda: db.table("fans").update({
                     "total_spent": new_spent,
                     "pending_ppv_check": None,
                     "ai_summary": summary,
+                    "sales_log": sales_log,
+                    "spend_tier": new_tier,
                 }).eq("id", fan_id).execute()
             )
             # Update session plan item as purchased

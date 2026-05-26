@@ -2323,12 +2323,32 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
     if price > existing_floor:
         summary["price_floor"] = int(price)
 
+    from datetime import datetime
+    # Get existing sales_log
+    sales_log = fan_data.get("sales_log") or []
+    sales_log.append({
+        "date": datetime.utcnow().strftime("%d.%m.%Y"),
+        "item": f"PPV media {media_id}",
+        "amount": int(price),
+        "chatter": "AI",
+    })
+
+    def _calc_tier(spent: int) -> str:
+        if spent >= 500: return "whale"
+        if spent >= 100: return "active"
+        if spent >= 20: return "casual"
+        return "cold"
+
+    new_tier = _calc_tier(new_spent)
+
     # Mark as purchased
     await asyncio.to_thread(
         lambda: db.table("fans").update({
             "total_spent": new_spent,
             "pending_ppv_check": None,
             "ai_summary": summary,
+            "sales_log": sales_log,
+            "spend_tier": new_tier,
         }).eq("id", fan_id).execute()
     )
 
