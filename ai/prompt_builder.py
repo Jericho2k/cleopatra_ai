@@ -355,11 +355,13 @@ Return ONLY a JSON array of 3 strings. No markdown.
         )
     elif pre_qual_stage == "ask_budget":
         user_prompt += (
-            "\n\nPRE-SESSION: You know what they're into. Now naturally find out their budget. "
-            "Don't ask directly — frame it as intimacy: "
-            "'I have a few things saved... depends how deep you want to go tonight 😏' "
-            "or 'I've got something for every mood — what kind of experience are you thinking?' "
-            "Listen for any number or signal they give. DO NOT send content yet."
+            "\n\nPRE-SESSION: You know their kinks. Now find out their budget naturally. "
+            "You MUST get a sense of how much they want to spend before sending anything. "
+            "Frame it as building the right experience for them — not asking for money:\n"
+            "  ✓ 'I have a few things... depends how far you want to go tonight 😏 what are you thinking?'\n"
+            "  ✓ 'I've got something for every mood — are we talking a little taste or the full experience?'\n"
+            "  ✓ 'how much time and... investment are you thinking tonight? 😏'\n"
+            "DO NOT send any content or PPV. Wait for their answer."
         )
 
     if active_session:
