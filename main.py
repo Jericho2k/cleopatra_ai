@@ -2290,6 +2290,65 @@ async def enrich_fan_endpoint(fan_id: str) -> dict:
     return {"status": "ok"}
 
 
+@app.post("/test/simulate-ppv-purchase")
+async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
+    """Dev only — simulate a fan purchasing a pending PPV."""
+    from db.queries import get_fan_session, save_fan_session
+    from datetime import datetime
+
+    db = get_supabase()
+
+    # Get pending PPV check
+    fan_row = await asyncio.to_thread(
+        lambda: db.table("fans")
+        .select("pending_ppv_check, total_spent, active_session, ai_summary")
+        .eq("id", fan_id)
+        .single()
+        .execute()
+    )
+    fan_data = fan_row.data or {}
+    pending = fan_data.get("pending_ppv_check")
+
+    if not pending:
+        return {"status": "error", "message": "No pending PPV check found for this fan"}
+
+    media_id = pending.get("media_id")
+    price = pending.get("price", 0)
+    current_spent = fan_data.get("total_spent") or 0
+    new_spent = current_spent + int(price)
+
+    # Update price floor in ai_summary
+    summary = fan_data.get("ai_summary") or {}
+    existing_floor = summary.get("price_floor", 0)
+    if price > existing_floor:
+        summary["price_floor"] = int(price)
+
+    # Mark as purchased
+    await asyncio.to_thread(
+        lambda: db.table("fans").update({
+            "total_spent": new_spent,
+            "pending_ppv_check": None,
+            "ai_summary": summary,
+        }).eq("id", fan_id).execute()
+    )
+
+    # Update session plan item as purchased
+    session = await get_fan_session(fan_id)
+    if session:
+        for item in session.get("plan", []):
+            if item.get("media_id") == media_id:
+                item["purchased"] = True
+        await save_fan_session(fan_id, session)
+
+    print(f"[TEST] Simulated PPV purchase fan={fan_id} media={media_id} price=${price} new_total=${new_spent}")
+    return {
+        "status": "ok",
+        "media_id": media_id,
+        "price": price,
+        "new_total_spent": new_spent,
+    }
+
+
 @app.post("/test/inject-message")
 async def test_inject_message(fan_id: str, creator_id: str, content: str) -> dict:
     """Dev testing only — simulate a fan message without Fansly webhook."""
