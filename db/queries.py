@@ -227,8 +227,8 @@ async def get_ppv_offers(creator_id: str) -> list[dict]:
             location = row.get("scene_location", "")
             price_min = row.get("price_min") or 15
             price_max = row.get("price_max") or 50
-            # Use midpoint price
-            price = round((price_min + price_max) / 2)
+            # Use lower third of range as default — session planner will set actual price
+            price = round(price_min + (price_max - price_min) * 0.25)
             # Build a natural title from category + scene
             category_labels = {
                 "lingerie_photo": "lingerie photo",
