@@ -2081,10 +2081,14 @@ async def get_my_creators(user_id: str) -> dict:
 async def plan_session(
     creator_id: str,
     fan_id: str,
-    body: dict = None,
+    request: Request,
 ) -> dict:
-    confirmed_kinks = (body or {}).get("confirmed_kinks", [])
-    confirmed_budget = (body or {}).get("budget", None)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    confirmed_kinks = body.get("confirmed_kinks", [])
+    confirmed_budget = body.get("budget", None)
     """
     Called when a sexting session is starting.
     Picks 5-8 vault items ordered by escalating explicitness,
@@ -2132,46 +2136,39 @@ async def plan_session(
     prompt += f"- Already purchased: {len(purchased_ids)} items\n\n"
     prompt += "Available vault content (media_id | details):\n"
     prompt += f"{vault_summary}\n\n"
-    prompt += "Select 6-8 items that would make the best escalating sexting session for this fan.\n"
+    prompt += "Select 5-7 items that make the best escalating sexting session for this fan.\n"
     prompt += "Rules:\n"
-    prompt += "1. ONLY pick items with price > 0 — never pick free teasers\n"
-    prompt += "2. Start with lower explicitness (2-3), escalate to higher (4-5) — save the best for last\n"
-    prompt += f"3. Prefer items matching fan's known kinks: {fan_kinks_str}\n"
-    prompt += "4. Group by scene_id for continuity — avoid jumping between scenes too quickly\n"
-    prompt += "5. Mix good_for values: opener -> mid_session -> closer\n"
-    prompt += "6. Never pick the same scene_id more than 3 times in a row\n"
-    prompt += "7. Content type price ranges (use these to calibrate, not as hard limits):\n"
-    prompt += "   - legs/feet/armpits: $15-70\n"
-    prompt += "   - lingerie photo/bundle: $10-80\n"
-    prompt += "   - lingerie video: $15-90\n"
-    prompt += "   - nude photo: $15-80\n"
-    prompt += "   - striptease video: $15-100\n"
-    prompt += "   - closeup photo/video: $25-130\n"
-    prompt += "   - dirty talk (text/audio/video): $5-50\n"
-    prompt += "   - solo/toy/orgasm video: $30-150\n"
-    prompt += "   - short solo video (<3min): $30-130\n"
-    prompt += "   - long solo video (>3min): $50-200\n"
-    prompt += "   - BG content: $50-300\n"
+    prompt += "1. ONLY pick items with price_min > 0 — never pick free teasers\n"
+    prompt += "2. ESCALATION IS MANDATORY: start explicitness 2, end at 4-5. Save the best for last.\n"
+    prompt += f"3. Match fan kinks where possible: {fan_kinks_str}\n"
+    prompt += "4. Group by scene_id for continuity — max 2 items from same scene in a row\n"
+    prompt += "5. First item MUST have good_for=opener or lowest explicitness available\n"
+    prompt += "6. Last item MUST be highest explicitness in the plan\n"
     if confirmed_budget:
         total = confirmed_budget
-        prompt += f"8. Fan's confirmed session budget: ${total}\n"
-        prompt += f"   - First item: bottom 20% of its type range (cheapest accessible entry point)\n"
+        prompt += f"7. Fan budget: ${total} total for session\n"
+        prompt += f"   - First item: price at bottom 25% of its price range (cheapest entry)\n"
         prompt += f"   - Middle items: mid-range of their type\n"
-        prompt += f"   - Final item: upper range of its type, but total session should not exceed ${total}\n"
-        prompt += f"   - Aim to use 70-90% of their stated budget across the full session\n"
+        prompt += f"   - Last 1-2 items: upper range, but total session cost should be ${round(total * 0.7)}-${total}\n"
+        prompt += f"   - Do NOT exceed ${total} total across all items\n"
     else:
-        prompt += "8. No budget stated — start conservatively at bottom of each content type range, escalate slowly\n"
-        prompt += "   First item should be $10-15 maximum to establish buying habit\n"
+        prompt += f"7. No budget stated. Fan tier: {fan_tier}\n"
+        prompt += "   - First item: MUST be $10-15 max (lingerie photo or similar, explicitness 2-3)\n"
+        prompt += "   - Escalate gradually — no item more than $20 above the previous\n"
+        prompt += "   - Cold tier max per item: $40. Casual tier: $60. Active+: no hard cap\n"
     if price_ceiling:
-        prompt += f"9. HARD LIMIT: never price any item above ${price_ceiling} — fan has declined above this before\n"
+        prompt += f"8. HARD CEILING: never price above ${price_ceiling} — fan declined above this\n"
     elif price_floor:
-        prompt += f"9. Fan has purchased at ${price_floor} before — start at or slightly above that\n"
+        prompt += f"8. Fan has bought at ${price_floor} — start at or just below that\n"
     else:
-        prompt += "9. No purchase history — be conservative, fan's ceiling is unknown\n"
-    prompt += "10. Select AT LEAST 2 explicit items (explicitness 4-5) in the plan\n"
-    prompt += "11. The session arc must feel like an escalating experience — each item should be noticeably better/more explicit than the last\n\n"
-    prompt += "Return ONLY a JSON array of objects:\n"
-    prompt += '[{"media_id":"id","price":25,"reason":"why this fits here","transition":"natural line to say before sending this e.g. \'I actually took this last night...\'"}]'
+        prompt += "8. No purchase history — be conservative\n"
+    prompt += "9. Each item's price MUST be within its price_min-price_max range shown above\n"
+    prompt += "10. For each item write a transition line that sounds like it's happening RIGHT NOW:\n"
+    prompt += "    ✓ 'I was just about to film something actually...'\n"
+    prompt += "    ✓ 'I took this this morning and haven't shown anyone'\n"
+    prompt += "    ✗ NEVER: 'I have this saved' or 'here is some content'\n\n"
+    prompt += "Return ONLY a JSON array:\n"
+    prompt += '[{"media_id":"id","price":15,"reason":"why this fits","transition":"in-the-moment line before sending"}]\n'
 
     response = await client.messages.create(
         model="claude-sonnet-4-20250514",
