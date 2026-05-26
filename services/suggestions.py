@@ -278,6 +278,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         fan_profile = await get_fan_by_id(fan_id)
         if not fan_profile:
             return
+        fan_tier = getattr(fan_profile, "spend_tier", "cold") or "cold"
 
         # Check for a pending tip and clear it atomically before building context
         pending_tip: dict | None = None
@@ -407,29 +408,42 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                     print(f"[QUAL] Kinks confirmed, moving to budget stage for fan={fan_id}")
 
             elif pre_qual and pre_qual.get("stage") == "ask_budget":
-                # Try to extract budget from latest message
-                budget_signals = {
-                    "10": 10, "15": 15, "20": 20, "25": 25, "30": 30,
-                    "40": 40, "50": 50, "100": 100, "not much": 20,
-                    "a little": 15, "whatever": 50, "anything": 50,
-                    "no limit": 100, "don't mind": 50, "don't care": 50,
-                }
-                detected_budget = None
-                msg_lower = latest_message.lower()
-                for signal, amount in budget_signals.items():
-                    if signal in msg_lower:
-                        detected_budget = amount
-                        break
                 import re as _re
-                dollar_match = _re.search(r'\$?(\d+)', latest_message)
+                msg_lower = latest_message.lower()
+                detected_budget = None
+
+                # Check for explicit dollar amounts first
+                dollar_match = _re.search(r'\$?\b(\d+)\b', latest_message)
                 if dollar_match:
                     detected_budget = min(int(dollar_match.group(1)), 300)
 
-                if detected_budget or any(s in msg_lower for s in [
+                # Check for named budget signals
+                if not detected_budget:
+                    budget_signals = {
+                        "not much": 20, "a little": 15, "whatever": 50,
+                        "anything": 50, "no limit": 100, "don't mind": 50,
+                        "don't care": 50, "broke": 15, "tight": 20,
+                    }
+                    for signal, amount in budget_signals.items():
+                        if signal in msg_lower:
+                            detected_budget = amount
+                            break
+
+                # Implicit consent — fan is clearly eager, proceed with conservative default
+                implicit_consent = any(s in msg_lower for s in [
                     "yes", "sure", "okay", "ready", "let's go", "send it",
-                    "show me", "i'm ready", "let's do it",
-                ]):
-                    pre_qual["budget_confirmed"] = detected_budget or 30
+                    "show me", "i'm ready", "let's do it", "send", "please",
+                    "now", "i have to", "i need", "just send", "just show",
+                    "dying", "can't wait", "want to see", "have to see",
+                    "so excited", "so hard", "hurry",
+                ])
+
+                if detected_budget or implicit_consent:
+                    # Use detected budget or fall back to spend-tier default
+                    if not detected_budget:
+                        tier_defaults = {"cold": 30, "casual": 50, "active": 80, "whale": 150}
+                        detected_budget = tier_defaults.get(fan_tier, 30)
+                    pre_qual["budget_confirmed"] = detected_budget
                     pre_qual["stage"] = "ready"
                     await asyncio.to_thread(
                         lambda: get_supabase()
@@ -438,7 +452,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         .eq("id", fan_id)
                         .execute()
                     )
-                    print(f"[QUAL] Budget confirmed=${detected_budget}, planning session for fan={fan_id}")
+                    print(f"[QUAL] Budget confirmed=${detected_budget} (implicit={implicit_consent}) for fan={fan_id}")
 
             if pre_qual and pre_qual.get("stage") == "ready":
                 # All info gathered — plan the session now
