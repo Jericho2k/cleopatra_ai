@@ -63,11 +63,27 @@ async def get_fan_by_id(fan_id: str) -> Fan | None:
 
 async def create_fan(creator_id: str, platform_fan_id: str, display_name: str) -> Fan:
     def _create():
-        r = get_supabase().table("fans").insert({
+        db = get_supabase()
+        creator = (
+            db.table("creators")
+            .select("auto_mode_new_fans")
+            .eq("id", creator_id)
+            .limit(1)
+            .execute()
+        )
+        auto_new = bool((creator.data or [{}])[0].get("auto_mode_new_fans", False))
+
+        row = {
             "creator_id": creator_id,
             "platform_fan_id": platform_fan_id,
             "display_name": display_name,
-        }).execute()
+        }
+        # Only set when the toggle is on, so existing global-fallback behavior
+        # is untouched when it's off (auto_mode stays NULL → falls back to creator.auto_mode).
+        if auto_new:
+            row["auto_mode"] = True
+
+        r = db.table("fans").insert(row).execute()
         return _row_to_fan(r.data[0])
 
     return await asyncio.to_thread(_create)
