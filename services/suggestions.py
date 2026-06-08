@@ -48,6 +48,34 @@ together_client = AsyncOpenAI(
 _pending_auto_replies: dict[str, asyncio.Task] = {}
 
 
+def _fan_wants_content(fan_message: str, situation: dict | None) -> bool:
+    """Detect assisted-mode content intent before building the final prompt."""
+    msg = (fan_message or "").lower()
+    move = (situation or {}).get("strategic_move", "")
+    intent = ((situation or {}).get("fan_intent", "") or "").lower()
+    purchase_signal = (situation or {}).get("purchase_signal", "none")
+    content_terms = [
+        "show me",
+        "send me",
+        "send it",
+        "content",
+        "pic",
+        "photo",
+        "video",
+        "play",
+        "see you",
+        "want to see",
+        "what do you have",
+    ]
+    intent_terms = ["want", "show", "play", "buy", "see", "content", "send", "hot", "sexy"]
+    return (
+        purchase_signal == "ready_to_buy"
+        or move in {"push_for_ppv", "hint_at_content", "build_tension"}
+        or any(term in intent for term in intent_terms)
+        or any(term in msg for term in content_terms)
+    )
+
+
 async def get_suggestions(
     fan_id: str,
     creator_id: str,
@@ -88,6 +116,26 @@ async def get_suggestions(
     )
 
     situation = await analyze_situation(ctx_without_situation)
+
+    # Auto-plan a session if the fan is asking for content and none is active.
+    if not active_session and _fan_wants_content(fan_message, situation):
+        try:
+            async with httpx.AsyncClient() as _hc:
+                plan_resp = await _hc.post(
+                    f"http://localhost:8080/plan-session/{creator_id}/{fan_id}",
+                    timeout=30,
+                )
+            plan_data = plan_resp.json()
+            if plan_data.get("status") == "ok":
+                active_session = plan_data.get("session") or await get_fan_session(fan_id)
+                print(
+                    f"[SESSION] Planned session for fan={fan_id} "
+                    f"items={len((active_session or {}).get('plan', []))}"
+                )
+            else:
+                print(f"[SESSION] plan-session status={plan_data.get('status')} fan={fan_id}")
+        except Exception as e:
+            print(f"[SESSION PLAN ERROR] {e}")
 
     ctx = ConversationContext(
         fan_message=fan_message,
