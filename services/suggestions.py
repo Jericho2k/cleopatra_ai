@@ -259,7 +259,7 @@ async def _update_fan_ai_summary(
 async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
     """Wait for fan to finish typing, then generate and send one reply."""
     try:
-        delay = 8  # TEST MODE — slightly longer to catch fast multi-message fans
+        delay = 20  # TEST MODE — slightly longer to catch fast multi-message fans
         await asyncio.sleep(delay)
 
         situation: dict | None = None  # initialized early — assigned properly later
