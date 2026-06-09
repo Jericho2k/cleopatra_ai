@@ -201,12 +201,6 @@ WELCOME MESSAGE (your opening style):
         fan_context_parts.append(f"What you've told him about yourself:\n{model_note}")
     if kinks:
         fan_context_parts.append(f"Known kinks/interests: {', '.join(kinks)}")
-    price_ceiling = ai_summary.get("price_ceiling")
-    price_floor = ai_summary.get("price_floor")
-    if price_ceiling:
-        fan_context_parts.append(f"💰 Known price ceiling: ${price_ceiling} — never offer above this")
-    if price_floor:
-        fan_context_parts.append(f"💰 Confirmed buyer at: ${price_floor}+")
     if reengagement_triggers:
         fan_context_parts.append(f"Re-engagement triggers: {reengagement_triggers}")
 
@@ -250,47 +244,12 @@ Return ONLY a JSON array of 3 strings. No markdown.
 
     purchase_signal = situation.get("purchase_signal", "none")
 
-    # Pre-session qualification state instructions
-    pre_qual = situation.get("pre_session_qual") if situation else None
-    if not pre_qual:
-        fan_pre_qual = getattr(fan, 'pre_session_qual', None)
-        pre_qual = fan_pre_qual
-
-    pre_qual_stage = (situation or {}).get("pre_session_qual_stage", "")
-
-    if pre_qual_stage == "ask_kinks":
-        user_prompt += (
-            "\n\nPRE-SESSION: Fan is ready to play. Before sending any content, "
-            "find out what they're into. Ask directly and naturally — "
-            "'so what are you actually into? 😏' or 'any specific things that get you going?' "
-            "If they're vague, give options based on what you have: "
-            "'do you like lingerie, more explicit stuff, or something else?' "
-            "DO NOT mention prices or send any content yet."
-        )
-    elif pre_qual_stage == "ask_budget":
-        user_prompt += (
-            "\n\nPRE-SESSION: You know their kinks. Now find out their budget naturally. "
-            "You MUST get a sense of how much they want to spend before sending anything. "
-            "Frame it as building the right experience for them — not asking for money:\n"
-            "  ✓ 'I have a few things... depends how far you want to go tonight 😏 what are you thinking?'\n"
-            "  ✓ 'I've got something for every mood — are we talking a little taste or the full experience?'\n"
-            "  ✓ 'how much time and... investment are you thinking tonight? 😏'\n"
-            "DO NOT send any content or PPV. Wait for their answer."
-        )
-
     if active_session:
         plan = active_session.get("plan", [])
         idx = active_session.get("current_index", 0)
         remaining = [p for p in plan[idx:] if not p.get("sent")]
 
-        if not active_session.get("budget_qualified"):
-            user_prompt += (
-                "\n\nSEXTING SESSION READY — but DO NOT send any content yet. "
-                "Tease that you have something special. Build anticipation. "
-                "Only ask if they're free/private if it hasn't already come up in conversation. "
-                "DO NOT mention any prices yet."
-            )
-        elif active_session.get("post_ppv_cooldown"):
+        if active_session.get("post_ppv_cooldown"):
             messages_left = active_session.get("cooldown_messages_remaining", 2)
             user_prompt += (
                 f"\n\nPOST-PPV COOLDOWN ({messages_left} exchanges remaining): "
@@ -301,7 +260,7 @@ Return ONLY a JSON array of 3 strings. No markdown.
         fan_msg_count = len([m for m in ctx.conversation_history if m.role == "fan"])
         session_started_at_msg = active_session.get("started_at_fan_msg_count", 0)
         msgs_since_session = fan_msg_count - session_started_at_msg
-        should_force_send = msgs_since_session >= 3 and remaining and active_session.get("budget_qualified")
+        should_force_send = msgs_since_session >= 3 and remaining
 
         if should_force_send or (purchase_signal == "ready_to_buy" and remaining):
             next_item = remaining[0]

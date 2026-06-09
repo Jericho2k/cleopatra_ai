@@ -48,32 +48,26 @@ together_client = AsyncOpenAI(
 _pending_auto_replies: dict[str, asyncio.Task] = {}
 
 
-def _fan_wants_content(fan_message: str, situation: dict | None) -> bool:
-    """Detect assisted-mode content intent before building the final prompt."""
-    msg = (fan_message or "").lower()
-    move = (situation or {}).get("strategic_move", "")
-    intent = ((situation or {}).get("fan_intent", "") or "").lower()
-    purchase_signal = (situation or {}).get("purchase_signal", "none")
-    content_terms = [
-        "show me",
-        "send me",
-        "send it",
-        "content",
-        "pic",
-        "photo",
-        "video",
-        "play",
-        "see you",
-        "want to see",
-        "what do you have",
-    ]
-    intent_terms = ["want", "show", "play", "buy", "see", "content", "send", "hot", "sexy"]
-    return (
-        purchase_signal == "ready_to_buy"
-        or move in {"push_for_ppv", "hint_at_content", "build_tension"}
-        or any(term in intent for term in intent_terms)
-        or any(term in msg for term in content_terms)
-    )
+_CONTENT_REQUEST_RE = re.compile(
+    r"\b(want(?:ed|s)?\s+(?:to\s+)?see|wanna\s+see|can\s+i\s+see|see\s+more|more\s+of\s+(?:you|u)|"
+    r"show\s+me|send\s+(?:me\s+)?(?:some|a|your|more|pics?|pictures?|vids?|videos?|content|nudes?)|"
+    r"what\s+(?:do\s+)?(?:you|u)\s+(?:have|got|sell)|let'?s\s+play|wanna\s+play|"
+    r"turn(?:s|ed)?\s+me\s+on|so\s+(?:hard|horny)|jerk(?:ing)?\s+off|touch(?:ing)?\s+myself)\b",
+    re.IGNORECASE,
+)
+
+
+def _fan_wants_content(message, situation):
+    if _CONTENT_REQUEST_RE.search((message or "").lower()):
+        return True
+    if situation:
+        if (situation.get("strategic_move") or "").lower() in {
+            "push_for_ppv",
+            "hint_at_content",
+            "build_tension",
+        }:
+            return True
+    return False
 
 
 async def get_suggestions(
@@ -364,180 +358,6 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         similar_exchanges = await find_similar_exchanges(latest_message, creator_id, enabled=False)
         conversation_stage = classify_stage(conversation_history, fan_profile)
 
-        # Budget qualification gate (NOW safe — latest_message exists)
-        if active_session and not active_session.get("budget_qualified"):
-            budget_signals = [
-                "i have", "i got", "budget", "i can spend", "how much",
-                "what's the cheapest", "i'll pay", "send me", "i want to buy",
-                "let's do", "let's play", "yes", "sure", "okay", "yeah",
-                "i can't wait", "cant wait", "show me", "show it", "send it",
-                "please", "i'm ready", "im ready", "so ready",
-                "stop teasing", "please send", "i want it", "give it to me",
-            ]
-            if any(s in latest_message.lower() for s in budget_signals):
-                active_session["budget_qualified"] = True
-                await save_fan_session(fan_id, active_session)
-                print(f"[SESSION] Fan budget-qualified for fan={fan_id}")
-
-        # Pre-session qualification state machine
-        pre_qual = None
-        if not active_session:
-            # Check if we have a qualification in progress
-            db_qual = await asyncio.to_thread(
-                lambda: get_supabase()
-                .table("fans")
-                .select("pre_session_qual")
-                .eq("id", fan_id)
-                .single()
-                .execute()
-            )
-            pre_qual = (db_qual.data or {}).get("pre_session_qual") or {}
-
-            move = situation.get("strategic_move", "") if situation else ""
-            fan_intent = situation.get("fan_intent", "").lower() if situation else ""
-            purchase_sig = situation.get("purchase_signal", "none") if situation else "none"
-            fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
-
-            session_triggers = ["push_for_ppv", "hint_at_content", "build_tension"]
-            intent_triggers = ["want", "show", "play", "buy", "see", "send", "stroke", "touch", "hard", "excited"]
-            has_intent = (
-                fan_msg_count >= 5 and (
-                    purchase_sig in ("ready_to_buy",)
-                    or move in session_triggers
-                    or any(t in fan_intent for t in intent_triggers)
-                    or any(t in latest_message.lower() for t in [
-                        "let's play", "show me", "i want to see", "send me",
-                        "send it", "send something", "stroke", "touch myself",
-                        "get off", "so hard", "i want u", "i want you",
-                    ])
-                )
-            )
-
-            if has_intent and not pre_qual:
-                # Start qualification — mark intent detected, kinks not yet confirmed
-                pre_qual = {
-                    "stage": "ask_kinks",
-                    "kinks_confirmed": [],
-                    "budget_confirmed": None,
-                    "started_at_msg": fan_msg_count,
-                }
-                await asyncio.to_thread(
-                    lambda: get_supabase()
-                    .table("fans")
-                    .update({"pre_session_qual": pre_qual})
-                    .eq("id", fan_id)
-                    .execute()
-                )
-                print(f"[QUAL] Started pre-session qualification for fan={fan_id}")
-
-            elif pre_qual and pre_qual.get("stage") == "ask_kinks":
-                # Try to extract kinks from latest message
-                kink_confirmed = situation.get("personal_details_mentioned", []) if situation else []
-                if kink_confirmed or any(t in latest_message.lower() for t in [
-                    "tits", "ass", "feet", "legs", "pussy", "solo", "toy", "lingerie",
-                    "striptease", "blowjob", "anal", "dominant", "submissive", "outdoor",
-                    "everything", "all", "anything", "whatever you have",
-                ]):
-                    # Kinks gathered — move to budget stage
-                    existing_kinks = pre_qual.get("kinks_confirmed", [])
-                    new_kinks = list(set(existing_kinks + [latest_message[:100]]))
-                    pre_qual["kinks_confirmed"] = new_kinks
-                    pre_qual["stage"] = "ask_budget"
-                    await asyncio.to_thread(
-                        lambda: get_supabase()
-                        .table("fans")
-                        .update({"pre_session_qual": pre_qual})
-                        .eq("id", fan_id)
-                        .execute()
-                    )
-                    print(f"[QUAL] Kinks confirmed, moving to budget stage for fan={fan_id}")
-
-            elif pre_qual and pre_qual.get("stage") == "ask_budget":
-                import re as _re
-                msg_lower = latest_message.lower()
-                detected_budget = None
-
-                # Check for explicit dollar amounts first
-                dollar_match = _re.search(r'\$?\b(\d+)\b', latest_message)
-                if dollar_match:
-                    detected_budget = min(int(dollar_match.group(1)), 300)
-
-                # Check for named budget signals
-                if not detected_budget:
-                    budget_signals = {
-                        "not much": 20, "a little": 15, "whatever": 50,
-                        "anything": 50, "no limit": 100, "don't mind": 50,
-                        "don't care": 50, "broke": 15, "tight": 20,
-                    }
-                    for signal, amount in budget_signals.items():
-                        if signal in msg_lower:
-                            detected_budget = amount
-                            break
-
-                # Implicit consent — fan is clearly eager, proceed with conservative default
-                implicit_consent = any(s in msg_lower for s in [
-                    "yes", "sure", "okay", "ready", "let's go", "send it",
-                    "show me", "i'm ready", "let's do it", "send", "please",
-                    "now", "i have to", "i need", "just send", "just show",
-                    "dying", "can't wait", "want to see", "have to see",
-                    "so excited", "so hard", "hurry",
-                ])
-
-                if detected_budget or implicit_consent:
-                    # Use detected budget or fall back to spend-tier default
-                    if not detected_budget:
-                        tier_defaults = {"cold": 30, "casual": 50, "active": 80, "whale": 150}
-                        detected_budget = tier_defaults.get(fan_tier, 30)
-                    pre_qual["budget_confirmed"] = detected_budget
-                    pre_qual["stage"] = "ready"
-                    await asyncio.to_thread(
-                        lambda: get_supabase()
-                        .table("fans")
-                        .update({"pre_session_qual": pre_qual})
-                        .eq("id", fan_id)
-                        .execute()
-                    )
-                    print(f"[QUAL] Budget confirmed=${detected_budget} (implicit={implicit_consent}) for fan={fan_id}")
-
-            if pre_qual and pre_qual.get("stage") == "ready":
-                # All info gathered — plan the session now
-                confirmed_kinks = pre_qual.get("kinks_confirmed", [])
-                confirmed_budget = pre_qual.get("budget_confirmed", 30)
-                try:
-                    import httpx as _httpx
-                    async with _httpx.AsyncClient() as _hc:
-                        plan_resp = await _hc.post(
-                            f"http://localhost:8080/plan-session/{creator_id}/{fan_id}",
-                            json={
-                                "confirmed_kinks": confirmed_kinks,
-                                "budget": confirmed_budget,
-                            },
-                            timeout=30,
-                        )
-                        plan_data = plan_resp.json()
-                        if plan_data.get("status") == "ok":
-                            active_session = plan_data.get("session")
-                            if not active_session:
-                                active_session = await get_fan_session(fan_id)
-                            if active_session:
-                                fan_msg_count_now = len([m for m in conversation_history if m.role == "fan"])
-                                active_session["started_at_fan_msg_count"] = fan_msg_count_now
-                                active_session["budget_qualified"] = True
-                                await save_fan_session(fan_id, active_session)
-                            # Clear qualification state
-                            await asyncio.to_thread(
-                                lambda: get_supabase()
-                                .table("fans")
-                                .update({"pre_session_qual": None})
-                                .eq("id", fan_id)
-                                .execute()
-                            )
-                            print(f"[SESSION] Planned with kinks={confirmed_kinks} budget=${confirmed_budget} items={len((active_session or {}).get('plan', []))}")
-                        else:
-                            print(f"[SESSION] plan-session returned status={plan_data.get('status')} fan={fan_id}")
-                except Exception as e:
-                    print(f"[SESSION PLAN ERROR] {e}")
-
         # Decrement post-PPV cooldown counter on each fan message
         if active_session and active_session.get("post_ppv_cooldown"):
             remaining = active_session.get("cooldown_messages_remaining", 0) - 1
@@ -564,11 +384,20 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         )
 
         situation = await analyze_situation(ctx_without_situation)
-        print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} budget_qualified={active_session.get('budget_qualified') if active_session else 'no_session'}")
+        print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')}")
 
-        # Inject qualification stage into situation so prompt builder can use it
-        if pre_qual:
-            situation["pre_session_qual_stage"] = pre_qual.get("stage", "")
+        # Plan a content set when the fan clearly asks to see/buy content. No budget gate.
+        if not active_session and _fan_wants_content(latest_message, situation):
+            try:
+                from main import plan_session
+                plan_data = await plan_session(creator_id, fan_id)
+                if plan_data.get("status") == "ok":
+                    active_session = plan_data.get("session") or await get_fan_session(fan_id)
+                    print(f"[SESSION] Planned for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
+                else:
+                    print(f"[SESSION] plan-session status={plan_data.get('status')} fan={fan_id}")
+            except Exception as e:
+                print(f"[SESSION PLAN ERROR] {e}")
 
         # Inject tip context into situation so prompt builder can use it
         if pending_tip:
@@ -663,24 +492,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                             await save_fan_session(fan_id, session)
                             print(f"[SESSION] Declined ${declined_price} — surfaced cheaper item ${cheaper.get('price')} for fan={fan_id}")
                         else:
-                            # No cheaper item available — log ceiling and clear session
-                            fan_profile_row = await asyncio.to_thread(
-                                lambda: get_supabase().table("fans")
-                                .select("ai_summary")
-                                .eq("id", fan_id)
-                                .single()
-                                .execute()
-                            )
-                            summary = (fan_profile_row.data or {}).get("ai_summary") or {}
-                            # Store ceiling as just below the declined price
-                            summary["price_ceiling"] = round(float(declined_price) * 0.8)
-                            await asyncio.to_thread(
-                                lambda: get_supabase().table("fans")
-                                .update({"ai_summary": summary})
-                                .eq("id", fan_id)
-                                .execute()
-                            )
-                            print(f"[SESSION] No cheaper items — stored price_ceiling=${summary['price_ceiling']} for fan={fan_id}")
+                            pass
                 except Exception as e:
                     print(f"[SESSION DECLINE HANDLER ERROR] {e}")
 
@@ -975,9 +787,6 @@ async def _verify_ppv_purchase(
                 .execute()
             )
             summary = (fan_summary_row.data or {}).get("ai_summary") or {}
-            existing_floor = summary.get("price_floor", 0)
-            if actual_amount > existing_floor:
-                summary["price_floor"] = int(actual_amount)
             from datetime import datetime
             sales_log_row = await asyncio.to_thread(
                 lambda: db.table("fans")

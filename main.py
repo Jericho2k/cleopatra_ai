@@ -2081,14 +2081,16 @@ async def get_my_creators(user_id: str) -> dict:
 async def plan_session(
     creator_id: str,
     fan_id: str,
-    request: Request,
+    request: Request = None,
 ) -> dict:
-    try:
-        body = await request.json()
-    except Exception:
+    if request is not None:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+    else:
         body = {}
     confirmed_kinks = body.get("confirmed_kinks", [])
-    confirmed_budget = body.get("budget", None)
     """
     Called when a sexting session is starting.
     Picks 5-8 vault items ordered by escalating explicitness,
@@ -2304,11 +2306,7 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
     current_spent = fan_data.get("total_spent") or 0
     new_spent = current_spent + int(price)
 
-    # Update price floor in ai_summary
     summary = fan_data.get("ai_summary") or {}
-    existing_floor = summary.get("price_floor", 0)
-    if price > existing_floor:
-        summary["price_floor"] = int(price)
 
     from datetime import datetime
     # Get existing sales_log
