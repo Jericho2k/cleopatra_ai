@@ -2108,109 +2108,95 @@ async def plan_session(
         kinks = fan.ai_summary.get("kinks", [])
 
     vault = await get_vault_for_session(creator_id, fan_kinks=kinks, exclude_media_ids=exclude, min_explicitness=2)
-    print(f"[SESSION PLAN] creator={creator_id} fan={fan_id} vault_items={len(vault)}")
     if not vault:
-        return {"status": "no_content"}
+        return {"status": "no_content", "session": None}
 
-    from anthropic import AsyncAnthropic
+    from db.queries import build_scenes
+    scenes = build_scenes(vault, min_items=2)
+    if not scenes:
+        return {"status": "no_content", "session": None}
 
-    client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    vault_summary = "\n".join(
-        [
-            f"[{i['media_id']}] cat={i['category']} explicit={i['explicitness']} scene={i['scene_id']} good_for={i['good_for']} price=${i['price_min']}-${i['price_max']} desc={i['description'][:80]}"
-            for i in vault[:80]
-        ]
+    # Summarize SCENES (not loose items) for the model — ~19 lines, not 80.
+    scene_summary = "\n".join(
+        f"[{i}] {s['location'] or 'misc'} / {s['outfit'] or 'n/a'} | "
+        f"{s['count']} items | explicit {s['explicit_min']}-{s['explicit_max']} | "
+        f"{', '.join(s['categories'])}"
+        for i, s in enumerate(scenes)
     )
 
     fan_kinks_str = ", ".join(kinks) if kinks else "unknown"
-    fan_spent = fan.total_spent if fan else 0
     fan_tier = fan.spend_tier if fan else "cold"
-    ai_summary = (fan.ai_summary or {}) if fan else {}
-    price_ceiling = ai_summary.get("price_ceiling")
-    price_floor = ai_summary.get("price_floor")
-    prompt = ""
-    prompt += "You are planning a sexting content session for an OnlyFans fan.\n\n"
-    prompt += "Fan profile:\n"
-    prompt += f"- Total spent: ${fan_spent} ({fan_tier} tier)\n"
-    prompt += f"- Known kinks/interests: {fan_kinks_str}\n"
-    prompt += f"- Already sent (not purchased): {len(sent_ids - purchased_ids)} items\n"
-    prompt += f"- Already purchased: {len(purchased_ids)} items\n\n"
-    prompt += "Available vault content (media_id | details):\n"
-    prompt += f"{vault_summary}\n\n"
-    prompt += "Select 5-7 items that make the best escalating sexting session for this fan.\n"
-    prompt += "Rules:\n"
-    prompt += "1. ONLY pick items with price_min > 0 — never pick free teasers\n"
-    prompt += "2. ESCALATION IS MANDATORY: start explicitness 2, end at 4-5. Save the best for last.\n"
-    prompt += f"3. Match fan kinks where possible: {fan_kinks_str}\n"
-    prompt += "4. Group by scene_id for continuity — max 2 items from same scene in a row\n"
-    prompt += "5. First item MUST have good_for=opener or lowest explicitness available\n"
-    prompt += "6. Last item MUST be highest explicitness in the plan\n"
-    if confirmed_budget:
-        total = confirmed_budget
-        prompt += f"7. Fan budget: ${total} total for session\n"
-        prompt += f"   - First item: price at bottom 25% of its price range (cheapest entry)\n"
-        prompt += f"   - Middle items: mid-range of their type\n"
-        prompt += f"   - Last 1-2 items: upper range, but total session cost should be ${round(total * 0.7)}-${total}\n"
-        prompt += f"   - Do NOT exceed ${total} total across all items\n"
-    else:
-        prompt += f"7. No budget stated. Fan tier: {fan_tier}\n"
-        prompt += "   - First item: MUST be $10-15 max (lingerie photo or similar, explicitness 2-3)\n"
-        prompt += "   - Escalate gradually — no item more than $20 above the previous\n"
-        prompt += "   - Cold tier max per item: $40. Casual tier: $60. Active+: no hard cap\n"
-    if price_ceiling:
-        prompt += f"8. HARD CEILING: never price above ${price_ceiling} — fan declined above this\n"
-    elif price_floor:
-        prompt += f"8. Fan has bought at ${price_floor} — start at or just below that\n"
-    else:
-        prompt += "8. No purchase history — be conservative\n"
-    prompt += "9. Each item's price MUST be within its price_min-price_max range shown above\n"
-    prompt += "10. For each item write a transition line that sounds like it's happening RIGHT NOW:\n"
-    prompt += "    ✓ 'I was just about to film something actually...'\n"
-    prompt += "    ✓ 'I took this this morning and haven't shown anyone'\n"
-    prompt += "    ✗ NEVER: 'I have this saved' or 'here is some content'\n\n"
-    prompt += "Return ONLY a JSON array:\n"
-    prompt += '[{"media_id":"id","price":15,"reason":"why this fits","transition":"in-the-moment line before sending"}]\n'
+
+    from anthropic import AsyncAnthropic
+    client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+    prompt = (
+        "You are planning a content set to send an adult-content fan who just asked to see more.\n\n"
+        f"Fan interests/kinks: {fan_kinks_str}\n"
+        f"Fan spend tier: {fan_tier}\n\n"
+        "Each option below is a COHERENT SET from one photoshoot — same outfit, same location, "
+        "internally consistent. You are choosing ONE set that best fits this fan, plus how many "
+        "images to bundle.\n\n"
+        f"Available sets:\n{scene_summary}\n\n"
+        "Pick the single best set. Rules:\n"
+        "- Match the fan's stated interests where possible.\n"
+        "- Prefer a set with a real explicitness range (so the bundle can escalate).\n"
+        "- bundle_size: 3 for cold/casual tier, 3-4 for active/whale.\n\n"
+        'Return ONLY JSON: {"scene_index": 0, "bundle_size": 3, "reason": "short why"}'
+    )
 
     response = await client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=1000,
+        max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )
-
     content = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
 
     try:
-        plan = _json.loads(content)
-        vault_by_id = {i["media_id"]: i for i in vault}
-        enriched = []
-        for item in plan:
-            mid = item.get("media_id", "")
-            vault_item = vault_by_id.get(mid, {})
-            enriched.append(
-                {
-                    "media_id": mid,
-                    "price": item.get("price", vault_item.get("price_min", 15)),
-                    "reason": item.get("reason", ""),
-                    "transition": item.get("transition", ""),
-                    "category": vault_item.get("category", ""),
-                    "description": vault_item.get("description", ""),
-                    "scene_id": vault_item.get("scene_id", ""),
-                    "is_video": vault_item.get("is_video", False),
-                    "sent": False,
-                    "purchased": False,
-                }
-            )
+        choice = _json.loads(content)
+        idx = int(choice.get("scene_index", 0))
+        idx = idx if 0 <= idx < len(scenes) else 0
+        bundle_size = max(2, min(int(choice.get("bundle_size", 3)), 4))
+        chosen = scenes[idx]
+
+        # Build the bundle DETERMINISTICALLY from the chosen scene: spread across the
+        # explicitness range so it escalates, all from the same shoot = consistent.
+        items = chosen["items"]  # already sorted low->high explicitness
+        if len(items) <= bundle_size:
+            bundle = items
+        else:
+            step = (len(items) - 1) / (bundle_size - 1)
+            bundle = [items[round(k * step)] for k in range(bundle_size)]
+
+        # One PPV price for the whole bundle, scaled to tier.
+        tier_base = {"whale": 1.4, "active": 1.1, "casual": 0.9, "cold": 0.8}.get(fan_tier, 0.9)
+        top_item = bundle[-1]
+        bundle_price = int(max(top_item.get("price_min", 15),
+                               round(top_item.get("price_max", 40) * tier_base / 5) * 5))
+
+        plan_item = {
+            "media_ids": [b["media_id"] for b in bundle],
+            "media_id": bundle[0]["media_id"],  # back-compat for single-id paths
+            "price": bundle_price,
+            "scene_key": chosen["scene_key"],
+            "location": chosen["location"],
+            "outfit": chosen["outfit"],
+            "reason": choice.get("reason", ""),
+            "description": f"{chosen['location']} / {chosen['outfit']} set ({len(bundle)} pcs)",
+            "is_video": any(b.get("is_video") for b in bundle),
+            "sent": False,
+            "purchased": False,
+        }
 
         session = {
-            "plan": enriched,
+            "plan": [plan_item],
             "current_index": 0,
             "started_at": __import__("datetime").datetime.utcnow().isoformat(),
             "fan_kinks": kinks,
-            "budget_qualified": False,
-            "post_ppv_cooldown": False,
-            "cooldown_messages_remaining": 0,
+            "scene_key": chosen["scene_key"],
         }
         await save_fan_session(fan_id, session)
+        print(f"[SESSION] scene={chosen['scene_key']} bundle={len(bundle)} price=${bundle_price}")
         return {"status": "ok", "session": session}
 
     except Exception as e:
