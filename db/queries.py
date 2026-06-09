@@ -1,6 +1,7 @@
 """All database reads and writes. No AI logic."""
 
 import asyncio
+from collections import Counter
 from datetime import datetime
 
 from core.supabase import get_supabase
@@ -290,7 +291,7 @@ async def get_vault_for_session(
         r = (
             get_supabase()
             .table("creator_vault_media")
-            .select("id, fansly_media_id, ai_description, content_category, price_min, price_max, explicitness_level, good_for, scene_id, scene_location, scene_outfit, scene_lighting, tags, filename, mimetype")
+            .select("id, fansly_media_id, ai_description, content_category, price_min, price_max, explicitness_level, good_for, scene_id, scene_location, scene_outfit, scene_lighting, tags, filename, mimetype, album_title")
             .eq("creator_id", creator_id)
             .neq("content_category", "")
             .neq("content_category", "other")
@@ -319,11 +320,57 @@ async def get_vault_for_session(
                 "scene_id": row.get("scene_id", ""),
                 "scene_location": row.get("scene_location", ""),
                 "scene_outfit": row.get("scene_outfit", ""),
+                "album_title": row.get("album_title", ""),
                 "tags": row.get("tags") or [],
                 "is_video": (row.get("mimetype") or "").startswith("video"),
             })
         return items
     return await asyncio.to_thread(_get)
+
+
+def _scene_key(item: dict) -> str:
+    """One shoot = one key. Priority: creator's own album folder, then the
+    classifier's scene_id, then a location+outfit signature as last resort."""
+    album = (item.get("album_title") or "").strip()
+    if album and not album.lower().startswith("album_"):   # named folder = a real shoot
+        return f"album:{album.lower()}"
+    sid = (item.get("scene_id") or "").strip().lower()
+    if sid and sid != "unknown":
+        return f"scene:{sid}"
+    loc = (item.get("scene_location") or "unknown").strip().lower()
+    outfit = (item.get("scene_outfit") or "unknown").strip().lower()
+    return f"sig:{loc}|{outfit}"
+
+
+def _mode(values: list[str]) -> str:
+    vals = [v for v in values if v and v != "unknown"]
+    return Counter(vals).most_common(1)[0][0] if vals else ""
+
+
+def build_scenes(vault_items: list[dict], min_items: int = 2) -> list[dict]:
+    """Group flat vault items into coherent scenes (one shoot each), each
+    internally ordered low -> high explicitness."""
+    groups: dict[str, list[dict]] = {}
+    for it in vault_items:
+        groups.setdefault(_scene_key(it), []).append(it)
+
+    scenes = []
+    for key, items in groups.items():
+        if len(items) < min_items:
+            continue
+        items.sort(key=lambda x: x.get("explicitness", 3))
+        scenes.append({
+            "scene_key": key,
+            "location": _mode([i.get("scene_location") for i in items]),
+            "outfit": _mode([i.get("scene_outfit") for i in items]),
+            "categories": sorted({i.get("category", "") for i in items if i.get("category")}),
+            "explicit_min": items[0].get("explicitness", 3),
+            "explicit_max": items[-1].get("explicitness", 3),
+            "count": len(items),
+            "items": items,
+        })
+    scenes.sort(key=lambda s: (s["explicit_max"], s["count"]), reverse=True)
+    return scenes
 
 
 async def get_fan_session(fan_id: str) -> dict | None:

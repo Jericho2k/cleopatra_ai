@@ -2379,6 +2379,22 @@ async def test_inject_message(fan_id: str, creator_id: str, content: str) -> dic
     return {"status": "ok", "fan_id": fan_id, "content": content}
 
 
+@app.get("/debug-scenes/{creator_id}")
+async def debug_scenes(creator_id: str) -> dict:
+    from db.queries import get_vault_for_session, build_scenes
+    vault = await get_vault_for_session(creator_id, min_explicitness=2)
+    scenes = build_scenes(vault)
+    return {
+        "total_items": len(vault),
+        "scene_count": len(scenes),
+        "scenes": [
+            {k: s[k] for k in ("scene_key", "location", "outfit",
+                               "explicit_min", "explicit_max", "count", "categories")}
+            for s in scenes
+        ],
+    }
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"status": "ok"}
