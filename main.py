@@ -2108,8 +2108,9 @@ async def plan_session(
         kinks = fan.ai_summary.get("kinks", [])
 
     vault = await get_vault_for_session(creator_id, fan_kinks=kinks, exclude_media_ids=exclude, min_explicitness=2)
+    print(f"[SESSION PLAN] creator={creator_id} fan={fan_id} vault_items={len(vault)}")
     if not vault:
-        return {"status": "no_content", "session": None}
+        return {"status": "no_content"}
 
     from anthropic import AsyncAnthropic
 

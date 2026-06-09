@@ -128,12 +128,9 @@ async def get_suggestions(
             plan_data = plan_resp.json()
             if plan_data.get("status") == "ok":
                 active_session = plan_data.get("session") or await get_fan_session(fan_id)
-                print(
-                    f"[SESSION] Planned session for fan={fan_id} "
-                    f"items={len((active_session or {}).get('plan', []))}"
-                )
+                print(f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
             else:
-                print(f"[SESSION] plan-session status={plan_data.get('status')} fan={fan_id}")
+                print(f"[SESSION] plan-session returned status={plan_data.get('status')} fan={fan_id}")
         except Exception as e:
             print(f"[SESSION PLAN ERROR] {e}")
 
@@ -536,6 +533,8 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                                 .execute()
                             )
                             print(f"[SESSION] Planned with kinks={confirmed_kinks} budget=${confirmed_budget} items={len((active_session or {}).get('plan', []))}")
+                        else:
+                            print(f"[SESSION] plan-session returned status={plan_data.get('status')} fan={fan_id}")
                 except Exception as e:
                     print(f"[SESSION PLAN ERROR] {e}")
 
