@@ -583,9 +583,20 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 text_out = part[: ppv_match.start()].strip()
                 media_id = ppv_match.group(1)
                 price = float(ppv_match.group(2))
+
+                # If a session is active, send the whole bundle, not just the tagged id.
+                media_ids = [media_id]
+                if active_session:
+                    plan = active_session.get("plan", [])
+                    idx = active_session.get("current_index", 0)
+                    if idx < len(plan) and plan[idx].get("media_ids"):
+                        media_ids = plan[idx]["media_ids"]
+                        media_id = media_ids[0]
+
                 ppv_media_context = {
                     "ppv": {
-                        "media_id": media_id,
+                        "media_ids": media_ids,
+                        "media_id": media_id,   # representative / back-compat
                         "price": price,
                         "access_type": "ppv",
                     }
@@ -659,7 +670,8 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                             },
                             json={
                                 "content": ppv_content,
-                                "mediaId": media_id,
+                                "mediaIds": media_ids,   # bundle — confirm apifansly's multi-media field name later
+                                "mediaId": media_id,     # fallback for single-media
                                 "access_type": "ppv",
                                 "price": price,
                             },
