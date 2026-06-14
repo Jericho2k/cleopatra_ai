@@ -3,6 +3,8 @@
 > Built for OFM agencies that refuse to sound like a bot.
 
 ---
+## System preview
+https://github.com/user-attachments/assets/5475aaf4-2740-4edf-be70-e660df086fc3
 
 ## What it does
 
