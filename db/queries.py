@@ -1,7 +1,6 @@
 """All database reads and writes. No AI logic."""
 
 import asyncio
-import math
 from collections import Counter
 from datetime import datetime
 
@@ -433,8 +432,8 @@ def propose_sets(vault_items, max_per_set=6, min_per_set=3, min_level=2):
             if len(bucket) < min_per_set:
                 continue
             n = len(bucket)
-            num = max(1, math.ceil(n / max_per_set))
-            size = math.ceil(n / num)
+            num = max(1, -(-n // max_per_set))
+            size = -(-n // num)
             chunks = [bucket[i:i + size] for i in range(0, n, size)]
             for ci, chunk in enumerate(chunks):
                 if len(chunk) < 2:
