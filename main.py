@@ -2372,7 +2372,7 @@ async def generate_sets(creator_id: str) -> dict:
     while True:
         rows = await asyncio.to_thread(
             lambda p=page: db.table("creator_vault_media")
-            .select("fansly_media_id, content_category, explicitness_level, scene_id, scene_location, scene_outfit, album_title, mimetype, price_min, price_max")
+            .select("fansly_media_id, content_category, explicitness_level, scene_id, scene_location, scene_outfit, album_title, mimetype, price_min, price_max, tags, good_for")
             .eq("creator_id", creator_id)
             .range(p * 1000, p * 1000 + 999)
             .execute()
@@ -2396,7 +2396,8 @@ async def generate_sets(creator_id: str) -> dict:
         "title": s["title"], "location": s["location"], "outfit": s["outfit"],
         "explicit_min": s["explicit_min"], "explicit_max": s["explicit_max"],
         "media_ids": s["media_ids"], "preview_media_id": s["preview_media_id"],
-        "suggested_price": s["suggested_price"], "status": "draft", "source": "ai",
+        "suggested_price": s["suggested_price"], "tags": s["tags"],
+        "status": "draft", "source": "ai",
     } for s in proposed]
 
     inserted = 0

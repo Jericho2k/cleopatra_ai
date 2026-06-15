@@ -1,6 +1,7 @@
 """All database reads and writes. No AI logic."""
 
 import asyncio
+import math
 from collections import Counter
 from datetime import datetime
 
@@ -386,10 +387,30 @@ def _set_key_coarse(item: dict) -> str:
     return ""   # no reliable shoot signal -> leave for manual, don't fake a set
 
 
-def propose_sets(vault_items: list[dict], min_items: int = 3) -> list[dict]:
-    groups: dict[str, list[dict]] = {}
+def _collect_tags(items, limit=8):
+    seen = []
+    for it in items:
+        vals = []
+        cc = (it.get("content_category") or "").strip().lower()
+        if cc: vals.append(cc)
+        for t in (it.get("tags") or []):
+            t = (t or "").strip().lower()
+            if t: vals.append(t)
+        gf = it.get("good_for")
+        if isinstance(gf, list):
+            vals += [(g or "").strip().lower() for g in gf]
+        elif isinstance(gf, str) and gf.strip():
+            vals.append(gf.strip().lower())
+        for v in vals:
+            if v and v not in _JUNK_META and v not in seen:
+                seen.append(v)
+    return seen[:limit]
+
+
+def propose_sets(vault_items, max_per_set=6, min_per_set=3, min_level=2):
+    groups = {}
     for it in vault_items:
-        if (it.get("mimetype") or "").startswith("video"):   # photos only
+        if (it.get("mimetype") or "").startswith("video"):
             continue
         key = _set_key_coarse(it)
         if not key:
@@ -398,31 +419,44 @@ def propose_sets(vault_items: list[dict], min_items: int = 3) -> list[dict]:
 
     sets = []
     for key, items in groups.items():
-        if len(items) < min_items:
-            continue
-        items.sort(key=lambda x: x.get("explicitness_level") or 0)
-        loc = _mode([i.get("scene_location") for i in items]).replace("_", " ").strip()
-        outfit = _mode([i.get("scene_outfit") for i in items]).strip()
-        if loc.lower() in _JUNK_META: loc = ""
-        if outfit.lower() in _JUNK_META: outfit = "nude"
-        sid = (items[0].get("scene_id") or "").strip()
-        if sid and sid.lower() not in _JUNK_META:
-            title = sid.replace("-", " ").replace("_", " ")
-        else:
-            title = " / ".join(p for p in [loc, outfit] if p) or "untitled set"
-        title = title[:80]
-        top = items[-1]
-        price = round((((top.get("price_min") or 15) + (top.get("price_max") or 40)) / 2) / 5) * 5
-        sets.append({
-            "title": title,
-            "location": loc or None,
-            "outfit": outfit or None,
-            "explicit_min": items[0].get("explicitness_level") or 0,
-            "explicit_max": top.get("explicitness_level") or 0,
-            "media_ids": [i["fansly_media_id"] for i in items if i.get("fansly_media_id")],
-            "preview_media_id": items[0].get("fansly_media_id"),
-            "suggested_price": price,
-        })
+        base = key.split(":", 1)[-1].replace("-", " ").replace("_", " ").strip()
+        # split by explicitness AND content focus
+        sub: dict[tuple, list] = {}
+        for it in items:
+            lvl = it.get("explicitness_level") or 0
+            if lvl < min_level:
+                continue
+            cat = (it.get("content_category") or "").strip().lower()
+            sub.setdefault((lvl, cat), []).append(it)
+
+        for (lvl, cat), bucket in sorted(sub.items()):
+            if len(bucket) < min_per_set:
+                continue
+            n = len(bucket)
+            num = max(1, math.ceil(n / max_per_set))
+            size = math.ceil(n / num)
+            chunks = [bucket[i:i + size] for i in range(0, n, size)]
+            for ci, chunk in enumerate(chunks):
+                if len(chunk) < 2:
+                    continue
+                top = chunk[-1]
+                price = round((((top.get("price_min") or 15) + (top.get("price_max") or 40)) / 2) / 5) * 5
+                loc = _mode([i.get("scene_location") for i in chunk]).replace("_", " ").strip()
+                outfit = _mode([i.get("scene_outfit") for i in chunk]).strip()
+                if loc.lower() in _JUNK_META: loc = ""
+                if outfit.lower() in _JUNK_META: outfit = "nude"
+                cat_label = cat if cat and cat not in _JUNK_META else ""
+                part = f" ({ci + 1})" if len(chunks) > 1 else ""
+                title = f"{base}{(' · ' + cat_label) if cat_label else ''} · lvl {lvl}{part}"
+                sets.append({
+                    "title": title[:80],
+                    "location": loc or None, "outfit": outfit or None,
+                    "explicit_min": lvl, "explicit_max": lvl,
+                    "media_ids": [i["fansly_media_id"] for i in chunk if i.get("fansly_media_id")],
+                    "preview_media_id": chunk[0].get("fansly_media_id"),
+                    "suggested_price": price,
+                    "tags": _collect_tags(chunk),
+                })
     sets.sort(key=lambda s: (s["explicit_max"], len(s["media_ids"])), reverse=True)
     return sets
 
