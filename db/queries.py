@@ -373,13 +373,17 @@ def build_scenes(vault_items: list[dict], min_items: int = 2) -> list[dict]:
     return scenes
 
 
+_JUNK_META = {"", "unclear", "unknown", "none", "n/a", "na", "null"}
+
+
 def _set_key_coarse(item: dict) -> str:
+    sid = (item.get("scene_id") or "").strip().lower()
+    if sid and sid not in _JUNK_META:
+        return f"scene:{sid}"
     album = (item.get("album_title") or "").strip()
     if album and not album.lower().startswith("album_"):
         return f"album:{album.lower()}"
-    loc = (item.get("scene_location") or "").strip().lower()
-    outfit = (item.get("scene_outfit") or "").strip().lower()
-    return f"sig:{loc}|{outfit}" if (loc or outfit) else ""
+    return ""   # no reliable shoot signal -> leave for manual, don't fake a set
 
 
 def propose_sets(vault_items: list[dict], min_items: int = 3) -> list[dict]:
@@ -397,11 +401,13 @@ def propose_sets(vault_items: list[dict], min_items: int = 3) -> list[dict]:
         if len(items) < min_items:
             continue
         items.sort(key=lambda x: x.get("explicitness_level") or 0)
-        loc = _mode([i.get("scene_location") for i in items])
-        outfit = _mode([i.get("scene_outfit") for i in items])
+        loc = _mode([i.get("scene_location") for i in items]).replace("_", " ").strip()
+        outfit = _mode([i.get("scene_outfit") for i in items]).strip()
+        if loc.lower() in _JUNK_META: loc = ""
+        if outfit.lower() in _JUNK_META: outfit = "nude"
         top = items[-1]
         price = round((((top.get("price_min") or 15) + (top.get("price_max") or 40)) / 2) / 5) * 5
-        title = " / ".join(p for p in [loc, outfit] if p) or key.split(":", 1)[-1]
+        title = " / ".join(p for p in [loc, outfit] if p) or "untitled set"
         sets.append({
             "title": title[:80],
             "location": loc or None,
