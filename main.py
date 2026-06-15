@@ -2363,6 +2363,51 @@ async def test_inject_message(fan_id: str, creator_id: str, content: str) -> dic
     return {"status": "ok", "fan_id": fan_id, "content": content}
 
 
+@app.post("/generate-sets/{creator_id}")
+async def generate_sets(creator_id: str) -> dict:
+    from db.queries import propose_sets
+    db = get_supabase()
+
+    items, page = [], 0
+    while True:
+        rows = await asyncio.to_thread(
+            lambda p=page: db.table("creator_vault_media")
+            .select("fansly_media_id, content_category, explicitness_level, scene_location, scene_outfit, album_title, mimetype, price_min, price_max")
+            .eq("creator_id", creator_id)
+            .range(p * 1000, p * 1000 + 999)
+            .execute()
+        )
+        batch = rows.data or []
+        items.extend(batch)
+        if len(batch) < 1000:
+            break
+        page += 1
+
+    proposed = propose_sets(items, min_items=3)
+
+    # Wipe prior AI drafts; never touch approved or manual sets
+    await asyncio.to_thread(
+        lambda: db.table("vault_sets").delete()
+        .eq("creator_id", creator_id).eq("status", "draft").eq("source", "ai").execute()
+    )
+
+    to_insert = [{
+        "creator_id": creator_id,
+        "title": s["title"], "location": s["location"], "outfit": s["outfit"],
+        "explicit_min": s["explicit_min"], "explicit_max": s["explicit_max"],
+        "media_ids": s["media_ids"], "preview_media_id": s["preview_media_id"],
+        "suggested_price": s["suggested_price"], "status": "draft", "source": "ai",
+    } for s in proposed]
+
+    inserted = 0
+    for i in range(0, len(to_insert), 100):
+        chunk = to_insert[i:i + 100]
+        await asyncio.to_thread(lambda c=chunk: db.table("vault_sets").insert(c).execute())
+        inserted += len(chunk)
+
+    return {"status": "ok", "drafts_created": inserted, "from_items": len(items)}
+
+
 @app.get("/debug-scenes/{creator_id}")
 async def debug_scenes(creator_id: str) -> dict:
     from db.queries import get_vault_for_session, build_scenes

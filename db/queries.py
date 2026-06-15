@@ -373,6 +373,49 @@ def build_scenes(vault_items: list[dict], min_items: int = 2) -> list[dict]:
     return scenes
 
 
+def _set_key_coarse(item: dict) -> str:
+    album = (item.get("album_title") or "").strip()
+    if album and not album.lower().startswith("album_"):
+        return f"album:{album.lower()}"
+    loc = (item.get("scene_location") or "").strip().lower()
+    outfit = (item.get("scene_outfit") or "").strip().lower()
+    return f"sig:{loc}|{outfit}" if (loc or outfit) else ""
+
+
+def propose_sets(vault_items: list[dict], min_items: int = 3) -> list[dict]:
+    groups: dict[str, list[dict]] = {}
+    for it in vault_items:
+        if (it.get("mimetype") or "").startswith("video"):   # photos only
+            continue
+        key = _set_key_coarse(it)
+        if not key:
+            continue
+        groups.setdefault(key, []).append(it)
+
+    sets = []
+    for key, items in groups.items():
+        if len(items) < min_items:
+            continue
+        items.sort(key=lambda x: x.get("explicitness_level") or 0)
+        loc = _mode([i.get("scene_location") for i in items])
+        outfit = _mode([i.get("scene_outfit") for i in items])
+        top = items[-1]
+        price = round((((top.get("price_min") or 15) + (top.get("price_max") or 40)) / 2) / 5) * 5
+        title = " / ".join(p for p in [loc, outfit] if p) or key.split(":", 1)[-1]
+        sets.append({
+            "title": title[:80],
+            "location": loc or None,
+            "outfit": outfit or None,
+            "explicit_min": items[0].get("explicitness_level") or 0,
+            "explicit_max": top.get("explicitness_level") or 0,
+            "media_ids": [i["fansly_media_id"] for i in items if i.get("fansly_media_id")],
+            "preview_media_id": items[0].get("fansly_media_id"),
+            "suggested_price": price,
+        })
+    sets.sort(key=lambda s: (s["explicit_max"], len(s["media_ids"])), reverse=True)
+    return sets
+
+
 async def get_fan_session(fan_id: str) -> dict | None:
     """Get active session plan for a fan."""
     def _get():
