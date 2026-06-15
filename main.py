@@ -2372,7 +2372,7 @@ async def generate_sets(creator_id: str) -> dict:
     while True:
         rows = await asyncio.to_thread(
             lambda p=page: db.table("creator_vault_media")
-            .select("fansly_media_id, content_category, explicitness_level, scene_location, scene_outfit, album_title, mimetype, price_min, price_max")
+            .select("fansly_media_id, content_category, explicitness_level, scene_id, scene_location, scene_outfit, album_title, mimetype, price_min, price_max")
             .eq("creator_id", creator_id)
             .range(p * 1000, p * 1000 + 999)
             .execute()
