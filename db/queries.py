@@ -405,11 +405,16 @@ def propose_sets(vault_items: list[dict], min_items: int = 3) -> list[dict]:
         outfit = _mode([i.get("scene_outfit") for i in items]).strip()
         if loc.lower() in _JUNK_META: loc = ""
         if outfit.lower() in _JUNK_META: outfit = "nude"
+        sid = (items[0].get("scene_id") or "").strip()
+        if sid and sid.lower() not in _JUNK_META:
+            title = sid.replace("-", " ").replace("_", " ")
+        else:
+            title = " / ".join(p for p in [loc, outfit] if p) or "untitled set"
+        title = title[:80]
         top = items[-1]
         price = round((((top.get("price_min") or 15) + (top.get("price_max") or 40)) / 2) / 5) * 5
-        title = " / ".join(p for p in [loc, outfit] if p) or "untitled set"
         sets.append({
-            "title": title[:80],
+            "title": title,
             "location": loc or None,
             "outfit": outfit or None,
             "explicit_min": items[0].get("explicitness_level") or 0,
