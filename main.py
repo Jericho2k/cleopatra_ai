@@ -1492,6 +1492,15 @@ async def _categorize_single_item(item: dict) -> dict:
                                 "type": "text",
                                 "text": (
                                     f"Classify this OnlyFans creator image. Pick one category:\n{CATEGORY_LIST}\n\n"
+                                    "Rate EXPLICITNESS strictly on what is ACTUALLY VISIBLE in THIS image:\n"
+                                    "-1 = junk/noise (screenshot, text, meme, unrelated)\n"
+                                    " 0 = casual/SFW (normal selfie, street clothes, nothing suggestive)\n"
+                                    " 1 = teaser (blurred, pixelated, censored, or fully covered)\n"
+                                    " 2 = suggestive but not provocative (hint of skin, flirty, still clothed)\n"
+                                    " 3 = sexy: lingerie / bikini / see-through, nothing explicit shown\n"
+                                    " 4 = nude: breasts, butt, or genitals exposed\n"
+                                    " 5 = explicit/lewd: spread, penetration, sex-act still — max\n"
+                                    "Lingerie with nothing exposed is 3, NEVER 5. A clothed selfie is 0.\n\n"
                                     "Return ONLY a single line of JSON, no newlines, no formatting:\n"
                                     '{"category":"category_key","description":"1-2 sentences","mood":"playful","explicitness":3,"good_for":"opener","tags":["tag1"],"scene_location":"bedroom","scene_outfit":"red lingerie","scene_lighting":"dim","scene_id":"bedroom-red-lingerie"}'
                                 ),
@@ -1534,7 +1543,7 @@ async def _categorize_single_item(item: dict) -> dict:
         mood = data.get("mood", "")
         price_info = VAULT_CATEGORIES[category]
 
-        explicitness = min(max(int(data.get("explicitness", 3)), 1), 5)
+        explicitness = min(max(int(data.get("explicitness", 0)), -1), 5)
         good_for = data.get("good_for", "standalone")
         if good_for not in ["opener", "mid_session", "closer", "standalone"]:
             good_for = "standalone"
