@@ -2383,7 +2383,7 @@ async def generate_sets(creator_id: str) -> dict:
             break
         page += 1
 
-    proposed = propose_sets(items, min_items=3)
+    proposed = propose_sets(items)
 
     # Wipe prior AI drafts; never touch approved or manual sets
     await asyncio.to_thread(
