@@ -1442,7 +1442,7 @@ async def _categorize_single_item(item: dict) -> dict:
                 '{"category": "category_key", "description": "one sentence description of likely content", "mood": "playful|intimate|explicit|teasing"}'
             )
             response = await client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=150,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -1475,7 +1475,7 @@ async def _categorize_single_item(item: dict) -> dict:
 
             if img_b64:
                 response = await client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=400,
                     messages=[{
                         "role": "user",
@@ -1514,7 +1514,7 @@ async def _categorize_single_item(item: dict) -> dict:
                 album = item.get("album_title", "")
                 print(f"[CATEGORIZE] falling back to filename analysis for item={item_id}")
                 response = await client.messages.create(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=300,
                     messages=[{"role": "user", "content": (
                         f"This is an OnlyFans image. Filename: '{filename}'. Album: '{album}'.\n"
@@ -2157,7 +2157,7 @@ async def plan_session(
     )
 
     response = await client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=300,
         messages=[{"role": "user", "content": prompt}],
     )

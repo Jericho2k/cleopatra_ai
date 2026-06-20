@@ -42,7 +42,7 @@ Analyze and return ONLY valid JSON:
 }}"""
 
     response = await client.messages.create(
-        model="MiniMaxAI/MiniMax-M3",
+        model="claude-haiku-4-5-20251001",
         max_tokens=400,
         messages=[{"role": "user", "content": user_content}],
     )
