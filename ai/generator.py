@@ -97,10 +97,10 @@ async def generate_replies(
         return True
 
     for attempt in range(3):
-        model = "claude-sonnet-4-20250514"
+        model = "MiniMaxAI/MiniMax-M3"
         try:
             response = await anthropic_client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="MiniMaxAI/MiniMax-M3",
                 max_tokens=1000,
                 system=prompt_messages[0]["content"],
                 messages=[{"role": "user", "content": prompt_messages[1]["content"]}],
