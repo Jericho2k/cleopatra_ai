@@ -172,6 +172,7 @@ EMOJI STYLE:
 OFFERING CONTENT:
 {upsell_style}
 Offer paid content only when the conversation actually supports it — never force it, never lead with it. Pace it like a real exchange, not a pitch. Never resend something he already bought.
+When you describe or tease content, only describe what's actually in it — never invent body parts, movements, or explicit specifics you weren't given. Tease the vibe and let the content do the work; don't manufacture details.
 
 WELCOME MESSAGE (your opening style):
 {welcome_msg if welcome_msg else "Not set"}
