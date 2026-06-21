@@ -135,6 +135,27 @@ async def get_sent_ppv(fan_id: str) -> list[dict]:
     return await asyncio.to_thread(_get)
 
 
+async def mark_ppv_purchased(fan_id: str, media_id: str, sent_at: str | None = None) -> bool:
+    def _mark() -> bool:
+        db = get_supabase()
+        r = db.table("messages").select("id, media_context, sent_at") \
+            .eq("fan_id", fan_id).eq("role", "creator") \
+            .not_.is_("media_context", "null").order("sent_at", desc=True).execute()
+        for row in (r.data or []):
+            mc = row.get("media_context") or {}
+            ppv = mc.get("ppv")
+            if not ppv or str(ppv.get("media_id")) != str(media_id):
+                continue
+            if sent_at and row.get("sent_at") and row["sent_at"] != sent_at:
+                continue
+            ppv["purchased"] = True
+            mc["ppv"] = ppv
+            db.table("messages").update({"media_context": mc}).eq("id", row["id"]).execute()
+            return True
+        return False
+    return await asyncio.to_thread(_mark)
+
+
 async def get_conversation_history(fan_id: str, limit: int = 40) -> list[Message]:
     def _get():
         r = get_supabase().table("messages").select("role, content, sent_at, media_context").eq("fan_id", fan_id).order("sent_at", desc=False).limit(limit).execute()

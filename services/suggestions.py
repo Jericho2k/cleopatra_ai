@@ -27,6 +27,7 @@ from db.queries import (
     get_fan_session,
     get_ppv_offers,
     get_sent_ppv,
+    mark_ppv_purchased,
     save_fan_session,
     save_message,
     update_fan_memory,
@@ -725,6 +726,49 @@ async def _send_reaction_fishing(
         print(f"[PPV REACTION ERROR] {e}")
 
 
+async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None = None) -> None:
+    """One place that records a confirmed PPV buy and reconciles every store:
+    sales_log, not_sold_log, total_spent, spend_tier, the message row, the session."""
+    def _tier(s: int) -> str:
+        return "whale" if s >= 500 else "active" if s >= 100 else "casual" if s >= 20 else "cold"
+
+    db = get_supabase()
+    fan = await asyncio.to_thread(lambda: db.table("fans")
+        .select("total_spent, sales_log, not_sold_log").eq("id", fan_id).single().execute())
+    row = fan.data or {}
+    sales_log = row.get("sales_log") or []
+    not_sold = row.get("not_sold_log") or []
+
+    if amount is None:
+        amount = next((e.get("amount", 0) for e in not_sold
+                       if str(media_id) in str(e.get("item", ""))), 0)
+    amount = int(amount or 0)
+
+    from datetime import datetime
+    sales_log.append({
+        "date": datetime.utcnow().strftime("%d.%m.%Y"),
+        "item": f"PPV media {media_id}",
+        "media_id": str(media_id),
+        "amount": amount, "chatter": "AI",
+    })
+    not_sold = [e for e in not_sold if str(media_id) not in str(e.get("item", ""))]
+    new_spent = int(row.get("total_spent", 0) or 0) + amount
+
+    await asyncio.to_thread(lambda: db.table("fans").update({
+        "total_spent": new_spent, "spend_tier": _tier(new_spent),
+        "sales_log": sales_log, "not_sold_log": not_sold, "pending_ppv_check": None,
+    }).eq("id", fan_id).execute())
+
+    await mark_ppv_purchased(fan_id, str(media_id))
+
+    session = await get_fan_session(fan_id)
+    if session:
+        for item in session.get("plan", []):
+            if str(item.get("media_id")) == str(media_id):
+                item["purchased"] = True
+        await save_fan_session(fan_id, session)
+
+
 async def _verify_ppv_purchase(
     fan_id: str,
     creator_id: str,
@@ -744,13 +788,12 @@ async def _verify_ppv_purchase(
         apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
         fan_row = await asyncio.to_thread(
             lambda: db.table("fans")
-            .select("platform_fan_id, total_spent, not_sold_log")
+            .select("platform_fan_id, not_sold_log")
             .eq("id", fan_id)
             .single()
             .execute()
         )
         platform_fan_id = (fan_row.data or {}).get("platform_fan_id")
-        current_spent = (fan_row.data or {}).get("total_spent", 0)
         api_key = os.environ.get("APIFANSLY_API_KEY")
         expected_price = float(pending.get("price", 0))
         sent_at_str = pending.get("sent_at", "")
@@ -789,56 +832,7 @@ async def _verify_ppv_purchase(
 
         if purchased:
             print(f"[PPV VERIFY] fan={fan_id} PURCHASED media={media_id} amount=${actual_amount}")
-            # Update price floor — we know they'll pay at least this much
-            new_spent = current_spent + int(actual_amount)
-            fan_summary_row = await asyncio.to_thread(
-                lambda: db.table("fans")
-                .select("ai_summary")
-                .eq("id", fan_id)
-                .single()
-                .execute()
-            )
-            summary = (fan_summary_row.data or {}).get("ai_summary") or {}
-            from datetime import datetime
-            sales_log_row = await asyncio.to_thread(
-                lambda: db.table("fans")
-                .select("sales_log")
-                .eq("id", fan_id)
-                .single()
-                .execute()
-            )
-            sales_log = (sales_log_row.data or {}).get("sales_log") or []
-            sales_log.append({
-                "date": datetime.utcnow().strftime("%d.%m.%Y"),
-                "item": f"PPV media {media_id}",
-                "amount": int(actual_amount),
-                "chatter": "AI",
-            })
-
-            def _calc_tier(spent: int) -> str:
-                if spent >= 500: return "whale"
-                if spent >= 100: return "active"
-                if spent >= 20: return "casual"
-                return "cold"
-
-            new_tier = _calc_tier(new_spent)
-
-            await asyncio.to_thread(
-                lambda: db.table("fans").update({
-                    "total_spent": new_spent,
-                    "pending_ppv_check": None,
-                    "ai_summary": summary,
-                    "sales_log": sales_log,
-                    "spend_tier": new_tier,
-                }).eq("id", fan_id).execute()
-            )
-            # Update session plan item as purchased
-            session = await get_fan_session(fan_id)
-            if session:
-                for item in session.get("plan", []):
-                    if item.get("media_id") == media_id:
-                        item["purchased"] = True
-                await save_fan_session(fan_id, session)
+            await record_ppv_purchase(fan_id, media_id, actual_amount)
         else:
             print(f"[PPV VERIFY] fan={fan_id} did NOT purchase media={media_id}")
             # Log to not_sold
