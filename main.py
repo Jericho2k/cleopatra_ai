@@ -2260,6 +2260,13 @@ async def mark_session_purchased(fan_id: str, media_id: str) -> dict:
     return {"status": "ok"}
 
 
+@app.post("/fan/{fan_id}/record-purchase/{media_id}")
+async def record_purchase_endpoint(fan_id: str, media_id: str, amount: float | None = None):
+    from services.suggestions import record_ppv_purchase
+    await record_ppv_purchase(fan_id, media_id, amount)
+    return {"status": "ok", "fan_id": fan_id, "media_id": media_id}
+
+
 @app.delete("/session/{fan_id}")
 async def clear_session(fan_id: str) -> dict:
     """End and clear the active session."""
