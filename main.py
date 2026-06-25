@@ -2086,6 +2086,23 @@ async def get_my_creators(user_id: str) -> dict:
     return {"creators": creators.data or []}
 
 
+@app.get("/creator/{creator_id}/auto-availability")
+async def auto_availability(creator_id: str) -> dict:
+    """Auto-mode is only available when at least one approved set exists.
+    Single source of truth for the dashboard's auto gate + a backend guard."""
+    db = get_supabase()
+    r = await asyncio.to_thread(
+        lambda: db.table("vault_sets")
+        .select("id", count="exact")
+        .eq("creator_id", creator_id)
+        .eq("status", "approved")
+        .limit(1)
+        .execute()
+    )
+    count = r.count or 0
+    return {"auto_available": count > 0, "approved_sets": count}
+
+
 @app.post("/plan-session/{creator_id}/{fan_id}")
 async def plan_session(
     creator_id: str,
@@ -2105,34 +2122,43 @@ async def plan_session(
     Picks 5-8 vault items ordered by escalating explicitness,
     grouped by scene continuity where possible.
     """
-    from db.queries import get_fan_by_id, get_sent_ppv, get_vault_for_session, save_fan_session
+    from db.queries import get_fan_by_id, get_sent_ppv, save_fan_session
     import json as _json
 
     fan = await get_fan_by_id(fan_id)
     sent_ppv = await get_sent_ppv(fan_id)
     purchased_ids = {s["media_id"] for s in sent_ppv if s.get("purchased")}
-    sent_ids = {s["media_id"] for s in sent_ppv}
-    exclude = purchased_ids
 
     kinks = confirmed_kinks or []
     if not kinks and fan and fan.ai_summary:
         kinks = fan.ai_summary.get("kinks", [])
 
-    vault = await get_vault_for_session(creator_id, fan_kinks=kinks, exclude_media_ids=exclude, min_explicitness=2)
-    if not vault:
-        return {"status": "no_content", "session": None}
+    # --- APPROVED SETS ONLY. No approved sets => auto-mode cannot sell. ---
+    db = get_supabase()
+    sets_row = await asyncio.to_thread(
+        lambda: db.table("vault_sets")
+        .select("id, title, location, outfit, explicit_min, explicit_max, "
+                "media_ids, preview_media_id, suggested_price, tags")
+        .eq("creator_id", creator_id)
+        .eq("status", "approved")
+        .execute()
+    )
+    approved = sets_row.data or []
 
-    from db.queries import build_scenes
-    scenes = build_scenes(vault, min_items=2)
-    if not scenes:
-        return {"status": "no_content", "session": None}
+    # Drop sets the fan has already fully purchased; keep partials.
+    sellable = [
+        s for s in approved
+        if s.get("media_ids") and not set(s["media_ids"]).issubset(purchased_ids)
+    ]
+    if not sellable:
+        print(f"[SESSION] no approved sets sellable creator={creator_id} fan={fan_id}")
+        return {"status": "no_sets", "session": None}
 
-    # Summarize SCENES (not loose items) for the model — ~19 lines, not 80.
-    scene_summary = "\n".join(
-        f"[{i}] {s['location'] or 'misc'} / {s['outfit'] or 'n/a'} | "
-        f"{s['count']} items | explicit {s['explicit_min']}-{s['explicit_max']} | "
-        f"{', '.join(s['categories'])}"
-        for i, s in enumerate(scenes)
+    set_summary = "\n".join(
+        f"[{i}] {s.get('title') or s.get('location') or 'set'} | "
+        f"{len(s['media_ids'])} pcs | explicit {s.get('explicit_min','?')}-{s.get('explicit_max','?')} | "
+        f"${s.get('suggested_price', 0)} | {', '.join(s.get('tags') or []) or 'no tags'}"
+        for i, s in enumerate(sellable)
     )
 
     fan_kinks_str = ", ".join(kinks) if kinks else "unknown"
@@ -2142,18 +2168,14 @@ async def plan_session(
     client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
     prompt = (
-        "You are planning a content set to send an adult-content fan who just asked to see more.\n\n"
+        "You are choosing ONE approved content set to send an adult-content fan who just asked to see more.\n\n"
         f"Fan interests/kinks: {fan_kinks_str}\n"
         f"Fan spend tier: {fan_tier}\n\n"
-        "Each option below is a COHERENT SET from one photoshoot — same outfit, same location, "
-        "internally consistent. You are choosing ONE set that best fits this fan, plus how many "
-        "images to bundle.\n\n"
-        f"Available sets:\n{scene_summary}\n\n"
-        "Pick the single best set. Rules:\n"
-        "- Match the fan's stated interests where possible.\n"
-        "- Prefer a set with a real explicitness range (so the bundle can escalate).\n"
-        "- bundle_size: 3 for cold/casual tier, 3-4 for active/whale.\n\n"
-        'Return ONLY JSON: {"scene_index": 0, "bundle_size": 3, "reason": "short why"}'
+        "Each option is a human-approved, coherent set from one shoot.\n\n"
+        f"Available approved sets:\n{set_summary}\n\n"
+        "Pick the single best set for this fan. Match stated interests where possible; "
+        "prefer a set whose explicitness suits the moment.\n\n"
+        'Return ONLY JSON: {"set_index": 0, "reason": "short why"}'
     )
 
     response = await client.messages.create(
@@ -2165,36 +2187,25 @@ async def plan_session(
 
     try:
         choice = _json.loads(content)
-        idx = int(choice.get("scene_index", 0))
-        idx = idx if 0 <= idx < len(scenes) else 0
-        bundle_size = max(2, min(int(choice.get("bundle_size", 3)), 4))
-        chosen = scenes[idx]
+        idx = int(choice.get("set_index", 0))
+        idx = idx if 0 <= idx < len(sellable) else 0
+        chosen = sellable[idx]
 
-        # Build the bundle DETERMINISTICALLY from the chosen scene: spread across the
-        # explicitness range so it escalates, all from the same shoot = consistent.
-        items = chosen["items"]  # already sorted low->high explicitness
-        if len(items) <= bundle_size:
-            bundle = items
-        else:
-            step = (len(items) - 1) / (bundle_size - 1)
-            bundle = [items[round(k * step)] for k in range(bundle_size)]
-
-        # One PPV price for the whole bundle, scaled to tier.
-        tier_base = {"whale": 1.4, "active": 1.1, "casual": 0.9, "cold": 0.8}.get(fan_tier, 0.9)
-        top_item = bundle[-1]
-        bundle_price = int(max(top_item.get("price_min", 15),
-                               round(top_item.get("price_max", 40) * tier_base / 5) * 5))
+        # Bundle = the approved set, as approved. No re-bundling, no invented price —
+        # use the human-set price. Drop any pieces already purchased.
+        media_ids = [m for m in chosen["media_ids"] if m not in purchased_ids]
+        bundle_price = int(chosen.get("suggested_price") or 0)
 
         plan_item = {
-            "media_ids": [b["media_id"] for b in bundle],
-            "media_id": bundle[0]["media_id"],  # back-compat for single-id paths
+            "media_ids": media_ids,
+            "media_id": media_ids[0],  # back-compat for single-id paths
             "price": bundle_price,
-            "scene_key": chosen["scene_key"],
-            "location": chosen["location"],
-            "outfit": chosen["outfit"],
+            "set_id": chosen["id"],
+            "scene_key": chosen.get("title") or chosen.get("location") or "set",
+            "location": chosen.get("location"),
+            "outfit": chosen.get("outfit"),
             "reason": choice.get("reason", ""),
-            "description": f"{chosen['location']} / {chosen['outfit']} set ({len(bundle)} pcs)",
-            "is_video": any(b.get("is_video") for b in bundle),
+            "description": f"{chosen.get('title') or chosen.get('location')} set ({len(media_ids)} pcs)",
             "sent": False,
             "purchased": False,
         }
@@ -2204,10 +2215,12 @@ async def plan_session(
             "current_index": 0,
             "started_at": __import__("datetime").datetime.utcnow().isoformat(),
             "fan_kinks": kinks,
-            "scene_key": chosen["scene_key"],
+            "set_id": chosen["id"],
+            "scene_key": plan_item["scene_key"],
         }
         await save_fan_session(fan_id, session)
-        print(f"[SESSION] scene={chosen['scene_key']} bundle={len(bundle)} price=${bundle_price}")
+        print(f"[SESSION] set={chosen['id']} '{plan_item['scene_key']}' "
+              f"pcs={len(media_ids)} price=${bundle_price}")
         return {"status": "ok", "session": session}
 
     except Exception as e:
@@ -2449,4 +2462,3 @@ async def health() -> dict:
 from routes.fansly import fansly_router
 
 app.include_router(fansly_router)
-
