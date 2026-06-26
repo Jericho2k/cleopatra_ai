@@ -347,6 +347,7 @@ session_store: SessionStore = None
 fansly_poller: FanslyPoller = None
 reengagement_task: asyncio.Task | None = None
 ppv_sweep_task: asyncio.Task | None = None
+vault_autosync_task: asyncio.Task | None = None
 
 
 async def reengagement_scheduler():
@@ -374,9 +375,46 @@ async def ppv_sweep_scheduler():
             print(f"[CRON PPV SWEEP ERROR] {e}")
 
 
+async def vault_autosync_scheduler():
+    """Once a day, sync any creator whose vault is >7 days stale, then categorize
+    only the genuinely-new items. The persisted last_vault_sync_at timestamp acts
+    as the cross-worker guard: the first worker to stamp it wins; others see the
+    cooldown via sync_vault_start and skip. Expensive ops stay bounded."""
+    while True:
+        await asyncio.sleep(24 * 60 * 60)
+        try:
+            print("[CRON] Vault auto-sync pass...")
+            db = get_supabase()
+            creators = await asyncio.to_thread(
+                lambda: db.table("creators").select("id").execute()
+            )
+            for c in (creators.data or []):
+                cid = c["id"]
+                cd = await _vault_cooldown_remaining(cid, "last_vault_sync_at")
+                if not cd["allowed"]:
+                    continue
+                # Reuse the guarded endpoint logic; it stamps + skips if already running.
+                res = await sync_vault_start(cid)
+                if res.get("status") != "started":
+                    continue
+                print(f"[CRON] auto-sync started creator={cid}")
+                # Let the sync finish, then categorize only new (uncategorized) items.
+                for _ in range(600):  # up to ~10 min
+                    await asyncio.sleep(1)
+                    st = _vault_sync_state.get(cid, {}).get("status")
+                    if st in ("done", "error", "idle", None):
+                        break
+                pending = await _count_uncategorized(cid)
+                if pending > 0:
+                    print(f"[CRON] auto-categorize creator={cid} new={pending}")
+                    await categorize_vault(cid, force=True)
+        except Exception as e:
+            print(f"[CRON VAULT AUTOSYNC ERROR] {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global session_store, fansly_poller, reengagement_task, ppv_sweep_task
+    global session_store, fansly_poller, reengagement_task, ppv_sweep_task, vault_autosync_task
 
     supabase = get_supabase()
     session_store = SessionStore(
@@ -392,6 +430,7 @@ async def lifespan(app: FastAPI):
     await fansly_poller.start_all()
     reengagement_task = asyncio.create_task(reengagement_scheduler())
     ppv_sweep_task = asyncio.create_task(ppv_sweep_scheduler())
+    vault_autosync_task = asyncio.create_task(vault_autosync_scheduler())
 
     yield
 
@@ -401,6 +440,8 @@ async def lifespan(app: FastAPI):
         reengagement_task.cancel()
     if ppv_sweep_task:
         ppv_sweep_task.cancel()
+    if vault_autosync_task:
+        vault_autosync_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1128,10 +1169,16 @@ async def sync_vault(creator_id: str) -> dict:
 
 
 @app.post("/sync-vault-start/{creator_id}")
-async def sync_vault_start(creator_id: str) -> dict:
+async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
     if creator_id in _vault_sync_state and _vault_sync_state[creator_id].get("status") == "running":
         return {"status": "already_running"}
+    # Cost guard: vault sync is expensive — once per 7 days unless forced.
+    if not force:
+        cd = await _vault_cooldown_remaining(creator_id, "last_vault_sync_at")
+        if not cd["allowed"]:
+            return {"status": "cooldown", **cd}
     _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": 0, "album": ""}
+    await _stamp_vault_op(creator_id, "last_vault_sync_at")
     asyncio.create_task(_run_vault_sync(creator_id))
     return {"status": "started"}
 
@@ -1589,16 +1636,82 @@ async def _categorize_single_item(item: dict) -> dict:
         }
 
 
+_VAULT_COOLDOWN_DAYS = 7
+
+
+async def _vault_cooldown_remaining(creator_id: str, column: str) -> dict:
+    """Returns cooldown info for an expensive vault op.
+    {allowed: bool, last_at: str|None, days_remaining: float, next_allowed_at: str|None}.
+    column is 'last_vault_sync_at' or 'last_categorize_at'."""
+    from datetime import datetime, timezone, timedelta
+    db = get_supabase()
+    row = await asyncio.to_thread(
+        lambda: db.table("creators").select(column).eq("id", creator_id).single().execute()
+    )
+    last_str = (row.data or {}).get(column)
+    if not last_str:
+        return {"allowed": True, "last_at": None, "days_remaining": 0, "next_allowed_at": None}
+    try:
+        last = datetime.fromisoformat(last_str.replace("Z", "+00:00"))
+    except Exception:
+        return {"allowed": True, "last_at": last_str, "days_remaining": 0, "next_allowed_at": None}
+    now = datetime.now(timezone.utc)
+    next_allowed = last + timedelta(days=_VAULT_COOLDOWN_DAYS)
+    if now >= next_allowed:
+        return {"allowed": True, "last_at": last_str, "days_remaining": 0, "next_allowed_at": None}
+    remaining = (next_allowed - now).total_seconds() / 86400
+    return {
+        "allowed": False, "last_at": last_str,
+        "days_remaining": round(remaining, 1),
+        "next_allowed_at": next_allowed.isoformat(),
+    }
+
+
+async def _stamp_vault_op(creator_id: str, column: str) -> None:
+    from datetime import datetime, timezone
+    db = get_supabase()
+    await asyncio.to_thread(
+        lambda: db.table("creators")
+        .update({column: datetime.now(timezone.utc).isoformat()})
+        .eq("id", creator_id).execute()
+    )
+
+
+async def _count_uncategorized(creator_id: str) -> int:
+    db = get_supabase()
+    r = await asyncio.to_thread(
+        lambda: db.table("creator_vault_media")
+        .select("id", count="exact", head=True)
+        .eq("creator_id", creator_id)
+        .or_("content_category.is.null,content_category.eq.")
+        .execute()
+    )
+    return r.count or 0
+
+
 _categorize_state: dict = {}
 
 
 @app.post("/categorize-vault/{creator_id}")
-async def categorize_vault(creator_id: str) -> dict:
+async def categorize_vault(creator_id: str, force: bool = False) -> dict:
     if _categorize_state.get(creator_id, {}).get("status") == "running":
         return {"status": "already_running", "state": _categorize_state[creator_id]}
-    _categorize_state[creator_id] = {"status": "running", "done": 0, "total": 0, "errors": 0}
+
+    # Cost guard #1: never spend API on a vault that has nothing uncategorized.
+    pending = await _count_uncategorized(creator_id)
+    if pending == 0:
+        return {"status": "nothing_to_categorize", "uncategorized": 0}
+
+    # Cost guard #2: cooldown against button-mashing (overridable with force=true).
+    if not force:
+        cd = await _vault_cooldown_remaining(creator_id, "last_categorize_at")
+        if not cd["allowed"]:
+            return {"status": "cooldown", **cd, "uncategorized": pending}
+
+    _categorize_state[creator_id] = {"status": "running", "done": 0, "total": pending, "errors": 0}
+    await _stamp_vault_op(creator_id, "last_categorize_at")
     asyncio.create_task(_run_vault_categorization(creator_id))
-    return {"status": "started"}
+    return {"status": "started", "uncategorized": pending}
 
 
 @app.get("/categorize-vault-status/{creator_id}")
