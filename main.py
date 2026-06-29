@@ -446,9 +446,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# CORS: restrict to known dashboard origins instead of a blanket wildcard.
+# - localhost / 127.0.0.1 (any port) and Vercel deploys are always allowed, so
+#   local dev and *.vercel.app dashboards work with no extra config.
+# - For a custom production domain, set CORS_ALLOW_ORIGINS in the environment
+#   (comma-separated, e.g. "https://app.example.com,https://www.example.com").
+_cors_origins = [
+    o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://[a-z0-9-]+\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
