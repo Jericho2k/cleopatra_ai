@@ -32,6 +32,8 @@ from db.queries import (
     save_message,
     update_fan_memory,
     update_fan_ai_summary,
+    update_creator_legend,
+    get_creator_legend,
 )
 from models.schemas import (
     ConversationContext,
@@ -87,6 +89,7 @@ async def get_suggestions(
     creator_persona = await get_creator_persona(creator_id)
     if creator_persona is None:
         creator_persona = Persona()
+    creator_legend = await get_creator_legend(creator_id)
     ppv_offers = await get_ppv_offers(creator_id)
     sent_ppv = await get_sent_ppv(fan_id)
     active_session = await get_fan_session(fan_id)
@@ -108,6 +111,7 @@ async def get_suggestions(
         ppv_offers=ppv_offers,
         sent_ppv=sent_ppv,
         active_session=active_session,
+        creator_legend=creator_legend,
     )
 
     situation = await analyze_situation(ctx_without_situation)
@@ -141,6 +145,7 @@ async def get_suggestions(
         ppv_offers=ppv_offers,
         sent_ppv=sent_ppv,
         active_session=active_session,
+        creator_legend=creator_legend,
     )
 
     prompt = build_prompt(ctx)
@@ -154,6 +159,24 @@ async def get_suggestions(
         asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
 
     return SuggestionResponse(suggestions=replies, stage=conversation_stage)
+
+
+def _render_legend(legend: dict) -> str:
+    """Human-readable rendering of the canonical creator legend for the UI note."""
+    if not legend:
+        return ""
+    labels = [
+        ("name", "Name"),
+        ("origin", "From"),
+        ("age", "Age"),
+        ("job", "Job"),
+        ("background", "Background"),
+    ]
+    lines = [f"{label}: {legend[key]}" for key, label in labels if (legend.get(key) or "").strip()]
+    other = legend.get("other") or []
+    if isinstance(other, list) and other:
+        lines.append("Other: " + "; ".join(other))
+    return "\n".join(lines)
 
 
 async def _update_fan_memory(
@@ -182,9 +205,17 @@ async def _update_fan_memory(
             '  "preferences": ["list of content preferences, kinks, or fetishes mentioned or implied"],\n'
             '  "member_note": "Fill in the Member template below with what you know. Leave fields blank if unknown.\\n'
             'Age: \nLocation: \nInterests/hobbies: \nKinks: \nAdditional info: ",\n'
-            '  "model_note": "Fill in the Model template below — what has the creator revealed about herself to THIS fan specifically. Leave fields blank if unknown.\\n'
-            'Name used: \nLocation told: \nBackground story told: \nKinks shared: \nOther personal details told: "\n'
+            '  "model_facts": {\n'
+            '      "name": "the name the creator goes by, if stated (else empty)",\n'
+            '      "origin": "where the creator said she is from, if stated (else empty)",\n'
+            '      "age": "the creator\'s age if she stated it (else empty)",\n'
+            '      "job": "the creator\'s job/what she does, if stated (else empty)",\n'
+            '      "background": "any backstory the creator told about herself (else empty)",\n'
+            '      "other": ["any other concrete personal facts the CREATOR stated about herself"]\n'
+            "  }\n"
             "}\n\n"
+            "For model_facts, ONLY include facts the creator (not the fan) actually stated about "
+            "HERSELF in this conversation. Leave a field empty if she did not state it. Do not guess.\n\n"
             "Conversation:\n"
             f"{convo_text}"
         )
@@ -209,7 +240,20 @@ async def _update_fan_memory(
         notes = data.get("notes", "")
         preferences = data.get("preferences") or []
         member_note = data.get("member_note", "")
-        model_note = data.get("model_note", "")
+        model_facts = data.get("model_facts") or {}
+        if not isinstance(model_facts, dict):
+            model_facts = {}
+
+        # Merge creator self-facts into the canonical per-creator legend (first-wins).
+        legend = {}
+        if model_facts:
+            try:
+                legend = await update_creator_legend(creator_id, model_facts)
+            except Exception as e:
+                print(f"[LEGEND ERROR] creator={creator_id} error={e}")
+
+        # Render the canonical legend to readable text for the operator's MODEL LEGEND box.
+        model_note = _render_legend(legend)
 
         if not isinstance(preferences, list):
             preferences = []
@@ -998,4 +1042,3 @@ async def _debounced_auto_reply_with_sleep_check(fan_id: str, creator_id: str) -
 def _should_update_memory(conversation_history: list[Message]) -> bool:
     count = len([m for m in conversation_history if m.role == "fan"])
     return count > 0 and count % 10 == 0
-

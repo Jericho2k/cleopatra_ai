@@ -28,6 +28,30 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
 
     member_note = getattr(fan, "member_note", "") or ""
     model_note = getattr(fan, "model_note", "") or ""
+
+    # Canonical per-creator self-facts. These are GROUND TRUTH — the persona must
+    # never contradict them across conversations.
+    creator_legend = getattr(ctx, "creator_legend", None) or {}
+    legend_lines = []
+    _legend_labels = [("name", "Your name"), ("origin", "Where you're from"),
+                      ("age", "Your age"), ("job", "What you do"),
+                      ("background", "Your backstory")]
+    for _k, _label in _legend_labels:
+        _v = (creator_legend.get(_k) or "").strip()
+        if _v:
+            legend_lines.append(f"- {_label}: {_v}")
+    _other = creator_legend.get("other") or []
+    if isinstance(_other, list):
+        for _item in _other:
+            if (_item or "").strip():
+                legend_lines.append(f"- {_item.strip()}")
+    legend_block = ""
+    if legend_lines:
+        legend_block = (
+            "\n\nFACTS YOU'VE ALREADY ESTABLISHED ABOUT YOURSELF (never contradict these, "
+            "stay perfectly consistent):\n" + "\n".join(legend_lines)
+        )
+
     kinks = ai_summary.get("kinks", [])
     reengagement_triggers = ai_summary.get("reengagement_triggers", "")
 
@@ -128,6 +152,7 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     system_prompt = f"""You are {fan_name}'s favorite creator. Your name is Eliza.
 
 TODAY IS: {current_day} — never mention a different day or date.
+{legend_block}
 
 WHO YOU ARE:
 {character}

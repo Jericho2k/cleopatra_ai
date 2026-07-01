@@ -562,3 +562,60 @@ async def update_fan_ai_summary(fan_id: str, summary: dict) -> None:
         }).eq("id", fan_id).execute()
 
     await asyncio.to_thread(_update)
+
+
+# --- Creator self-consistency legend (canonical, per-creator) ---
+
+# Stable identity attributes: first value established wins and is never overwritten,
+# so the persona can't contradict itself across conversations.
+_LEGEND_STABLE_KEYS = ("name", "origin", "age", "job", "background")
+
+
+async def get_creator_legend(creator_id: str) -> dict:
+    """Return the creator's canonical self-facts, e.g.
+    {"name": "Eliza", "origin": "California", "age": "", "job": "", "background": "",
+     "other": ["has a cat named Milo"]}."""
+    def _get():
+        r = (
+            get_supabase().table("creators")
+            .select("legend").eq("id", creator_id).single().execute()
+        )
+        return (r.data or {}).get("legend") or {}
+    return await asyncio.to_thread(_get)
+
+
+async def update_creator_legend(creator_id: str, new_facts: dict) -> dict:
+    """First-established-wins merge into creators.legend.
+    - Stable keys: only fill if currently empty; never overwrite a locked value.
+    - 'other': accumulate distinct freeform details (deduped, capped).
+    Returns the merged legend."""
+    existing = await get_creator_legend(creator_id)
+    merged = dict(existing)
+
+    for key in _LEGEND_STABLE_KEYS:
+        incoming = (new_facts.get(key) or "").strip()
+        if incoming and not (merged.get(key) or "").strip():
+            merged[key] = incoming  # lock it in
+
+    # freeform accumulation
+    other_existing = merged.get("other") or []
+    if not isinstance(other_existing, list):
+        other_existing = [str(other_existing)]
+    incoming_other = new_facts.get("other") or []
+    if isinstance(incoming_other, str):
+        incoming_other = [incoming_other]
+    seen = {o.strip().lower() for o in other_existing}
+    for item in incoming_other:
+        it = (item or "").strip()
+        if it and it.lower() not in seen:
+            other_existing.append(it)
+            seen.add(it.lower())
+    merged["other"] = other_existing[:20]  # cap to avoid unbounded growth
+
+    if merged != existing:
+        def _write():
+            get_supabase().table("creators").update(
+                {"legend": merged}
+            ).eq("id", creator_id).execute()
+        await asyncio.to_thread(_write)
+    return merged
