@@ -57,6 +57,25 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
 
     mood = situation.get("fan_mood", "")
     energy = situation.get("conversation_energy", "")
+    crisis_signal = (situation.get("crisis_signal") or "none")
+    crisis_block = ""
+    if crisis_signal == "self_harm":
+        crisis_block = (
+            "\n\nIMPORTANT OVERRIDE — the fan has expressed something that sounds like genuine "
+            "distress about harming himself or not wanting to be alive. Drop everything else. "
+            "Do NOT flirt, tease, roleplay, or mention or sell any content. Respond as a warm, "
+            "grounded human being: take him seriously, acknowledge what he said with genuine care, "
+            "and gently encourage him to reach out to someone who can help or a crisis line in his "
+            "country. Keep it short, sincere, and kind. Selling right now is completely off the table."
+        )
+    elif crisis_signal == "harm_to_others":
+        crisis_block = (
+            "\n\nIMPORTANT OVERRIDE — the fan has expressed what sounds like genuine intent to hurt "
+            "a real person (this is NOT sexual roleplay directed at you). Drop everything else. Do NOT "
+            "flirt, tease, roleplay, encourage it, or mention or sell any content. Do not play along. "
+            "Respond briefly and seriously as a real person would, make clear you're not okay with "
+            "that, and de-escalate. Selling right now is completely off the table."
+        )
     strategy = situation.get("strategic_move", "build connection")
     personal_details = situation.get("personal_details_mentioned", [])
     pending_tip = situation.get("pending_tip")
@@ -68,6 +87,9 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
         ),
         StageType.WARMING_UP: (
             "Building connection. Use what he's told you. Keep it light and personal. "
+            "Early on, work in the natural getting-to-know-you questions a real girl would ask "
+            "(where he's from, what he does, how old he is) if they haven't come up yet, casually "
+            "and one at a time, never like a form. "
             "You can mention your content naturally if it fits, never force it."
         ),
         StageType.FLIRTING: (
@@ -150,7 +172,7 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     current_day = datetime.now().strftime("%A, %B %d")  # e.g. "Tuesday, May 12"
 
     system_prompt = f"""You are {fan_name}'s favorite creator. Your name is Eliza.
-
+{crisis_block}
 TODAY IS: {current_day} — never mention a different day or date.
 {legend_block}
 

@@ -38,7 +38,8 @@ Analyze and return ONLY valid JSON:
   "personal_details_mentioned": ["any names, locations, jobs, interests mentioned by fan"],
   "avoid_repeating": "flag if the creator has already used the same line recently",
   "purchase_signal": "none | ready_to_buy | bought | declined | uncertain — none=no purchase context. ready_to_buy=fan just said yes/I want it/send it after a price was mentioned but no PPV sent yet. bought=positive reaction after PPV was already sent. declined=mentions price/can't afford/maybe later. uncertain=unclear",
-  "resend_requested": "true | false — did the fan indicate they cannot see content that was sent, it did not arrive, or they are asking for it to be sent again? Look at the full conversation context, not just the latest message."
+  "resend_requested": "true | false — did the fan indicate they cannot see content that was sent, it did not arrive, or they are asking for it to be sent again? Look at the full conversation context, not just the latest message.",
+  "crisis_signal": "none | self_harm | harm_to_others — DEFAULT none. This is NOT about sexual roughness or kink: choking, rough, degradation, or violent fantasy DIRECTED AT THE CREATOR as sexual roleplay is none. Only flag self_harm if the fan expresses genuine intent to hurt or kill himself or that he doesn't want to be alive. Only flag harm_to_others if the fan states real intent to harm a specific real person (not sexual fantasy about the creator). When unsure, use none."
 }}"""
 
     response = await client.messages.create(
@@ -63,4 +64,5 @@ Analyze and return ONLY valid JSON:
             "avoid_repeating": "",
             "purchase_signal": "none",
             "resend_requested": "false",
+            "crisis_signal": "none",
         }

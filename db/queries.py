@@ -564,6 +564,23 @@ async def update_fan_ai_summary(fan_id: str, summary: dict) -> None:
     await asyncio.to_thread(_update)
 
 
+# --- Creator autonomy caps (per-creator, agency-configurable) ---
+
+async def get_creator_caps(creator_id: str) -> dict:
+    """Per-creator autonomy limits set by the agency. All optional; null/absent = no limit.
+    Keys: caps_enabled (bool), max_ppv_per_fan_per_day (int|null),
+    max_spend_per_fan_per_day (int|null), max_sets_per_session (int|null)."""
+    def _get():
+        r = (
+            get_supabase().table("creators")
+            .select("caps_enabled, max_ppv_per_fan_per_day, "
+                    "max_spend_per_fan_per_day, max_sets_per_session")
+            .eq("id", creator_id).single().execute()
+        )
+        return r.data or {}
+    return await asyncio.to_thread(_get)
+
+
 # --- Creator self-consistency legend (canonical, per-creator) ---
 
 # Stable identity attributes: first value established wins and is never overwritten,

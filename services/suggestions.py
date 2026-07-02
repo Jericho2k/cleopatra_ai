@@ -34,6 +34,7 @@ from db.queries import (
     update_fan_ai_summary,
     update_creator_legend,
     get_creator_legend,
+    get_creator_caps,
 )
 from models.schemas import (
     ConversationContext,
@@ -60,7 +61,49 @@ _CONTENT_REQUEST_RE = re.compile(
 )
 
 
+async def _within_daily_caps(creator_id: str, sent_ppv: list[dict], fan_profile) -> tuple[bool, str]:
+    """Enforce the agency's per-fan daily autonomy caps before auto-selling.
+    Returns (allowed, reason). No caps configured => always allowed.
+    Counts today's sends/spend from sent_ppv (already loaded in the suggestion path)."""
+    try:
+        caps = await get_creator_caps(creator_id)
+    except Exception:
+        return True, ""  # never block selling on a config-read failure
+
+    if not caps.get("caps_enabled"):
+        return True, ""
+
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date()
+
+    def _is_today(sent_at: str) -> bool:
+        if not sent_at:
+            return False
+        try:
+            return datetime.fromisoformat(sent_at.replace("Z", "+00:00")).date() == today
+        except Exception:
+            return False
+
+    todays = [s for s in (sent_ppv or []) if _is_today(s.get("sent_at", ""))]
+
+    max_sends = caps.get("max_ppv_per_fan_per_day")
+    if max_sends is not None and len(todays) >= int(max_sends):
+        return False, f"daily send cap reached ({len(todays)}/{max_sends})"
+
+    max_spend = caps.get("max_spend_per_fan_per_day")
+    if max_spend is not None:
+        spent_today = sum(int(s.get("price", 0) or 0) for s in todays if s.get("purchased"))
+        if spent_today >= int(max_spend):
+            return False, f"daily spend cap reached (${spent_today}/${max_spend})"
+
+    return True, ""
+
+
 def _fan_wants_content(message, situation):
+    # Hard stop: never treat a crisis message as a buying signal. If the fan is
+    # expressing genuine self-harm or intent to harm a real person, we do not sell.
+    if situation and (situation.get("crisis_signal") or "none") != "none":
+        return False
     if _CONTENT_REQUEST_RE.search((message or "").lower()):
         return True
     if situation:
@@ -116,22 +159,27 @@ async def get_suggestions(
 
     situation = await analyze_situation(ctx_without_situation)
 
-    # Auto-plan a session if the fan is asking for content and none is active.
+    # Auto-plan a session if the fan is asking for content and none is active,
+    # and the creator's per-fan daily caps (if configured) aren't exceeded.
     if not active_session and _fan_wants_content(fan_message, situation):
-        try:
-            async with httpx.AsyncClient() as _hc:
-                plan_resp = await _hc.post(
-                    f"http://localhost:8080/plan-session/{creator_id}/{fan_id}",
-                    timeout=30,
-                )
-            plan_data = plan_resp.json()
-            if plan_data.get("status") == "ok":
-                active_session = plan_data.get("session") or await get_fan_session(fan_id)
-                print(f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
-            else:
-                print(f"[SESSION] plan-session returned status={plan_data.get('status')} fan={fan_id}")
-        except Exception as e:
-            print(f"[SESSION PLAN ERROR] {e}")
+        cap_ok, cap_reason = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
+        if not cap_ok:
+            print(f"[CAP] fan={fan_id} plan suppressed: {cap_reason}")
+        else:
+            try:
+                async with httpx.AsyncClient() as _hc:
+                    plan_resp = await _hc.post(
+                        f"http://localhost:8080/plan-session/{creator_id}/{fan_id}",
+                        timeout=30,
+                    )
+                plan_data = plan_resp.json()
+                if plan_data.get("status") == "ok":
+                    active_session = plan_data.get("session") or await get_fan_session(fan_id)
+                    print(f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
+                else:
+                    print(f"[SESSION] plan-session returned status={plan_data.get('status')} fan={fan_id}")
+            except Exception as e:
+                print(f"[SESSION PLAN ERROR] {e}")
 
     ctx = ConversationContext(
         fan_message=fan_message,
@@ -299,8 +347,10 @@ async def _update_fan_ai_summary(
             "Analyze this conversation and return a JSON object with these fields:\n"
             "{\n"
             '  "real_name": "their real name if mentioned, otherwise null",\n'
+            '  "age": "their age if mentioned or clearly stated, otherwise null",\n'
             '  "location": "city/country if mentioned, otherwise null",\n'
             '  "occupation": "job or income signals if mentioned, otherwise null",\n'
+            '  "hobbies": "their hobbies or interests if mentioned, otherwise null",\n'
             '  "relationship_status": "single/relationship/married/unknown",\n'
             '  "payday": "when they get paid if mentioned, otherwise null",\n'
             '  "kinks": ["list of explicit kinks, fetishes, or sexual preferences mentioned or clearly implied"],\n'
@@ -431,18 +481,23 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         situation = await analyze_situation(ctx_without_situation)
         print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')}")
 
-        # Plan a content set when the fan clearly asks to see/buy content. No budget gate.
+        # Plan a content set when the fan clearly asks to see/buy content, unless
+        # the creator's per-fan daily caps (if configured) are exceeded.
         if not active_session and _fan_wants_content(latest_message, situation):
-            try:
-                from main import plan_session
-                plan_data = await plan_session(creator_id, fan_id)
-                if plan_data.get("status") == "ok":
-                    active_session = plan_data.get("session") or await get_fan_session(fan_id)
-                    print(f"[SESSION] Planned for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
-                else:
-                    print(f"[SESSION] plan-session status={plan_data.get('status')} fan={fan_id}")
-            except Exception as e:
-                print(f"[SESSION PLAN ERROR] {e}")
+            cap_ok, cap_reason = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
+            if not cap_ok:
+                print(f"[CAP] fan={fan_id} plan suppressed: {cap_reason}")
+            else:
+                try:
+                    from main import plan_session
+                    plan_data = await plan_session(creator_id, fan_id)
+                    if plan_data.get("status") == "ok":
+                        active_session = plan_data.get("session") or await get_fan_session(fan_id)
+                        print(f"[SESSION] Planned for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
+                    else:
+                        print(f"[SESSION] plan-session status={plan_data.get('status')} fan={fan_id}")
+                except Exception as e:
+                    print(f"[SESSION PLAN ERROR] {e}")
 
         # Inject tip context into situation so prompt builder can use it
         if pending_tip:
