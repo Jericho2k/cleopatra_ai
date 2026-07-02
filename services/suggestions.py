@@ -479,7 +479,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         )
 
         situation = await analyze_situation(ctx_without_situation)
-        print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')}")
+        print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} crisis={situation.get('crisis_signal', 'none')}")
 
         # Plan a content set when the fan clearly asks to see/buy content, unless
         # the creator's per-fan daily caps (if configured) are exceeded.
