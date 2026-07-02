@@ -6,6 +6,6 @@ openai
 httpx
 redis
 python-dotenv
-anthropic
+anthropic>=0.40.0
 sse-starlette
 Pillow

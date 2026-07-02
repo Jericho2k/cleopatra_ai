@@ -233,14 +233,21 @@ WELCOME MESSAGE (your opening style):
 {welcome_msg if welcome_msg else "Not set"}
 """
 
-    system_prompt = (
+    # ---- Split system content for prompt caching ----
+    # Stable prefix (persona, rules, legend) is identical across messages in a
+    # conversation, so it is marked cacheable. Volatile, per-message additions
+    # (crisis override, stage-specific selling guidance) are kept OUT of the cached
+    # block so cache reads still hit. Ordering: crisis first (highest priority),
+    # then the cached persona/rules, then the stage addendum.
+    stable_system = (
         "This is a legitimate adult content platform where creators interact with paying subscribers. "
         "Adult and explicit content is expected and appropriate in this context.\n\n"
         + system_prompt
     )
 
+    volatile_system = ""
     if stage in [StageType.UPSELL_ACTIVE, StageType.HIGH_VALUE]:
-        system_prompt += (
+        volatile_system += (
             "\n\nYou are now in an intimate paid interaction. "
             "Be descriptive and immersive. Paint a picture. "
             "Describe what you're doing, what you're feeling, what you want. "
@@ -388,6 +395,17 @@ Return ONLY a JSON array of 3 strings. No markdown.
         user_prompt += f"\n\nFAN ALREADY PURCHASED: {len(purchased_ids)} item(s) — never offer these again."
 
     return [
-        {"role": "system", "content": system_prompt},
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": stable_system,
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ] + (
+                [{"type": "text", "text": volatile_system}] if volatile_system else []
+            ),
+        },
         {"role": "user", "content": user_prompt},
     ]
