@@ -35,6 +35,7 @@ from db.queries import (
     update_creator_legend,
     get_creator_legend,
     get_creator_caps,
+    freeze_fan_for_review,
 )
 from models.schemas import (
     ConversationContext,
@@ -59,6 +60,26 @@ _CONTENT_REQUEST_RE = re.compile(
     r"turn(?:s|ed)?\s+me\s+on|so\s+(?:hard|horny)|jerk(?:ing)?\s+off|touch(?:ing)?\s+myself)\b",
     re.IGNORECASE,
 )
+
+
+async def _crisis_freezes_chat(creator_id: str, fan_id: str, situation: dict) -> bool:
+    """If a crisis is flagged and the creator's policy is 'freeze', mark the fan for
+    human review and signal the auto path to stop. Returns True if the chat should be
+    frozen (auto-reply must abort). 'continue' policy (default) returns False so the
+    existing care-first crisis prompt handles it inline."""
+    signal = (situation.get("crisis_signal") or "none")
+    if signal == "none":
+        return False
+    try:
+        caps = await get_creator_caps(creator_id)
+    except Exception:
+        caps = {}
+    policy = (caps.get("crisis_policy") or "continue")
+    if policy == "freeze":
+        await freeze_fan_for_review(fan_id, f"crisis:{signal}")
+        print(f"[CRISIS] fan={fan_id} FROZEN for human review (signal={signal})")
+        return True
+    return False
 
 
 async def _within_daily_caps(creator_id: str, sent_ppv: list[dict], fan_profile) -> tuple[bool, str]:
@@ -412,6 +433,11 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         fan_profile = await get_fan_by_id(fan_id)
         if not fan_profile:
             return
+        # Frozen for human review (e.g. prior crisis under 'freeze' policy): auto-mode
+        # stays out until a human clears the flag in the dashboard.
+        if getattr(fan_profile, "needs_human_review", False):
+            print(f"[AUTO REPLY] fan={fan_id} is frozen for human review — skipping auto-reply")
+            return
         fan_tier = getattr(fan_profile, "spend_tier", "cold") or "cold"
 
         # Check for a pending tip and clear it atomically before building context
@@ -480,6 +506,11 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
         situation = await analyze_situation(ctx_without_situation)
         print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} crisis={situation.get('crisis_signal', 'none')}")
+
+        # Sticky-situation policy: if a crisis is flagged and the creator opted to
+        # freeze rather than continue, stop here — flag for a human, send nothing.
+        if await _crisis_freezes_chat(creator_id, fan_id, situation):
+            return
 
         # Plan a content set when the fan clearly asks to see/buy content, unless
         # the creator's per-fan daily caps (if configured) are exceeded.
@@ -833,7 +864,7 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
 
     db = get_supabase()
     fan = await asyncio.to_thread(lambda: db.table("fans")
-        .select("total_spent, sales_log, not_sold_log").eq("id", fan_id).single().execute())
+        .select("total_spent, sales_log, not_sold_log, creator_id, needs_human_review").eq("id", fan_id).single().execute())
     row = fan.data or {}
     sales_log = row.get("sales_log") or []
     not_sold = row.get("not_sold_log") or []
@@ -866,6 +897,22 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
             if str(item.get("media_id")) == str(media_id):
                 item["purchased"] = True
         await save_fan_session(fan_id, session)
+
+    # Whale handoff: if the agency set a threshold, hand the fan to a human the
+    # moment their total spend first crosses it (only on the crossing, not on every
+    # later purchase, and not if they're already flagged for review).
+    old_spent = int(row.get("total_spent", 0) or 0)
+    creator_id = row.get("creator_id")
+    if creator_id and not row.get("needs_human_review"):
+        try:
+            caps = await get_creator_caps(creator_id)
+            threshold = caps.get("whale_handoff_threshold")
+            threshold = int(threshold) if threshold else 0
+            if threshold and old_spent < threshold <= new_spent:
+                await freeze_fan_for_review(fan_id, f"whale:${new_spent}")
+                print(f"[WHALE HANDOFF] fan={fan_id} crossed ${threshold} (now ${new_spent}) — handed to human")
+        except Exception as e:
+            print(f"[WHALE HANDOFF ERROR] fan={fan_id} error={e}")
 
 
 async def _verify_ppv_purchase(

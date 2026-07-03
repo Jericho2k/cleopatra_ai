@@ -20,6 +20,7 @@ def _row_to_fan(row: dict) -> Fan:
         fansly_group_id=str(row["fansly_group_id"]) if row.get("fansly_group_id") is not None else None,
         total_spent=row.get("total_spent", 0),
         spend_tier=row.get("spend_tier", "cold"),
+        needs_human_review=row.get("needs_human_review", False),
         last_active=last_active,
         preferences=row.get("preferences") or [],
         notes=row.get("notes", ""),
@@ -566,15 +567,31 @@ async def update_fan_ai_summary(fan_id: str, summary: dict) -> None:
 
 # --- Creator autonomy caps (per-creator, agency-configurable) ---
 
+async def freeze_fan_for_review(fan_id: str, reason: str) -> None:
+    """Mark a fan's conversation as frozen and needing human intervention.
+    Auto-mode will skip frozen fans until a human clears the flag in the dashboard."""
+    from datetime import datetime, timezone
+    def _update():
+        get_supabase().table("fans").update({
+            "needs_human_review": True,
+            "review_reason": reason,
+            "frozen_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", fan_id).execute()
+    await asyncio.to_thread(_update)
+
+
 async def get_creator_caps(creator_id: str) -> dict:
     """Per-creator autonomy limits set by the agency. All optional; null/absent = no limit.
     Keys: caps_enabled (bool), max_ppv_per_fan_per_day (int|null),
-    max_spend_per_fan_per_day (int|null), max_sets_per_session (int|null)."""
+    max_spend_per_fan_per_day (int|null), max_sets_per_session (int|null),
+    crisis_policy ('continue'|'freeze'), whale_handoff_threshold (int|null;
+    null/0 = disabled, else hand the fan to a human once total_spent crosses it)."""
     def _get():
         r = (
             get_supabase().table("creators")
             .select("caps_enabled, max_ppv_per_fan_per_day, "
-                    "max_spend_per_fan_per_day, max_sets_per_session")
+                    "max_spend_per_fan_per_day, max_sets_per_session, crisis_policy, "
+                    "whale_handoff_threshold")
             .eq("id", creator_id).single().execute()
         )
         return r.data or {}
