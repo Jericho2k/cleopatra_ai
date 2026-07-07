@@ -4,6 +4,7 @@ Routes are thin and delegate all logic to services.
 """
 
 import asyncio
+from core.tasks import spawn
 import json
 import os
 import random
@@ -174,8 +175,8 @@ async def process_incoming_fan_message(
             f"should_update={_should_update_memory(conversation_history)}"
         )
         if _should_update_memory(conversation_history):
-            asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent))
-            asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
+            spawn(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent), name="update_fan_memory")
+            spawn(_update_fan_ai_summary(fan_id, conversation_history), name="update_fan_ai_summary")
         return
 
     creator_persona = await get_creator_persona(creator_id)
@@ -234,8 +235,8 @@ async def process_incoming_fan_message(
         f"should_update={_should_update_memory(conversation_history)}"
     )
     if _should_update_memory(conversation_history):
-        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent))
-        asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
+        spawn(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent), name="update_fan_memory")
+        spawn(_update_fan_ai_summary(fan_id, conversation_history), name="update_fan_ai_summary")
 
 
 class ReplyRequest(BaseModel):
@@ -327,7 +328,7 @@ async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
     fan = await get_fan(creator_id, platform_fan_id)
     if not fan:
         fan = await create_fan(creator_id, platform_fan_id, f"Fan_{platform_fan_id[-6:]}")
-        asyncio.create_task(_enrich_fan_profile(fan.id, creator_id, platform_fan_id))
+        spawn(_enrich_fan_profile(fan.id, creator_id, platform_fan_id), name="enrich_fan_profile")
 
     # Update group_id if not already stored
     if not fan.fansly_group_id and group_id:
@@ -463,6 +464,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- API authentication ---------------------------------------------------
+# Path-based policy so we don't have to touch ~33 route decorators:
+#   • OPTIONS (CORS preflight) and health/root  -> always open
+#   • external webhooks                         -> require WEBHOOK_SECRET
+#   • everything else (operator/CRUD/admin)     -> require DASHBOARD_API_SECRET
+# Unconfigured secrets fail open in dev, closed in prod (see core/auth.py).
+from starlette.responses import JSONResponse
+from core.auth import _is_dev, _consteq
+
+_PUBLIC_PATHS = {"/health", "/"}
+_WEBHOOK_PATHS = {"/webhook/fansly", "/generate-suggestions"}
+
+
+@app.middleware("http")
+async def api_auth_middleware(request, call_next):
+    path = request.url.path
+    if request.method == "OPTIONS" or path in _PUBLIC_PATHS:
+        return await call_next(request)
+
+    if path in _WEBHOOK_PATHS:
+        expected = os.environ.get("WEBHOOK_SECRET")
+        supplied = request.headers.get("x-webhook-secret")
+    else:
+        expected = os.environ.get("DASHBOARD_API_SECRET")
+        supplied = request.headers.get("x-api-key")
+
+    if not expected:
+        if _is_dev():
+            return await call_next(request)
+        return JSONResponse({"detail": "Server auth is not configured"}, status_code=500)
+
+    if not supplied or not _consteq(supplied, expected):
+        return JSONResponse({"detail": "Missing or invalid credentials"}, status_code=401)
+
+    return await call_next(request)
+
 
 
 @app.post("/suggestions", response_model=SuggestionResponse)
@@ -705,7 +743,7 @@ async def connect_creator(req: ConnectCreatorRequest) -> dict:
             }).execute()
         )
 
-        asyncio.create_task(sync_chats_background(creator["id"]))
+        spawn(sync_chats_background(creator["id"]), name="sync_chats_background")
 
         return {"success": True, "creator": creator}
 
@@ -761,7 +799,7 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
             }).execute()
         )
 
-        asyncio.create_task(sync_chats_background(creator["id"]))
+        spawn(sync_chats_background(creator["id"]), name="sync_chats_background")
 
         return {"success": True, "creator": creator}
 
@@ -1041,9 +1079,10 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
         fan_profile = await get_fan_by_id(fan_id)
 
         if fan_profile and len(conversation_history) >= 10:
-            asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
-            asyncio.create_task(
-                _update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent)
+            spawn(_update_fan_ai_summary(fan_id, conversation_history), name="update_fan_ai_summary")
+            spawn(
+                _update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent),
+                name="update_fan_memory",
             )
 
     return {"status": "ok", "imported": imported}
@@ -1189,7 +1228,7 @@ async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
             return {"status": "cooldown", **cd}
     _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": 0, "album": ""}
     await _stamp_vault_op(creator_id, "last_vault_sync_at")
-    asyncio.create_task(_run_vault_sync(creator_id))
+    spawn(_run_vault_sync(creator_id), name="run_vault_sync")
     return {"status": "started"}
 
 
@@ -1424,7 +1463,7 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
         print(f"[UPLOAD] saved to DB media_id={media_id}")
         # Auto-categorize in background
         if saved.get("id"):
-            asyncio.create_task(_categorize_single_item_and_save(saved))
+            spawn(_categorize_single_item_and_save(saved), name="categorize_single_item")
         return {"status": "ok", "item": saved}
 
 
@@ -1720,7 +1759,7 @@ async def categorize_vault(creator_id: str, force: bool = False) -> dict:
 
     _categorize_state[creator_id] = {"status": "running", "done": 0, "total": pending, "errors": 0}
     await _stamp_vault_op(creator_id, "last_categorize_at")
-    asyncio.create_task(_run_vault_categorization(creator_id))
+    spawn(_run_vault_categorization(creator_id), name="run_vault_categorization")
     return {"status": "started", "uncategorized": pending}
 
 
@@ -2073,7 +2112,7 @@ async def fansly_webhook(payload: dict) -> dict:
     fan = await get_fan(creator_id, platform_fan_id)
     if not fan:
         fan = await create_fan(creator_id, platform_fan_id, f"Fan_{platform_fan_id[-6:]}")
-        asyncio.create_task(_enrich_fan_profile(fan.id, creator_id, platform_fan_id))
+        spawn(_enrich_fan_profile(fan.id, creator_id, platform_fan_id), name="enrich_fan_profile")
 
     if message_id:
         mid = str(message_id)

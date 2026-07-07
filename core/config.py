@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     UPSTASH_REDIS_TOKEN: str
     OPENAI_API_KEY: str
     APP_ENV: str = "development"
+    DASHBOARD_API_SECRET: str = ""
+    WEBHOOK_SECRET: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

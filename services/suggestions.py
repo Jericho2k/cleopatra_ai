@@ -4,6 +4,7 @@ Coordinates DB, stage classification, RAG, prompt building, and generation
 """
 
 import asyncio
+from core.tasks import spawn
 import json
 import os
 import random
@@ -224,8 +225,8 @@ async def get_suggestions(
         await save_message(fan_id, creator_id, "fan", fan_message)
 
     if _should_update_memory(conversation_history):
-        asyncio.create_task(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent))
-        asyncio.create_task(_update_fan_ai_summary(fan_id, conversation_history))
+        spawn(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent), name="update_fan_memory")
+        spawn(_update_fan_ai_summary(fan_id, conversation_history), name="update_fan_ai_summary")
 
     return SuggestionResponse(suggestions=replies, stage=conversation_stage)
 
@@ -597,7 +598,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             pending = (fan_data.data or {}).get("pending_ppv_check")
             if pending:
                 print(f"[PPV SIGNAL] fan={fan_id} signal={purchase_signal} pending={pending}")
-                asyncio.create_task(_verify_ppv_purchase(fan_id, creator_id, pending))
+                spawn(_verify_ppv_purchase(fan_id, creator_id, pending), name="verify_ppv_purchase")
 
             if purchase_signal == "declined" and active_session:
                 # Fan declined — find cheapest unsent item below declined price
@@ -759,7 +760,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         }).eq("id", fan_id).execute()
                     )
                     # Send reaction fishing follow-up after short delay
-                    asyncio.create_task(_send_reaction_fishing(fan_id, creator_id, group_id, apifansly_account_id))
+                    spawn(_send_reaction_fishing(fan_id, creator_id, group_id, apifansly_account_id), name="send_reaction_fishing")
                 except Exception as e:
                     print(f"[PPV PENDING ERROR] {e}")
 
