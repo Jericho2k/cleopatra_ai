@@ -126,6 +126,10 @@ def _fan_wants_content(message, situation):
     # expressing genuine self-harm or intent to harm a real person, we do not sell.
     if situation and (situation.get("crisis_signal") or "none") != "none":
         return False
+    # He just declined / said he's broke: "send me something for free" is not a
+    # buying signal. Don't plan or push a sale on a decline turn.
+    if situation and (situation.get("purchase_signal") or "none") == "declined":
+        return False
     if _CONTENT_REQUEST_RE.search((message or "").lower()):
         return True
     if situation:
@@ -272,7 +276,7 @@ async def _update_fan_memory(
             "Analyze this conversation and return a JSON object with exactly these fields:\n"
             "{\n"
             '  "notes": "2-3 sentence internal summary of key facts about this fan",\n'
-            '  "preferences": ["list of content preferences, kinks, or fetishes mentioned or implied"],\n'
+            '  "preferences": ["ONLY stable content preferences the FAN clearly wants from the creator, stated or repeated. NOT: things he says about his own body, one-off dirty talk, or anything merely mentioned in passing. Empty list is better than guessing."],\n'
             '  "member_note": "Fill in the Member template below with what you know. Leave fields blank if unknown.\\n'
             'Age: \nLocation: \nInterests/hobbies: \nKinks: \nAdditional info: ",\n'
             '  "model_facts": {\n'
@@ -286,6 +290,12 @@ async def _update_fan_memory(
             "}\n\n"
             "For model_facts, ONLY include facts the creator (not the fan) actually stated about "
             "HERSELF in this conversation. Leave a field empty if she did not state it. Do not guess.\n\n"
+            "SPEAKER ATTRIBUTION IS CRITICAL — read the line labels. Lines starting 'Creator:' are "
+            "the creator speaking; lines starting 'Fan:' are the fan. Facts from 'Fan:' lines NEVER "
+            "go into model_facts, no matter what they are. Example of the mistake to avoid: if the "
+            "FAN says 'im living in miami', that is the FAN's location — it belongs in member_note, "
+            "and model_facts.origin stays empty. model_facts.origin is filled ONLY by a 'Creator:' "
+            "line like 'Creator: I'm a California girl'. When in doubt, leave the field empty.\n\n"
             "Conversation:\n"
             f"{convo_text}"
         )
@@ -374,8 +384,8 @@ async def _update_fan_ai_summary(
             '  "occupation": "job or income signals if mentioned, otherwise null",\n'
             '  "hobbies": "their hobbies or interests if mentioned, otherwise null",\n'
             '  "relationship_status": "single/relationship/married/unknown",\n'
-            '  "payday": "when they get paid if mentioned, otherwise null",\n'
-            '  "kinks": ["list of explicit kinks, fetishes, or sexual preferences mentioned or clearly implied"],\n'
+            '  "payday": "when they get paid, if mentioned in ANY form (e.g. paycheck next week, payday is the 1st, broke till Friday), otherwise null",\n'
+            '  "kinks": ["ONLY kinks/preferences the FAN clearly and repeatedly expresses wanting from the creator. NOT descriptions of himself or his anatomy, NOT one-off dirty-talk phrases, NOT topics merely touched on once. Fewer, higher-confidence entries beat a keyword dump."],\n'
             '  "emotional_type": "one of: romantic | submissive | dominant | transactional | playful | mixed",\n'
             '  "spending_behavior": "description of how they spend — e.g. tips spontaneously, haggles on price, pays without hesitation",\n'
             '  "best_time_to_message": "time of day or days they seem most active, or null",\n'
