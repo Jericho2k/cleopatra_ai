@@ -2290,6 +2290,10 @@ async def plan_session(
     fan = await get_fan_by_id(fan_id)
     sent_ppv = await get_sent_ppv(fan_id)
     purchased_ids = {s["media_id"] for s in sent_ppv if s.get("purchased")}
+    # Everything ever sent to this fan (purchased or not). A sent-but-unpurchased PPV
+    # is already sitting locked in his chat — resending it is pointless and looks
+    # broken (real bug: fan declined a $51 set and got the exact same set again).
+    sent_ids = {s["media_id"] for s in sent_ppv if s.get("media_id")}
 
     kinks = confirmed_kinks or []
     if not kinks and fan and fan.ai_summary:
@@ -2307,10 +2311,13 @@ async def plan_session(
     )
     approved = sets_row.data or []
 
-    # Drop sets the fan has already fully purchased; keep partials.
+    # Drop sets the fan already fully purchased OR that were already sent to him
+    # (a sent set is in his chat whether he bought it or not — never resend).
     sellable = [
         s for s in approved
-        if s.get("media_ids") and not set(s["media_ids"]).issubset(purchased_ids)
+        if s.get("media_ids")
+        and not set(s["media_ids"]).issubset(purchased_ids)
+        and not set(s["media_ids"]).issubset(sent_ids)
     ]
     if not sellable:
         print(f"[SESSION] no approved sets sellable creator={creator_id} fan={fan_id}")
