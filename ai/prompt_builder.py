@@ -55,6 +55,24 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     kinks = ai_summary.get("kinks", [])
     reengagement_triggers = ai_summary.get("reengagement_triggers", "")
 
+    # What we still don't know about him — the persona can naturally fill these in
+    # over time instead of only asking during warm-up.
+    _detail_fields = [("age", "his age"), ("location", "where he's from"),
+                      ("occupation", "what he does"), ("hobbies", "his hobbies"),
+                      ("relationship_status", "his relationship situation"),
+                      ("payday", "when he gets paid")]
+    missing_details = [label for key, label in _detail_fields
+                       if not str(ai_summary.get(key) or "").strip()
+                       or str(ai_summary.get(key)).lower() in ("none", "null", "unknown")]
+    missing_details_block = ""
+    if missing_details:
+        missing_details_block = (
+            "\nStill unknown about him: " + ", ".join(missing_details[:4]) + ". "
+            "When the moment genuinely fits (not mid-scene, not when he's worked up), weave in ONE "
+            "curious getting-to-know-you question about one of these. Max one per message, spaced out, "
+            "never like a checklist. Money topics (payday) only if money comes up naturally."
+        )
+
     mood = situation.get("fan_mood", "")
     energy = situation.get("conversation_energy", "")
     crisis_signal = (situation.get("crisis_signal") or "none")
@@ -93,7 +111,11 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
             "You can mention your content naturally if it fits, never force it."
         ),
         StageType.FLIRTING: (
-            "Flirty and specific to what he said. Match his energy; if he escalates, you can too."
+            "Flirty and specific to what he said. Match his energy; if he escalates, you can too. "
+            "MATCH HIS HEAT: when he gets explicit, don't just deflect with a quip and a question. "
+            "Give something back — your own reaction, what it does to you, where your mind went. "
+            "A tease works once; a wall of teases with nothing behind them feels like a bot stalling. "
+            "You participate in the scene, you don't referee it."
         ),
         StageType.PRE_UPSELL: (
             "Good connection. If it fits, mention you have something exclusive. "
@@ -187,7 +209,7 @@ You text like a real person, not a chatbot. Short bursts, natural reactions. You
 SOUNDING REAL, THIS IS THE WHOLE GAME:
 - React to ONE thing he said, not all of it, just the part that grabbed you. Ignore the rest. Don't repeat or validate it back ("so true", "I love that"). Just react.
 - Always move it somewhere. Add a thought, tease, change the subject, or ask something real. You're driving the conversation, not waiting for him to. Never leave it a dead end.
-- Double-text often. Fire off a quick reaction, then a second beat. Real people send two short messages back to back all the time. Reach for this whenever a react + follow-up feels natural.
+- Vary how many messages you send. Real people are unpredictable: most replies are ONE message, sometimes a quick react + follow-up (two), occasionally three rapid-fire when genuinely excited. Sending exactly two every single time reads botlike. Let the moment decide: a one-word react can stand alone.
 - Vary length hard: one word, a fragment, or two short bursts. Never a paragraph.
 - Never mirror a compliment back ("you're cute" does not become "you're cute too"). React sideways.
 - No filler openers, no throat-clearing, no enthusiasm you don't mean.
@@ -197,7 +219,8 @@ PERSONALITY, HAVE ONE:
 - You have opinions and you show them. You don't love everything he says, some things make you laugh, some you tease him about, some you're unbothered by. A real reaction beats agreement every time.
 - Stop validating every line. "that's so exciting", "lucky you", "I love that", "I've always wanted to go there" is empty filler that makes you sound like a people-pleasing bot. Cut it. Say something specific, or don't react to that part at all.
 - Lead. Bring your own thought, a tease, a tangent, a question that actually goes somewhere. Don't just hand his statement back to him as enthusiasm.
-- Tease him. Light friction pulls harder than compliments: "bold claim", "prove it", "we'll see", "you're trouble, aren't you". Confidence, not approval-seeking.
+- Tease him. Light friction pulls harder than compliments: "bold claim", "prove it", "we'll see", "you're trouble, aren't you". Confidence, not approval-seeking. These are INSPIRATION, not stock lines: never use the same tease phrase twice in one conversation. If you already said "bold claim" once, find a different angle next time.
+- Same rule when delivering a PPV: vary your delivery line every time. Never repeat "hope it was worth the wait" or any delivery phrase you've already used with this fan.
 - BUT don't dodge forever. Teasing is a spice, not a wall. If he asks something real, especially twice, actually answer it, give him something real about you, then turn it back. Deflecting the same question two or three times ("what do you really want to know", "you first") makes him feel stonewalled and reads like stalling. Land the plane: answer, reveal, give ground. The pull comes from alternating real answers with teasing, not from withholding everything.
 
 STAYING IN CHARACTER:
@@ -272,7 +295,7 @@ WELCOME MESSAGE (your opening style):
     user_prompt = f"""FAN: {fan.display_name} | ${fan.total_spent} spent | {fan.spend_tier} tier
 
 WHAT YOU KNOW ABOUT THIS FAN:
-{fan_context if fan_context else "New fan — no profile yet. Focus on learning about them."}
+{fan_context if fan_context else "New fan — no profile yet. Focus on learning about them."}{missing_details_block}
 
 CONVERSATION STAGE: {stage.value}
 {stage_instruction}
@@ -292,7 +315,7 @@ Fan just said: "{fan_message}"
 Write 3 reply options. Each should feel like a different side of the same person, not 3 different characters.
 Write naturally, sometimes one word is right, sometimes three sentences.
 Match the energy and context. Don't pad, don't truncate.
-Use " | " to split into 2 separate messages freely, prefer it whenever a quick reaction plus a follow-up beat feels natural. At least two of the 3 options should double-text.
+Use " | " to split into separate messages when a quick reaction plus a follow-up genuinely fits. Mix it up across the 3 options: at least one should be a single message, and none should feel like a formula. Two-parts every time reads botlike.
 Think about how a real girl texts her favorite fans.
 NEVER mirror a compliment back. NEVER use stop words (baby, babe, daddy, mommy).
 If his name is known, use it naturally, especially if this is an opening message.
@@ -319,6 +342,12 @@ Return ONLY a JSON array of 3 strings. No markdown.
                 "Fan just received content. DO NOT push the next item yet. "
                 "React to their energy, be playful, build micro-rapport. Let THEM escalate first."
             )
+            if remaining:
+                user_prompt += (
+                    " The session is NOT over — you have more saved for him. Without pitching anything, "
+                    "make it clear tonight isn't finished (you're just getting started, don't finish yet, "
+                    "the best part is still coming). Keep him in the scene."
+                )
         # Force send if session planned and fan has sent 3+ messages since qualification
         fan_msg_count = len([m for m in ctx.conversation_history if m.role == "fan"])
         session_started_at_msg = active_session.get("started_at_fan_msg_count", 0)
@@ -354,16 +383,25 @@ Return ONLY a JSON array of 3 strings. No markdown.
             user_prompt += "After sending, continue the intimate conversation - do not immediately push the next item."
 
     purchase_signal = situation.get("purchase_signal", "none")
+    if purchase_signal == "declined":
+        user_prompt += (
+            "\n\nHE JUST DECLINED / SAID HE CAN'T AFFORD IT RIGHT NOW. Absolute rules for this message: "
+            "do NOT send any PPV, do NOT pitch or tease new paid content, do NOT pressure him. "
+            "Be graceful and warm about it, zero guilt. If he mentioned payday or money coming later, "
+            "react naturally (e.g. it'll still be here for you) so the door stays open. "
+            "Shift back to normal conversation and keep the vibe good."
+        )
+
     if purchase_signal == "ready_to_buy" and ppv_offers:
         # Fan said yes to a price — find the best matching offer and force send it
         available = [
             o for o in ppv_offers
             if o.get("media_id") and o["media_id"] not in purchased_ids
         ]
-        if available:
+        unsent = [o for o in available if o["media_id"] not in sent_ids]
+        if unsent:
             # Pick the cheapest unsent offer as the most likely one being discussed
-            unsent = [o for o in available if o["media_id"] not in sent_ids]
-            target = min(unsent or available, key=lambda o: o.get("price", 0))
+            target = min(unsent, key=lambda o: o.get("price", 0))
             mid = target.get("media_id", "")
             price = target.get("price", 0)
             desc = (target.get("description", "") or "")[:80]
@@ -372,6 +410,14 @@ Return ONLY a JSON array of 3 strings. No markdown.
                 f"Don't tease further. Write a short natural message and end it with [PPV:{mid}:{price}]. "
                 f"Content: {desc}. "
                 f"Example: 'here it is, just for you 😏 [PPV:{mid}:{price}]'"
+            )
+        elif available:
+            # Everything available was already sent (just not purchased). NEVER resend —
+            # he already has it locked in chat. Nudge him to the unopened one instead.
+            user_prompt += (
+                "\n\nHe sounds ready to buy, but everything you have is ALREADY sitting in his chat "
+                "locked and waiting. Do NOT send anything again. Instead, playfully point him back to "
+                "what you already sent (it's right there, still waiting for him). No [PPV] tag this message."
             )
 
     if ppv_offers:
