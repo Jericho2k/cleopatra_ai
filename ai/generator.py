@@ -142,6 +142,9 @@ async def generate_replies(
             print(f"[GENERATOR ERROR] attempt {attempt + 1} model={model} error={e}")
             continue
 
-    # Fallback if all attempts fail
-    return filter_suggestions(["hey 😘", "omg haha", "tell me more"])
-
+    # All attempts failed. FAIL CLOSED — never send contextless filler ("hey",
+    # "omg haha") to a real fan. Returning empty means the auto path sends nothing
+    # this turn (a missed reply is recoverable; a nonsense reply is not) and the
+    # assisted path shows no suggestions rather than garbage ones.
+    print("[GENERATOR ERROR] all attempts failed — returning no suggestions (fail closed)")
+    return []

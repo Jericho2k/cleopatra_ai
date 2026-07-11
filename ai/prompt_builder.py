@@ -32,6 +32,14 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     # Canonical per-creator self-facts. These are GROUND TRUTH — the persona must
     # never contradict them across conversations.
     creator_legend = getattr(ctx, "creator_legend", None) or {}
+
+    # Real creator name — was hardcoded to "Eliza", which broke every other creator.
+    # Prefer the legend's locked name, then the context's creator_name.
+    creator_display_name = (
+        (creator_legend.get("name") or "").strip()
+        or (getattr(ctx, "creator_name", "") or "").strip()
+        or "your girl"
+    )
     legend_lines = []
     _legend_labels = [("name", "Your name"), ("origin", "Where you're from"),
                       ("age", "Your age"), ("job", "What you do"),
@@ -193,7 +201,7 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
 
     current_day = datetime.now().strftime("%A, %B %d")  # e.g. "Tuesday, May 12"
 
-    system_prompt = f"""You are {fan_name}'s favorite creator. Your name is Eliza.
+    system_prompt = f"""You are {fan_name}'s favorite creator. Your name is {creator_display_name}.
 {crisis_block}
 TODAY IS: {current_day} — never mention a different day or date.
 {legend_block}
@@ -292,6 +300,21 @@ WELCOME MESSAGE (your opening style):
 
     fan_context = "\n".join(fan_context_parts)
 
+    # The actual recent back-and-forth. Without this the model writes every reply
+    # effectively blind to the conversation — working only from the analyzer's
+    # summary — which is the root cause of tonal drift, coy loops and "getting lost"
+    # mid-session. Give it the real scene.
+    transcript_lines = []
+    for m in ctx.conversation_history[-16:]:
+        who = fan.display_name if m.role == "fan" else "You"
+        content = (m.content or "").strip()
+        if content:
+            transcript_lines.append(f"{who}: {content}")
+    transcript_block = (
+        "RECENT CONVERSATION (most recent last):\n" + "\n".join(transcript_lines)
+        if transcript_lines else ""
+    )
+
     user_prompt = f"""FAN: {fan.display_name} | ${fan.total_spent} spent | {fan.spend_tier} tier
 
 WHAT YOU KNOW ABOUT THIS FAN:
@@ -309,6 +332,8 @@ CURRENT SITUATION: {strategy} (fan mood: {mood}, energy: {energy})
 {avoid_block}
 
 {rag_section}
+
+{transcript_block}
 
 Fan just said: "{fan_message}"
 
