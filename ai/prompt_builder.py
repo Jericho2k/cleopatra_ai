@@ -373,13 +373,16 @@ Return ONLY a JSON array of 3 strings. No markdown.
                     "make it clear tonight isn't finished (you're just getting started, don't finish yet, "
                     "the best part is still coming). Keep him in the scene."
                 )
-        # Force send if session planned and fan has sent 3+ messages since qualification
+        # Force send if session planned and fan has sent 3+ messages since qualification.
+        # NEVER while selling is paused (he told us he can't afford it) — that's how a
+        # broke fan ended up getting PPVs pushed at him repeatedly mid-session.
+        selling_paused = bool(getattr(fan, "sale_paused_at", None)) and purchase_signal != "money_available"
         fan_msg_count = len([m for m in ctx.conversation_history if m.role == "fan"])
         session_started_at_msg = active_session.get("started_at_fan_msg_count", 0)
         msgs_since_session = fan_msg_count - session_started_at_msg
-        should_force_send = msgs_since_session >= 3 and remaining
+        should_force_send = (not selling_paused) and msgs_since_session >= 3 and remaining
 
-        if should_force_send or (purchase_signal == "ready_to_buy" and remaining):
+        if not selling_paused and (should_force_send or (purchase_signal == "ready_to_buy" and remaining)):
             next_item = remaining[0]
             next_media_id = next_item.get("media_id", "")
             next_price = next_item.get("price", 0)
@@ -408,6 +411,18 @@ Return ONLY a JSON array of 3 strings. No markdown.
             user_prompt += "After sending, continue the intimate conversation - do not immediately push the next item."
 
     purchase_signal = situation.get("purchase_signal", "none")
+
+    # Persistent decline lock: he already told us he can't afford it. This holds
+    # across turns until he says money is available — so a later "but I'm so hard,
+    # send me something" must NOT be answered with a sale.
+    if getattr(fan, "sale_paused_at", None) and purchase_signal != "money_available":
+        user_prompt += (
+            "\n\nSELLING IS PAUSED FOR HIM. He already told you he can't afford it right now. "
+            "Do NOT send PPV, do NOT pitch, tease, or hint at paid content, do NOT mention prices — "
+            "even if he asks for content or says he's worked up. Stay warm and keep the conversation "
+            "good without selling. If he says money has come in, that changes things, but until then: no offers."
+        )
+
     if purchase_signal == "declined":
         user_prompt += (
             "\n\nHE JUST DECLINED / SAID HE CAN'T AFFORD IT RIGHT NOW. Absolute rules for this message: "

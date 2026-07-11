@@ -21,6 +21,7 @@ def _row_to_fan(row: dict) -> Fan:
         total_spent=row.get("total_spent", 0),
         spend_tier=row.get("spend_tier", "cold"),
         needs_human_review=row.get("needs_human_review", False),
+        sale_paused_at=row.get("sale_paused_at"),
         last_active=last_active,
         preferences=row.get("preferences") or [],
         notes=row.get("notes", ""),
@@ -576,6 +577,29 @@ async def freeze_fan_for_review(fan_id: str, reason: str) -> None:
             "needs_human_review": True,
             "review_reason": reason,
             "frozen_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", fan_id).execute()
+    await asyncio.to_thread(_update)
+
+
+async def set_fan_decline_lock(fan_id: str, price: float | None) -> None:
+    """Mark that the fan declined on affordability. While locked, auto-mode does NOT
+    sell to this fan (no PPV, no cheaper-item resurfacing). Cleared when he signals
+    money is available / payday arrives."""
+    from datetime import datetime, timezone
+    def _update():
+        get_supabase().table("fans").update({
+            "sale_paused_at": datetime.now(timezone.utc).isoformat(),
+            "sale_paused_price": price,
+        }).eq("id", fan_id).execute()
+    await asyncio.to_thread(_update)
+
+
+async def clear_fan_decline_lock(fan_id: str) -> None:
+    """Lift the decline lock (fan signaled money is available)."""
+    def _update():
+        get_supabase().table("fans").update({
+            "sale_paused_at": None,
+            "sale_paused_price": None,
         }).eq("id", fan_id).execute()
     await asyncio.to_thread(_update)
 

@@ -36,6 +36,8 @@ from db.queries import (
     update_creator_legend,
     get_creator_legend,
     get_creator_caps,
+    set_fan_decline_lock,
+    clear_fan_decline_lock,
     freeze_fan_for_review,
 )
 from models.schemas import (
@@ -121,6 +123,12 @@ async def _within_daily_caps(creator_id: str, sent_ppv: list[dict], fan_profile)
     return True, ""
 
 
+def _selling_locked(fan_profile) -> bool:
+    """True while the fan is under a decline lock (said he can't afford it and hasn't
+    since signaled money). No planning, no PPV, no cheaper-item retry while locked."""
+    return bool(getattr(fan_profile, "sale_paused_at", None))
+
+
 def _fan_wants_content(message, situation):
     # Hard stop: never treat a crisis message as a buying signal. If the fan is
     # expressing genuine self-harm or intent to harm a real person, we do not sell.
@@ -187,7 +195,7 @@ async def get_suggestions(
 
     # Auto-plan a session if the fan is asking for content and none is active,
     # and the creator's per-fan daily caps (if configured) aren't exceeded.
-    if not active_session and _fan_wants_content(fan_message, situation):
+    if not active_session and not _selling_locked(fan_profile) and _fan_wants_content(fan_message, situation):
         cap_ok, cap_reason = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
         if not cap_ok:
             print(f"[CAP] fan={fan_id} plan suppressed: {cap_reason}")
@@ -525,7 +533,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
         # Plan a content set when the fan clearly asks to see/buy content, unless
         # the creator's per-fan daily caps (if configured) are exceeded.
-        if not active_session and _fan_wants_content(latest_message, situation):
+        if not active_session and not _selling_locked(fan_profile) and _fan_wants_content(latest_message, situation):
             cap_ok, cap_reason = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
             if not cap_ok:
                 print(f"[CAP] fan={fan_id} plan suppressed: {cap_reason}")
@@ -610,33 +618,25 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 print(f"[PPV SIGNAL] fan={fan_id} signal={purchase_signal} pending={pending}")
                 spawn(_verify_ppv_purchase(fan_id, creator_id, pending), name="verify_ppv_purchase")
 
-            if purchase_signal == "declined" and active_session:
-                # Fan declined — find cheapest unsent item below declined price
-                # and inject it into session as a retry at a lower price point
+            if purchase_signal == "declined":
+                # Hard affordability decline: STOP selling this fan. No PPV, no
+                # cheaper-item resurfacing (that behavior is why a fan who said he
+                # was broke got the same $28 PPV three times). The lock persists
+                # across turns until he signals money is available.
                 try:
-                    declined_price = (pending or {}).get("price", 999)
-                    session = await get_fan_session(fan_id)
-                    if session:
-                        plan = session.get("plan", [])
-                        idx = session.get("current_index", 0)
-                        remaining_items = [
-                            p for p in plan[idx:]
-                            if not p.get("sent") and float(p.get("price", 999)) < float(declined_price) * 0.75
-                        ]
-                        if remaining_items:
-                            # Surface cheapest alternative
-                            cheaper = min(remaining_items, key=lambda x: x.get("price", 999))
-                            # Remove from original position first, then insert at current index
-                            original_idx = plan.index(cheaper)
-                            plan.pop(original_idx)
-                            insert_at = idx if original_idx >= idx else idx - 1
-                            plan.insert(insert_at, cheaper)
-                            await save_fan_session(fan_id, session)
-                            print(f"[SESSION] Declined ${declined_price} — surfaced cheaper item ${cheaper.get('price')} for fan={fan_id}")
-                        else:
-                            pass
+                    declined_price = (pending or {}).get("price")
+                    await set_fan_decline_lock(fan_id, declined_price)
+                    print(f"[SESSION] fan={fan_id} DECLINED — selling paused (was ${declined_price})")
                 except Exception as e:
-                    print(f"[SESSION DECLINE HANDLER ERROR] {e}")
+                    print(f"[DECLINE LOCK ERROR] fan={fan_id} error={e}")
+
+        # Money is available again → lift the lock so the full experience resumes.
+        if purchase_signal == "money_available":
+            try:
+                await clear_fan_decline_lock(fan_id)
+                print(f"[SESSION] fan={fan_id} money available — selling resumed")
+            except Exception as e:
+                print(f"[DECLINE UNLOCK ERROR] fan={fan_id} error={e}")
 
         ctx = ConversationContext(
             fan_message=latest_message,

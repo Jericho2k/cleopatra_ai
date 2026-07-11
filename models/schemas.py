@@ -25,6 +25,7 @@ class Fan(BaseModel):
     total_spent: int = 0
     spend_tier: str = "cold"  # whale | active | casual | cold
     needs_human_review: bool = False
+    sale_paused_at: str | None = None
     last_active: datetime | None = None
     preferences: list[str] = []
     notes: str = ""
