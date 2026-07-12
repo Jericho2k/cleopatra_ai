@@ -127,8 +127,15 @@ async def get_sent_ppv(fan_id: str) -> list[dict]:
             mc = row.get("media_context") or {}
             ppv = mc.get("ppv")
             if ppv and ppv.get("media_id"):
+                media_ids = [
+                    str(value)
+                    for value in (ppv.get("media_ids") or [ppv["media_id"]])
+                    if value
+                ]
                 sent.append({
-                    "media_id": ppv["media_id"],
+                    "media_id": str(ppv["media_id"]),
+                    "media_ids": media_ids,
+                    "set_id": str(ppv["set_id"]) if ppv.get("set_id") else None,
                     "price": ppv.get("price", 0),
                     "purchased": ppv.get("purchased", False),
                     "sent_at": row.get("sent_at", ""),
@@ -159,9 +166,22 @@ async def mark_ppv_purchased(fan_id: str, media_id: str, sent_at: str | None = N
 
 
 async def get_conversation_history(fan_id: str, limit: int = 40) -> list[Message]:
+    """Return the newest ``limit`` messages in chronological prompt order.
+
+    Supabase applies LIMIT after ORDER BY. Querying ascending returned the oldest
+    40 messages in long conversations, so auto mode could answer stale context.
+    """
     def _get():
-        r = get_supabase().table("messages").select("role, content, sent_at, media_context").eq("fan_id", fan_id).order("sent_at", desc=False).limit(limit).execute()
-        return [_row_to_message(row) for row in (r.data or [])]
+        r = (
+            get_supabase().table("messages")
+            .select("role, content, sent_at, media_context")
+            .eq("fan_id", fan_id)
+            .order("sent_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        rows = list(reversed(r.data or []))
+        return [_row_to_message(row) for row in rows]
 
     return await asyncio.to_thread(_get)
 
