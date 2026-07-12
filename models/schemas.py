@@ -89,6 +89,7 @@ class ConversationContext(BaseModel):
     sent_ppv: list[dict] = []
     active_session: dict | None = None
     creator_legend: dict = {}
+    commercial_decision: dict | None = None
 
 
 class SuggestionRequest(BaseModel):

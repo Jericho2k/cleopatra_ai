@@ -17,6 +17,7 @@ from openai import AsyncOpenAI
 from core.config import get_settings
 from core.supabase import get_supabase
 from ai.prompt_builder import build_prompt
+from services.commercial_orchestrator import orchestrate
 from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
@@ -531,6 +532,25 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         if await _crisis_freezes_chat(creator_id, fan_id, situation):
             return
 
+        # Commercial layer: deterministic policy decides what happens next
+        # (sell / pause / tease / schedule). Flag-gated so it can be turned off
+        # instantly in prod without a deploy.
+        decision = None
+        if os.environ.get("COMMERCIAL_LAYER_ENABLED", "").lower() in ("1", "true", "yes"):
+            try:
+                cap_ok, _ = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
+                decision = await orchestrate(
+                    creator_id=creator_id,
+                    fan_id=fan_id,
+                    situation=situation,
+                    fan_has_bought_before=bool(getattr(fan_profile, "total_spent", 0)),
+                    within_daily_caps=cap_ok,
+                    frozen_for_review=bool(getattr(fan_profile, "needs_human_review", False)),
+                )
+            except Exception as e:
+                print(f"[COMMERCIAL ERROR] fan={fan_id}: {e} — falling back to legacy path")
+                decision = None
+
         # Plan a content set when the fan clearly asks to see/buy content, unless
         # the creator's per-fan daily caps (if configured) are exceeded.
         if not active_session and not _selling_locked(fan_profile) and _fan_wants_content(latest_message, situation):
@@ -650,6 +670,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             ppv_offers=ppv_offers,
             sent_ppv=sent_ppv,
             active_session=active_session,
+            commercial_decision=decision.model_dump(mode="json") if decision else None,
         )
 
         prompt = build_prompt(ctx)

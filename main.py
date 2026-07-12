@@ -376,6 +376,19 @@ async def ppv_sweep_scheduler():
             print(f"[CRON PPV SWEEP ERROR] {e}")
 
 
+async def _scheduled_actions_scheduler():
+    """Runs the commercial scheduled-actions queue (payday re-engagement, etc)."""
+    from workers.scheduled_actions import process_once
+    while True:
+        await asyncio.sleep(60)
+        try:
+            sent = await process_once()
+            if sent:
+                print(f"[CRON] scheduled actions: sent {sent}")
+        except Exception as e:
+            print(f"[CRON SCHEDULED ACTIONS ERROR] {e}")
+
+
 async def vault_autosync_scheduler():
     """Once a day, sync any creator whose vault is >7 days stale, then categorize
     only the genuinely-new items. The persisted last_vault_sync_at timestamp acts
@@ -432,6 +445,7 @@ async def lifespan(app: FastAPI):
     reengagement_task = asyncio.create_task(reengagement_scheduler())
     ppv_sweep_task = asyncio.create_task(ppv_sweep_scheduler())
     vault_autosync_task = asyncio.create_task(vault_autosync_scheduler())
+    scheduled_actions_task = asyncio.create_task(_scheduled_actions_scheduler())
 
     yield
 
