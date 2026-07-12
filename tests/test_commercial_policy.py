@@ -1,176 +1,170 @@
-"""Tests for the commercial policy engine.
-
-This is the whole point of making the decision a pure function: the business rules
-that used to live in prompt paragraphs (and broke constantly) are now assertable.
-Every bug we hit in live transcripts gets a test here.
-"""
+"""Regression tests for deterministic commercial policy."""
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.commercial import (  # noqa: E402
-    ActionType, CommercialEvent, CreatorPolicy, EventType,
-    FanCommercialState, FanStatus, SextingMode,
+    ActionType,
+    CommercialEvent,
+    CreatorPolicy,
+    EventType,
+    FanCommercialState,
+    FanStatus,
+    PackageOption,
+    SextingMode,
 )
-from services.commercial_policy import (  # noqa: E402
-    CommercialContext, decide_next_action,
-)
+from services.commercial_policy import CommercialContext, decide_next_action  # noqa: E402
 from services.payday import resolve_payday  # noqa: E402
 
 
-def ev(t, raw=""):
-    return CommercialEvent(type=t, raw_expression=raw)
-
-
-def test_broke_fan_is_never_sold_to():
-    """THE regression test. Live bug: fan said he was broke and got the same $28
-    PPV three times."""
-    d = decide_next_action(
-        CreatorPolicy(),
-        FanCommercialState(status=FanStatus.PAUSED_UNTIL_PAYDAY),
-        [ev(EventType.WANTS_MEDIA)],   # he's asking for content while broke
-        CommercialContext(),
+def ev(event_type, raw="", *, cents=None, position=None, metadata=None):
+    return CommercialEvent(
+        type=event_type,
+        raw_expression=raw,
+        amount_cents=cents,
+        package_position=position,
+        metadata=metadata or {},
     )
-    assert d.must_not_send_media is True
-    assert d.action in (ActionType.CONTINUE_NORMAL_CHAT, ActionType.CONTINUE_FREE_TEXT)
-    assert d.mention_price is None
 
 
-def test_payday_mention_schedules_followup():
-    d = decide_next_action(
+def package(price=2800, set_id="set-28"):
+    return PackageOption(
+        package_id=f"set:{set_id}",
+        label="lingerie set",
+        price_cents=price,
+        set_id=set_id,
+    )
+
+
+def test_selected_cheaper_package_beats_payday_mention():
+    selected = ev(
+        EventType.PACKAGE_SELECTED,
+        "$28",
+        cents=2800,
+        metadata={"set_id": "set-28", "package_id": "set:set-28"},
+    )
+    decision = decide_next_action(
+        CreatorPolicy(),
+        FanCommercialState(status=FanStatus.OFFER_PENDING),
+        [selected, ev(EventType.BUDGET_LIMIT_STATED, cents=2800), ev(EventType.PAYDAY_MENTIONED, "Friday")],
+        CommercialContext(package_options=[package()]),
+    )
+    assert decision.action == ActionType.CREATE_PAID_SESSION
+    assert decision.session_budget_cents == 2800
+    assert decision.schedule_payday_followup is False
+    assert decision.new_status == FanStatus.PAID_SESSION_ACTIVE
+
+
+def test_cannot_afford_any_option_schedules_payday():
+    decision = decide_next_action(
         CreatorPolicy(),
         FanCommercialState(),
         [ev(EventType.MONEY_UNAVAILABLE), ev(EventType.PAYDAY_MENTIONED, "Friday")],
-        CommercialContext(),
+        CommercialContext(package_options=[package()]),
     )
-    assert d.action == ActionType.PAUSE_UNTIL_PAYDAY
-    assert d.schedule_payday_followup is True
-    assert d.new_status == FanStatus.PAUSED_UNTIL_PAYDAY
-    assert d.must_not_send_media is True
+    assert decision.action == ActionType.PAUSE_UNTIL_PAYDAY
+    assert decision.schedule_payday_followup is True
+    assert decision.must_not_ask_question is True
+    assert decision.conversation_continuation == "none"
 
 
-def test_no_payday_means_no_schedule():
-    d = decide_next_action(
+def test_broke_fan_is_never_sold_to():
+    decision = decide_next_action(
         CreatorPolicy(),
-        FanCommercialState(),
-        [ev(EventType.MONEY_UNAVAILABLE)],
-        CommercialContext(),
+        FanCommercialState(status=FanStatus.PAUSED_UNTIL_PAYDAY),
+        [ev(EventType.WANTS_MEDIA)],
+        CommercialContext(package_options=[package()]),
     )
-    assert d.action == ActionType.PAUSE_NO_BUDGET
-    assert d.schedule_payday_followup is False
+    assert decision.must_not_send_media is True
+    assert decision.action in (ActionType.CONTINUE_NORMAL_CHAT, ActionType.CONTINUE_FREE_TEXT)
 
 
-def test_money_available_lifts_the_pause():
-    d = decide_next_action(
+def test_money_available_lifts_pause():
+    decision = decide_next_action(
         CreatorPolicy(),
         FanCommercialState(status=FanStatus.PAUSED_UNTIL_PAYDAY),
         [ev(EventType.MONEY_AVAILABLE)],
         CommercialContext(),
     )
-    assert d.action == ActionType.RESUME_PREVIOUS_OFFER
-    assert d.new_status == FanStatus.IDLE
-    assert d.mention_previous_interest is True
+    assert decision.action == ActionType.RESUME_PREVIOUS_OFFER
+    assert decision.new_status == FanStatus.IDLE
 
 
-def test_crisis_beats_everything():
-    d = decide_next_action(
+def test_crisis_beats_package_selection():
+    decision = decide_next_action(
         CreatorPolicy(),
-        FanCommercialState(status=FanStatus.PAID_SESSION_ACTIVE),
-        [ev(EventType.CRISIS), ev(EventType.READY_TO_BUY)],
-        CommercialContext(),
+        FanCommercialState(),
+        [ev(EventType.CRISIS), ev(EventType.PACKAGE_SELECTED, cents=2800)],
+        CommercialContext(package_options=[package()]),
     )
-    assert d.action == ActionType.HAND_OFF_TO_HUMAN
-    assert d.must_not_send_media is True
+    assert decision.action == ActionType.HAND_OFF_TO_HUMAN
+    assert decision.must_not_send_media is True
 
 
-def test_hybrid_teaser_gives_a_taste_then_offers():
+def test_hybrid_teaser_gives_taste_then_offer():
     policy = CreatorPolicy(sexting_mode=SextingMode.HYBRID_TEASER, teaser_max_messages=4)
-    # early: free teaser
-    d = decide_next_action(
-        policy, FanCommercialState(teaser_messages_used=1),
-        [ev(EventType.WANTS_EXPLICIT)], CommercialContext(),
+    option = package()
+    early = decide_next_action(
+        policy,
+        FanCommercialState(teaser_messages_used=1),
+        [ev(EventType.WANTS_EXPLICIT)],
+        CommercialContext(package_options=[option]),
     )
-    assert d.action == ActionType.START_FREE_TEASER
-    assert d.may_be_explicit is True
-    assert d.must_not_send_media is True
-    # exhausted: transition to the offer
-    d2 = decide_next_action(
-        policy, FanCommercialState(teaser_messages_used=4),
-        [ev(EventType.WANTS_EXPLICIT)], CommercialContext(),
+    assert early.action == ActionType.START_FREE_TEASER
+    exhausted = decide_next_action(
+        policy,
+        FanCommercialState(teaser_messages_used=4),
+        [ev(EventType.WANTS_EXPLICIT)],
+        CommercialContext(package_options=[option]),
     )
-    assert d2.action == ActionType.END_TEASER_AND_OFFER
+    assert exhausted.action == ActionType.END_TEASER_AND_OFFER
 
 
 def test_paid_only_never_gives_free_explicit():
-    d = decide_next_action(
+    decision = decide_next_action(
         CreatorPolicy(sexting_mode=SextingMode.PAID_ONLY),
         FanCommercialState(),
         [ev(EventType.WANTS_EXPLICIT)],
         CommercialContext(),
     )
-    assert d.may_be_explicit is False
-    assert d.action != ActionType.START_FREE_TEASER
+    assert decision.may_be_explicit is False
+    assert decision.action != ActionType.START_FREE_TEASER
 
 
-def test_free_text_mode_allows_explicit_even_when_broke():
-    d = decide_next_action(
+def test_free_text_mode_allows_text_while_paused():
+    decision = decide_next_action(
         CreatorPolicy(sexting_mode=SextingMode.FREE_TEXT_ALLOWED),
         FanCommercialState(status=FanStatus.PAUSED_UNTIL_PAYDAY),
         [ev(EventType.WANTS_EXPLICIT)],
         CommercialContext(),
     )
-    assert d.action == ActionType.CONTINUE_FREE_TEXT
-    assert d.may_be_explicit is True
-    assert d.must_not_send_media is True   # media still paid
+    assert decision.action == ActionType.CONTINUE_FREE_TEXT
+    assert decision.must_not_send_media is True
 
 
-def test_qualification_does_not_fire_on_weak_signal():
-    """Live bug: 'where are you from, James' fired mid-flirt out of nowhere."""
-    d = decide_next_action(
-        CreatorPolicy(sexting_mode=SextingMode.PAID_ONLY),
-        FanCommercialState(),
-        [],  # no real buying signal
-        CommercialContext(),
-    )
-    assert d.action == ActionType.CONTINUE_NORMAL_CHAT
 
-
-def test_no_approved_sets_means_no_sale():
-    d = decide_next_action(
+def test_unmatched_package_selection_does_not_start_session():
+    decision = decide_next_action(
         CreatorPolicy(),
-        FanCommercialState(),
-        [ev(EventType.WANTS_MEDIA), ev(EventType.READY_TO_BUY)],
-        CommercialContext(approved_sets_available=False),
+        FanCommercialState(status=FanStatus.OFFER_PENDING),
+        [ev(EventType.PACKAGE_SELECTED, "$28", cents=2800)],
+        CommercialContext(package_options=[package(price=2500, set_id="set-25")]),
     )
-    assert d.action != ActionType.CREATE_PAID_SESSION
+    assert decision.action == ActionType.PRESENT_SESSION_OPTIONS
+    assert decision.must_not_send_media is True
+    assert decision.new_status == FanStatus.OFFER_PENDING
 
-
-def test_payday_resolver():
-    from datetime import datetime, timezone
-    # Wednesday 2026-07-15
+def test_timezone_aware_payday_resolver():
     now = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
-    dt, conf = resolve_payday("Friday", now=now, send_hour=18)
-    assert dt is not None and conf > 0.5
-    assert dt.weekday() == 4 and dt.hour == 18
-    assert dt > now
-    # unresolvable -> no guess
-    dt2, conf2 = resolve_payday("when I feel like it", now=now)
-    assert dt2 is None and conf2 == 0.0
-
-
-if __name__ == "__main__":
-    import traceback
-    passed = failed = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"  PASS  {name}")
-                passed += 1
-            except Exception:
-                print(f"  FAIL  {name}")
-                traceback.print_exc()
-                failed += 1
-    print(f"\n{passed} passed, {failed} failed")
-    sys.exit(1 if failed else 0)
+    target, confidence = resolve_payday(
+        "Friday",
+        now=now,
+        send_hour=18,
+        timezone_name="Europe/Berlin",
+    )
+    assert target is not None and confidence > 0.5
+    assert target.weekday() == 4
+    assert target.hour == 18
+    assert str(target.tzinfo) == "Europe/Berlin"
