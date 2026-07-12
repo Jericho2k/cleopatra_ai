@@ -1,55 +1,81 @@
-"""
-Step 1 of the prompt chain.
-Analyzes the conversation situation before generating replies.
-"""
+"""Step 1 of the prompt chain: understand the conversation.
 
+This module extracts observations only. Commercial decisions are made by the
+policy layer. A deterministic normalizer handles common offer-selection phrases
+so one mixed sentence cannot be collapsed into a generic decline.
+"""
 import json
 import os
+import re
 
 from anthropic import AsyncAnthropic
 from models.schemas import ConversationContext
+from services.commercial_events import normalize_commercial_facts
 
 client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 
 async def analyze_situation(ctx: ConversationContext) -> dict:
-    """Analyze fan mood, intent and best strategic move."""
-
-    recent = ctx.conversation_history[-10:]
-    convo = "\n".join([
+    recent = ctx.conversation_history[-12:]
+    convo = "\n".join(
         f"{'Fan' if m.role == 'fan' else 'Creator'}: {m.content}"
         for m in recent
-    ])
+    )
 
-    user_content = f"""You are analyzing an OnlyFans chat to help the creator respond perfectly.
+    user_content = f"""You are analyzing an adult creator chat so another system can decide the correct business action.
 
 Conversation so far:
 {convo}
 
 Latest fan message: "{ctx.fan_message}"
 
-Analyze and return ONLY valid JSON:
+Return ONLY valid JSON with exactly these fields:
 {{
-  "fan_mood": "one of: excited/bored/horny/lonely/curious/frustrated/romantic/testing/shy",
-  "fan_intent": "what does this message signal — is he complimenting, escalating, testing, opening up, pulling back?",
+  "fan_mood": "excited/bored/horny/lonely/curious/frustrated/romantic/testing/shy",
+  "fan_intent": "brief description of what the latest message means",
   "conversation_energy": "rising/flat/dropping",
-  "strategic_move": "what should the creator do RIGHT NOW — choose one: mirror_warmth/tease_and_deflect/get_curious/hint_at_content/build_tension/re_engage/push_for_ppv/acknowledge_compliment_and_redirect. NEVER use tease_and_deflect or get_curious if the fan is asking about the creator's identity — use mirror_warmth instead.",
-  "tone": "what tone should the reply have — playful/warm/flirty/mysterious/direct/casual",
-  "personal_details_mentioned": ["any names, locations, jobs, interests mentioned by fan"],
-  "avoid_repeating": "flag if the creator has already used the same line recently",
-  "purchase_signal": "none | ready_to_buy | bought | declined | money_available | uncertain — none=no purchase context. ready_to_buy=fan just said yes/I want it/send it after a price was mentioned but no PPV sent yet. bought=positive reaction after PPV was already sent. declined=fan indicates he CANNOT AFFORD it right now (broke, no money, paycheck hasn't come, too expensive, not right now). money_available=fan indicates money is NOW available (just got paid, payday came, got the money, can afford it now) — used to reopen selling after an earlier decline. uncertain=unclear",
-  "resend_requested": "true | false — did the fan indicate they cannot see content that was sent, it did not arrive, or they are asking for it to be sent again? Look at the full conversation context, not just the latest message.",
-  "crisis_signal": "none | self_harm | harm_to_others — DEFAULT none, but err toward flagging self_harm when the language plausibly references self-harm even if it might be hyperbole. This is NOT about sexual roughness or kink: choking, rough, degradation, being held by the throat, or any violent/rough fantasy DIRECTED AT THE CREATOR as sexual roleplay is always none. Flag self_harm if the fan references hurting himself, cutting, bleeding, his veins/wrists, ending his life, not wanting to be alive, or similar self-directed harm — including phrasing like 'I'd cut my veins', 'I'd die for you', 'I can't go on' — because we respond with care rather than gambling that it was a joke. Flag harm_to_others only if the fan states real intent to harm a specific real person (not sexual fantasy about the creator). When a message mixes flirtation with self-harm phrasing, still flag self_harm.",
-  "wants_explicit": "true | false — is the fan asking to sext/roleplay, or escalating sexually in a way that asks for an explicit experience (not just a compliment)?",
-  "wants_media": "true | false — is the fan asking to SEE content (photos/videos), as opposed to wanting text?",
-  "payday_raw": "If the fan says when money will arrive, return his exact words for the timing ONLY (e.g. 'Friday', 'next week', 'the 1st', 'in 3 days'). Otherwise empty string. Do not invent a date.",
-  "budget_stated_usd": "If the fan explicitly states an amount he has/can spend (e.g. 'I have $50 tonight'), return the number only. Otherwise empty string. Only what he ACTUALLY said — never a guess at what he can afford.",
-  "desired_experience": "If clear, what experience does he want (e.g. 'joi', 'sexting', 'photos', 'video')? Otherwise empty string."
-}}"""
+  "strategic_move": "mirror_warmth/tease_and_deflect/get_curious/hint_at_content/build_tension/re_engage/push_for_ppv/acknowledge_compliment_and_redirect",
+  "tone": "playful/warm/flirty/mysterious/direct/casual",
+  "personal_details_mentioned": ["facts the fan just stated"],
+  "avoid_repeating": "what the creator should avoid repeating",
+
+  "purchase_signal": "none/ready_to_buy/bought/declined/money_available/uncertain",
+  "offer_response": "none/accepted/declined/counteroffer/deferred",
+  "selected_offer_price_usd": "number only, or empty string",
+  "selected_offer_position": "first/second/empty",
+  "current_budget_limit_usd": "number only, or empty string",
+  "cannot_afford_any_offer_now": "true/false",
+  "deferred_purchase_intent": "true/false",
+
+  "resend_requested": "true/false",
+  "crisis_signal": "none/self_harm/harm_to_others",
+  "wants_explicit": "true/false",
+  "wants_media": "true/false",
+  "payday_raw": "exact timing words only, e.g. Friday/next week/the 1st, or empty",
+  "payday_confidence": 0.0,
+  "budget_stated_usd": "number only if the fan explicitly says what he has available now, otherwise empty",
+  "desired_experience": "joi/sexting/photos/video/other/empty"
+}}
+
+COMMERCIAL INTERPRETATION RULES:
+- Treat facts independently. A fan can select a cheaper offer now AND mention a future payday.
+- Example: "can we do the $28 one, I don't have more right now, I get paid Friday" means:
+  offer_response=accepted, selected_offer_price_usd=28, current_budget_limit_usd=28,
+  cannot_afford_any_offer_now=false, payday_raw=Friday, deferred_purchase_intent=false,
+  purchase_signal=ready_to_buy.
+- cannot_afford_any_offer_now=true only when he cannot buy ANY offered option now.
+- "I can't spend more than $28" is a limit, not a refusal, if he accepts the $28 option.
+- declined means he refused the available offer(s), not merely that he chose the cheaper one.
+- deferred means he wants a specific offer later rather than now.
+- money_available means previously unavailable money is available now.
+
+SAFETY:
+- Crisis is not sexual roughness or consensual roleplay. Flag self_harm for plausible self-directed harm language and harm_to_others only for real intent toward a real person.
+"""
 
     response = await client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=400,
+        max_tokens=650,
         messages=[{"role": "user", "content": user_content}],
     )
 
@@ -59,31 +85,43 @@ Analyze and return ONLY valid JSON:
     try:
         result = json.loads(content)
     except Exception:
-        result = {
-            "fan_mood": "curious",
-            "fan_intent": "engaging with creator",
-            "conversation_energy": "flat",
-            "strategic_move": "mirror_warmth",
-            "tone": "playful",
-            "personal_details_mentioned": [],
-            "avoid_repeating": "",
-            "purchase_signal": "none",
-            "resend_requested": "false",
-            "crisis_signal": "none",
-        }
+        result = _fallback_result()
 
-    # Deterministic safety backstop: the crisis rail must not depend solely on one
-    # probabilistic classification. If the latest message contains unambiguous
-    # self-harm phrasing, force the flag even if the classifier rationalized it as
-    # flirtation. Kept intentionally narrow to avoid catching kink/roleplay.
     if _looks_like_self_harm(ctx.fan_message):
         result["crisis_signal"] = "self_harm"
 
-    return result
+    creator_lines = [m.content for m in recent if m.role == "creator"]
+    return normalize_commercial_facts(result, ctx.fan_message, creator_lines)
 
 
-# Unambiguous self-harm phrases. Deliberately conservative: these read as genuine
-# self-harm regardless of surrounding flirtation, and are not kink/roleplay terms.
+def _fallback_result() -> dict:
+    return {
+        "fan_mood": "curious",
+        "fan_intent": "engaging with creator",
+        "conversation_energy": "flat",
+        "strategic_move": "mirror_warmth",
+        "tone": "playful",
+        "personal_details_mentioned": [],
+        "avoid_repeating": "",
+        "purchase_signal": "none",
+        "offer_response": "none",
+        "selected_offer_price_usd": "",
+        "selected_offer_position": "",
+        "current_budget_limit_usd": "",
+        "cannot_afford_any_offer_now": "false",
+        "deferred_purchase_intent": "false",
+        "resend_requested": "false",
+        "crisis_signal": "none",
+        "wants_explicit": "false",
+        "wants_media": "false",
+        "payday_raw": "",
+        "payday_confidence": 0.0,
+        "budget_stated_usd": "",
+        "desired_experience": "",
+    }
+
+
+
 _SELF_HARM_PATTERNS = (
     "cut my vein", "cut my wrist", "slit my wrist", "slit my vein",
     "kill myself", "end my life", "end it all", "want to die",
@@ -95,4 +133,4 @@ _SELF_HARM_PATTERNS = (
 
 def _looks_like_self_harm(message: str) -> bool:
     text = (message or "").lower()
-    return any(p in text for p in _SELF_HARM_PATTERNS)
+    return any(pattern in text for pattern in _SELF_HARM_PATTERNS)
