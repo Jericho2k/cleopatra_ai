@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from core.supabase import get_supabase
 from models.commercial import CreatorPolicy, FanCommercialState, PackageOption
+from services.media_packages import build_offer_packages, usable_sets
 
 
 async def get_creator_policy(creator_id: str) -> CreatorPolicy:
@@ -23,6 +24,20 @@ async def get_creator_policy(creator_id: str) -> CreatorPolicy:
         return CreatorPolicy(**row)
     except Exception:
         return CreatorPolicy()
+
+
+async def save_creator_policy(creator_id: str, policy: CreatorPolicy) -> CreatorPolicy:
+    payload = {"creator_id": creator_id, **policy.model_dump(mode="json")}
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    def _upsert():
+        response = get_supabase().table("creator_commercial_policies").upsert(
+            payload, on_conflict="creator_id"
+        ).execute()
+        return (response.data or [payload])[0]
+
+    await asyncio.to_thread(_upsert)
+    return policy
 
 
 async def get_fan_state(fan_id: str) -> FanCommercialState:
@@ -60,6 +75,7 @@ async def save_fan_state(
         "offered_packages": [p.model_dump(mode="json") for p in state.offered_packages],
         "selected_package_id": state.selected_package_id,
         "selected_package_set_id": state.selected_package_set_id,
+        "selected_package_set_ids": state.selected_package_set_ids,
         "selected_package_label": state.selected_package_label,
         "selected_package_price_cents": state.selected_package_price_cents,
         "last_offer_at": state.last_offer_at.isoformat() if state.last_offer_at else None,
@@ -72,6 +88,15 @@ async def save_fan_state(
             state.free_session_started_at.isoformat()
             if state.free_session_started_at else None
         ),
+        "free_session_ended_at": (
+            state.free_session_ended_at.isoformat()
+            if state.free_session_ended_at else None
+        ),
+        "last_session_completed_at": (
+            state.last_session_completed_at.isoformat()
+            if state.last_session_completed_at else None
+        ),
+        "last_session_revenue_cents": state.last_session_revenue_cents,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -105,18 +130,20 @@ async def get_offerable_packages(
     fan_id: str,
     policy: CreatorPolicy,
 ) -> list[PackageOption]:
-    """Return up to two real, approved set-backed options near policy targets."""
+    """Build up to two coherent, multi-step packages from approved vault sets."""
     def _get():
         db = get_supabase()
         rows = (
             db.table("vault_sets")
-            .select("id, title, suggested_price, tags, explicit_min, explicit_max")
+            .select(
+                "id, title, location, outfit, suggested_price, tags, "
+                "explicit_min, explicit_max, media_ids"
+            )
             .eq("creator_id", creator_id)
             .eq("status", "approved")
             .execute()
         ).data or []
 
-        # Exclude sets already sent where the message recorded a set_id.
         sent_rows = (
             db.table("messages")
             .select("media_context")
@@ -125,58 +152,40 @@ async def get_offerable_packages(
             .not_.is_("media_context", "null")
             .execute()
         ).data or []
-        sent_set_ids = {
-            str((row.get("media_context") or {}).get("ppv", {}).get("set_id"))
-            for row in sent_rows
-            if (row.get("media_context") or {}).get("ppv", {}).get("set_id")
-        }
+        sent_set_ids: set[str] = set()
+        sent_media_ids: set[str] = set()
+        for row in sent_rows:
+            ppv = (row.get("media_context") or {}).get("ppv") or {}
+            if ppv.get("set_id"):
+                sent_set_ids.add(str(ppv["set_id"]))
+            for media_id in (ppv.get("media_ids") or [ppv.get("media_id")]):
+                if media_id:
+                    sent_media_ids.add(str(media_id))
 
-        candidates: list[PackageOption] = []
-        for row in rows:
-            set_id = str(row.get("id") or "")
-            price = row.get("suggested_price")
-            if not set_id or set_id in sent_set_ids or price is None:
-                continue
-            try:
-                price_cents = int(round(float(price) * 100))
-            except (TypeError, ValueError):
-                continue
-            if price_cents <= 0:
-                continue
-            label = str(row.get("title") or "private set").strip()
-            tags = row.get("tags") or []
-            experience = ", ".join(str(tag) for tag in tags[:3]) if tags else None
-            candidates.append(PackageOption(
-                package_id=f"set:{set_id}",
-                label=label,
-                price_cents=price_cents,
-                set_id=set_id,
-                experience=experience,
-            ))
-        return candidates
+        fan_row = (
+            db.table("fans").select("ai_summary, preferences")
+            .eq("id", fan_id).single().execute()
+        ).data or {}
+        summary = fan_row.get("ai_summary") or {}
+        preferences = fan_row.get("preferences") or {}
+        preferred_tags = list(summary.get("kinks") or [])
+        if isinstance(preferences, dict):
+            preferred_tags.extend(str(value) for value in preferences.values() if isinstance(value, str))
+        elif isinstance(preferences, list):
+            preferred_tags.extend(str(value) for value in preferences)
 
-    candidates = await asyncio.to_thread(_get)
-    if not candidates:
-        return []
+        available = usable_sets(rows, sent_set_ids)
+        for row in available:
+            row["media_ids"] = [
+                str(media_id)
+                for media_id in (row.get("media_ids") or [])
+                if str(media_id) not in sent_media_ids
+            ]
+        available = [row for row in available if row.get("media_ids")]
+        return available, preferred_tags
 
-    def nearest(target: int, excluded: set[str]) -> PackageOption | None:
-        remaining = [c for c in candidates if c.package_id not in excluded]
-        if not remaining:
-            return None
-        return min(remaining, key=lambda c: abs(c.price_cents - target))
-
-    chosen: list[PackageOption] = []
-    quick = nearest(policy.quick_package_target_cents, set())
-    if quick:
-        chosen.append(quick)
-    if policy.offer_two_packages:
-        full = nearest(
-            policy.full_package_target_cents,
-            {package.package_id for package in chosen},
-        )
-        if full:
-            chosen.append(full)
-    return sorted(chosen, key=lambda package: package.price_cents)
+    rows, preferred_tags = await asyncio.to_thread(_get)
+    return build_offer_packages(rows, policy, preferred_tags=preferred_tags)
 
 
 async def schedule_action(

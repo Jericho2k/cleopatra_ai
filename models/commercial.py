@@ -61,12 +61,17 @@ class CommercialEvent(BaseModel):
 
 
 class PackageOption(BaseModel):
-    """A real package backed by an approved vault set."""
+    """A real package backed by one or more approved vault sets.
+
+    ``set_id`` is retained for backward compatibility and points to the first
+    step. ``set_ids`` is authoritative for multi-step sessions.
+    """
 
     package_id: str
     label: str
     price_cents: int
     set_id: str | None = None
+    set_ids: list[str] = Field(default_factory=list)
     experience: str | None = None
 
 
@@ -84,6 +89,10 @@ class CreatorPolicy(BaseModel):
     offer_two_packages: bool = True
     quick_package_target_cents: int = 2500
     full_package_target_cents: int = 6000
+    session_min_steps: int = 2
+    session_max_steps: int = 4
+    post_purchase_cooldown_messages: int = 2
+    require_purchase_before_next_step: bool = True
 
 
 class FanCommercialState(BaseModel):
@@ -100,6 +109,7 @@ class FanCommercialState(BaseModel):
     offered_packages: list[PackageOption] = Field(default_factory=list)
     selected_package_id: str | None = None
     selected_package_set_id: str | None = None
+    selected_package_set_ids: list[str] = Field(default_factory=list)
     selected_package_label: str | None = None
     selected_package_price_cents: int | None = None
     last_offer_at: datetime | None = None
@@ -111,6 +121,9 @@ class FanCommercialState(BaseModel):
     last_declined_price_cents: int | None = None
     teaser_messages_used: int = 0
     free_session_started_at: datetime | None = None
+    free_session_ended_at: datetime | None = None
+    last_session_completed_at: datetime | None = None
+    last_session_revenue_cents: int = 0
 
 
 class ActionType(str, Enum):
@@ -152,6 +165,7 @@ class CommercialDecision(BaseModel):
     schedule_payday_followup: bool = False
     session_budget_cents: int | None = None
     selected_package_set_id: str | None = None
+    selected_package_set_ids: list[str] = Field(default_factory=list)
 
     must_not_ask_question: bool = False
     max_messages: int | None = None
