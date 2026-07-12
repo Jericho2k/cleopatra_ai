@@ -1,5 +1,5 @@
 """Commercial orchestrator: observations -> policy -> durable state/actions."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from db.commercial_queries import (
     cancel_actions_for_fan,
@@ -10,7 +10,7 @@ from db.commercial_queries import (
     save_fan_state,
     schedule_action,
 )
-from db.queries import clear_fan_decline_lock
+from db.queries import clear_fan_decline_lock, save_fan_session
 from models.commercial import (
     ActionType,
     CommercialDecision,
@@ -22,6 +22,13 @@ from models.commercial import (
 from services.commercial_events import extract_events, selected_package_event, stated_budget_cents
 from services.commercial_policy import CommercialContext, decide_next_action
 from services.payday import resolve_payday
+from services.session_lifecycle import (
+    has_pending_purchase,
+    has_remaining_steps,
+    is_cooldown_active,
+    normalize_session,
+    resume_session,
+)
 
 
 async def orchestrate(
@@ -33,24 +40,43 @@ async def orchestrate(
     approved_sets_available: bool = True,
     within_daily_caps: bool = True,
     frozen_for_review: bool = False,
+    active_session: dict | None = None,
 ) -> CommercialDecision:
     events = extract_events(situation)
     policy = await get_creator_policy(creator_id)
     state = await get_fan_state(fan_id)
+    now = datetime.now(timezone.utc)
+
+    # Reset a consumed free allowance only after the configured cooldown has
+    # genuinely elapsed. The next qualifying message can then start a new window.
+    if state.free_session_ended_at:
+        ended = state.free_session_ended_at
+        if ended.tzinfo is None:
+            ended = ended.replace(tzinfo=timezone.utc)
+        if now >= ended + timedelta(hours=max(0, policy.free_session_cooldown_hours)):
+            state.teaser_messages_used = 0
+            state.free_session_started_at = None
+            state.free_session_ended_at = None
 
     package_options = await get_offerable_packages(creator_id, fan_id, policy)
     _resolve_selected_package(events, state.offered_packages or package_options)
 
+    session = normalize_session(active_session)
     ctx = CommercialContext(
         fan_has_bought_before=fan_has_bought_before,
         approved_sets_available=approved_sets_available and bool(package_options or state.offered_packages),
         within_daily_caps=within_daily_caps,
         frozen_for_review=frozen_for_review,
         package_options=package_options,
+        now=now,
+        session_exists=bool(session),
+        paused_session_available=bool(session and session.get("status") == "paused"),
+        session_has_pending_purchase=has_pending_purchase(session),
+        session_has_remaining_steps=has_remaining_steps(session),
+        session_cooldown_active=is_cooldown_active(session),
     )
     decision = decide_next_action(policy, state, events, ctx)
 
-    now = datetime.now(timezone.utc)
     if decision.new_status:
         state.status = decision.new_status
 
@@ -58,11 +84,12 @@ async def orchestrate(
     if desired:
         state.desired_experience = desired
 
-    if decision.action in (ActionType.PRESENT_SESSION_OPTIONS, ActionType.END_TEASER_AND_OFFER):
+    if decision.action in {ActionType.PRESENT_SESSION_OPTIONS, ActionType.END_TEASER_AND_OFFER}:
         state.offered_packages = decision.package_options
         state.last_offer_at = now
         state.selected_package_id = None
         state.selected_package_set_id = None
+        state.selected_package_set_ids = []
         state.selected_package_label = None
         state.selected_package_price_cents = None
 
@@ -70,24 +97,25 @@ async def orchestrate(
     if selected:
         package = _package_from_event(selected, state.offered_packages or package_options)
         cents = selected.amount_cents or (package.price_cents if package else None)
-
-        # Persist the explicit amount even if package matching failed, but do not
-        # activate or plan a session unless it resolves to an offered set.
         if cents:
             state.confirmed_budget_cents = cents
             state.budget_source = "package_selected" if package else "fan_explicit"
 
         if package:
+            set_ids = list(package.set_ids or ([package.set_id] if package.set_id else []))
             state.selected_package_id = package.package_id
-            state.selected_package_set_id = package.set_id
+            state.selected_package_set_id = set_ids[0] if set_ids else None
+            state.selected_package_set_ids = set_ids
             state.selected_package_label = package.label
             state.selected_package_price_cents = package.price_cents
-            decision.selected_package_set_id = package.set_id
+            decision.selected_package_set_id = state.selected_package_set_id
+            decision.selected_package_set_ids = set_ids
             decision.session_budget_cents = package.price_cents
             decision.mention_price = package.price_cents // 100
 
         if decision.action == ActionType.CREATE_PAID_SESSION and package:
             state.status = FanStatus.PAID_SESSION_ACTIVE
+            state.free_session_ended_at = now if state.free_session_started_at else state.free_session_ended_at
             try:
                 await clear_fan_decline_lock(fan_id)
             except Exception as exc:
@@ -97,12 +125,47 @@ async def orchestrate(
         state.confirmed_budget_cents = cents
         state.budget_source = "fan_explicit"
 
-    if decision.action in (ActionType.START_FREE_TEASER, ActionType.CONTINUE_FREE_TEXT):
+    if decision.action in {ActionType.START_FREE_TEASER, ActionType.CONTINUE_FREE_TEXT}:
         state.teaser_messages_used += 1
         if state.free_session_started_at is None:
             state.free_session_started_at = now
+        limit = (
+            policy.teaser_max_messages
+            if decision.action == ActionType.START_FREE_TEASER
+            else policy.free_text_max_messages
+        )
+        if state.teaser_messages_used >= max(1, limit):
+            state.free_session_ended_at = now
 
-    payday_event = next((e for e in events if e.type == EventType.PAYDAY_MENTIONED), None)
+    if decision.action == ActionType.END_TEASER_AND_OFFER and state.free_session_started_at:
+        state.free_session_ended_at = state.free_session_ended_at or now
+
+    if decision.action == ActionType.RESUME_PREVIOUS_OFFER and session and session.get("status") == "paused":
+        resumed = resume_session(session)
+        await save_fan_session(fan_id, resumed)
+        state.status = FanStatus.PAID_SESSION_ACTIVE
+
+    # Self-heal legacy/stale sessions whose index already passed the final step.
+    if (
+        session
+        and session.get("status") == "active"
+        and not has_pending_purchase(session)
+        and not has_remaining_steps(session)
+    ):
+        state.status = FanStatus.IDLE
+        state.last_session_completed_at = now
+        state.last_session_revenue_cents = int(session.get("revenue_cents", 0) or 0)
+        state.confirmed_budget_cents = None
+        state.budget_source = None
+        state.offered_packages = []
+        state.selected_package_id = None
+        state.selected_package_set_id = None
+        state.selected_package_set_ids = []
+        state.selected_package_label = None
+        state.selected_package_price_cents = None
+        await save_fan_session(fan_id, None)
+
+    payday_event = next((event for event in events if event.type == EventType.PAYDAY_MENTIONED), None)
     if payday_event:
         raw = payday_event.raw_expression
         when, confidence = resolve_payday(
@@ -131,32 +194,24 @@ async def orchestrate(
                     payload={
                         "desired_experience": state.desired_experience or "",
                         "last_offer_price_cents": state.last_declined_price_cents,
+                        "selected_package_id": state.selected_package_id,
                         "payday_raw": raw,
                     },
-                    # One logical payday action per fan. A corrected date replaces it.
                     dedupe_key=f"payday:{fan_id}",
                 )
-                print(
-                    f"[COMMERCIAL] fan={fan_id} PAUSED_UNTIL_PAYDAY, "
-                    f"follow-up {when.isoformat()}"
-                )
+                print(f"[COMMERCIAL] fan={fan_id} payday follow-up {when.isoformat()}")
             else:
                 state.status = FanStatus.PAUSED_NO_BUDGET
-                print(
-                    f"[COMMERCIAL] fan={fan_id} payday '{raw}' unresolved — "
-                    "no follow-up scheduled"
-                )
+                print(f"[COMMERCIAL] fan={fan_id} payday '{raw}' unresolved")
 
-    # Selecting/buying now means a payday mention is CRM knowledge only, not a
-    # reason to schedule a second sales message.
     selected_resolved_now = bool(
         selected
         and selected.metadata.get("package_id")
         and decision.action == ActionType.CREATE_PAID_SESSION
     )
     resolved_now = selected_resolved_now or any(
-        e.type in (EventType.MONEY_AVAILABLE, EventType.PURCHASED)
-        for e in events
+        event.type in {EventType.MONEY_AVAILABLE, EventType.PURCHASED}
+        for event in events
     )
     if resolved_now:
         try:
@@ -182,12 +237,7 @@ def _resolve_selected_package(
 
     package: PackageOption | None = None
     if event.amount_cents is not None:
-        package = min(
-            offered_packages,
-            key=lambda candidate: abs(candidate.price_cents - event.amount_cents),
-        )
-        # Only accept a price match within one dollar. Otherwise preserve the raw
-        # event and let the policy avoid inventing a package.
+        package = min(offered_packages, key=lambda item: abs(item.price_cents - event.amount_cents))
         if abs(package.price_cents - event.amount_cents) > 100:
             package = None
     elif event.package_position == "first":
@@ -196,10 +246,12 @@ def _resolve_selected_package(
         package = offered_packages[1]
 
     if package:
+        set_ids = list(package.set_ids or ([package.set_id] if package.set_id else []))
         event.amount_cents = package.price_cents
         event.metadata.update({
             "package_id": package.package_id,
-            "set_id": package.set_id,
+            "set_id": set_ids[0] if set_ids else None,
+            "set_ids": set_ids,
             "label": package.label,
         })
 
@@ -210,7 +262,7 @@ def _package_from_event(
 ) -> PackageOption | None:
     package_id = event.metadata.get("package_id")
     if package_id:
-        return next((p for p in offered_packages if p.package_id == package_id), None)
+        return next((package for package in offered_packages if package.package_id == package_id), None)
     if event.amount_cents is not None:
-        return next((p for p in offered_packages if p.price_cents == event.amount_cents), None)
+        return next((package for package in offered_packages if package.price_cents == event.amount_cents), None)
     return None

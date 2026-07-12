@@ -31,6 +31,7 @@ from db.queries import (
     get_ppv_offers,
     save_message,
 )
+from models.commercial import CreatorPolicy
 from models.schemas import (
     ConversationContext,
     Fan,
@@ -2279,169 +2280,56 @@ async def auto_availability(creator_id: str) -> dict:
     return {"auto_available": count > 0, "approved_sets": count}
 
 
+@app.get("/creator/{creator_id}/commercial-policy")
+async def read_commercial_policy(creator_id: str) -> dict:
+    from db.commercial_queries import get_creator_policy
+
+    policy = await get_creator_policy(creator_id)
+    return {"creator_id": creator_id, "policy": policy.model_dump(mode="json")}
+
+
+@app.put("/creator/{creator_id}/commercial-policy")
+async def update_commercial_policy(creator_id: str, policy: CreatorPolicy) -> dict:
+    from db.commercial_queries import save_creator_policy
+
+    saved = await save_creator_policy(creator_id, policy)
+    return {"status": "ok", "creator_id": creator_id, "policy": saved.model_dump(mode="json")}
+
+
+@app.get("/fan/{fan_id}/commercial-state")
+async def read_commercial_state(fan_id: str) -> dict:
+    from db.commercial_queries import get_fan_state
+
+    state = await get_fan_state(fan_id)
+    return {"fan_id": fan_id, "state": state.model_dump(mode="json")}
+
+
 @app.post("/plan-session/{creator_id}/{fan_id}")
 async def plan_session(
     creator_id: str,
     fan_id: str,
     request: Request = None,
 ) -> dict:
+    """Create a coherent, confirmed-budget multi-step paid session."""
+    body = {}
     if request is not None:
         try:
             body = await request.json()
         except Exception:
             body = {}
-    else:
-        body = {}
-    confirmed_kinks = body.get("confirmed_kinks", [])
-    """
-    Called when a sexting session is starting.
-    Picks 5-8 vault items ordered by escalating explicitness,
-    grouped by scene continuity where possible.
-    """
-    from db.queries import get_fan_by_id, get_sent_ppv, save_fan_session
-    import json as _json
 
-    fan = await get_fan_by_id(fan_id)
-    selected_set_id = body.get("selected_set_id")
-    selected_price_cents = body.get("selected_price_cents")
-    commercial_state = None
-    if os.environ.get("COMMERCIAL_LAYER_ENABLED", "").lower() in ("1", "true", "yes"):
-        from db.commercial_queries import get_fan_state
-        commercial_state = await get_fan_state(fan_id)
-        selected_set_id = selected_set_id or commercial_state.selected_package_set_id
-        selected_price_cents = (
-            selected_price_cents
-            or commercial_state.selected_package_price_cents
-            or commercial_state.confirmed_budget_cents
-        )
-    sent_ppv = await get_sent_ppv(fan_id)
-    purchased_ids = {s["media_id"] for s in sent_ppv if s.get("purchased")}
-    # Everything ever sent to this fan (purchased or not). A sent-but-unpurchased PPV
-    # is already sitting locked in his chat — resending it is pointless and looks
-    # broken (real bug: fan declined a $51 set and got the exact same set again).
-    sent_ids = {s["media_id"] for s in sent_ppv if s.get("media_id")}
+    selected_set_ids = body.get("selected_set_ids") or []
+    if not selected_set_ids and body.get("selected_set_id"):
+        selected_set_ids = [body["selected_set_id"]]
 
-    kinks = confirmed_kinks or []
-    if not kinks and fan and fan.ai_summary:
-        kinks = fan.ai_summary.get("kinks", [])
-
-    # --- APPROVED SETS ONLY. No approved sets => auto-mode cannot sell. ---
-    db = get_supabase()
-    sets_row = await asyncio.to_thread(
-        lambda: db.table("vault_sets")
-        .select("id, title, location, outfit, explicit_min, explicit_max, "
-                "media_ids, preview_media_id, suggested_price, tags")
-        .eq("creator_id", creator_id)
-        .eq("status", "approved")
-        .execute()
+    from services.session_planner import plan_session_for_fan
+    return await plan_session_for_fan(
+        creator_id,
+        fan_id,
+        selected_set_ids=selected_set_ids,
+        selected_price_cents=body.get("selected_price_cents"),
+        confirmed_kinks=body.get("confirmed_kinks") or [],
     )
-    approved = sets_row.data or []
-
-    # Drop sets the fan already fully purchased OR that were already sent to him
-    # (a sent set is in his chat whether he bought it or not — never resend).
-    sellable = [
-        s for s in approved
-        if s.get("media_ids")
-        and not set(s["media_ids"]).issubset(purchased_ids)
-        and not set(s["media_ids"]).issubset(sent_ids)
-    ]
-    if not sellable:
-        print(f"[SESSION] no approved sets sellable creator={creator_id} fan={fan_id}")
-        return {"status": "no_sets", "session": None}
-
-    set_summary = "\n".join(
-        f"[{i}] {s.get('title') or s.get('location') or 'set'} | "
-        f"{len(s['media_ids'])} pcs | explicit {s.get('explicit_min','?')}-{s.get('explicit_max','?')} | "
-        f"${s.get('suggested_price', 0)} | {', '.join(s.get('tags') or []) or 'no tags'}"
-        for i, s in enumerate(sellable)
-    )
-
-    fan_kinks_str = ", ".join(kinks) if kinks else "unknown"
-    fan_tier = fan.spend_tier if fan else "cold"
-
-    from anthropic import AsyncAnthropic
-    client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-
-    prompt = (
-        "You are choosing ONE approved content set to send an adult-content fan who just asked to see more.\n\n"
-        f"Fan interests/kinks: {fan_kinks_str}\n"
-        f"Fan spend tier: {fan_tier}\n\n"
-        "Each option is a human-approved, coherent set from one shoot.\n\n"
-        f"Available approved sets:\n{set_summary}\n\n"
-        "Pick the single best set for this fan. Match stated interests where possible; "
-        "prefer a set whose explicitness suits the moment.\n\n"
-        'Return ONLY JSON: {"set_index": 0, "reason": "short why"}'
-    )
-
-    try:
-        if selected_set_id:
-            chosen = next(
-                (item for item in sellable if str(item.get("id")) == str(selected_set_id)),
-                None,
-            )
-            if chosen is None:
-                return {
-                    "status": "selected_set_unavailable",
-                    "session": None,
-                    "message": "The package selected in chat is no longer sellable.",
-                }
-            choice = {"reason": "fan selected this offered package"}
-        else:
-            response = await client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=300,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            content = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-            choice = _json.loads(content)
-            idx = int(choice.get("set_index", 0))
-            idx = idx if 0 <= idx < len(sellable) else 0
-            chosen = sellable[idx]
-
-        # Bundle = the approved set. If the fan selected an offered package, the
-        # exact persisted package price is authoritative; otherwise use the human
-        # approved set price.
-        media_ids = [m for m in chosen["media_ids"] if m not in purchased_ids]
-        bundle_price = (
-            round(int(selected_price_cents) / 100, 2)
-            if selected_set_id and selected_price_cents
-            else int(chosen.get("suggested_price") or 0)
-        )
-
-        plan_item = {
-            "media_ids": media_ids,
-            "media_id": media_ids[0],  # back-compat for single-id paths
-            "price": bundle_price,
-            "set_id": chosen["id"],
-            "scene_key": chosen.get("title") or chosen.get("location") or "set",
-            "location": chosen.get("location"),
-            "outfit": chosen.get("outfit"),
-            "reason": choice.get("reason", ""),
-            "description": f"{chosen.get('title') or chosen.get('location')} set ({len(media_ids)} pcs)",
-            "sent": False,
-            "purchased": False,
-        }
-
-        session = {
-            "plan": [plan_item],
-            "current_index": 0,
-            "started_at": __import__("datetime").datetime.utcnow().isoformat(),
-            "fan_kinks": kinks,
-            "set_id": chosen["id"],
-            "scene_key": plan_item["scene_key"],
-            "commercial_package_id": (
-                commercial_state.selected_package_id if commercial_state else None
-            ),
-            "confirmed_budget_cents": selected_price_cents,
-        }
-        await save_fan_session(fan_id, session)
-        print(f"[SESSION] set={chosen['id']} '{plan_item['scene_key']}' "
-              f"pcs={len(media_ids)} price=${bundle_price}")
-        return {"status": "ok", "session": session}
-
-    except Exception as e:
-        print(f"[SESSION PLAN ERROR] {e}")
-        return {"status": "error", "message": str(e)}
 
 
 @app.get("/session/{fan_id}")
@@ -2454,39 +2342,36 @@ async def get_session(fan_id: str) -> dict:
 
 @app.post("/session/{fan_id}/advance")
 async def advance_session(fan_id: str) -> dict:
-    """Mark current session item as sent and move to next."""
+    """Mark current step sent. Purchase confirmation advances the index."""
     from db.queries import get_fan_session, save_fan_session
+    from services.session_lifecycle import mark_step_sent
 
     session = await get_fan_session(fan_id)
     if not session:
         return {"status": "no_session"}
-    plan = session.get("plan", [])
-    idx = session.get("current_index", 0)
-    if idx < len(plan):
-        plan[idx]["sent"] = True
-        session["current_index"] = idx + 1
-        await save_fan_session(fan_id, session)
+    try:
+        session = mark_step_sent(session)
+    except ValueError as exc:
+        return {"status": "blocked", "message": str(exc)}
+    await save_fan_session(fan_id, session)
     return {
         "status": "ok",
-        "next_index": session["current_index"],
-        "remaining": len(plan) - session["current_index"],
+        "current_index": session.get("current_index", 0),
+        "awaiting_purchase_index": session.get("awaiting_purchase_index"),
+        "remaining": len(session.get("plan") or []) - int(session.get("current_index", 0) or 0),
     }
 
 
 @app.post("/session/{fan_id}/purchased/{media_id}")
-async def mark_session_purchased(fan_id: str, media_id: str) -> dict:
-    """Mark a session item as purchased."""
-    from db.queries import get_fan_session, save_fan_session
+async def mark_session_purchased(
+    fan_id: str,
+    media_id: str,
+    amount: float | None = None,
+) -> dict:
+    from services.suggestions import record_ppv_purchase
 
-    session = await get_fan_session(fan_id)
-    if not session:
-        return {"status": "no_session"}
-    for item in session.get("plan", []):
-        if item["media_id"] == media_id:
-            item["purchased"] = True
-            break
-    await save_fan_session(fan_id, session)
-    return {"status": "ok"}
+    await record_ppv_purchase(fan_id, media_id, amount)
+    return {"status": "ok", "fan_id": fan_id, "media_id": media_id}
 
 
 @app.post("/fan/{fan_id}/record-purchase/{media_id}")

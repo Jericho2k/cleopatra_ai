@@ -18,7 +18,15 @@ from core.config import get_settings
 from core.supabase import get_supabase
 from ai.prompt_builder import build_prompt
 from services.commercial_orchestrator import orchestrate
-from models.commercial import ActionType
+from models.commercial import ActionType, FanStatus
+from db.commercial_queries import get_creator_policy, get_fan_state, save_fan_state
+from services.session_planner import plan_session_for_fan
+from services.session_lifecycle import (
+    decrement_cooldown,
+    mark_step_declined,
+    mark_step_purchased,
+    mark_step_sent,
+)
 from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
@@ -500,17 +508,13 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         similar_exchanges = await find_similar_exchanges(latest_message, creator_id, enabled=False)
         conversation_stage = classify_stage(conversation_history, fan_profile)
 
-        # Decrement post-PPV cooldown counter on each fan message
+        # A purchased PPV starts a short text-only bridge before the next step.
+        # Sending a PPV does NOT advance the plan; only a confirmed purchase does.
         if active_session and active_session.get("post_ppv_cooldown"):
-            remaining = active_session.get("cooldown_messages_remaining", 0) - 1
-            if remaining <= 0:
-                active_session["post_ppv_cooldown"] = False
-                active_session["cooldown_messages_remaining"] = 0
-                print(f"[SESSION] Cooldown lifted for fan={fan_id}")
-            else:
-                active_session["cooldown_messages_remaining"] = remaining
-                print(f"[SESSION] Cooldown active, {remaining} messages remaining for fan={fan_id}")
+            active_session = decrement_cooldown(active_session)
             await save_fan_session(fan_id, active_session)
+            remaining = active_session.get("cooldown_messages_remaining", 0)
+            print(f"[SESSION] cooldown fan={fan_id} remaining={remaining}")
 
         ctx_without_situation = ConversationContext(
             fan_message=latest_message,
@@ -548,6 +552,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                     fan_has_bought_before=bool(getattr(fan_profile, "total_spent", 0)),
                     within_daily_caps=cap_ok,
                     frozen_for_review=bool(getattr(fan_profile, "needs_human_review", False)),
+                    active_session=active_session,
                 )
             except Exception as e:
                 # Full Auto must fail closed. Silently reverting to the legacy
@@ -571,8 +576,12 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 print(f"[CAP] fan={fan_id} plan suppressed: {cap_reason}")
             else:
                 try:
-                    from main import plan_session
-                    plan_data = await plan_session(creator_id, fan_id)
+                    plan_data = await plan_session_for_fan(
+                        creator_id,
+                        fan_id,
+                        selected_set_ids=(decision.selected_package_set_ids if decision else None),
+                        selected_price_cents=(decision.session_budget_cents if decision else None),
+                    )
                     if plan_data.get("status") == "ok":
                         active_session = plan_data.get("session") or await get_fan_session(fan_id)
                         print(f"[SESSION] Planned for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
@@ -638,41 +647,66 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         print(f"[PPV RESEND ERROR] {e}")
                         # Fall through to normal generation if resend fails
 
-        # Check if fan is reacting to a pending PPV
+        # Purchase/decline reactions. With Commercial v2 enabled, the final
+        # policy action — not the analyzer's raw single label — controls locks.
         purchase_signal = situation.get("purchase_signal", "none")
+        pending = None
         if purchase_signal in ("bought", "declined"):
             db = get_supabase()
             fan_data = await asyncio.to_thread(
-                lambda: db.table("fans")
-                .select("pending_ppv_check")
-                .eq("id", fan_id)
-                .single()
-                .execute()
+                lambda: db.table("fans").select("pending_ppv_check")
+                .eq("id", fan_id).single().execute()
             )
             pending = (fan_data.data or {}).get("pending_ppv_check")
-            if pending:
-                print(f"[PPV SIGNAL] fan={fan_id} signal={purchase_signal} pending={pending}")
+            if pending and purchase_signal == "bought":
+                print(f"[PPV SIGNAL] fan={fan_id} bought pending={pending}")
                 spawn(_verify_ppv_purchase(fan_id, creator_id, pending), name="verify_ppv_purchase")
 
-            if purchase_signal == "declined":
-                # Hard affordability decline: STOP selling this fan. No PPV, no
-                # cheaper-item resurfacing (that behavior is why a fan who said he
-                # was broke got the same $28 PPV three times). The lock persists
-                # across turns until he signals money is available.
+        if commercial_enabled and decision is not None:
+            if decision.action in {ActionType.PAUSE_NO_BUDGET, ActionType.PAUSE_UNTIL_PAYDAY}:
                 try:
                     declined_price = (pending or {}).get("price")
                     await set_fan_decline_lock(fan_id, declined_price)
-                    print(f"[SESSION] fan={fan_id} DECLINED — selling paused (was ${declined_price})")
-                except Exception as e:
-                    print(f"[DECLINE LOCK ERROR] fan={fan_id} error={e}")
-
-        # Money is available again → lift the lock so the full experience resumes.
-        if purchase_signal == "money_available":
-            try:
-                await clear_fan_decline_lock(fan_id)
-                print(f"[SESSION] fan={fan_id} money available — selling resumed")
-            except Exception as e:
-                print(f"[DECLINE UNLOCK ERROR] fan={fan_id} error={e}")
+                    if active_session and active_session.get("awaiting_purchase_index") is not None:
+                        active_session = mark_step_declined(
+                            active_session,
+                            reason=decision.action.value,
+                            pause=True,
+                        )
+                        await save_fan_session(fan_id, active_session)
+                    print(f"[SESSION] fan={fan_id} affordability pause ({decision.action.value})")
+                except Exception as exc:
+                    print(f"[DECLINE LOCK ERROR] fan={fan_id} error={exc}")
+            elif decision.action in {ActionType.CREATE_PAID_SESSION, ActionType.RESUME_PREVIOUS_OFFER}:
+                try:
+                    await clear_fan_decline_lock(fan_id)
+                except Exception as exc:
+                    print(f"[DECLINE UNLOCK ERROR] fan={fan_id} error={exc}")
+            elif decision.action == ActionType.CONTINUE_NORMAL_CHAT and purchase_signal == "declined":
+                # A normal 'no' is not proof of poverty. End only the pending offer.
+                if active_session and active_session.get("awaiting_purchase_index") is not None:
+                    active_session = mark_step_declined(active_session, reason="offer_declined", pause=False)
+                    await save_fan_session(fan_id, None)
+                    state = await get_fan_state(fan_id)
+                    state.status = FanStatus.IDLE
+                    state.confirmed_budget_cents = None
+                    state.selected_package_id = None
+                    state.selected_package_set_id = None
+                    state.selected_package_set_ids = []
+                    state.selected_package_price_cents = None
+                    await save_fan_state(fan_id, creator_id, state)
+        else:
+            # Legacy behavior is retained only when Commercial v2 is disabled.
+            if purchase_signal == "declined":
+                try:
+                    await set_fan_decline_lock(fan_id, (pending or {}).get("price"))
+                except Exception as exc:
+                    print(f"[DECLINE LOCK ERROR] fan={fan_id} error={exc}")
+            elif purchase_signal == "money_available":
+                try:
+                    await clear_fan_decline_lock(fan_id)
+                except Exception as exc:
+                    print(f"[DECLINE UNLOCK ERROR] fan={fan_id} error={exc}")
 
         ctx = ConversationContext(
             fan_message=latest_message,
@@ -758,6 +792,13 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 await asyncio.sleep(random.randint(5, 15))
 
             ppv_match = re.search(r"\[PPV:([^:]+):(\d+(?:\.\d+)?)\]", part)
+            if ppv_match and commercial_enabled and (
+                decision is None
+                or decision.action not in {ActionType.CREATE_PAID_SESSION, ActionType.SEND_NEXT_PPV_STEP}
+            ):
+                print(f"[COMMERCIAL GUARD] stripped unauthorized PPV fan={fan_id} action={getattr(decision, 'action', None)}")
+                ppv_match = None
+                part = re.sub(r"\[PPV:[^\]]+\]", "", part).strip()
             if ppv_match:
                 text_out = part[: ppv_match.start()].strip()
                 media_id = ppv_match.group(1)
@@ -767,18 +808,28 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 media_ids = [media_id]
                 if active_session:
                     plan = active_session.get("plan", [])
-                    idx = active_session.get("current_index", 0)
+                    idx = int(active_session.get("current_index", 0) or 0)
                     if idx < len(plan) and plan[idx].get("media_ids"):
+                        # The stored plan is authoritative. The writer may emit a
+                        # delivery command, but it cannot alter media or price.
                         media_ids = plan[idx]["media_ids"]
                         media_id = media_ids[0]
+                        price = float(plan[idx].get("price") or price)
 
+                current_step = None
+                if active_session:
+                    plan = active_session.get("plan", [])
+                    idx = int(active_session.get("current_index", 0) or 0)
+                    if 0 <= idx < len(plan):
+                        current_step = plan[idx]
                 ppv_media_context = {
                     "ppv": {
                         "media_ids": media_ids,
-                        "media_id": media_id,   # representative / back-compat
+                        "media_id": media_id,
                         "price": price,
                         "access_type": "ppv",
-                        "set_id": (active_session or {}).get("set_id"),
+                        "set_id": (current_step or {}).get("set_id"),
+                        "step_index": (active_session or {}).get("current_index"),
                     }
                 }
             else:
@@ -802,6 +853,9 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         lambda mid=media_id, pr=price: db.table("fans").update({
                             "pending_ppv_check": {
                                 "media_id": mid,
+                                "media_ids": media_ids,
+                                "set_id": (current_step or {}).get("set_id"),
+                                "step_index": (active_session or {}).get("current_index"),
                                 "price": pr,
                                 "sent_at": __import__("datetime").datetime.utcnow().isoformat(),
                             }
@@ -812,24 +866,21 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 except Exception as e:
                     print(f"[PPV PENDING ERROR] {e}")
 
-            # Advance session plan if PPV was sent
+            # Sending creates a purchase gate. The plan advances only after a
+            # confirmed purchase webhook, never merely because media was sent.
             if ppv_match and active_session:
                 try:
                     session = await get_fan_session(fan_id)
                     if session:
-                        plan = session.get("plan", [])
-                        idx = session.get("current_index", 0)
-                        if idx < len(plan):
-                            plan[idx]["sent"] = True
-                            session["current_index"] = idx + 1
-                            # Start cooldown — require 2 fan messages before next item
-                            session["post_ppv_cooldown"] = True
-                            session["cooldown_messages_remaining"] = 2
-                            await save_fan_session(fan_id, session)
-                            active_session = session
-                            print(f"[SESSION] Advanced to item {idx + 1}/{len(plan)} for fan={fan_id}, cooldown started")
-                except Exception as e:
-                    print(f"[SESSION ADVANCE ERROR] {e}")
+                        session = mark_step_sent(session)
+                        await save_fan_session(fan_id, session)
+                        active_session = session
+                        print(
+                            f"[SESSION] sent step={session.get('awaiting_purchase_index')} "
+                            f"fan={fan_id}; awaiting purchase"
+                        )
+                except Exception as exc:
+                    print(f"[SESSION SEND STATE ERROR] {exc}")
 
             if group_id and apifansly_account_id:
                 if ppv_match:
@@ -906,62 +957,119 @@ async def _send_reaction_fishing(
 
 
 async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None = None) -> None:
-    """One place that records a confirmed PPV buy and reconciles every store:
-    sales_log, not_sold_log, total_spent, spend_tier, the message row, the session."""
-    def _tier(s: int) -> str:
-        return "whale" if s >= 500 else "active" if s >= 100 else "casual" if s >= 20 else "cold"
+    """Record one confirmed PPV purchase idempotently and advance its session.
+
+    The paid-session plan moves forward only here, after confirmation. The final
+    step closes and clears the active session and resets session-specific state.
+    """
+    def _tier(total: int) -> str:
+        return "whale" if total >= 500 else "active" if total >= 100 else "casual" if total >= 20 else "cold"
 
     db = get_supabase()
-    fan = await asyncio.to_thread(lambda: db.table("fans")
-        .select("total_spent, sales_log, not_sold_log, creator_id, needs_human_review").eq("id", fan_id).single().execute())
-    row = fan.data or {}
-    sales_log = row.get("sales_log") or []
-    not_sold = row.get("not_sold_log") or []
-
-    if amount is None:
-        amount = next((e.get("amount", 0) for e in not_sold
-                       if str(media_id) in str(e.get("item", ""))), 0)
-    amount = int(amount or 0)
-
-    from datetime import datetime
-    sales_log.append({
-        "date": datetime.utcnow().strftime("%d.%m.%Y"),
-        "item": f"PPV media {media_id}",
-        "media_id": str(media_id),
-        "amount": amount, "chatter": "AI",
-    })
-    not_sold = [e for e in not_sold if str(media_id) not in str(e.get("item", ""))]
-    new_spent = int(row.get("total_spent", 0) or 0) + amount
-
-    await asyncio.to_thread(lambda: db.table("fans").update({
-        "total_spent": new_spent, "spend_tier": _tier(new_spent),
-        "sales_log": sales_log, "not_sold_log": not_sold, "pending_ppv_check": None,
-    }).eq("id", fan_id).execute())
-
-    await mark_ppv_purchased(fan_id, str(media_id))
+    fan_response = await asyncio.to_thread(
+        lambda: db.table("fans")
+        .select(
+            "total_spent, sales_log, not_sold_log, creator_id, "
+            "needs_human_review, pending_ppv_check"
+        )
+        .eq("id", fan_id).single().execute()
+    )
+    row = fan_response.data or {}
+    creator_id = row.get("creator_id")
+    sales_log = list(row.get("sales_log") or [])
+    not_sold = list(row.get("not_sold_log") or [])
+    pending = row.get("pending_ppv_check") or {}
 
     session = await get_fan_session(fan_id)
-    if session:
-        for item in session.get("plan", []):
-            if str(item.get("media_id")) == str(media_id):
-                item["purchased"] = True
-        await save_fan_session(fan_id, session)
+    if amount is None:
+        amount = pending.get("price")
+    if amount is None and session:
+        idx = session.get("awaiting_purchase_index")
+        plan = session.get("plan") or []
+        if idx is not None and 0 <= int(idx) < len(plan):
+            amount = plan[int(idx)].get("price")
+    if amount is None:
+        amount = next(
+            (entry.get("amount", 0) for entry in not_sold if str(media_id) in str(entry.get("item", ""))),
+            0,
+        )
+    amount_dollars = int(round(float(amount or 0)))
 
-    # Whale handoff: if the agency set a threshold, hand the fan to a human the
-    # moment their total spend first crosses it (only on the crossing, not on every
-    # later purchase, and not if they're already flagged for review).
+    already_recorded = any(str(entry.get("media_id")) == str(media_id) for entry in sales_log)
     old_spent = int(row.get("total_spent", 0) or 0)
-    creator_id = row.get("creator_id")
-    if creator_id and not row.get("needs_human_review"):
+    new_spent = old_spent
+    if not already_recorded:
+        from datetime import datetime
+        sales_log.append({
+            "date": datetime.utcnow().strftime("%d.%m.%Y"),
+            "item": f"PPV media {media_id}",
+            "media_id": str(media_id),
+            "amount": amount_dollars,
+            "chatter": "AI",
+        })
+        not_sold = [entry for entry in not_sold if str(media_id) not in str(entry.get("item", ""))]
+        new_spent = old_spent + amount_dollars
+
+    await asyncio.to_thread(
+        lambda: db.table("fans").update({
+            "total_spent": new_spent,
+            "spend_tier": _tier(new_spent),
+            "sales_log": sales_log,
+            "not_sold_log": not_sold,
+            "pending_ppv_check": None,
+        }).eq("id", fan_id).execute()
+    )
+    await mark_ppv_purchased(fan_id, str(media_id))
+
+    if session and creator_id:
+        try:
+            policy = await get_creator_policy(creator_id)
+            updated, completed = mark_step_purchased(
+                session,
+                media_id=str(media_id),
+                set_id=(pending or {}).get("set_id"),
+                amount_cents=amount_dollars * 100,
+                cooldown_messages=policy.post_purchase_cooldown_messages,
+            )
+            state = await get_fan_state(fan_id)
+            if completed:
+                from datetime import datetime, timezone
+                state.status = FanStatus.IDLE
+                state.last_session_completed_at = datetime.now(timezone.utc)
+                state.last_session_revenue_cents = int(updated.get("revenue_cents", 0) or 0)
+                state.confirmed_budget_cents = None
+                state.budget_source = None
+                state.offered_packages = []
+                state.selected_package_id = None
+                state.selected_package_set_id = None
+                state.selected_package_set_ids = []
+                state.selected_package_label = None
+                state.selected_package_price_cents = None
+                await save_fan_session(fan_id, None)
+                print(f"[SESSION] completed fan={fan_id} revenue_cents={state.last_session_revenue_cents}")
+            else:
+                state.status = FanStatus.PAID_SESSION_ACTIVE
+                await save_fan_session(fan_id, updated)
+                print(
+                    f"[SESSION] purchase confirmed fan={fan_id}; "
+                    f"next={updated.get('current_index')}/{len(updated.get('plan') or [])}"
+                )
+            await save_fan_state(fan_id, creator_id, state)
+        except Exception as exc:
+            # Purchase accounting remains recorded; lifecycle mismatch is loudly
+            # logged for human review rather than double-charging on a retry.
+            print(f"[SESSION PURCHASE RECONCILE ERROR] fan={fan_id}: {exc}")
+
+    # Whale handoff only on the threshold crossing, not duplicate webhooks.
+    if creator_id and not row.get("needs_human_review") and not already_recorded:
         try:
             caps = await get_creator_caps(creator_id)
-            threshold = caps.get("whale_handoff_threshold")
-            threshold = int(threshold) if threshold else 0
+            threshold = int(caps.get("whale_handoff_threshold") or 0)
             if threshold and old_spent < threshold <= new_spent:
                 await freeze_fan_for_review(fan_id, f"whale:${new_spent}")
-                print(f"[WHALE HANDOFF] fan={fan_id} crossed ${threshold} (now ${new_spent}) — handed to human")
-        except Exception as e:
-            print(f"[WHALE HANDOFF ERROR] fan={fan_id} error={e}")
+                print(f"[WHALE HANDOFF] fan={fan_id} crossed ${threshold} (now ${new_spent})")
+        except Exception as exc:
+            print(f"[WHALE HANDOFF ERROR] fan={fan_id} error={exc}")
 
 
 async def _verify_ppv_purchase(
