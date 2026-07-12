@@ -410,6 +410,33 @@ Return ONLY a JSON array of 3 strings. No markdown.
             user_prompt += f"IMPORTANT: The price is ${next_price} — do not mention any other price.\n"
             user_prompt += "After sending, continue the intimate conversation - do not immediately push the next item."
 
+    # ---- COMMERCIAL DECISION (authoritative) --------------------------------
+    # When the commercial layer is on, the policy engine has already decided what
+    # happens. The model's job is only to express it. This block outranks every
+    # heuristic below it.
+    decision = getattr(ctx, "commercial_decision", None) or {}
+    if decision:
+        act = decision.get("action", "")
+        goal = decision.get("goal", "")
+        lines = [f"\n\nDECIDED ACTION: {act}", f"WHAT TO ACHIEVE: {goal}"]
+        if decision.get("must_not_send_media"):
+            lines.append("You must NOT send media and must NOT include any [PPV:...] tag in this message.")
+        if not decision.get("may_be_explicit", False):
+            lines.append("Keep this message non-explicit.")
+        else:
+            lines.append("You may be explicit here — actually deliver the experience, don't just tease.")
+        opts = decision.get("package_options") or []
+        if opts:
+            lines.append(
+                f"Offer him a choice between two experiences priced ${opts[0]} and ${opts[-1]}. "
+                "Let him pick — do not ask 'what's your budget'."
+            )
+        if decision.get("mention_price"):
+            lines.append(f"The price is ${decision['mention_price']}.")
+        if decision.get("mention_previous_interest"):
+            lines.append("Reference what he wanted earlier, warmly and specifically.")
+        user_prompt += "\n".join(lines)
+
     purchase_signal = situation.get("purchase_signal", "none")
 
     # Persistent decline lock: he already told us he can't afford it. This holds
