@@ -353,9 +353,16 @@ Return ONLY a JSON array of 3 strings. No markdown.
     purchased_ids = {s["media_id"] for s in sent_ppv if s.get("purchased")}
     active_session = ctx.active_session
 
+    decision = getattr(ctx, "commercial_decision", None) or {}
+    decision_action = decision.get("action", "")
     purchase_signal = situation.get("purchase_signal", "none")
 
-    if active_session:
+    # A commercial decision is authoritative. Session-specific instructions are
+    # included only when the policy explicitly created/continued a paid session.
+    if active_session and (
+        not decision
+        or decision_action in {"CREATE_PAID_SESSION", "SEND_NEXT_PPV_STEP"}
+    ):
         plan = active_session.get("plan", [])
         idx = active_session.get("current_index", 0)
         remaining = [p for p in plan[idx:] if not p.get("sent")]
@@ -411,38 +418,54 @@ Return ONLY a JSON array of 3 strings. No markdown.
             user_prompt += "After sending, continue the intimate conversation - do not immediately push the next item."
 
     # ---- COMMERCIAL DECISION (authoritative) --------------------------------
-    # When the commercial layer is on, the policy engine has already decided what
-    # happens. The model's job is only to express it. This block outranks every
-    # heuristic below it.
-    decision = getattr(ctx, "commercial_decision", None) or {}
+    # Appended after session context, and legacy sales heuristics below are disabled
+    # whenever this decision exists. The writer expresses; it does not re-decide.
     if decision:
         act = decision.get("action", "")
         goal = decision.get("goal", "")
-        lines = [f"\n\nDECIDED ACTION: {act}", f"WHAT TO ACHIEVE: {goal}"]
+        lines = [
+            f"\n\nFINAL COMMERCIAL POLICY — THIS OVERRIDES CONFLICTING TEXT ABOVE:",
+            f"DECIDED ACTION: {act}",
+            f"WHAT TO ACHIEVE: {goal}",
+        ]
         if decision.get("must_not_send_media"):
-            lines.append("You must NOT send media and must NOT include any [PPV:...] tag in this message.")
+            lines.append("Do NOT send media and do NOT include a [PPV:...] tag.")
         if not decision.get("may_be_explicit", False):
-            lines.append("Keep this message non-explicit.")
+            lines.append("Keep this response non-explicit.")
         else:
-            lines.append("You may be explicit here — actually deliver the experience, don't just tease.")
-        opts = decision.get("package_options") or []
-        if opts:
-            lines.append(
-                f"Offer him a choice between two experiences priced ${opts[0]} and ${opts[-1]}. "
-                "Let him pick — do not ask 'what's your budget'."
-            )
-        if decision.get("mention_price"):
-            lines.append(f"The price is ${decision['mention_price']}.")
-        if decision.get("mention_previous_interest"):
-            lines.append("Reference what he wanted earlier, warmly and specifically.")
-        user_prompt += "\n".join(lines)
+            lines.append("Explicit text is allowed only to the degree required by the decided action.")
 
-    purchase_signal = situation.get("purchase_signal", "none")
+        options = decision.get("package_options") or []
+        if options:
+            rendered = []
+            for option in options:
+                if isinstance(option, dict):
+                    label = option.get("label") or "private experience"
+                    cents = int(option.get("price_cents") or 0)
+                    rendered.append(f"{label}: ${cents / 100:g}")
+                else:
+                    rendered.append(f"${option}")
+            lines.append(
+                "Offer ONLY these exact options: " + "; ".join(rendered) + ". "
+                "Do not invent another price or package. Let him choose without asking his budget."
+            )
+        if decision.get("mention_price") is not None:
+            lines.append(f"The exact price is ${decision['mention_price']}.")
+        if decision.get("mention_previous_interest"):
+            lines.append("Reference the specific experience he wanted earlier.")
+        if decision.get("must_not_ask_question"):
+            lines.append("Do not ask a question in this response.")
+        max_messages = decision.get("max_messages")
+        if max_messages:
+            lines.append(f"Use at most {max_messages} message part(s).")
+        if decision.get("conversation_continuation") == "none":
+            lines.append("It is allowed to end cleanly. Do not manufacture a topic pivot or filler question.")
+        user_prompt += "\n".join(lines)
 
     # Persistent decline lock: he already told us he can't afford it. This holds
     # across turns until he says money is available — so a later "but I'm so hard,
     # send me something" must NOT be answered with a sale.
-    if getattr(fan, "sale_paused_at", None) and purchase_signal != "money_available":
+    if not decision and getattr(fan, "sale_paused_at", None) and purchase_signal != "money_available":
         user_prompt += (
             "\n\nSELLING IS PAUSED FOR HIM. He already told you he can't afford it right now. "
             "Do NOT send PPV, do NOT pitch, tease, or hint at paid content, do NOT mention prices — "
@@ -450,7 +473,7 @@ Return ONLY a JSON array of 3 strings. No markdown.
             "good without selling. If he says money has come in, that changes things, but until then: no offers."
         )
 
-    if purchase_signal == "declined":
+    if not decision and purchase_signal == "declined":
         user_prompt += (
             "\n\nHE JUST DECLINED / SAID HE CAN'T AFFORD IT RIGHT NOW. Absolute rules for this message: "
             "do NOT send any PPV, do NOT pitch or tease new paid content, do NOT pressure him. "
@@ -459,7 +482,7 @@ Return ONLY a JSON array of 3 strings. No markdown.
             "Shift back to normal conversation and keep the vibe good."
         )
 
-    if purchase_signal == "ready_to_buy" and ppv_offers:
+    if not decision and purchase_signal == "ready_to_buy" and ppv_offers:
         # Fan said yes to a price — find the best matching offer and force send it
         available = [
             o for o in ppv_offers
@@ -487,7 +510,7 @@ Return ONLY a JSON array of 3 strings. No markdown.
                 "what you already sent (it's right there, still waiting for him). No [PPV] tag this message."
             )
 
-    if ppv_offers:
+    if not decision and ppv_offers:
         available = [o for o in ppv_offers if o.get("media_id") and o["media_id"] not in purchased_ids]
         offers_text = "\n".join([
             f"- [{o.get('media_id', '')}] {o['title']}: ${o.get('price', 0)} — {o.get('description', '')}"

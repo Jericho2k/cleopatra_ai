@@ -18,6 +18,7 @@ from core.config import get_settings
 from core.supabase import get_supabase
 from ai.prompt_builder import build_prompt
 from services.commercial_orchestrator import orchestrate
+from models.commercial import ActionType
 from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
@@ -535,8 +536,9 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         # Commercial layer: deterministic policy decides what happens next
         # (sell / pause / tease / schedule). Flag-gated so it can be turned off
         # instantly in prod without a deploy.
+        commercial_enabled = os.environ.get("COMMERCIAL_LAYER_ENABLED", "").lower() in ("1", "true", "yes")
         decision = None
-        if os.environ.get("COMMERCIAL_LAYER_ENABLED", "").lower() in ("1", "true", "yes"):
+        if commercial_enabled:
             try:
                 cap_ok, _ = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
                 decision = await orchestrate(
@@ -548,12 +550,22 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                     frozen_for_review=bool(getattr(fan_profile, "needs_human_review", False)),
                 )
             except Exception as e:
-                print(f"[COMMERCIAL ERROR] fan={fan_id}: {e} — falling back to legacy path")
-                decision = None
+                # Full Auto must fail closed. Silently reverting to the legacy
+                # planner can send content after a pause or at the wrong price.
+                print(f"[COMMERCIAL ERROR] fan={fan_id}: {e} — auto reply aborted")
+                return
 
-        # Plan a content set when the fan clearly asks to see/buy content, unless
-        # the creator's per-fan daily caps (if configured) are exceeded.
-        if not active_session and not _selling_locked(fan_profile) and _fan_wants_content(latest_message, situation):
+        # With commercial v2 enabled, only CREATE_PAID_SESSION may start a plan.
+        # PRESENT_SESSION_OPTIONS, PAUSE_* and ordinary chat must never invoke the
+        # legacy content planner. When the flag is off, preserve old behavior.
+        should_plan = (
+            decision is not None and decision.action == ActionType.CREATE_PAID_SESSION
+        ) if commercial_enabled else (
+            not _selling_locked(fan_profile)
+            and _fan_wants_content(latest_message, situation)
+        )
+
+        if not active_session and should_plan:
             cap_ok, cap_reason = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
             if not cap_ok:
                 print(f"[CAP] fan={fan_id} plan suppressed: {cap_reason}")
@@ -566,8 +578,12 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         print(f"[SESSION] Planned for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
                     else:
                         print(f"[SESSION] plan-session status={plan_data.get('status')} fan={fan_id}")
+                        if commercial_enabled:
+                            return
                 except Exception as e:
                     print(f"[SESSION PLAN ERROR] {e}")
+                    if commercial_enabled:
+                        return
 
         # Inject tip context into situation so prompt builder can use it
         if pending_tip:
@@ -762,6 +778,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         "media_id": media_id,   # representative / back-compat
                         "price": price,
                         "access_type": "ppv",
+                        "set_id": (active_session or {}).get("set_id"),
                     }
                 }
             else:

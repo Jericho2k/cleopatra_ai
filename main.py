@@ -2302,6 +2302,18 @@ async def plan_session(
     import json as _json
 
     fan = await get_fan_by_id(fan_id)
+    selected_set_id = body.get("selected_set_id")
+    selected_price_cents = body.get("selected_price_cents")
+    commercial_state = None
+    if os.environ.get("COMMERCIAL_LAYER_ENABLED", "").lower() in ("1", "true", "yes"):
+        from db.commercial_queries import get_fan_state
+        commercial_state = await get_fan_state(fan_id)
+        selected_set_id = selected_set_id or commercial_state.selected_package_set_id
+        selected_price_cents = (
+            selected_price_cents
+            or commercial_state.selected_package_price_cents
+            or commercial_state.confirmed_budget_cents
+        )
     sent_ppv = await get_sent_ppv(fan_id)
     purchased_ids = {s["media_id"] for s in sent_ppv if s.get("purchased")}
     # Everything ever sent to this fan (purchased or not). A sent-but-unpurchased PPV
@@ -2361,23 +2373,40 @@ async def plan_session(
         'Return ONLY JSON: {"set_index": 0, "reason": "short why"}'
     )
 
-    response = await client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    content = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-
     try:
-        choice = _json.loads(content)
-        idx = int(choice.get("set_index", 0))
-        idx = idx if 0 <= idx < len(sellable) else 0
-        chosen = sellable[idx]
+        if selected_set_id:
+            chosen = next(
+                (item for item in sellable if str(item.get("id")) == str(selected_set_id)),
+                None,
+            )
+            if chosen is None:
+                return {
+                    "status": "selected_set_unavailable",
+                    "session": None,
+                    "message": "The package selected in chat is no longer sellable.",
+                }
+            choice = {"reason": "fan selected this offered package"}
+        else:
+            response = await client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=300,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            content = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
+            choice = _json.loads(content)
+            idx = int(choice.get("set_index", 0))
+            idx = idx if 0 <= idx < len(sellable) else 0
+            chosen = sellable[idx]
 
-        # Bundle = the approved set, as approved. No re-bundling, no invented price —
-        # use the human-set price. Drop any pieces already purchased.
+        # Bundle = the approved set. If the fan selected an offered package, the
+        # exact persisted package price is authoritative; otherwise use the human
+        # approved set price.
         media_ids = [m for m in chosen["media_ids"] if m not in purchased_ids]
-        bundle_price = int(chosen.get("suggested_price") or 0)
+        bundle_price = (
+            round(int(selected_price_cents) / 100, 2)
+            if selected_set_id and selected_price_cents
+            else int(chosen.get("suggested_price") or 0)
+        )
 
         plan_item = {
             "media_ids": media_ids,
@@ -2400,6 +2429,10 @@ async def plan_session(
             "fan_kinks": kinks,
             "set_id": chosen["id"],
             "scene_key": plan_item["scene_key"],
+            "commercial_package_id": (
+                commercial_state.selected_package_id if commercial_state else None
+            ),
+            "confirmed_budget_cents": selected_price_cents,
         }
         await save_fan_session(fan_id, session)
         print(f"[SESSION] set={chosen['id']} '{plan_item['scene_key']}' "
