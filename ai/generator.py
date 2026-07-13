@@ -81,49 +81,128 @@ def _clean_reply(reply: str) -> str:
     return " | ".join(parts)
 
 
-def parse_reply_candidates(content: str, creator_persona: Persona) -> list[str]:
-    """Parse and validate the model's JSON array response."""
+def parse_reply_candidates(
+    content: str,
+    creator_persona: Persona,
+) -> list[str]:
+    """Parse model output into validated reply candidates.
 
-    content = re.sub(
+    Invalid, malformed, or non-JSON model output must fail closed by
+    returning an empty list. Full Auto must never send fallback filler.
+    """
+    if not content or not content.strip():
+        return []
+
+    # Remove injected/reminder blocks.
+    cleaned = re.sub(
         r"<[a-z_]+_reminder>.*?</[a-z_]+_reminder>",
         "",
         content,
         flags=re.DOTALL,
     ).strip()
-    lines = content.splitlines()
-    cleaned_lines = [line for line in lines if not line.lstrip().startswith("```")]
-    cleaned = "\n".join(cleaned_lines).strip() or content
 
-    payload = json.loads(cleaned)
+    # Remove Markdown code fences while preserving their contents.
+    cleaned_lines = [
+        line
+        for line in cleaned.splitlines()
+        if not line.lstrip().startswith("```")
+    ]
+    cleaned = "\n".join(cleaned_lines).strip()
+
+    if not cleaned:
+        return []
+
+    try:
+        payload = json.loads(cleaned)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return []
+
     if not isinstance(payload, list):
         return []
 
-    replies = [_clean_reply(item) for item in payload if isinstance(item, str)]
+    replies = [
+        _clean_reply(reply)
+        for reply in payload
+        if isinstance(reply, str)
+    ]
     replies = [reply for reply in replies if reply]
+
     if not replies:
         return []
 
+    bot_phrases = [
+        "certainly",
+        "of course",
+        "i'd be happy",
+        "as an ai",
+        "i understand that",
+        "great question",
+        "absolutely",
+        "i apologize",
+        "hehe",
+        "too sweet",
+        "ur too sweet",
+        "u r too sweet",
+        "making me blush",
+        "u make me blush",
+        "ur making me blush",
+        "omg you're curious",
+        "i like that",
+        "nice dreams",
+        "friendly vibes",
+        "that sounds nice",
+        "sounds interesting",
+        "that's nice",
+        "what's your story",
+        "gorgeous back at ya",
+        "mind blowing yourself",
+        "hi yourself",
+        "hello yourself",
+        "gorgeous yourself",
+        "beautiful yourself",
+        "sexy yourself",
+        "yourself",
+        "stunning yourself",
+        "interesting",
+        "noted",
+        "understood",
+        "got it",
+        "sure thing",
+    ]
+
     def is_valid(reply: str) -> bool:
         lowered = reply.lower()
-        if any(phrase in lowered for phrase in BOT_PHRASES):
+
+        if any(phrase in lowered for phrase in bot_phrases):
             return False
-        if creator_persona.avg_message_length == "short" and len(reply.split()) > 25:
+
+        if (
+            creator_persona.avg_message_length == "short"
+            and len(reply.split()) > 25
+        ):
             return False
+
         return True
 
     valid = [reply for reply in replies if is_valid(reply)]
-    if len(valid) < 2:
-        return []
 
-    result = list(valid[:3])
-    if len(result) < 3:
+    if len(valid) >= 3:
+        return filter_suggestions(valid[:3])
+
+    if len(valid) >= 2:
+        result = list(valid)
+
         for reply in replies:
             if reply not in result:
                 result.append(reply)
+
             if len(result) == 3:
                 break
 
-    return filter_suggestions(result) if len(result) == 3 else []
+        if len(result) == 3:
+            return filter_suggestions(result)
+
+    return []
 
 
 async def generate_replies(
