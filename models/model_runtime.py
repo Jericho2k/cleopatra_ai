@@ -15,12 +15,18 @@ class ModelTarget:
     model: str
     base_url: str | None = None
     api_key_env: str | None = None
+
     input_per_million: float = 0.0
     output_per_million: float = 0.0
     cache_read_per_million: float = 0.0
     cache_write_per_million: float = 0.0
+
     adult_policy: str = "unverified"
     enabled: bool = True
+
+    stream: bool = False
+    timeout_seconds: float = 45.0
+
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -38,6 +44,8 @@ class ModelTarget:
             adult_policy=str(data.get("adult_policy") or "unverified"),
             enabled=bool(data.get("enabled", True)),
             metadata=dict(data.get("metadata") or {}),
+            stream=bool(data.get("stream", False)),
+            timeout_seconds=float(data.get("timeout_seconds") or 45.0),
         )
 
 

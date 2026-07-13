@@ -212,6 +212,39 @@ async def persist_run_finish(run_id: str, summary: dict[str, Any]) -> None:
         ).eq("id", run_id).execute()
     )
 
+def save_results_file(
+    output_path: Path,
+    *,
+    run_id: str,
+    rows: list[dict[str, Any]],
+    status: str,
+    summary: dict[str, Any] | None = None,
+) -> None:
+    """Atomically save evaluation progress after every model result."""
+
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "status": status,
+        "results": rows,
+    }
+
+    if summary is not None:
+        payload["summary"] = summary
+
+    temporary_path = output_path.with_suffix(
+        output_path.suffix + ".tmp"
+    )
+
+    temporary_path.write_text(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    temporary_path.replace(output_path)
 
 async def main() -> int:
     args = parse_args()
@@ -238,7 +271,20 @@ async def main() -> int:
             {"catalog": args.catalog, "scenarios": args.scenarios},
         )
 
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_path = output_dir / f"model_eval_{run_id}.json"
+
     rows: list[dict[str, Any]] = []
+
+    save_results_file(
+        output_path,
+        run_id=run_id,
+        rows=rows,
+        status="running",
+    )
+
     for scenario in scenarios:
         ctx = build_context(scenario)
         prompt = build_prompt(ctx)
@@ -256,20 +302,38 @@ async def main() -> int:
                 "model": target.model,
             }
             if skip_reason:
-                row = {**base_row, "skipped": True, "skip_reason": skip_reason}
+                row = {
+                    **base_row,
+                    "skipped": True,
+                    "skip_reason": skip_reason,
+                }
+
                 rows.append(row)
+
+                save_results_file(
+                    output_path,
+                    run_id=run_id,
+                    rows=rows,
+                    status="running",
+                )
+
                 if args.persist:
                     await persist_output(run_id, row)
-                print(f"SKIP {scenario['id']} / {target.name}: {skip_reason}")
+
+                print(
+                    f"SKIP {scenario['id']} / {target.name}: "
+                    f"{skip_reason}"
+                )
                 continue
 
             try:
-                result = await complete(
-                    target,
-                    system=system,
-                    messages=messages,
-                    max_tokens=1000,
-                )
+                async with asyncio.timeout(target.timeout_seconds):
+                    result = await complete(
+                        target,
+                        system=system,
+                        messages=messages,
+                        max_tokens=1000,
+                    )
                 replies = parse_reply_candidates(result.text, ctx.creator_persona)
                 checks = automatic_checks(replies, scenario.get("checks") or {})
                 row = {
@@ -298,21 +362,46 @@ async def main() -> int:
                     f"pass={checks.get('passed')} cost=${row['estimated_cost_usd']:.6f} "
                     f"latency={result.latency_ms}ms"
                 )
+            except TimeoutError:
+                row = {
+                    **base_row,
+                    "skipped": False,
+                    "error": (
+                        f"Timed out after "
+                        f"{target.timeout_seconds:.0f} seconds"
+                    ),
+                    "replies": [],
+                }
+
+                print(
+                    f"TIMEOUT {scenario['id']} / {target.name}: "
+                    f"{target.timeout_seconds:.0f}s"
+                )
+
             except Exception as error:
-                row = {**base_row, "skipped": False, "error": str(error), "replies": []}
-                print(f"FAIL {scenario['id']} / {target.name}: {error}")
+                row = {
+                    **base_row,
+                    "skipped": False,
+                    "error": str(error),
+                    "replies": [],
+                }
+
+                print(
+                    f"FAIL {scenario['id']} / {target.name}: "
+                    f"{error}"
+                )
 
             rows.append(row)
+
+            save_results_file(
+                output_path,
+                run_id=run_id,
+                rows=rows,
+                status="running",
+            )
+
             if args.persist:
                 await persist_output(run_id, row)
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"model_eval_{run_id}.json"
-    output_path.write_text(
-        json.dumps({"run_id": run_id, "results": rows}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
 
     completed = [row for row in rows if not row.get("skipped") and not row.get("error")]
     summary = {
@@ -328,6 +417,14 @@ async def main() -> int:
         "output_path": str(output_path),
     }
     print(json.dumps(summary, indent=2))
+
+    save_results_file(
+        output_path,
+        run_id=run_id,
+        rows=rows,
+        status="completed",
+        summary=summary,
+    )
 
     if args.persist:
         await persist_run_finish(run_id, summary)

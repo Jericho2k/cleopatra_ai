@@ -32,3 +32,18 @@ def test_target_from_mapping_normalizes_provider():
     )
     assert target.provider == "together"
     assert target.model == "some/model"
+
+
+def test_target_from_mapping_supports_stream_and_timeout():
+    target = ModelTarget.from_mapping(
+        {
+            "name": "Streaming candidate",
+            "provider": "together",
+            "model": "some/model",
+            "stream": True,
+            "timeout_seconds": 30,
+        }
+    )
+
+    assert target.stream is True
+    assert target.timeout_seconds == 30

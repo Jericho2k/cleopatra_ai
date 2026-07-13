@@ -180,23 +180,84 @@ async def _complete_openai_compatible(
     if not target.base_url:
         raise RuntimeError(f"No base URL configured for {target.name}")
 
-    client = AsyncOpenAI(base_url=target.base_url, api_key=_api_key(target))
-    payload_messages = [{"role": "system", "content": system}, *messages]
+    client = AsyncOpenAI(
+        base_url=target.base_url,
+        api_key=_api_key(target),
+        timeout=target.timeout_seconds,
+    )
+
+    payload_messages = [
+        {"role": "system", "content": system},
+        *messages,
+    ]
+
     kwargs: dict[str, Any] = {
         "model": target.model,
         "messages": payload_messages,
         "max_tokens": max_tokens,
     }
+
     if temperature is not None:
         kwargs["temperature"] = temperature
 
-    response = await client.chat.completions.create(**kwargs)
-    content = response.choices[0].message.content or ""
-    usage = response.usage
-    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0) if usage else 0
-    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0) if usage else 0
-    prompt_details = getattr(usage, "prompt_tokens_details", None) if usage else None
-    cached_tokens = int(getattr(prompt_details, "cached_tokens", 0) or 0)
+    raw_response_id: str | None = None
+    usage = None
+
+    if target.stream:
+        stream = await client.chat.completions.create(
+            **kwargs,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        content_parts: list[str] = []
+
+        async for chunk in stream:
+            if raw_response_id is None:
+                raw_response_id = getattr(chunk, "id", None)
+
+            choices = getattr(chunk, "choices", None) or []
+
+            for choice in choices:
+                delta = getattr(choice, "delta", None)
+                text = getattr(delta, "content", None)
+
+                if isinstance(text, str) and text:
+                    content_parts.append(text)
+
+            chunk_usage = getattr(chunk, "usage", None)
+
+            if chunk_usage is not None:
+                usage = chunk_usage
+
+        content = "".join(content_parts)
+
+    else:
+        response = await client.chat.completions.create(**kwargs)
+
+        content = response.choices[0].message.content or ""
+        usage = response.usage
+        raw_response_id = getattr(response, "id", None)
+
+    prompt_tokens = (
+        int(getattr(usage, "prompt_tokens", 0) or 0)
+        if usage
+        else 0
+    )
+    completion_tokens = (
+        int(getattr(usage, "completion_tokens", 0) or 0)
+        if usage
+        else 0
+    )
+
+    prompt_details = (
+        getattr(usage, "prompt_tokens_details", None)
+        if usage
+        else None
+    )
+    cached_tokens = int(
+        getattr(prompt_details, "cached_tokens", 0) or 0
+    )
 
     return ModelResult(
         text=content,
@@ -207,5 +268,5 @@ async def _complete_openai_compatible(
             cache_read_tokens=cached_tokens,
         ),
         latency_ms=0,
-        raw_response_id=getattr(response, "id", None),
+        raw_response_id=raw_response_id,
     )
