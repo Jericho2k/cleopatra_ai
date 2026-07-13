@@ -201,7 +201,10 @@ async def get_suggestions(
         creator_legend=creator_legend,
     )
 
-    situation = await analyze_situation(ctx_without_situation)
+    situation = await analyze_situation(
+        ctx_without_situation,
+        telemetry_context={"creator_id": creator_id, "fan_id": fan_id},
+    )
 
     # Auto-plan a session if the fan is asking for content and none is active,
     # and the creator's per-fan daily caps (if configured) aren't exceeded.
@@ -241,7 +244,11 @@ async def get_suggestions(
     )
 
     prompt = build_prompt(ctx)
-    replies = await generate_replies(prompt, creator_persona)
+    replies = await generate_replies(
+        prompt,
+        creator_persona,
+        telemetry_context={"creator_id": creator_id, "fan_id": fan_id, "feature": "assisted_reply"},
+    )
 
     if save_fan_message:
         await save_message(fan_id, creator_id, "fan", fan_message)
@@ -529,7 +536,10 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             active_session=active_session,
         )
 
-        situation = await analyze_situation(ctx_without_situation)
+        situation = await analyze_situation(
+            ctx_without_situation,
+            telemetry_context={"creator_id": creator_id, "fan_id": fan_id},
+        )
         print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} crisis={situation.get('crisis_signal', 'none')}")
 
         # Sticky-situation policy: if a crisis is flagged and the creator opted to
@@ -724,7 +734,11 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         )
 
         prompt = build_prompt(ctx)
-        replies = await generate_replies(prompt, creator_persona)
+        replies = await generate_replies(
+            prompt,
+            creator_persona,
+            telemetry_context={"creator_id": creator_id, "fan_id": fan_id, "feature": "auto_reply"},
+        )
 
         if not replies:
             return

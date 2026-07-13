@@ -4,22 +4,29 @@ This module extracts observations only. Commercial decisions are made by the
 policy layer. A deterministic normalizer handles common offer-selection phrases
 so one mixed sentence cannot be collapsed into a generic decline.
 """
-import json
-import os
-import re
 
-from anthropic import AsyncAnthropic
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from ai.model_providers import complete, get_runtime_target
+from models.model_runtime import ModelTelemetryContext
 from models.schemas import ConversationContext
 from services.commercial_events import normalize_commercial_facts
+from services.model_telemetry import record_model_failure, record_model_result
 
-client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-
-async def analyze_situation(ctx: ConversationContext) -> dict:
+async def analyze_situation(
+    ctx: ConversationContext,
+    *,
+    telemetry_context: dict[str, Any] | None = None,
+) -> dict:
     recent = ctx.conversation_history[-12:]
     convo = "\n".join(
-        f"{'Fan' if m.role == 'fan' else 'Creator'}: {m.content}"
-        for m in recent
+        f"{'Fan' if message.role == 'fan' else 'Creator'}: {message.content}"
+        for message in recent
     )
 
     user_content = f"""You are analyzing an adult creator chat so another system can decide the correct business action.
@@ -73,24 +80,57 @@ SAFETY:
 - Crisis is not sexual roughness or consensual roleplay. Flag self_harm for plausible self-directed harm language and harm_to_others only for real intent toward a real person.
 """
 
-    response = await client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=650,
-        messages=[{"role": "user", "content": user_content}],
+    target = get_runtime_target("ANALYZER")
+    metadata = telemetry_context or {}
+    model_context = ModelTelemetryContext(
+        feature=str(metadata.get("feature") or "situation_analyzer"),
+        creator_id=metadata.get("creator_id"),
+        fan_id=metadata.get("fan_id") or ctx.fan_profile.id,
+        metadata={
+            key: value
+            for key, value in metadata.items()
+            if key not in {"feature", "creator_id", "fan_id"}
+        },
     )
 
-    content = response.content[0].text
-    content = content.replace("```json", "").replace("```", "").strip()
-
     try:
-        result = json.loads(content)
-    except Exception:
+        response = await complete(
+            target,
+            system="Return only the requested JSON object. Do not add commentary.",
+            messages=[{"role": "user", "content": user_content}],
+            max_tokens=650,
+            temperature=0.0,
+        )
+        content = response.text.replace("```json", "").replace("```", "").strip()
+        try:
+            result = json.loads(content)
+            parse_valid = isinstance(result, dict)
+        except Exception as error:
+            result = _fallback_result()
+            parse_valid = False
+            await record_model_result(
+                response,
+                model_context,
+                success=False,
+                parse_valid=False,
+                error=f"parse_error: {error}",
+            )
+        else:
+            await record_model_result(
+                response,
+                model_context,
+                success=parse_valid,
+                parse_valid=parse_valid,
+            )
+    except Exception as error:
+        await record_model_failure(target, model_context, error=str(error))
+        print(f"[SITUATION ANALYZER ERROR] provider={target.provider} model={target.model} error={error}")
         result = _fallback_result()
 
     if _looks_like_self_harm(ctx.fan_message):
         result["crisis_signal"] = "self_harm"
 
-    creator_lines = [m.content for m in recent if m.role == "creator"]
+    creator_lines = [message.content for message in recent if message.role == "creator"]
     return normalize_commercial_facts(result, ctx.fan_message, creator_lines)
 
 
@@ -121,13 +161,27 @@ def _fallback_result() -> dict:
     }
 
 
-
 _SELF_HARM_PATTERNS = (
-    "cut my vein", "cut my wrist", "slit my wrist", "slit my vein",
-    "kill myself", "end my life", "end it all", "want to die",
-    "don't want to live", "dont want to live", "don't want to be alive",
-    "dont want to be alive", "not worth living", "harm myself", "hurt myself",
-    "bleed out", "overdose", "take my own life", "suicidal", "suicide",
+    "cut my vein",
+    "cut my wrist",
+    "slit my wrist",
+    "slit my vein",
+    "kill myself",
+    "end my life",
+    "end it all",
+    "want to die",
+    "don't want to live",
+    "dont want to live",
+    "don't want to be alive",
+    "dont want to be alive",
+    "not worth living",
+    "harm myself",
+    "hurt myself",
+    "bleed out",
+    "overdose",
+    "take my own life",
+    "suicidal",
+    "suicide",
 )
 
 

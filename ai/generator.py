@@ -1,150 +1,212 @@
-"""LLM reply generator for Cleopatra.
+"""Provider-neutral LLM reply generator for Cleopatra."""
 
-Calls Together AI via the OpenAI-compatible client and returns reply options.
-"""
+from __future__ import annotations
 
 import json
 import re
+from typing import Any
 
-import anthropic
-import os
-
-from core.config import get_settings
+from ai.model_providers import complete, get_runtime_target
+from models.model_runtime import ModelTarget, ModelTelemetryContext
 from models.schemas import Persona
-
-
-# Module level — create once
-anthropic_client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+from services.model_telemetry import record_model_failure, record_model_result
 
 BANNED_PHRASES = [
-    "hehe", "making me blush", "ur too sweet", "aww that's so sweet",
-    "you're so sweet", "wired", "$500 yet", "too sweet",
+    "hehe",
+    "making me blush",
+    "ur too sweet",
+    "aww that's so sweet",
+    "you're so sweet",
+    "wired",
+    "$500 yet",
+    "too sweet",
+]
+
+BOT_PHRASES = [
+    "certainly",
+    "of course",
+    "i'd be happy",
+    "as an ai",
+    "i understand that",
+    "great question",
+    "absolutely",
+    "i apologize",
+    "hehe",
+    "too sweet",
+    "ur too sweet",
+    "u r too sweet",
+    "making me blush",
+    "u make me blush",
+    "ur making me blush",
+    "omg you're curious",
+    "i like that",
+    "nice dreams",
+    "friendly vibes",
+    "that sounds nice",
+    "sounds interesting",
+    "that's nice",
+    "what's your story",
+    "gorgeous back at ya",
+    "mind blowing yourself",
+    "hi yourself",
+    "hello yourself",
+    "gorgeous yourself",
+    "beautiful yourself",
+    "sexy yourself",
+    "yourself",
+    "stunning yourself",
+    "interesting",
+    "noted",
+    "understood",
+    "got it",
+    "sure thing",
 ]
 
 
 def filter_suggestions(suggestions: list[str]) -> list[str]:
     filtered = []
-    for s in suggestions:
-        lower = s.lower()
+    for suggestion in suggestions:
+        lower = suggestion.lower()
         if not any(phrase in lower for phrase in BANNED_PHRASES):
-            filtered.append(s)
-    return filtered if filtered else suggestions  # fallback to unfiltered if all banned
+            filtered.append(suggestion)
+    return filtered if filtered else suggestions
 
 
 def _clean_reply(reply: str) -> str:
     """Fix malformed split messages."""
     if "|" not in reply:
         return reply.strip()
-    parts = [p.strip() for p in reply.split("|")]
-    # Remove empty parts
-    parts = [p for p in parts if p]
-    if len(parts) == 0:
-        return ""
+    parts = [part.strip() for part in reply.split("|")]
+    parts = [part for part in parts if part]
     return " | ".join(parts)
 
 
-async def generate_replies(
-    prompt_messages: list[dict],
-    creator_persona: Persona,
-) -> list[str]:
-    bot_phrases = [
-        "certainly",
-        "of course",
-        "i'd be happy",
-        "as an ai",
-        "i understand that",
-        "great question",
-        "absolutely",
-        "i apologize",
-        "hehe",
-        "too sweet",
-        "ur too sweet",
-        "u r too sweet",
-        "making me blush",
-        "u make me blush",
-        "ur making me blush",
-        "omg you're curious",
-        "i like that",
-        "nice dreams",
-        "friendly vibes",
-        "that sounds nice",
-        "sounds interesting",
-        "that's nice",
-        "what's your story",
-        "gorgeous back at ya",
-        "mind blowing yourself",
-        "hi yourself",
-        "hello yourself",
-        "gorgeous yourself",
-        "beautiful yourself",
-        "sexy yourself",
-        "yourself",
-        "stunning yourself",
-        "interesting",
-        "noted",
-        "understood",
-        "got it",
-        "sure thing",
-    ]
+def parse_reply_candidates(content: str, creator_persona: Persona) -> list[str]:
+    """Parse and validate the model's JSON array response."""
 
-    def _is_valid(reply: str) -> bool:
+    content = re.sub(
+        r"<[a-z_]+_reminder>.*?</[a-z_]+_reminder>",
+        "",
+        content,
+        flags=re.DOTALL,
+    ).strip()
+    lines = content.splitlines()
+    cleaned_lines = [line for line in lines if not line.lstrip().startswith("```")]
+    cleaned = "\n".join(cleaned_lines).strip() or content
+
+    payload = json.loads(cleaned)
+    if not isinstance(payload, list):
+        return []
+
+    replies = [_clean_reply(item) for item in payload if isinstance(item, str)]
+    replies = [reply for reply in replies if reply]
+    if not replies:
+        return []
+
+    def is_valid(reply: str) -> bool:
         lowered = reply.lower()
-        if any(phrase in lowered for phrase in bot_phrases):
+        if any(phrase in lowered for phrase in BOT_PHRASES):
             return False
-        if creator_persona.avg_message_length == "short":
-            if len(reply.split()) > 25:
-                return False
+        if creator_persona.avg_message_length == "short" and len(reply.split()) > 25:
+            return False
         return True
 
+    valid = [reply for reply in replies if is_valid(reply)]
+    if len(valid) < 2:
+        return []
+
+    result = list(valid[:3])
+    if len(result) < 3:
+        for reply in replies:
+            if reply not in result:
+                result.append(reply)
+            if len(result) == 3:
+                break
+
+    return filter_suggestions(result) if len(result) == 3 else []
+
+
+async def generate_replies(
+    prompt_messages: list[dict[str, Any]],
+    creator_persona: Persona,
+    *,
+    telemetry_context: dict[str, Any] | None = None,
+    target_override: ModelTarget | None = None,
+) -> list[str]:
+    """Generate exactly three reply candidates, failing closed on bad output."""
+
+    target = target_override or get_runtime_target("CHAT")
+    metadata = telemetry_context or {}
+    context = ModelTelemetryContext(
+        feature=str(metadata.get("feature") or "chat_reply"),
+        creator_id=metadata.get("creator_id"),
+        fan_id=metadata.get("fan_id"),
+        evaluation_run_id=metadata.get("evaluation_run_id"),
+        scenario_id=metadata.get("scenario_id"),
+        metadata={
+            key: value
+            for key, value in metadata.items()
+            if key
+            not in {
+                "feature",
+                "creator_id",
+                "fan_id",
+                "evaluation_run_id",
+                "scenario_id",
+            }
+        },
+    )
+
+    system = str(prompt_messages[0]["content"])
+    messages = [{"role": "user", "content": str(prompt_messages[1]["content"])}]
+
     for attempt in range(3):
-        model = "claude-sonnet-4-6"
         try:
-            response = await anthropic_client.messages.create(
-                model="claude-sonnet-4-6",
+            result = await complete(
+                target,
+                system=system,
+                messages=messages,
                 max_tokens=1000,
-                system=prompt_messages[0]["content"],
-                messages=[{"role": "user", "content": prompt_messages[1]["content"]}],
             )
-            content = response.content[0].text
-            # Strip ALL injected system blocks before parsing
-            content = re.sub(r"<[a-z_]+_reminder>.*?</[a-z_]+_reminder>", "", content, flags=re.DOTALL)
-            content = content.strip()
-
-            # Strip markdown code fences if present
-            lines = content.splitlines()
-            cleaned_lines = [line for line in lines if not line.lstrip().startswith("```")]
-            cleaned = "\n".join(cleaned_lines).strip() or content.strip()
-
-            replies = json.loads(cleaned)
-            if not isinstance(replies, list):
+            try:
+                replies = parse_reply_candidates(result.text, creator_persona)
+            except Exception as parse_error:
+                replies = []
+                await record_model_result(
+                    result,
+                    context,
+                    success=False,
+                    retry_count=attempt,
+                    parse_valid=False,
+                    error=f"parse_error: {parse_error}",
+                )
+                print(
+                    f"[GENERATOR ERROR] attempt {attempt + 1} "
+                    f"model={target.model} parse_error={parse_error}"
+                )
                 continue
 
-            # Ensure list of strings
-            replies = [_clean_reply(r) for r in replies if isinstance(r, str)]
-            replies = [r for r in replies if r]  # remove any that became empty
-            if not replies:
-                continue
+            await record_model_result(
+                result,
+                context,
+                success=bool(replies),
+                retry_count=attempt,
+                parse_valid=bool(replies),
+                error=None if replies else "reply candidates failed validation",
+            )
+            if replies:
+                return replies
+        except Exception as error:
+            await record_model_failure(
+                target,
+                context,
+                error=str(error),
+                retry_count=attempt,
+            )
+            print(
+                f"[GENERATOR ERROR] attempt {attempt + 1} "
+                f"provider={target.provider} model={target.model} error={error}"
+            )
 
-            valid = [r for r in replies if _is_valid(r)]
-            if len(valid) >= 2:
-                if len(valid) >= 3:
-                    return filter_suggestions(valid[:3])
-                # Pad to 3 with any other replies (even if invalid)
-                result = list(valid)
-                for r in replies:
-                    if r not in result:
-                        result.append(r)
-                    if len(result) == 3:
-                        break
-                if len(result) == 3:
-                    return filter_suggestions(result)
-        except Exception as e:
-            print(f"[GENERATOR ERROR] attempt {attempt + 1} model={model} error={e}")
-            continue
-
-    # All attempts failed. FAIL CLOSED — never send contextless filler ("hey",
-    # "omg haha") to a real fan. Returning empty means the auto path sends nothing
-    # this turn (a missed reply is recoverable; a nonsense reply is not) and the
-    # assisted path shows no suggestions rather than garbage ones.
     print("[GENERATOR ERROR] all attempts failed — returning no suggestions (fail closed)")
     return []
