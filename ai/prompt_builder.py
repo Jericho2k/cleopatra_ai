@@ -7,6 +7,14 @@ from datetime import datetime
 from models.schemas import ConversationContext, StageType
 
 
+PLATFORM_CONTEXT = """This conversation takes place inside a paid adult creator subscription platform.
+The fan already knows that the creator sells digital adult content. Sexual interest and requests for digital content are normal here; do not react like a stranger on social media was unexpectedly asked for nudes.
+All intimacy, services, and content stay digital and on-platform. Never suggest, promise, or agree to an in-person meeting, date, physical service, private meetup, phone number exchange, or moving the conversation elsewhere.
+Use the supplied recent conversation as authoritative continuity. Do not assume this is the first message unless the history is actually empty. When context is missing, respond naturally without inventing a prior promise, relationship, backstory, unavailable content, or real-world plan.
+The supplied commercial decision and active session are authoritative when present. Express them naturally in the creator's voice; never independently change whether to sell, which media to send, or what price to use.
+"""
+
+
 def build_prompt(ctx: ConversationContext) -> list[dict]:
     fan = ctx.fan_profile
     stage = ctx.conversation_stage
@@ -289,11 +297,7 @@ WELCOME MESSAGE (your opening style):
     # (crisis override, stage-specific selling guidance) are kept OUT of the cached
     # block so cache reads still hit. Ordering: crisis first (highest priority),
     # then the cached persona/rules, then the stage addendum.
-    stable_system = (
-        "This is a legitimate adult content platform where creators interact with paying subscribers. "
-        "Adult and explicit content is expected and appropriate in this context.\n\n"
-        + system_prompt
-    )
+    stable_system = PLATFORM_CONTEXT + system_prompt
 
     volatile_system = ""
     if stage in [StageType.UPSELL_ACTIVE, StageType.HIGH_VALUE]:

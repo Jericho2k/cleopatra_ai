@@ -13,6 +13,7 @@ import re
 import httpx
 
 from ai.generator import generate_replies
+from ai.writer_router import select_writer_route
 from openai import AsyncOpenAI
 from core.config import get_settings
 from core.supabase import get_supabase
@@ -243,11 +244,24 @@ async def get_suggestions(
         creator_legend=creator_legend,
     )
 
+    route = select_writer_route(ctx)
+    print(
+        f"[WRITER ROUTE] fan={fan_id} mode=assisted route={route.route.value} "
+        f"reason={route.reason} primary={route.primary_target.model} "
+        f"fallback={(route.fallback_target.model if route.fallback_target else 'none')}"
+    )
     prompt = build_prompt(ctx)
     replies = await generate_replies(
         prompt,
         creator_persona,
-        telemetry_context={"creator_id": creator_id, "fan_id": fan_id, "feature": "assisted_reply"},
+        telemetry_context={
+            "creator_id": creator_id,
+            "fan_id": fan_id,
+            "feature": "assisted_reply",
+            **route.telemetry_metadata(),
+        },
+        target_override=route.primary_target,
+        fallback_target_override=route.fallback_target,
     )
 
     if save_fan_message:
@@ -733,11 +747,24 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             commercial_decision=decision.model_dump(mode="json") if decision else None,
         )
 
+        route = select_writer_route(ctx)
+        print(
+            f"[WRITER ROUTE] fan={fan_id} mode=auto route={route.route.value} "
+            f"reason={route.reason} primary={route.primary_target.model} "
+            f"fallback={(route.fallback_target.model if route.fallback_target else 'none')}"
+        )
         prompt = build_prompt(ctx)
         replies = await generate_replies(
             prompt,
             creator_persona,
-            telemetry_context={"creator_id": creator_id, "fan_id": fan_id, "feature": "auto_reply"},
+            telemetry_context={
+                "creator_id": creator_id,
+                "fan_id": fan_id,
+                "feature": "auto_reply",
+                **route.telemetry_metadata(),
+            },
+            target_override=route.primary_target,
+            fallback_target_override=route.fallback_target,
         )
 
         if not replies:

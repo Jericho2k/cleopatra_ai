@@ -204,6 +204,62 @@ def parse_reply_candidates(
 
     return []
 
+def _same_model_target(left: ModelTarget, right: ModelTarget | None) -> bool:
+    return bool(
+        right
+        and left.provider == right.provider
+        and left.model == right.model
+        and left.base_url == right.base_url
+    )
+
+
+def _telemetry_context_for_attempt(
+    metadata: dict[str, Any],
+    *,
+    primary_target: ModelTarget,
+    attempt_target: ModelTarget,
+    fallback_target: ModelTarget | None,
+    attempt: int,
+) -> ModelTelemetryContext:
+    fallback_used = not _same_model_target(primary_target, attempt_target)
+    reserved = {
+        "feature",
+        "creator_id",
+        "fan_id",
+        "evaluation_run_id",
+        "scenario_id",
+    }
+    attempt_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if key not in reserved
+    }
+    attempt_metadata.update(
+        {
+            "writer_attempt": attempt + 1,
+            "writer_attempt_role": "fallback" if fallback_used else "primary",
+            "writer_fallback_used": fallback_used,
+            "writer_attempt_provider": attempt_target.provider,
+            "writer_attempt_model": attempt_target.model,
+            "writer_primary_provider": primary_target.provider,
+            "writer_primary_model": primary_target.model,
+            "writer_fallback_provider": (
+                fallback_target.provider if fallback_target else None
+            ),
+            "writer_fallback_model": (
+                fallback_target.model if fallback_target else None
+            ),
+        }
+    )
+    return ModelTelemetryContext(
+        feature=str(metadata.get("feature") or "chat_reply"),
+        creator_id=metadata.get("creator_id"),
+        fan_id=metadata.get("fan_id"),
+        evaluation_run_id=metadata.get("evaluation_run_id"),
+        scenario_id=metadata.get("scenario_id"),
+        metadata=attempt_metadata,
+    )
+
 
 async def generate_replies(
     prompt_messages: list[dict[str, Any]],
@@ -211,38 +267,38 @@ async def generate_replies(
     *,
     telemetry_context: dict[str, Any] | None = None,
     target_override: ModelTarget | None = None,
+    fallback_target_override: ModelTarget | None = None,
 ) -> list[str]:
-    """Generate exactly three reply candidates, failing closed on bad output."""
+    """Generate three candidates with a bounded primary-to-fallback plan.
 
-    target = target_override or get_runtime_target("CHAT")
-    metadata = telemetry_context or {}
-    context = ModelTelemetryContext(
-        feature=str(metadata.get("feature") or "chat_reply"),
-        creator_id=metadata.get("creator_id"),
-        fan_id=metadata.get("fan_id"),
-        evaluation_run_id=metadata.get("evaluation_run_id"),
-        scenario_id=metadata.get("scenario_id"),
-        metadata={
-            key: value
-            for key, value in metadata.items()
-            if key
-            not in {
-                "feature",
-                "creator_id",
-                "fan_id",
-                "evaluation_run_id",
-                "scenario_id",
-            }
-        },
-    )
+    Ordinary routed turns try Kimi twice, then DeepSeek once. Complex and
+    safety-sensitive routes use DeepSeek only. Every attempt is logged with the
+    route, reason, model role, and whether fallback was used.
+    """
 
+    primary_target = target_override or get_runtime_target("CHAT")
+    fallback_target = fallback_target_override
+    if _same_model_target(primary_target, fallback_target):
+        fallback_target = None
+
+    attempt_targets = [primary_target, primary_target]
+    attempt_targets.append(fallback_target or primary_target)
+
+    metadata = dict(telemetry_context or {})
     system = str(prompt_messages[0]["content"])
     messages = [{"role": "user", "content": str(prompt_messages[1]["content"])}]
 
-    for attempt in range(3):
+    for attempt, attempt_target in enumerate(attempt_targets):
+        context = _telemetry_context_for_attempt(
+            metadata,
+            primary_target=primary_target,
+            attempt_target=attempt_target,
+            fallback_target=fallback_target,
+            attempt=attempt,
+        )
         try:
             result = await complete(
-                target,
+                attempt_target,
                 system=system,
                 messages=messages,
                 max_tokens=1000,
@@ -261,7 +317,7 @@ async def generate_replies(
                 )
                 print(
                     f"[GENERATOR ERROR] attempt {attempt + 1} "
-                    f"model={target.model} parse_error={parse_error}"
+                    f"model={attempt_target.model} parse_error={parse_error}"
                 )
                 continue
 
@@ -274,17 +330,23 @@ async def generate_replies(
                 error=None if replies else "reply candidates failed validation",
             )
             if replies:
+                if not _same_model_target(primary_target, attempt_target):
+                    print(
+                        f"[WRITER ROUTE] fallback succeeded "
+                        f"primary={primary_target.model} fallback={attempt_target.model}"
+                    )
                 return replies
         except Exception as error:
             await record_model_failure(
-                target,
+                attempt_target,
                 context,
                 error=str(error),
                 retry_count=attempt,
             )
             print(
                 f"[GENERATOR ERROR] attempt {attempt + 1} "
-                f"provider={target.provider} model={target.model} error={error}"
+                f"provider={attempt_target.provider} "
+                f"model={attempt_target.model} error={error}"
             )
 
     print("[GENERATOR ERROR] all attempts failed — returning no suggestions (fail closed)")
