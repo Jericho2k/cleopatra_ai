@@ -200,6 +200,14 @@ async def _complete_openai_compatible(
     if temperature is not None:
         kwargs["temperature"] = temperature
 
+    reasoning_enabled = target.metadata.get("reasoning_enabled")
+    if reasoning_enabled is not None:
+        extra_body = dict(kwargs.get("extra_body") or {})
+        extra_body["reasoning"] = {
+            "enabled": bool(reasoning_enabled),
+        }
+        kwargs["extra_body"] = extra_body
+
     raw_response_id: str | None = None
     usage = None
 
@@ -255,8 +263,19 @@ async def _complete_openai_compatible(
         if usage
         else None
     )
-    cached_tokens = int(
+    nested_cached_tokens = int(
         getattr(prompt_details, "cached_tokens", 0) or 0
+    )
+
+    flat_cached_tokens = int(
+        getattr(usage, "cached_tokens", 0) or 0
+        if usage
+        else 0
+    )
+
+    cached_tokens = max(
+        nested_cached_tokens,
+        flat_cached_tokens,
     )
 
     return ModelResult(

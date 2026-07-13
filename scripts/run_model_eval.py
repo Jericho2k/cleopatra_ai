@@ -53,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=str(ROOT / "eval" / "results"))
     parser.add_argument("--models", help="Comma-separated candidate names or model IDs")
     parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument(
+        "--start",
+        type=int,
+        default=0,
+        help="Zero-based scenario index to start from.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--persist", action="store_true")
     parser.add_argument(
@@ -212,6 +218,131 @@ async def persist_run_finish(run_id: str, summary: dict[str, Any]) -> None:
         ).eq("id", run_id).execute()
     )
 
+def build_model_summaries(
+    rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    summaries: dict[str, dict[str, Any]] = {}
+
+    for row in rows:
+        candidate_name = str(
+            row.get("candidate_name") or "unknown"
+        )
+
+        summary = summaries.setdefault(
+            candidate_name,
+            {
+                "provider": row.get("provider"),
+                "model": row.get("model"),
+                "completed": 0,
+                "skipped": 0,
+                "errors": 0,
+                "automatic_passes": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "total_accounted_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "latency_ms_total": 0,
+            },
+        )
+
+        if row.get("skipped"):
+            summary["skipped"] += 1
+            continue
+
+        if row.get("error"):
+            summary["errors"] += 1
+            continue
+
+        summary["completed"] += 1
+
+        if row.get("automatic_checks", {}).get("passed"):
+            summary["automatic_passes"] += 1
+
+        usage = row.get("usage") or {}
+
+        input_tokens = int(
+            usage.get("input_tokens") or 0
+        )
+        output_tokens = int(
+            usage.get("output_tokens") or 0
+        )
+        cache_read_tokens = int(
+            usage.get("cache_read_tokens") or 0
+        )
+        cache_write_tokens = int(
+            usage.get("cache_write_tokens") or 0
+        )
+
+        summary["input_tokens"] += input_tokens
+        summary["output_tokens"] += output_tokens
+        summary["cache_read_tokens"] += cache_read_tokens
+        summary["cache_write_tokens"] += cache_write_tokens
+
+        summary["total_accounted_tokens"] += (
+            input_tokens
+            + output_tokens
+            + cache_read_tokens
+            + cache_write_tokens
+        )
+
+        summary["estimated_cost_usd"] += float(
+            row.get("estimated_cost_usd") or 0
+        )
+
+        summary["latency_ms_total"] += int(
+            row.get("latency_ms") or 0
+        )
+
+    for summary in summaries.values():
+        completed = int(summary["completed"])
+        paid_input = int(summary["input_tokens"])
+        cached_input = int(summary["cache_read_tokens"])
+        total_input = paid_input + cached_input
+
+        summary["estimated_cost_usd"] = round(
+            float(summary["estimated_cost_usd"]),
+            8,
+        )
+
+        summary["average_cost_usd"] = round(
+            (
+                float(summary["estimated_cost_usd"])
+                / completed
+            )
+            if completed
+            else 0.0,
+            8,
+        )
+
+        summary["average_latency_ms"] = round(
+            (
+                int(summary["latency_ms_total"])
+                / completed
+            )
+            if completed
+            else 0,
+        )
+
+        summary["cache_hit_rate"] = round(
+            (
+                cached_input / total_input
+            )
+            if total_input
+            else 0.0,
+            4,
+        )
+
+        summary["cached_input_share_percent"] = round(
+            float(summary["cache_hit_rate"]) * 100,
+            2,
+        )
+
+        del summary["latency_ms_total"]
+
+    return summaries
+
 def save_results_file(
     output_path: Path,
     *,
@@ -246,9 +377,15 @@ def save_results_file(
 
     temporary_path.replace(output_path)
 
+
+
 async def main() -> int:
     args = parse_args()
     scenarios = load_json(args.scenarios)
+
+    if args.start:
+        scenarios = scenarios[args.start:]
+
     if args.limit:
         scenarios = scenarios[: args.limit]
     targets = load_targets(args.catalog, args.models)
@@ -404,19 +541,59 @@ async def main() -> int:
                 await persist_output(run_id, row)
 
     completed = [row for row in rows if not row.get("skipped") and not row.get("error")]
+    model_summaries = build_model_summaries(rows)
+
     summary = {
         "completed": len(completed),
-        "skipped": sum(bool(row.get("skipped")) for row in rows),
-        "errors": sum(bool(row.get("error")) for row in rows),
+        "skipped": sum(
+            bool(row.get("skipped"))
+            for row in rows
+        ),
+        "errors": sum(
+            bool(row.get("error"))
+            for row in rows
+        ),
         "automatic_passes": sum(
-            bool(row.get("automatic_checks", {}).get("passed")) for row in completed
+            bool(
+                row.get(
+                    "automatic_checks",
+                    {},
+                ).get("passed")
+            )
+            for row in completed
         ),
         "estimated_cost_usd": round(
-            sum(float(row.get("estimated_cost_usd") or 0) for row in completed), 6
+            sum(
+                float(
+                    row.get("estimated_cost_usd")
+                    or 0
+                )
+                for row in completed
+            ),
+            6,
         ),
+        "model_summaries": model_summaries,
         "output_path": str(output_path),
     }
     print(json.dumps(summary, indent=2))
+
+    print("\nPer-model usage summary:")
+
+    for candidate_name, model_summary in model_summaries.items():
+        print(
+            f"- {candidate_name}: "
+            f"completed={model_summary['completed']} "
+            f"passes={model_summary['automatic_passes']} "
+            f"input={model_summary['input_tokens']} "
+            f"output={model_summary['output_tokens']} "
+            f"cached={model_summary['cache_read_tokens']} "
+            f"cache_share="
+            f"{model_summary['cached_input_share_percent']:.2f}% "
+            f"avg_cost="
+            f"${model_summary['average_cost_usd']:.6f} "
+            f"avg_latency="
+            f"{model_summary['average_latency_ms']}ms"
+        )
 
     save_results_file(
         output_path,

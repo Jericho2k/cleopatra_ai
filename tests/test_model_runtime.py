@@ -47,3 +47,18 @@ def test_target_from_mapping_supports_stream_and_timeout():
 
     assert target.stream is True
     assert target.timeout_seconds == 30
+
+
+def test_model_target_preserves_reasoning_metadata():
+    target = ModelTarget.from_mapping(
+        {
+            "name": "Test reasoning model",
+            "provider": "together",
+            "model": "test/model",
+            "metadata": {
+                "reasoning_enabled": False,
+            },
+        }
+    )
+
+    assert target.metadata["reasoning_enabled"] is False

@@ -27,3 +27,54 @@ def test_forbidden_phrase_fails():
         {"must_not_contain": ["wait until friday"]},
     )
     assert checks["passed"] is False
+
+
+def test_build_model_summaries_tracks_cache_and_cost():
+    rows = [
+        {
+            "candidate_name": "Test model",
+            "provider": "together",
+            "model": "test/model",
+            "skipped": False,
+            "usage": {
+                "input_tokens": 600,
+                "output_tokens": 100,
+                "cache_read_tokens": 400,
+                "cache_write_tokens": 0,
+            },
+            "estimated_cost_usd": 0.002,
+            "latency_ms": 1000,
+            "automatic_checks": {
+                "passed": True,
+            },
+        },
+        {
+            "candidate_name": "Test model",
+            "provider": "together",
+            "model": "test/model",
+            "skipped": False,
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 120,
+                "cache_read_tokens": 500,
+                "cache_write_tokens": 0,
+            },
+            "estimated_cost_usd": 0.003,
+            "latency_ms": 3000,
+            "automatic_checks": {
+                "passed": False,
+            },
+        },
+    ]
+
+    summaries = module.build_model_summaries(rows)
+    summary = summaries["Test model"]
+
+    assert summary["completed"] == 2
+    assert summary["automatic_passes"] == 1
+    assert summary["input_tokens"] == 1100
+    assert summary["output_tokens"] == 220
+    assert summary["cache_read_tokens"] == 900
+    assert summary["average_cost_usd"] == 0.0025
+    assert summary["average_latency_ms"] == 2000
+    assert summary["cached_input_share_percent"] == 45.0
