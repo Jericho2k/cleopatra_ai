@@ -1,0 +1,92 @@
+{
+  "updated_at": "2026-07-13",
+  "notes": [
+    "Pricing is a snapshot and must be reviewed before production decisions.",
+    "adult_policy describes provider eligibility, not raw model capability.",
+    "Do not run adult scenarios through a provider marked ineligible."
+  ],
+  "models": [
+    {
+      "name": "Anthropic Sonnet 4.6 baseline",
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-6",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "input_per_million": 3.0,
+      "output_per_million": 15.0,
+      "cache_read_per_million": 0.30,
+      "cache_write_per_million": 3.75,
+      "adult_policy": "ineligible",
+      "enabled": true,
+      "metadata": {"role": "quality baseline for non-adult scenarios only"}
+    },
+    {
+      "name": "Together MiniMax M3",
+      "provider": "together",
+      "model": "MiniMaxAI/MiniMax-M3",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "input_per_million": 0.30,
+      "output_per_million": 1.20,
+      "cache_read_per_million": 0.06,
+      "adult_policy": "unverified",
+      "enabled": true
+    },
+    {
+      "name": "Together Qwen3.7 Plus",
+      "provider": "together",
+      "model": "Qwen/Qwen3.7-Plus",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "input_per_million": 0.32,
+      "output_per_million": 1.28,
+      "adult_policy": "unverified",
+      "enabled": true
+    },
+    {
+      "name": "Together DeepSeek V4 Pro",
+      "provider": "together",
+      "model": "deepseek-ai/DeepSeek-V4-Pro",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "input_per_million": 1.74,
+      "output_per_million": 3.48,
+      "cache_read_per_million": 0.20,
+      "adult_policy": "unverified",
+      "enabled": true
+    },
+    {
+      "name": "Together GPT-OSS 120B",
+      "provider": "together",
+      "model": "openai/gpt-oss-120b",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "input_per_million": 0.15,
+      "output_per_million": 0.60,
+      "adult_policy": "unverified",
+      "enabled": true
+    },
+    {
+      "name": "Together Llama 3.3 70B",
+      "provider": "together",
+      "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "input_per_million": 1.04,
+      "output_per_million": 1.04,
+      "adult_policy": "unverified",
+      "enabled": true
+    },
+    {
+      "name": "Self-hosted candidate",
+      "provider": "self_hosted",
+      "model": "replace-with-local-model-id",
+      "base_url": "http://localhost:8000/v1",
+      "api_key_env": "SELF_HOSTED_API_KEY",
+      "input_per_million": 0.0,
+      "output_per_million": 0.0,
+      "adult_policy": "operator_responsibility",
+      "enabled": false,
+      "metadata": {"note": "Set real amortized GPU cost before comparing economics."}
+    }
+  ]
+}
