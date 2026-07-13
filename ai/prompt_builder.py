@@ -35,24 +35,43 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
 
     # Real creator name — was hardcoded to "Eliza", which broke every other creator.
     # Prefer the legend's locked name, then the context's creator_name.
+    legend_name = creator_legend.get("name")
+    context_name = getattr(ctx, "creator_name", "")
+
     creator_display_name = (
-        (creator_legend.get("name") or "").strip()
-        or (getattr(ctx, "creator_name", "") or "").strip()
-        or "your girl"
-    )
+        str(legend_name).strip()
+        if legend_name is not None
+        else ""
+    ) or (
+        str(context_name).strip()
+        if context_name is not None
+        else ""
+    ) or "your girl"
     legend_lines = []
     _legend_labels = [("name", "Your name"), ("origin", "Where you're from"),
                       ("age", "Your age"), ("job", "What you do"),
                       ("background", "Your backstory")]
     for _k, _label in _legend_labels:
-        _v = (creator_legend.get(_k) or "").strip()
+        raw_value = creator_legend.get(_k)
+
+        if raw_value is None:
+            continue
+
+        _v = str(raw_value).strip()
+
         if _v:
             legend_lines.append(f"- {_label}: {_v}")
     _other = creator_legend.get("other") or []
+
     if isinstance(_other, list):
         for _item in _other:
-            if (_item or "").strip():
-                legend_lines.append(f"- {_item.strip()}")
+            if _item is None:
+                continue
+
+            item_text = str(_item).strip()
+
+            if item_text:
+                legend_lines.append(f"- {item_text}")
     legend_block = ""
     if legend_lines:
         legend_block = (
