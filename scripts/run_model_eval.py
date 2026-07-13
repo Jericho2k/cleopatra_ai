@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""Run a small, reproducible Cleopatra model comparison from the command line."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import re
+import sys
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from ai.generator import parse_reply_candidates  # noqa: E402
+from ai.model_providers import complete  # noqa: E402
+from ai.prompt_builder import build_prompt  # noqa: E402
+from models.model_runtime import (  # noqa: E402
+    ModelTarget,
+    ModelTelemetryContext,
+    estimate_cost_usd,
+)
+from models.schemas import (  # noqa: E402
+    ConversationContext,
+    Fan,
+    Message,
+    Persona,
+    StageType,
+)
+from services.model_telemetry import record_model_result  # noqa: E402
+
+REFUSAL_MARKERS = (
+    "i can't help with that",
+    "i cannot help with that",
+    "i'm unable to",
+    "i cannot engage",
+    "i can't engage",
+    "as an ai",
+    "sexual content policy",
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--catalog", default=str(ROOT / "config" / "model_candidates.json"))
+    parser.add_argument("--scenarios", default=str(ROOT / "eval" / "scenarios.json"))
+    parser.add_argument("--output-dir", default=str(ROOT / "eval" / "results"))
+    parser.add_argument("--models", help="Comma-separated candidate names or model IDs")
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--persist", action="store_true")
+    parser.add_argument(
+        "--allow-unverified-adult",
+        action="store_true",
+        help="Allow adult-required scenarios for targets whose provider policy is unverified.",
+    )
+    return parser.parse_args()
+
+
+def load_json(path: str) -> Any:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def load_targets(path: str, selector: str | None) -> list[ModelTarget]:
+    payload = load_json(path)
+    rows = payload.get("models", payload)
+    targets = [ModelTarget.from_mapping(row) for row in rows if row.get("enabled", True)]
+    if not selector:
+        return targets
+    wanted = {item.strip().lower() for item in selector.split(",") if item.strip()}
+    return [
+        target
+        for target in targets
+        if target.name.lower() in wanted or target.model.lower() in wanted
+    ]
+
+
+def build_context(scenario: dict[str, Any]) -> ConversationContext:
+    persona = Persona(
+        avg_message_length="short",
+        sends_multiple_messages=True,
+        emoji_usage="rare",
+        capitalization="lowercase",
+        punctuation_style="casual",
+        flirt_style="direct but natural",
+        dont_list=["robotic language", "long paragraphs", "generic compliments"],
+    )
+    fan = Fan(
+        id=f"eval-{scenario['id']}",
+        display_name="test fan",
+        total_spent=int(scenario.get("total_spent") or 0),
+        ai_summary=scenario.get("fan_summary") or {},
+    )
+    history = [Message(**row) for row in scenario.get("history", [])]
+    return ConversationContext(
+        fan_message=scenario.get("fan_message", ""),
+        conversation_history=history,
+        fan_profile=fan,
+        creator_persona=persona,
+        similar_exchanges=[],
+        conversation_stage=StageType(scenario.get("stage", "WARMING_UP")),
+        creator_name="Maya",
+        situation=scenario.get("situation") or {},
+        commercial_decision=scenario.get("commercial_decision") or None,
+        creator_legend={"location": "Los Angeles", "age": 24},
+    )
+
+
+def automatic_checks(replies: list[str], checks: dict[str, Any]) -> dict[str, Any]:
+    joined = " \n ".join(replies).lower()
+    result: dict[str, Any] = {
+        "has_three_replies": len(replies) == 3,
+        "refusal_free": not any(marker in joined for marker in REFUSAL_MARKERS),
+    }
+
+    max_words = checks.get("max_words")
+    if max_words:
+        result["within_word_limit"] = all(len(reply.split()) <= int(max_words) for reply in replies)
+
+    must_not = [str(item).lower() for item in checks.get("must_not_contain", [])]
+    if must_not:
+        result["forbidden_phrases_absent"] = not any(item in joined for item in must_not)
+
+    must_any = [str(item).lower() for item in checks.get("must_contain_any", [])]
+    if must_any:
+        result["required_reference_present"] = any(item in joined for item in must_any)
+
+    if checks.get("question_required"):
+        result["question_present"] = any("?" in reply for reply in replies)
+    if checks.get("question_forbidden"):
+        result["question_absent"] = all("?" not in reply for reply in replies)
+
+    max_price = checks.get("max_price_usd")
+    if max_price is not None:
+        prices = [float(match) for match in re.findall(r"\$(\d+(?:\.\d{1,2})?)", joined)]
+        result["price_within_limit"] = all(price <= float(max_price) for price in prices)
+
+    if checks.get("refusal_forbidden", True):
+        result["refusal_allowed_for_case"] = result["refusal_free"]
+
+    result["passed"] = all(bool(value) for key, value in result.items() if key != "passed")
+    return result
+
+
+def adult_skip_reason(target: ModelTarget, scenario: dict[str, Any], allow_unverified: bool) -> str | None:
+    if not scenario.get("adult_required"):
+        return None
+    if target.adult_policy == "ineligible":
+        return "provider marked ineligible for adult-required scenarios"
+    if target.adult_policy == "unverified" and not allow_unverified:
+        return "provider adult-use terms unverified; pass --allow-unverified-adult only after review"
+    return None
+
+
+async def persist_run_start(run_id: str, scenario_count: int, model_count: int, config: dict[str, Any]) -> None:
+    from core.supabase import get_supabase
+
+    await asyncio.to_thread(
+        lambda: get_supabase().table("model_evaluation_runs").insert(
+            {
+                "id": run_id,
+                "scenario_count": scenario_count,
+                "model_count": model_count,
+                "config": config,
+            }
+        ).execute()
+    )
+
+
+async def persist_output(run_id: str, row: dict[str, Any]) -> None:
+    from core.supabase import get_supabase
+
+    payload = {
+        "run_id": run_id,
+        "scenario_id": row["scenario_id"],
+        "candidate_name": row["candidate_name"],
+        "provider": row["provider"],
+        "model": row["model"],
+        "skipped": row.get("skipped", False),
+        "skip_reason": row.get("skip_reason"),
+        "replies": row.get("replies", []),
+        "automatic_checks": row.get("automatic_checks", {}),
+        "latency_ms": row.get("latency_ms"),
+        "estimated_cost_usd": row.get("estimated_cost_usd", 0),
+        "input_tokens": row.get("usage", {}).get("input_tokens", 0),
+        "output_tokens": row.get("usage", {}).get("output_tokens", 0),
+        "cache_read_tokens": row.get("usage", {}).get("cache_read_tokens", 0),
+        "raw_text": row.get("raw_text"),
+        "error": row.get("error"),
+    }
+    await asyncio.to_thread(
+        lambda: get_supabase().table("model_evaluation_outputs").upsert(payload).execute()
+    )
+
+
+async def persist_run_finish(run_id: str, summary: dict[str, Any]) -> None:
+    from core.supabase import get_supabase
+
+    await asyncio.to_thread(
+        lambda: get_supabase().table("model_evaluation_runs").update(
+            {
+                "status": "completed",
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "summary": summary,
+            }
+        ).eq("id", run_id).execute()
+    )
+
+
+async def main() -> int:
+    args = parse_args()
+    scenarios = load_json(args.scenarios)
+    if args.limit:
+        scenarios = scenarios[: args.limit]
+    targets = load_targets(args.catalog, args.models)
+    if not targets:
+        raise SystemExit("No enabled model targets matched the selection.")
+
+    print(f"Scenarios: {len(scenarios)}")
+    for target in targets:
+        print(f"- {target.name}: {target.provider} / {target.model} / adult={target.adult_policy}")
+
+    if args.dry_run:
+        return 0
+
+    run_id = str(uuid.uuid4())
+    if args.persist:
+        await persist_run_start(
+            run_id,
+            len(scenarios),
+            len(targets),
+            {"catalog": args.catalog, "scenarios": args.scenarios},
+        )
+
+    rows: list[dict[str, Any]] = []
+    for scenario in scenarios:
+        ctx = build_context(scenario)
+        prompt = build_prompt(ctx)
+        system = str(prompt[0]["content"])
+        messages = [{"role": "user", "content": str(prompt[1]["content"])}]
+
+        for target in targets:
+            skip_reason = adult_skip_reason(target, scenario, args.allow_unverified_adult)
+            base_row = {
+                "run_id": run_id,
+                "scenario_id": scenario["id"],
+                "scenario_title": scenario["title"],
+                "candidate_name": target.name,
+                "provider": target.provider,
+                "model": target.model,
+            }
+            if skip_reason:
+                row = {**base_row, "skipped": True, "skip_reason": skip_reason}
+                rows.append(row)
+                if args.persist:
+                    await persist_output(run_id, row)
+                print(f"SKIP {scenario['id']} / {target.name}: {skip_reason}")
+                continue
+
+            try:
+                result = await complete(
+                    target,
+                    system=system,
+                    messages=messages,
+                    max_tokens=1000,
+                )
+                replies = parse_reply_candidates(result.text, ctx.creator_persona)
+                checks = automatic_checks(replies, scenario.get("checks") or {})
+                row = {
+                    **base_row,
+                    "skipped": False,
+                    "replies": replies,
+                    "raw_text": result.text,
+                    "automatic_checks": checks,
+                    "latency_ms": result.latency_ms,
+                    "estimated_cost_usd": estimate_cost_usd(target, result.usage),
+                    "usage": result.usage.__dict__,
+                }
+                await record_model_result(
+                    result,
+                    ModelTelemetryContext(
+                        feature="model_evaluation",
+                        evaluation_run_id=run_id,
+                        scenario_id=scenario["id"],
+                        metadata={"candidate_name": target.name},
+                    ),
+                    success=bool(replies),
+                    parse_valid=bool(replies),
+                )
+                print(
+                    f"DONE {scenario['id']} / {target.name}: "
+                    f"pass={checks.get('passed')} cost=${row['estimated_cost_usd']:.6f} "
+                    f"latency={result.latency_ms}ms"
+                )
+            except Exception as error:
+                row = {**base_row, "skipped": False, "error": str(error), "replies": []}
+                print(f"FAIL {scenario['id']} / {target.name}: {error}")
+
+            rows.append(row)
+            if args.persist:
+                await persist_output(run_id, row)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"model_eval_{run_id}.json"
+    output_path.write_text(
+        json.dumps({"run_id": run_id, "results": rows}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    completed = [row for row in rows if not row.get("skipped") and not row.get("error")]
+    summary = {
+        "completed": len(completed),
+        "skipped": sum(bool(row.get("skipped")) for row in rows),
+        "errors": sum(bool(row.get("error")) for row in rows),
+        "automatic_passes": sum(
+            bool(row.get("automatic_checks", {}).get("passed")) for row in completed
+        ),
+        "estimated_cost_usd": round(
+            sum(float(row.get("estimated_cost_usd") or 0) for row in completed), 6
+        ),
+        "output_path": str(output_path),
+    }
+    print(json.dumps(summary, indent=2))
+
+    if args.persist:
+        await persist_run_finish(run_id, summary)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))
