@@ -31,6 +31,44 @@ from services.session_lifecycle import (
 )
 
 
+def _learned_explicit_value(situation: dict, fact_key: str):
+    intelligence = situation.get("learned_fan_intelligence") or {}
+    for fact in intelligence.get("facts") or []:
+        if fact.get("fact_key") != fact_key:
+            continue
+        if fact.get("status") not in {"explicit", "confirmed"}:
+            continue
+        return fact.get("value")
+    return None
+
+
+def _augment_events_with_safe_learned_context(
+    events: list[CommercialEvent],
+    situation: dict,
+) -> None:
+    """Use durable facts only where persistence is genuinely safe.
+
+    A prior payday can complete an affordability pause when the current message says
+    money is unavailable but omits the already-known date. Historical budgets are
+    deliberately *not* converted into a current spend ceiling; price learning is a
+    later Phase 2 concern and purchases remain authoritative.
+    """
+
+    types = {event.type for event in events}
+    if EventType.MONEY_UNAVAILABLE not in types or EventType.PAYDAY_MENTIONED in types:
+        return
+    payday = _learned_explicit_value(situation, "payday")
+    if payday:
+        events.append(
+            CommercialEvent(
+                type=EventType.PAYDAY_MENTIONED,
+                raw_expression=str(payday),
+                confidence=0.85,
+                metadata={"source": "passive_fan_intelligence"},
+            )
+        )
+
+
 async def orchestrate(
     creator_id: str,
     fan_id: str,
@@ -43,6 +81,7 @@ async def orchestrate(
     active_session: dict | None = None,
 ) -> CommercialDecision:
     events = extract_events(situation)
+    _augment_events_with_safe_learned_context(events, situation)
     policy = await get_creator_policy(creator_id)
     state = await get_fan_state(fan_id)
     now = datetime.now(timezone.utc)

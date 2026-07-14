@@ -15,12 +15,122 @@ The supplied commercial decision and active session are authoritative when prese
 """
 
 
+def _display_fact_value(value) -> str:
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return str(value or "").strip()
+
+
+def _render_fan_intelligence(intelligence: dict) -> str:
+    """Render compact evidence-backed knowledge for the writer."""
+    if not intelligence:
+        return ""
+
+    facts = intelligence.get("facts") or []
+    conflicts = intelligence.get("conflicts") or []
+    lines: list[str] = []
+
+    hard_limits = [
+        str(value).strip()
+        for value in (intelligence.get("hard_limits") or [])
+        if str(value).strip()
+    ]
+    if hard_limits:
+        lines.append("Hard limits (never violate or negotiate): " + "; ".join(hard_limits[:10]))
+
+    labels = {
+        "preferred_name": "preferred name",
+        "age": "age",
+        "location": "location",
+        "timezone": "time zone",
+        "occupation": "occupation",
+        "relationship_status": "relationship status",
+        "usual_availability": "usual availability",
+        "weekday_availability": "weekday availability",
+        "weekend_availability": "weekend availability",
+        "payday": "payday",
+        "content_interest": "likes",
+        "disliked_content": "dislikes",
+        "kink_interest": "interest",
+        "preferred_tone": "preferred tone",
+        "preferred_dynamic": "preferred dynamic",
+        "preferred_format": "preferred format",
+        "stated_budget_cents": "stated budget",
+        "accepted_price_cents": "accepted price",
+        "rejected_price_cents": "rejected price",
+        "counteroffer_cents": "counteroffer",
+        "price_sensitivity": "price sensitivity",
+        "purchase_intent": "purchase intent",
+        "objection_pattern": "objection pattern",
+    }
+    money_keys = {
+        "stated_budget_cents",
+        "accepted_price_cents",
+        "rejected_price_cents",
+        "counteroffer_cents",
+    }
+    explicit: list[str] = []
+    inferred: list[str] = []
+    for fact in facts[:40]:
+        key = str(fact.get("fact_key") or "").strip()
+        if not key or key == "hard_limit":
+            continue
+        value = fact.get("value")
+        if key in money_keys:
+            try:
+                rendered = f"${int(value) / 100:g}"
+            except (TypeError, ValueError):
+                continue
+        else:
+            rendered = _display_fact_value(value)
+        if not rendered:
+            continue
+        item = f"{labels.get(key, key.replace('_', ' '))}: {rendered}"
+        if fact.get("status") == "inferred":
+            inferred.append(item)
+        else:
+            explicit.append(item)
+
+    if explicit:
+        lines.append("Known facts: " + "; ".join(explicit[:20]))
+    if inferred:
+        lines.append("Possible signals (do not state as certain): " + "; ".join(inferred[:8]))
+    if conflicts:
+        keys = [
+            str(item.get("fact_key") or "").replace("_", " ")
+            for item in conflicts
+        ]
+        keys = [key for key in keys if key]
+        if keys:
+            lines.append(
+                "Conflicted information (do not assume either value; clarify only when natural): "
+                + ", ".join(keys[:8])
+            )
+
+    if not lines:
+        return ""
+    return "LEARNED FAN INTELLIGENCE (evidence-backed):\n" + "\n".join(
+        f"- {line}" for line in lines
+    )
+
+
 def build_prompt(ctx: ConversationContext) -> list[dict]:
     fan = ctx.fan_profile
     stage = ctx.conversation_stage
     persona = ctx.creator_persona
     situation = ctx.situation or {}
     ai_summary = getattr(fan, "ai_summary", None) or {}
+    fan_intelligence = getattr(ctx, "fan_intelligence", None) or {}
+    learned_intelligence_block = _render_fan_intelligence(fan_intelligence)
+    learned_by_key: dict[str, list] = {}
+    for learned_fact in fan_intelligence.get("facts") or []:
+        if learned_fact.get("status") == "contradicted":
+            continue
+        key = str(learned_fact.get("fact_key") or "")
+        if key:
+            learned_by_key.setdefault(key, []).append(learned_fact.get("value"))
 
     character = getattr(persona, "character", "") or "Confident, playful Eastern European creator."
     comm_style = getattr(persona, "communication_style", "") or "Short casual texts, mirrors energy."
@@ -96,9 +206,21 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
                       ("occupation", "what he does"), ("hobbies", "his hobbies"),
                       ("relationship_status", "his relationship situation"),
                       ("payday", "when he gets paid")]
-    missing_details = [label for key, label in _detail_fields
-                       if not str(ai_summary.get(key) or "").strip()
-                       or str(ai_summary.get(key)).lower() in ("none", "null", "unknown")]
+    def _detail_known(key: str) -> bool:
+        learned_values = [
+            value for value in learned_by_key.get(key, []) if str(value or "").strip()
+        ]
+        if learned_values:
+            return True
+        summary_value = str(ai_summary.get(key) or "").strip()
+        return bool(
+            summary_value
+            and summary_value.lower() not in ("none", "null", "unknown")
+        )
+
+    missing_details = [
+        label for key, label in _detail_fields if not _detail_known(key)
+    ]
     missing_details_block = ""
     if missing_details:
         missing_details_block = (
@@ -310,6 +432,8 @@ WELCOME MESSAGE (your opening style):
 
     # Build the fan context block
     fan_context_parts = []
+    if learned_intelligence_block:
+        fan_context_parts.append(learned_intelligence_block)
     if notes:
         fan_context_parts.append(f"Summary: {notes}")
     if member_note:

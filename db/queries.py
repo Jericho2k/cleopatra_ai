@@ -194,10 +194,14 @@ async def save_message(
     was_ai_suggested: bool = False,
     fansly_message_id: str | None = None,
     media_context: dict | None = None,
-) -> None:
-    """media_context: e.g. {"attachments": [...]} for fan, {"ppv": {...}} for creator PPV."""
+) -> str | None:
+    """Persist a message and return its internal ID when Supabase returns it.
 
-    def _save():
+    Existing callers may ignore the return value. The passive intelligence layer uses
+    it as evidence provenance for manually submitted fan messages.
+    """
+
+    def _save() -> str | None:
         row = {
             "fan_id": fan_id,
             "creator_id": creator_id,
@@ -209,9 +213,13 @@ async def save_message(
             row["fansly_message_id"] = fansly_message_id
         if media_context is not None:
             row["media_context"] = media_context
-        get_supabase().table("messages").insert(row).execute()
+        response = get_supabase().table("messages").insert(row).execute()
+        data = response.data or []
+        if data and data[0].get("id") is not None:
+            return str(data[0]["id"])
+        return None
 
-    await asyncio.to_thread(_save)
+    return await asyncio.to_thread(_save)
 
 
 async def get_creator_fansly_account_id(creator_id: str) -> str | None:

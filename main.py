@@ -22,6 +22,7 @@ from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from core.supabase import get_supabase
+from db.fan_intelligence_queries import get_fan_intelligence_context
 from db.queries import (
     create_fan,
     get_conversation_history,
@@ -39,6 +40,7 @@ from models.schemas import (
     SuggestionRequest,
     SuggestionResponse,
 )
+from services.fan_intelligence import learn_from_fan_message
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
 from services.suggestions import (
@@ -145,6 +147,16 @@ async def process_incoming_fan_message(
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
 
+    spawn(
+        learn_from_fan_message(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            fan_message=message_content,
+            source_message_id=message_id,
+            conversation_history=conversation_history,
+        ),
+        name=f"fan_intelligence:{fan_id}",
+    )
     fan_auto = fan_profile.auto_mode
     if fan_auto is None:
         effective_auto = auto_mode
@@ -180,6 +192,7 @@ async def process_incoming_fan_message(
             spawn(_update_fan_ai_summary(fan_id, conversation_history), name="update_fan_ai_summary")
         return
 
+    fan_intelligence = await get_fan_intelligence_context(fan_id)
     creator_persona = await get_creator_persona(creator_id)
     if creator_persona is None:
         creator_persona = Persona()
@@ -199,9 +212,12 @@ async def process_incoming_fan_message(
         conversation_stage=conversation_stage,
         creator_name="a creator",
         ppv_offers=ppv_offers,
+        fan_intelligence=fan_intelligence,
     )
 
     situation = await analyze_situation(ctx_without_situation)
+    if fan_intelligence:
+        situation["learned_fan_intelligence"] = fan_intelligence
 
     ctx = ConversationContext(
         fan_message=message_content,
@@ -213,6 +229,7 @@ async def process_incoming_fan_message(
         creator_name="a creator",
         situation=situation,
         ppv_offers=ppv_offers,
+        fan_intelligence=fan_intelligence,
     )
 
     prompt = build_prompt(ctx)

@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class StageType(str, Enum):
@@ -90,6 +90,7 @@ class ConversationContext(BaseModel):
     active_session: dict | None = None
     creator_legend: dict = {}
     commercial_decision: dict | None = None
+    fan_intelligence: dict = Field(default_factory=dict)
 
 
 class SuggestionRequest(BaseModel):

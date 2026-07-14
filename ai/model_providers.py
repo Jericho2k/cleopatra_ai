@@ -39,6 +39,7 @@ def get_runtime_target(prefix: str) -> ModelTarget:
     defaults = {
         "CHAT": ("anthropic", "claude-sonnet-4-6"),
         "ANALYZER": ("anthropic", "claude-haiku-4-5-20251001"),
+        "EXTRACTOR": ("together", "openai/gpt-oss-120b"),
     }
     default_provider, default_model = defaults.get(prefix, ("together", ""))
 

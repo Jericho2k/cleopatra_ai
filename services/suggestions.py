@@ -20,8 +20,10 @@ from core.supabase import get_supabase
 from ai.prompt_builder import build_prompt
 from services.commercial_orchestrator import orchestrate
 from models.commercial import ActionType, FanStatus
+from db.fan_intelligence_queries import get_fan_intelligence_context
 from db.commercial_queries import get_creator_policy, get_fan_state, save_fan_state
 from services.session_planner import plan_session_for_fan
+from services.fan_intelligence import learn_from_fan_message
 from services.session_lifecycle import (
     decrement_cooldown,
     mark_step_declined,
@@ -174,6 +176,7 @@ async def get_suggestions(
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
 
+    fan_intelligence = await get_fan_intelligence_context(fan_id)
     creator_persona = await get_creator_persona(creator_id)
     if creator_persona is None:
         creator_persona = Persona()
@@ -200,12 +203,15 @@ async def get_suggestions(
         sent_ppv=sent_ppv,
         active_session=active_session,
         creator_legend=creator_legend,
+        fan_intelligence=fan_intelligence,
     )
 
     situation = await analyze_situation(
         ctx_without_situation,
         telemetry_context={"creator_id": creator_id, "fan_id": fan_id},
     )
+    if fan_intelligence:
+        situation["learned_fan_intelligence"] = fan_intelligence
 
     # Auto-plan a session if the fan is asking for content and none is active,
     # and the creator's per-fan daily caps (if configured) aren't exceeded.
@@ -242,6 +248,7 @@ async def get_suggestions(
         sent_ppv=sent_ppv,
         active_session=active_session,
         creator_legend=creator_legend,
+        fan_intelligence=fan_intelligence,
     )
 
     route = select_writer_route(ctx)
@@ -265,7 +272,23 @@ async def get_suggestions(
     )
 
     if save_fan_message:
-        await save_message(fan_id, creator_id, "fan", fan_message)
+        evidence_message_id = await save_message(
+            fan_id, creator_id, "fan", fan_message
+        )
+        extraction_history = [
+            *conversation_history,
+            Message(role="fan", content=fan_message),
+        ]
+        spawn(
+            learn_from_fan_message(
+                creator_id=creator_id,
+                fan_id=fan_id,
+                fan_message=fan_message,
+                source_message_id=evidence_message_id,
+                conversation_history=extraction_history,
+            ),
+            name=f"fan_intelligence:{fan_id}",
+        )
 
     if _should_update_memory(conversation_history):
         spawn(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent), name="update_fan_memory")
@@ -483,6 +506,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         fan_profile = await get_fan_by_id(fan_id)
         if not fan_profile:
             return
+        fan_intelligence = await get_fan_intelligence_context(fan_id)
         # Frozen for human review (e.g. prior crisis under 'freeze' policy): auto-mode
         # stays out until a human clears the flag in the dashboard.
         if getattr(fan_profile, "needs_human_review", False):
@@ -548,12 +572,15 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             ppv_offers=ppv_offers,
             sent_ppv=sent_ppv,
             active_session=active_session,
+            fan_intelligence=fan_intelligence,
         )
 
         situation = await analyze_situation(
             ctx_without_situation,
             telemetry_context={"creator_id": creator_id, "fan_id": fan_id},
         )
+        if fan_intelligence:
+            situation["learned_fan_intelligence"] = fan_intelligence
         print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} crisis={situation.get('crisis_signal', 'none')}")
 
         # Sticky-situation policy: if a crisis is flagged and the creator opted to
@@ -745,6 +772,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             sent_ppv=sent_ppv,
             active_session=active_session,
             commercial_decision=decision.model_dump(mode="json") if decision else None,
+            fan_intelligence=fan_intelligence,
         )
 
         route = select_writer_route(ctx)
