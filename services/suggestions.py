@@ -24,6 +24,10 @@ from db.fan_intelligence_queries import get_fan_intelligence_context
 from db.commercial_queries import get_creator_policy, get_fan_state, save_fan_state
 from services.session_planner import plan_session_for_fan
 from services.fan_intelligence import learn_from_fan_message
+from services.fan_lifecycle import (
+    get_fan_lifecycle_context,
+    refresh_fan_lifecycle,
+)
 from services.session_lifecycle import (
     decrement_cooldown,
     mark_step_declined,
@@ -177,6 +181,7 @@ async def get_suggestions(
         fan_profile = Fan(id=fan_id, display_name=fan_id)
 
     fan_intelligence = await get_fan_intelligence_context(fan_id)
+    buyer_lifecycle = await get_fan_lifecycle_context(fan_id)
     creator_persona = await get_creator_persona(creator_id)
     if creator_persona is None:
         creator_persona = Persona()
@@ -204,6 +209,7 @@ async def get_suggestions(
         active_session=active_session,
         creator_legend=creator_legend,
         fan_intelligence=fan_intelligence,
+        buyer_lifecycle=buyer_lifecycle,
     )
 
     situation = await analyze_situation(
@@ -212,6 +218,15 @@ async def get_suggestions(
     )
     if fan_intelligence:
         situation["learned_fan_intelligence"] = fan_intelligence
+
+    buyer_lifecycle = await refresh_fan_lifecycle(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        situation=situation,
+        active_session=active_session,
+        fan_profile=fan_profile,
+        trigger_type="assisted_message",
+    )
 
     # Auto-plan a session if the fan is asking for content and none is active,
     # and the creator's per-fan daily caps (if configured) aren't exceeded.
@@ -249,6 +264,7 @@ async def get_suggestions(
         active_session=active_session,
         creator_legend=creator_legend,
         fan_intelligence=fan_intelligence,
+        buyer_lifecycle=buyer_lifecycle,
     )
 
     route = select_writer_route(ctx)
@@ -266,6 +282,7 @@ async def get_suggestions(
             "fan_id": fan_id,
             "feature": "assisted_reply",
             **route.telemetry_metadata(),
+            "buyer_lifecycle_stage": buyer_lifecycle.get("stage"),
         },
         target_override=route.primary_target,
         fallback_target_override=route.fallback_target,
@@ -507,6 +524,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         if not fan_profile:
             return
         fan_intelligence = await get_fan_intelligence_context(fan_id)
+        buyer_lifecycle = await get_fan_lifecycle_context(fan_id)
         # Frozen for human review (e.g. prior crisis under 'freeze' policy): auto-mode
         # stays out until a human clears the flag in the dashboard.
         if getattr(fan_profile, "needs_human_review", False):
@@ -573,6 +591,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             sent_ppv=sent_ppv,
             active_session=active_session,
             fan_intelligence=fan_intelligence,
+            buyer_lifecycle=buyer_lifecycle,
         )
 
         situation = await analyze_situation(
@@ -759,6 +778,16 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 except Exception as exc:
                     print(f"[DECLINE UNLOCK ERROR] fan={fan_id} error={exc}")
 
+        buyer_lifecycle = await refresh_fan_lifecycle(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            situation=situation,
+            commercial_decision=decision,
+            active_session=active_session,
+            fan_profile=fan_profile,
+            trigger_type="auto_message",
+        )
+
         ctx = ConversationContext(
             fan_message=latest_message,
             conversation_history=conversation_history,
@@ -773,6 +802,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             active_session=active_session,
             commercial_decision=decision.model_dump(mode="json") if decision else None,
             fan_intelligence=fan_intelligence,
+            buyer_lifecycle=buyer_lifecycle,
         )
 
         route = select_writer_route(ctx)
@@ -790,6 +820,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 "fan_id": fan_id,
                 "feature": "auto_reply",
                 **route.telemetry_metadata(),
+            "buyer_lifecycle_stage": buyer_lifecycle.get("stage"),
             },
             target_override=route.primary_target,
             fallback_target_override=route.fallback_target,
@@ -1139,6 +1170,14 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
                 print(f"[WHALE HANDOFF] fan={fan_id} crossed ${threshold} (now ${new_spent})")
         except Exception as exc:
             print(f"[WHALE HANDOFF ERROR] fan={fan_id} error={exc}")
+
+    if creator_id:
+        await refresh_fan_lifecycle(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            active_session=await get_fan_session(fan_id),
+            trigger_type="purchase_confirmed",
+        )
 
 
 async def _verify_ppv_purchase(

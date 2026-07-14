@@ -135,6 +135,8 @@ def select_writer_route(ctx: Any) -> WriterRouteDecision:
 
     situation = _mapping(getattr(ctx, "situation", None))
     commercial_decision = _mapping(getattr(ctx, "commercial_decision", None))
+    buyer_lifecycle = _mapping(getattr(ctx, "buyer_lifecycle", None))
+    lifecycle_stage = _normalized(buyer_lifecycle.get("stage"))
     fan = getattr(ctx, "fan_profile", None)
 
     crisis_signal = _normalized(situation.get("crisis_signal") or "none")
@@ -194,6 +196,13 @@ def select_writer_route(ctx: Any) -> WriterRouteDecision:
         return WriterRouteDecision(
             route=WriterRoute.COMMERCIAL_COMPLEX,
             reason=f"conversation_stage:{stage.lower()}",
+            primary_target=complex_target,
+        )
+
+    if lifecycle_stage == "VIP":
+        return WriterRouteDecision(
+            route=WriterRoute.COMMERCIAL_COMPLEX,
+            reason="buyer_lifecycle:vip",
             primary_target=complex_target,
         )
 

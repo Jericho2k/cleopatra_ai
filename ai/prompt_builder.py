@@ -445,6 +445,38 @@ WELCOME MESSAGE (your opening style):
     if reengagement_triggers:
         fan_context_parts.append(f"Re-engagement triggers: {reengagement_triggers}")
 
+    buyer_lifecycle = getattr(ctx, "buyer_lifecycle", None) or {}
+    buyer_stage = str(buyer_lifecycle.get("stage") or "").strip().upper()
+    if buyer_stage:
+        purchase_count = int(buyer_lifecycle.get("purchase_count") or 0)
+        total_spent_cents = int(buyer_lifecycle.get("total_spent_cents") or 0)
+        lifecycle_guidance = {
+            "PROSPECT": (
+                "No confirmed purchase yet. Build trust and learn what he actually wants; "
+                "do not act entitled to a sale."
+            ),
+            "FIRST_PURCHASE_PROSPECT": (
+                "He has shown recent first-purchase intent. Reduce friction, keep the next "
+                "commercial step clear, and do not overwhelm him with multiple new angles."
+            ),
+            "FIRST_TIME_BUYER": (
+                "He has made exactly one confirmed purchase. Reinforce that trust and pay "
+                "attention to his reaction before forcing another offer."
+            ),
+            "REPEAT_BUYER": (
+                "He is a confirmed repeat buyer. Be more confident and personalized, use "
+                "what he has already liked, and never recycle purchased content."
+            ),
+            "VIP": (
+                "He is a VIP. Prioritize continuity and premium treatment; avoid generic "
+                "low-value pitches or making him repeat himself."
+            ),
+        }.get(buyer_stage, "Use the supplied buyer stage as context, not as a script.")
+        fan_context_parts.append(
+            f"Buyer lifecycle: {buyer_stage} | confirmed purchases: {purchase_count} | "
+            f"total spend: ${total_spent_cents / 100:g}. {lifecycle_guidance}"
+        )
+
     fan_context = "\n".join(fan_context_parts)
 
     # The actual recent back-and-forth. Without this the model writes every reply

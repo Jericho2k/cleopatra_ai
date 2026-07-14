@@ -91,6 +91,7 @@ class ConversationContext(BaseModel):
     creator_legend: dict = {}
     commercial_decision: dict | None = None
     fan_intelligence: dict = Field(default_factory=dict)
+    buyer_lifecycle: dict = Field(default_factory=dict)
 
 
 class SuggestionRequest(BaseModel):
