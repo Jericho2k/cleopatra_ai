@@ -6,6 +6,11 @@ from collections import defaultdict
 from typing import Any, Iterable
 
 from models.commercial import CreatorPolicy, PackageOption
+from models.vault_pricing import (
+    approved_target_from_learning,
+    cents_from_row,
+    resolve_sequence_price,
+)
 
 
 def normalize_text(value: Any) -> str:
@@ -43,10 +48,7 @@ def explicitness(row: dict[str, Any]) -> float:
 
 
 def price_cents(row: dict[str, Any]) -> int:
-    try:
-        return max(0, int(round(float(row.get("suggested_price") or 0) * 100)))
-    except (TypeError, ValueError):
-        return 0
+    return cents_from_row(row)
 
 
 def usable_sets(rows: Iterable[dict[str, Any]], sent_set_ids: set[str] | None = None) -> list[dict[str, Any]]:
@@ -166,7 +168,7 @@ def package_from_sequence(
     return PackageOption(
         package_id=f"package:{package_key}:{'-'.join(set_ids)}",
         label=label,
-        price_cents=int(target_cents),
+        price_cents=resolve_sequence_price(sequence, int(target_cents)),
         set_id=set_ids[0],
         set_ids=set_ids,
         experience=experience,
@@ -178,12 +180,16 @@ def build_offer_packages(
     policy: CreatorPolicy,
     *,
     preferred_tags: list[str] | None = None,
+    price_learning: dict[str, Any] | None = None,
 ) -> list[PackageOption]:
     if not rows:
         return []
+    quick_target_cents = approved_target_from_learning(
+        price_learning, fallback_cents=policy.quick_package_target_cents
+    )
     quick_sequence = choose_sequence(
         rows,
-        target_cents=policy.quick_package_target_cents,
+        target_cents=quick_target_cents,
         min_steps=policy.session_min_steps,
         max_steps=min(policy.session_max_steps, 3),
         preferred_tags=preferred_tags,
@@ -191,7 +197,7 @@ def build_offer_packages(
     quick = package_from_sequence(
         quick_sequence,
         label="quick private session",
-        target_cents=policy.quick_package_target_cents,
+        target_cents=quick_target_cents,
         package_key="quick",
     )
     packages = [quick] if quick else []
@@ -199,9 +205,14 @@ def build_offer_packages(
     if policy.offer_two_packages:
         # Reuse of the first step is allowed only if there is not enough coherent
         # media. Prefer a larger progression for the premium package.
+        full_target_cents = approved_target_from_learning(
+            price_learning,
+            fallback_cents=policy.full_package_target_cents,
+            use_ceiling=True,
+        )
         full_sequence = choose_sequence(
             rows,
-            target_cents=policy.full_package_target_cents,
+            target_cents=full_target_cents,
             min_steps=max(policy.session_min_steps, len(quick_sequence) + 1),
             max_steps=policy.session_max_steps,
             preferred_tags=preferred_tags,
@@ -209,7 +220,7 @@ def build_offer_packages(
         full = package_from_sequence(
             full_sequence,
             label="full private session",
-            target_cents=policy.full_package_target_cents,
+            target_cents=full_target_cents,
             package_key="full",
         )
         if full and (not quick or full.set_ids != quick.set_ids):

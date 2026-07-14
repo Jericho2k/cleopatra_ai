@@ -37,6 +37,7 @@ from services.price_learning import (
     get_price_learning_context,
     refresh_price_learning,
 )
+from services.adaptive_session_planner import plan_next_action
 from services.session_lifecycle import (
     decrement_cooldown,
     mark_step_declined,
@@ -279,6 +280,19 @@ async def get_suggestions(
             except Exception as e:
                 print(f"[SESSION PLAN ERROR] {e}")
 
+    session_strategy = await plan_next_action(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        situation=situation,
+        lifecycle=buyer_lifecycle,
+        affordability=affordability,
+        price_learning=price_learning,
+        active_session=active_session,
+        conversation_stage=conversation_stage.value,
+        trigger_type="assisted_message",
+    )
+    situation["session_strategy"] = session_strategy
+
     ctx = ConversationContext(
         fan_message=fan_message,
         conversation_history=conversation_history,
@@ -296,6 +310,7 @@ async def get_suggestions(
         buyer_lifecycle=buyer_lifecycle,
         affordability=affordability,
         price_learning=price_learning,
+        session_strategy=session_strategy,
     )
 
     route = select_writer_route(ctx)
@@ -316,6 +331,8 @@ async def get_suggestions(
             "buyer_lifecycle_stage": buyer_lifecycle.get("stage"),
             "price_learning_mode": price_learning.get("mode"),
             "price_learning_confidence": price_learning.get("confidence"),
+            "session_strategy_goal": session_strategy.get("goal"),
+            "session_strategy_action": session_strategy.get("next_action"),
         },
         target_override=route.primary_target,
         fallback_target_override=route.fallback_target,
@@ -860,6 +877,21 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         )
         situation["price_learning"] = price_learning
 
+        decision_context = decision.model_dump(mode="json") if decision else None
+        session_strategy = await plan_next_action(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            situation=situation,
+            commercial_decision=decision_context,
+            lifecycle=buyer_lifecycle,
+            affordability=affordability,
+            price_learning=price_learning,
+            active_session=active_session,
+            conversation_stage=conversation_stage.value,
+            trigger_type="auto_message",
+        )
+        situation["session_strategy"] = session_strategy
+
         ctx = ConversationContext(
             fan_message=latest_message,
             conversation_history=conversation_history,
@@ -877,6 +909,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             buyer_lifecycle=buyer_lifecycle,
             affordability=affordability,
             price_learning=price_learning,
+            session_strategy=session_strategy,
         )
 
         route = select_writer_route(ctx)
@@ -897,6 +930,8 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             "buyer_lifecycle_stage": buyer_lifecycle.get("stage"),
             "price_learning_mode": price_learning.get("mode"),
             "price_learning_confidence": price_learning.get("confidence"),
+            "session_strategy_goal": session_strategy.get("goal"),
+            "session_strategy_action": session_strategy.get("next_action"),
             },
             target_override=route.primary_target,
             fallback_target_override=route.fallback_target,

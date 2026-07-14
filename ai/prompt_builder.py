@@ -217,6 +217,35 @@ def _render_price_learning(price_learning: dict) -> str:
     ])
     return "PRICE LEARNING (internal, evidence-backed):\n- " + "\n- ".join(lines)
 
+
+def _render_session_strategy(session_strategy: dict) -> str:
+    """Render next-best-action guidance below the authoritative business rules."""
+    if not session_strategy:
+        return ""
+    lines = [
+        f"goal: {session_strategy.get('goal', 'RAPPORT')}",
+        f"phase: {session_strategy.get('phase', 'RAPPORT')}",
+        f"next action: {session_strategy.get('next_action', 'CONTINUE_CHAT')}",
+        f"writer objective: {session_strategy.get('writer_goal', 'continue naturally')}",
+    ]
+    avoid = [str(item) for item in session_strategy.get("writer_avoid") or []]
+    if avoid:
+        lines.append("avoid: " + ", ".join(avoid))
+    if session_strategy.get("must_ask_question"):
+        lines.append("ask exactly one natural question")
+    if session_strategy.get("must_not_ask_question"):
+        lines.append("do not ask a question")
+    if session_strategy.get("max_messages") is not None:
+        lines.append(f"maximum message bubbles: {session_strategy['max_messages']}")
+    prices = [int(value) for value in session_strategy.get("approved_offer_prices_cents") or []]
+    if prices:
+        lines.append("approved offer prices only: " + ", ".join(f"${value / 100:g}" for value in prices))
+    lines.extend([
+        "This is execution guidance, not permission to change the commercial decision.",
+        "Never invent an offer, price, discount, content set, or promise.",
+    ])
+    return "ADAPTIVE SESSION STRATEGY (internal):\n- " + "\n- ".join(lines)
+
 def build_prompt(ctx: ConversationContext) -> list[dict]:
     fan = ctx.fan_profile
     stage = ctx.conversation_stage
@@ -229,6 +258,8 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     affordability_block = _render_affordability(affordability)
     price_learning = getattr(ctx, "price_learning", None) or {}
     price_learning_block = _render_price_learning(price_learning)
+    session_strategy = getattr(ctx, "session_strategy", None) or {}
+    session_strategy_block = _render_session_strategy(session_strategy)
     learned_by_key: dict[str, list] = {}
     for learned_fact in fan_intelligence.get("facts") or []:
         if learned_fact.get("status") == "contradicted":
@@ -543,6 +574,8 @@ WELCOME MESSAGE (your opening style):
         fan_context_parts.append(affordability_block)
     if price_learning_block:
         fan_context_parts.append(price_learning_block)
+    if session_strategy_block:
+        fan_context_parts.append(session_strategy_block)
     if notes:
         fan_context_parts.append(f"Summary: {notes}")
     if member_note:

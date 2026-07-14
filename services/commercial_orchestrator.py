@@ -98,8 +98,10 @@ async def orchestrate(
             state.free_session_started_at = None
             state.free_session_ended_at = None
 
-    package_options = await get_offerable_packages(creator_id, fan_id, policy)
     price_learning = situation.get("price_learning") or {}
+    package_options = await get_offerable_packages(
+        creator_id, fan_id, policy, price_learning=price_learning
+    )
     package_options = select_recommended_packages(
         package_options,
         price_learning,

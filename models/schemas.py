@@ -94,6 +94,7 @@ class ConversationContext(BaseModel):
     buyer_lifecycle: dict = Field(default_factory=dict)
     affordability: dict = Field(default_factory=dict)
     price_learning: dict = Field(default_factory=dict)
+    session_strategy: dict = Field(default_factory=dict)
 
 
 class SuggestionRequest(BaseModel):

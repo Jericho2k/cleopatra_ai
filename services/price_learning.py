@@ -8,6 +8,7 @@ import os
 from typing import Any
 
 from db.affordability_queries import get_affordability_events
+from db.pricing_policy_queries import get_effective_price_learning_policy
 from db.price_learning_queries import (
     get_price_learning_policy,
     get_price_learning_profile,
@@ -54,7 +55,7 @@ async def refresh_price_learning(
         affordability_context = affordability or await get_affordability_context(fan_id)
         lifecycle_context = lifecycle or await get_fan_lifecycle_context(fan_id)
         events = await get_affordability_events(fan_id, limit=200)
-        policy = await get_price_learning_policy(creator_id)
+        policy = await get_effective_price_learning_policy(creator_id)
         existing = await get_price_learning_profile(fan_id)
         profile = derive_price_learning_profile(
             events,

@@ -129,6 +129,7 @@ async def get_offerable_packages(
     creator_id: str,
     fan_id: str,
     policy: CreatorPolicy,
+    price_learning: dict | None = None,
 ) -> list[PackageOption]:
     """Build up to two coherent, multi-step packages from approved vault sets."""
     def _get():
@@ -137,7 +138,8 @@ async def get_offerable_packages(
             db.table("vault_sets")
             .select(
                 "id, title, location, outfit, suggested_price, tags, "
-                "explicit_min, explicit_max, media_ids"
+                "explicit_min, explicit_max, media_ids, base_price_cents, "
+                "min_price_cents, max_price_cents, dynamic_pricing_enabled"
             )
             .eq("creator_id", creator_id)
             .eq("status", "approved")
@@ -185,7 +187,9 @@ async def get_offerable_packages(
         return available, preferred_tags
 
     rows, preferred_tags = await asyncio.to_thread(_get)
-    return build_offer_packages(rows, policy, preferred_tags=preferred_tags)
+    return build_offer_packages(
+        rows, policy, preferred_tags=preferred_tags, price_learning=price_learning
+    )
 
 
 async def schedule_action(
