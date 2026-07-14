@@ -33,6 +33,10 @@ from services.fan_lifecycle import (
     get_fan_lifecycle_context,
     refresh_fan_lifecycle,
 )
+from services.price_learning import (
+    get_price_learning_context,
+    refresh_price_learning,
+)
 from services.session_lifecycle import (
     decrement_cooldown,
     mark_step_declined,
@@ -188,6 +192,7 @@ async def get_suggestions(
     fan_intelligence = await get_fan_intelligence_context(fan_id)
     buyer_lifecycle = await get_fan_lifecycle_context(fan_id)
     affordability = await get_affordability_context(fan_id)
+    price_learning = await get_price_learning_context(fan_id)
     creator_persona = await get_creator_persona(creator_id)
     if creator_persona is None:
         creator_persona = Persona()
@@ -217,6 +222,7 @@ async def get_suggestions(
         fan_intelligence=fan_intelligence,
         buyer_lifecycle=buyer_lifecycle,
         affordability=affordability,
+        price_learning=price_learning,
     )
 
     situation = await analyze_situation(
@@ -241,6 +247,15 @@ async def get_suggestions(
         fan_profile=fan_profile,
         trigger_type="assisted_message",
     )
+
+    price_learning = await refresh_price_learning(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        affordability=affordability,
+        lifecycle=buyer_lifecycle,
+        trigger_type="assisted_message",
+    )
+    situation["price_learning"] = price_learning
 
     # Auto-plan a session if the fan is asking for content and none is active,
     # and the creator's per-fan daily caps (if configured) aren't exceeded.
@@ -280,6 +295,7 @@ async def get_suggestions(
         fan_intelligence=fan_intelligence,
         buyer_lifecycle=buyer_lifecycle,
         affordability=affordability,
+        price_learning=price_learning,
     )
 
     route = select_writer_route(ctx)
@@ -298,6 +314,8 @@ async def get_suggestions(
             "feature": "assisted_reply",
             **route.telemetry_metadata(),
             "buyer_lifecycle_stage": buyer_lifecycle.get("stage"),
+            "price_learning_mode": price_learning.get("mode"),
+            "price_learning_confidence": price_learning.get("confidence"),
         },
         target_override=route.primary_target,
         fallback_target_override=route.fallback_target,
@@ -541,6 +559,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         fan_intelligence = await get_fan_intelligence_context(fan_id)
         buyer_lifecycle = await get_fan_lifecycle_context(fan_id)
         affordability = await get_affordability_context(fan_id)
+        price_learning = await get_price_learning_context(fan_id)
         # Frozen for human review (e.g. prior crisis under 'freeze' policy): auto-mode
         # stays out until a human clears the flag in the dashboard.
         if getattr(fan_profile, "needs_human_review", False):
@@ -609,6 +628,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             fan_intelligence=fan_intelligence,
             buyer_lifecycle=buyer_lifecycle,
             affordability=affordability,
+            price_learning=price_learning,
         )
 
         situation = await analyze_situation(
@@ -623,6 +643,14 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             situation=situation,
             source_ref=f"auto:{len(conversation_history)}:{latest_message}",
         )
+        price_learning = await refresh_price_learning(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            affordability=affordability,
+            lifecycle=buyer_lifecycle,
+            trigger_type="auto_message_pre_policy",
+        )
+        situation["price_learning"] = price_learning
         print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} crisis={situation.get('crisis_signal', 'none')}")
 
         # Sticky-situation policy: if a crisis is flagged and the creator opted to
@@ -823,6 +851,15 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             trigger_type="auto_message",
         )
 
+        price_learning = await refresh_price_learning(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            affordability=affordability,
+            lifecycle=buyer_lifecycle,
+            trigger_type="auto_message_post_lifecycle",
+        )
+        situation["price_learning"] = price_learning
+
         ctx = ConversationContext(
             fan_message=latest_message,
             conversation_history=conversation_history,
@@ -839,6 +876,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             fan_intelligence=fan_intelligence,
             buyer_lifecycle=buyer_lifecycle,
             affordability=affordability,
+            price_learning=price_learning,
         )
 
         route = select_writer_route(ctx)
@@ -857,6 +895,8 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 "feature": "auto_reply",
                 **route.telemetry_metadata(),
             "buyer_lifecycle_stage": buyer_lifecycle.get("stage"),
+            "price_learning_mode": price_learning.get("mode"),
+            "price_learning_confidence": price_learning.get("confidence"),
             },
             target_override=route.primary_target,
             fallback_target_override=route.fallback_target,
@@ -1223,6 +1263,11 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
             creator_id=creator_id,
             fan_id=fan_id,
             active_session=await get_fan_session(fan_id),
+            trigger_type="purchase_confirmed",
+        )
+        await refresh_price_learning(
+            creator_id=creator_id,
+            fan_id=fan_id,
             trigger_type="purchase_confirmed",
         )
 

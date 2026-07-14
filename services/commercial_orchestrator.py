@@ -21,6 +21,7 @@ from models.commercial import (
 )
 from services.commercial_events import extract_events, selected_package_event, stated_budget_cents
 from services.commercial_policy import CommercialContext, decide_next_action
+from services.price_learning import select_recommended_packages
 from services.payday import resolve_payday
 from services.session_lifecycle import (
     has_pending_purchase,
@@ -98,6 +99,12 @@ async def orchestrate(
             state.free_session_ended_at = None
 
     package_options = await get_offerable_packages(creator_id, fan_id, policy)
+    price_learning = situation.get("price_learning") or {}
+    package_options = select_recommended_packages(
+        package_options,
+        price_learning,
+        max_options=2 if policy.offer_two_packages else 1,
+    )
     _resolve_selected_package(events, state.offered_packages or package_options)
 
     session = normalize_session(active_session)

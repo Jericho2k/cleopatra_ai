@@ -182,6 +182,41 @@ def _render_affordability(affordability: dict) -> str:
     return "COMMERCIAL AFFORDABILITY (evidence-backed):\n- " + "\n- ".join(lines)
 
 
+
+def _render_price_learning(price_learning: dict) -> str:
+    """Render internal price guidance without exposing it as fan wealth."""
+    if not price_learning:
+        return ""
+
+    def money(value) -> str | None:
+        try:
+            return f"${int(value) / 100:g}" if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    mode = str(price_learning.get("mode") or "DISCOVERY")
+    confidence = str(price_learning.get("confidence") or "NONE")
+    floor = money(price_learning.get("recommended_floor_cents"))
+    target = money(price_learning.get("recommended_target_cents"))
+    ceiling = money(price_learning.get("recommended_ceiling_cents"))
+    lines = [f"mode: {mode}", f"confidence: {confidence}"]
+    if floor:
+        lines.append(f"floor: {floor}")
+    if target:
+        lines.append(f"target: {target}")
+    if ceiling:
+        lines.append(f"ceiling: {ceiling}")
+    reasons = [str(item) for item in price_learning.get("reason_codes") or []]
+    if reasons:
+        lines.append("reasons: " + ", ".join(reasons))
+    lines.extend([
+        "This is internal commercial guidance, not estimated wealth or a permanent budget.",
+        "Use approved packages only. Never invent a price, discount, bundle, or payment promise.",
+        "Do not disclose the learned range or say that the system has scored his spending.",
+        "The deterministic commercial decision and an explicitly selected offer override this guidance.",
+    ])
+    return "PRICE LEARNING (internal, evidence-backed):\n- " + "\n- ".join(lines)
+
 def build_prompt(ctx: ConversationContext) -> list[dict]:
     fan = ctx.fan_profile
     stage = ctx.conversation_stage
@@ -192,6 +227,8 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     learned_intelligence_block = _render_fan_intelligence(fan_intelligence)
     affordability = getattr(ctx, "affordability", None) or {}
     affordability_block = _render_affordability(affordability)
+    price_learning = getattr(ctx, "price_learning", None) or {}
+    price_learning_block = _render_price_learning(price_learning)
     learned_by_key: dict[str, list] = {}
     for learned_fact in fan_intelligence.get("facts") or []:
         if learned_fact.get("status") == "contradicted":
@@ -504,6 +541,8 @@ WELCOME MESSAGE (your opening style):
         fan_context_parts.append(learned_intelligence_block)
     if affordability_block:
         fan_context_parts.append(affordability_block)
+    if price_learning_block:
+        fan_context_parts.append(price_learning_block)
     if notes:
         fan_context_parts.append(f"Summary: {notes}")
     if member_note:

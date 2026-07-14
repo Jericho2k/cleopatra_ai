@@ -93,6 +93,7 @@ class ConversationContext(BaseModel):
     fan_intelligence: dict = Field(default_factory=dict)
     buyer_lifecycle: dict = Field(default_factory=dict)
     affordability: dict = Field(default_factory=dict)
+    price_learning: dict = Field(default_factory=dict)
 
 
 class SuggestionRequest(BaseModel):
