@@ -116,6 +116,72 @@ def _render_fan_intelligence(intelligence: dict) -> str:
     )
 
 
+
+
+def _render_affordability(affordability: dict) -> str:
+    """Render money evidence without turning it into an estimated wealth score."""
+    if not affordability:
+        return ""
+
+    def money(value) -> str | None:
+        try:
+            return f"${int(value) / 100:g}" if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    lines: list[str] = []
+    status = str(affordability.get("status") or "UNKNOWN")
+    lines.append(f"status: {status}")
+
+    available = money(affordability.get("current_available_cents"))
+    limit = money(affordability.get("current_limit_cents"))
+    selected = money(affordability.get("latest_offer_selected_cents"))
+    counter = money(affordability.get("latest_counteroffer_cents"))
+    rejected = money(affordability.get("latest_rejected_price_cents"))
+    last_purchase = money(affordability.get("last_confirmed_purchase_cents"))
+    highest_purchase = money(affordability.get("highest_confirmed_purchase_cents"))
+
+    if available:
+        lines.append(f"explicitly available now: {available}")
+    if limit:
+        lines.append(f"current-session ceiling: {limit}")
+    if selected:
+        lines.append(f"selected offer awaiting purchase: {selected}")
+    if counter:
+        lines.append(f"latest explicit counteroffer: {counter}")
+    if rejected:
+        lines.append(f"latest explicitly rejected price: {rejected}")
+    if affordability.get("temporary_constraint"):
+        until = affordability.get("constraint_until")
+        lines.append(
+            "temporary cash constraint"
+            + (f" until {until}" if until else "")
+        )
+    if affordability.get("payday_raw"):
+        lines.append(
+            f"future liquidity mentioned: {affordability['payday_raw']}"
+        )
+    if last_purchase:
+        lines.append(f"last confirmed purchase: {last_purchase}")
+    if highest_purchase:
+        lines.append(f"highest confirmed purchase: {highest_purchase}")
+    count = int(affordability.get("confirmed_purchase_count") or 0)
+    if count:
+        lines.append(f"confirmed purchase count: {count}")
+
+    lines.append(
+        "This is evidence, not estimated wealth. A purchase is not a permanent "
+        "budget, a selected offer is not yet a purchase, and a payday mention "
+        "does not by itself mean he cannot buy now."
+    )
+    lines.append(
+        "Do not cold-ask 'what is your budget?'. Discover naturally through "
+        "exact approved options and explicit reactions; the deterministic "
+        "commercial decision remains authoritative."
+    )
+    return "COMMERCIAL AFFORDABILITY (evidence-backed):\n- " + "\n- ".join(lines)
+
+
 def build_prompt(ctx: ConversationContext) -> list[dict]:
     fan = ctx.fan_profile
     stage = ctx.conversation_stage
@@ -124,6 +190,8 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     ai_summary = getattr(fan, "ai_summary", None) or {}
     fan_intelligence = getattr(ctx, "fan_intelligence", None) or {}
     learned_intelligence_block = _render_fan_intelligence(fan_intelligence)
+    affordability = getattr(ctx, "affordability", None) or {}
+    affordability_block = _render_affordability(affordability)
     learned_by_key: dict[str, list] = {}
     for learned_fact in fan_intelligence.get("facts") or []:
         if learned_fact.get("status") == "contradicted":
@@ -434,6 +502,8 @@ WELCOME MESSAGE (your opening style):
     fan_context_parts = []
     if learned_intelligence_block:
         fan_context_parts.append(learned_intelligence_block)
+    if affordability_block:
+        fan_context_parts.append(affordability_block)
     if notes:
         fan_context_parts.append(f"Summary: {notes}")
     if member_note:

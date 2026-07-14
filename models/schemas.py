@@ -92,6 +92,7 @@ class ConversationContext(BaseModel):
     commercial_decision: dict | None = None
     fan_intelligence: dict = Field(default_factory=dict)
     buyer_lifecycle: dict = Field(default_factory=dict)
+    affordability: dict = Field(default_factory=dict)
 
 
 class SuggestionRequest(BaseModel):

@@ -83,6 +83,24 @@ def normalize_commercial_facts(
         ):
             out["current_budget_limit_usd"] = str(selected_price or "")
 
+    # A negotiated amount that does not match an offered package is a
+    # counteroffer, not package acceptance. Exact offered prices remain
+    # authoritative; price learning is handled later.
+    negotiation = re.search(
+        r"\b(can (?:you|u) do|would you do|what about|how about|for|instead|i can do|i'll do)\b",
+        text,
+    )
+    if message_amounts and offered_amounts and negotiation:
+        proposed = message_amounts[0]
+        if proposed not in offered_amounts:
+            out["counteroffer_usd"] = str(proposed)
+            out["selected_offer_price_usd"] = ""
+            out["selected_offer_position"] = ""
+            out["offer_response"] = "none"
+            out["purchase_signal"] = "none"
+            selected_price = None
+            selected_position = ""
+
     cannot_buy_any = bool(re.search(
         r"\b(can'?t afford (?:either|any|it|that)|can'?t pay (?:right now|today|yet)|"
         r"don'?t have (?:any )?money|no money|broke|not enough for (?:either|any))\b",
@@ -128,6 +146,7 @@ def _fallback_situation() -> dict:
         "selected_offer_price_usd": "",
         "selected_offer_position": "",
         "current_budget_limit_usd": "",
+        "counteroffer_usd": "",
         "cannot_afford_any_offer_now": "false",
         "deferred_purchase_intent": "false",
         "resend_requested": "false",
@@ -215,6 +234,15 @@ def extract_events(situation: dict) -> list[CommercialEvent]:
         events.append(CommercialEvent(type=EventType.OFFER_DECLINED))
     elif offer_response == "deferred":
         events.append(CommercialEvent(type=EventType.DEFERRED_PURCHASE))
+
+    counteroffer_cents = _money_cents(situation.get("counteroffer_usd"))
+    if counteroffer_cents is not None:
+        events.append(CommercialEvent(
+            type=EventType.COUNTEROFFER_STATED,
+            raw_expression=str(situation.get("counteroffer_usd")),
+            amount_cents=counteroffer_cents,
+            confidence=0.98,
+        ))
 
     current_limit_cents = _money_cents(situation.get("current_budget_limit_usd"))
     if current_limit_cents is not None:

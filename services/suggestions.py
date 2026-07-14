@@ -24,6 +24,11 @@ from db.fan_intelligence_queries import get_fan_intelligence_context
 from db.commercial_queries import get_creator_policy, get_fan_state, save_fan_state
 from services.session_planner import plan_session_for_fan
 from services.fan_intelligence import learn_from_fan_message
+from services.affordability import (
+    get_affordability_context,
+    record_confirmed_purchase,
+    refresh_affordability_from_situation,
+)
 from services.fan_lifecycle import (
     get_fan_lifecycle_context,
     refresh_fan_lifecycle,
@@ -182,6 +187,7 @@ async def get_suggestions(
 
     fan_intelligence = await get_fan_intelligence_context(fan_id)
     buyer_lifecycle = await get_fan_lifecycle_context(fan_id)
+    affordability = await get_affordability_context(fan_id)
     creator_persona = await get_creator_persona(creator_id)
     if creator_persona is None:
         creator_persona = Persona()
@@ -210,6 +216,7 @@ async def get_suggestions(
         creator_legend=creator_legend,
         fan_intelligence=fan_intelligence,
         buyer_lifecycle=buyer_lifecycle,
+        affordability=affordability,
     )
 
     situation = await analyze_situation(
@@ -218,6 +225,13 @@ async def get_suggestions(
     )
     if fan_intelligence:
         situation["learned_fan_intelligence"] = fan_intelligence
+
+    affordability = await refresh_affordability_from_situation(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        situation=situation,
+        source_ref=f"assisted:{len(conversation_history)}:{fan_message}",
+    )
 
     buyer_lifecycle = await refresh_fan_lifecycle(
         creator_id=creator_id,
@@ -265,6 +279,7 @@ async def get_suggestions(
         creator_legend=creator_legend,
         fan_intelligence=fan_intelligence,
         buyer_lifecycle=buyer_lifecycle,
+        affordability=affordability,
     )
 
     route = select_writer_route(ctx)
@@ -525,6 +540,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             return
         fan_intelligence = await get_fan_intelligence_context(fan_id)
         buyer_lifecycle = await get_fan_lifecycle_context(fan_id)
+        affordability = await get_affordability_context(fan_id)
         # Frozen for human review (e.g. prior crisis under 'freeze' policy): auto-mode
         # stays out until a human clears the flag in the dashboard.
         if getattr(fan_profile, "needs_human_review", False):
@@ -592,6 +608,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             active_session=active_session,
             fan_intelligence=fan_intelligence,
             buyer_lifecycle=buyer_lifecycle,
+            affordability=affordability,
         )
 
         situation = await analyze_situation(
@@ -600,6 +617,12 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         )
         if fan_intelligence:
             situation["learned_fan_intelligence"] = fan_intelligence
+        affordability = await refresh_affordability_from_situation(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            situation=situation,
+            source_ref=f"auto:{len(conversation_history)}:{latest_message}",
+        )
         print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} crisis={situation.get('crisis_signal', 'none')}")
 
         # Sticky-situation policy: if a crisis is flagged and the creator opted to
@@ -728,6 +751,18 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 .eq("id", fan_id).single().execute()
             )
             pending = (fan_data.data or {}).get("pending_ppv_check")
+            if pending and purchase_signal == "declined":
+                try:
+                    pending_price_cents = int(round(float(pending.get("price") or 0) * 100))
+                    affordability = await refresh_affordability_from_situation(
+                        creator_id=creator_id,
+                        fan_id=fan_id,
+                        situation=situation,
+                        source_ref=f"auto-decline:{len(conversation_history)}:{latest_message}",
+                        offered_price_cents=pending_price_cents,
+                    )
+                except Exception as exc:
+                    print(f"[AFFORDABILITY] decline price record failed fan={fan_id}: {exc}")
             if pending and purchase_signal == "bought":
                 print(f"[PPV SIGNAL] fan={fan_id} bought pending={pending}")
                 spawn(_verify_ppv_purchase(fan_id, creator_id, pending), name="verify_ppv_purchase")
@@ -803,6 +838,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             commercial_decision=decision.model_dump(mode="json") if decision else None,
             fan_intelligence=fan_intelligence,
             buyer_lifecycle=buyer_lifecycle,
+            affordability=affordability,
         )
 
         route = select_writer_route(ctx)
@@ -1120,6 +1156,17 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
         }).eq("id", fan_id).execute()
     )
     await mark_ppv_purchased(fan_id, str(media_id))
+    if creator_id and not already_recorded:
+        try:
+            await record_confirmed_purchase(
+                creator_id=creator_id,
+                fan_id=fan_id,
+                amount_cents=amount_dollars * 100,
+                source_ref=f"ppv:{media_id}",
+                metadata={"media_id": str(media_id)},
+            )
+        except Exception as exc:
+            print(f"[AFFORDABILITY] purchase record failed fan={fan_id}: {exc}")
 
     if session and creator_id:
         try:

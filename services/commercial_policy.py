@@ -86,6 +86,8 @@ def compute_readiness(
         score += 1
     if _has(events, EventType.BUDGET_STATED):
         score += 3
+    if _has(events, EventType.COUNTEROFFER_STATED):
+        score += 3
     if _has(events, EventType.READY_TO_BUY):
         score += 3
     if _has(events, EventType.PACKAGE_SELECTED):
@@ -197,6 +199,23 @@ def decide_next_action(
             max_messages=1,
             conversation_continuation="none",
             reason="cannot buy now, no payday",
+        )
+
+    counteroffer = _get(events, EventType.COUNTEROFFER_STATED)
+    if counteroffer:
+        return CommercialDecision(
+            action=ActionType.PRESENT_SESSION_OPTIONS,
+            goal=(
+                "acknowledge his amount without promising an unapproved discount; "
+                "offer only the exact available packages"
+            ),
+            package_options=ctx.package_options or state.offered_packages,
+            must_not_send_media=True,
+            may_be_explicit=True,
+            new_status=FanStatus.OFFER_PENDING,
+            max_messages=2,
+            conversation_continuation="required",
+            reason="counteroffer does not match an approved package",
         )
 
     if _has(events, EventType.OFFER_DECLINED):

@@ -43,6 +43,7 @@ class EventType(str, Enum):
     PAYDAY_MENTIONED = "PAYDAY_MENTIONED"
     BUDGET_STATED = "BUDGET_STATED"  # voluntarily states an amount available now
     BUDGET_LIMIT_STATED = "BUDGET_LIMIT_STATED"  # accepts/limits current spend to X
+    COUNTEROFFER_STATED = "COUNTEROFFER_STATED"  # explicit negotiated amount, not an offered package
     PACKAGE_SELECTED = "PACKAGE_SELECTED"
     OFFER_DECLINED = "OFFER_DECLINED"
     DEFERRED_PURCHASE = "DEFERRED_PURCHASE"
