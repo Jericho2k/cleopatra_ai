@@ -95,6 +95,7 @@ class ConversationContext(BaseModel):
     affordability: dict = Field(default_factory=dict)
     price_learning: dict = Field(default_factory=dict)
     session_strategy: dict = Field(default_factory=dict)
+    conversation_director: dict = Field(default_factory=dict)
 
 
 class SuggestionRequest(BaseModel):

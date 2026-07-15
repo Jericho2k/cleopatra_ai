@@ -31,7 +31,11 @@ class NextBestAction(str, Enum):
     HAND_OFF = "HAND_OFF"
     CONTINUE_CHAT = "CONTINUE_CHAT"
     ASK_ONE_QUESTION = "ASK_ONE_QUESTION"
+    PLAYFUL_FLIRT = "PLAYFUL_FLIRT"
+    DEEPEN_RAPPORT = "DEEPEN_RAPPORT"
     BUILD_TENSION = "BUILD_TENSION"
+    SEED_PREMIUM_CONTENT = "SEED_PREMIUM_CONTENT"
+    PIVOT_ENERGY = "PIVOT_ENERGY"
     PRESENT_APPROVED_OPTIONS = "PRESENT_APPROVED_OPTIONS"
     ACCEPT_NO_AND_RESET = "ACCEPT_NO_AND_RESET"
     HOLD_PRICE = "HOLD_PRICE"
@@ -88,6 +92,7 @@ def derive_session_strategy(
     price_learning: dict[str, Any] | None = None,
     active_session: dict[str, Any] | None = None,
     conversation_stage: str | None = None,
+    conversation_director: dict[str, Any] | None = None,
 ) -> SessionStrategy:
     """Build one deterministic execution strategy.
 
@@ -101,6 +106,7 @@ def derive_session_strategy(
     affordability = affordability or {}
     price_learning = price_learning or {}
     active_session = active_session or {}
+    conversation_director = conversation_director or {}
 
     action = _enum_value(decision.get("action"))
     stage = str(conversation_stage or "").upper()
@@ -108,6 +114,11 @@ def derive_session_strategy(
     crisis = str(situation.get("crisis_signal") or "none").lower()
     lifecycle_stage = str(lifecycle.get("stage") or "PROSPECT").upper()
     price_mode = str(price_learning.get("mode") or "DISCOVERY").upper()
+    director_action = _enum_value(conversation_director.get("action"))
+    director_phase = _enum_value(conversation_director.get("phase"))
+    director_reason = str(
+        conversation_director.get("transition_reason") or "conversation_director"
+    )
 
     offer_ids, offer_prices = _approved_offers(decision)
     selected_price = _int_or_none(decision.get("session_budget_cents"))
@@ -253,6 +264,137 @@ def derive_session_strategy(
             reason_codes=["high_purchase_intent_or_exact_price"],
             **shared,
         )
+
+
+    # For non-commercial turns, the persistent Conversation Director controls
+    # progression so the writer does not repeat tease/qualify loops forever.
+    if action in {"", "CONTINUE_NORMAL_CHAT"} and director_action:
+        director_shared = {
+            **shared,
+            "reason_codes": [f"conversation_director:{director_reason}"],
+        }
+
+        if director_action == "DISCOVER_PREFERENCE":
+            return SessionStrategy(
+                goal=SessionGoal.QUALIFY,
+                phase=director_phase or "QUALIFICATION",
+                next_action=NextBestAction.ASK_ONE_QUESTION,
+                writer_goal=(
+                    "react first, then ask exactly one playful context-specific "
+                    "question that reveals what he liked or wants"
+                ),
+                writer_avoid=[
+                    "multiple questions",
+                    "generic questionnaire",
+                    "price pitch",
+                    "repeating the previous tease",
+                ],
+                must_ask_question=True,
+                max_messages=2,
+                route_hint="default",
+                **director_shared,
+            )
+
+        if director_action == "PLAYFUL_FLIRT":
+            return SessionStrategy(
+                goal=SessionGoal.WARM,
+                phase=director_phase or "FLIRT",
+                next_action=NextBestAction.PLAYFUL_FLIRT,
+                writer_goal=(
+                    "reward his energy with one fresh playful angle and leave a "
+                    "natural opening for him to invest more"
+                ),
+                writer_avoid=[
+                    "package menu",
+                    "price",
+                    "generic thank-you",
+                    "repeating the previous wording",
+                ],
+                max_messages=2,
+                route_hint="default",
+                **director_shared,
+            )
+
+        if director_action == "BUILD_TENSION":
+            return SessionStrategy(
+                goal=SessionGoal.WARM,
+                phase=director_phase or "TENSION",
+                next_action=NextBestAction.BUILD_TENSION,
+                writer_goal=(
+                    "increase anticipation using a new conversational move, not "
+                    "another version of the same tease"
+                ),
+                writer_avoid=[
+                    "abrupt sale",
+                    "generic menu",
+                    "invented promise",
+                    "repeating the last move",
+                ],
+                max_messages=2,
+                route_hint="default",
+                **director_shared,
+            )
+
+        if director_action == "SEED_PREMIUM_CONTENT":
+            return SessionStrategy(
+                goal=SessionGoal.WARM,
+                phase=director_phase or "SOFT_OFFER",
+                next_action=NextBestAction.SEED_PREMIUM_CONTENT,
+                writer_goal=(
+                    "make one subtle on-platform bridge suggesting there is more "
+                    "and let him lean in; do not present options or quote a price"
+                ),
+                writer_avoid=[
+                    "price",
+                    "package menu",
+                    "invented content",
+                    "discount",
+                    "hard close",
+                ],
+                must_not_ask_question=True,
+                max_messages=2,
+                route_hint="default",
+                **director_shared,
+            )
+
+        if director_action == "PIVOT_ENERGY":
+            return SessionStrategy(
+                goal=SessionGoal.RAPPORT,
+                phase=director_phase or "RAPPORT",
+                next_action=NextBestAction.PIVOT_ENERGY,
+                writer_goal=(
+                    "change the conversational texture and give him room to "
+                    "re-engage; do not keep escalating the same tease"
+                ),
+                writer_avoid=["price", "offer", "same tease", "pressure"],
+                must_not_ask_question=True,
+                max_messages=1,
+                route_hint="default",
+                **director_shared,
+            )
+
+        if director_action in {"RESPOND_AND_OPEN", "DEEPEN_RAPPORT"}:
+            return SessionStrategy(
+                goal=SessionGoal.RAPPORT,
+                phase=director_phase or "RAPPORT",
+                next_action=(
+                    NextBestAction.RESPOND_AND_OPEN
+                    if director_action == "RESPOND_AND_OPEN"
+                    else NextBestAction.DEEPEN_RAPPORT
+                ),
+                writer_goal=(
+                    "respond specifically to what he said and deepen the exchange "
+                    "without forcing flirtation or a sale"
+                ),
+                writer_avoid=[
+                    "generic opener",
+                    "premature offer",
+                    "invented backstory",
+                ],
+                max_messages=2,
+                route_hint="default",
+                **director_shared,
+            )
 
     if lifecycle_stage in {"PROSPECT", "FIRST_PURCHASE_PROSPECT"} and not _has_preferences(situation):
         return SessionStrategy(

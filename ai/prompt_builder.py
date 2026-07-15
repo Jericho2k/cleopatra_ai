@@ -218,6 +218,48 @@ def _render_price_learning(price_learning: dict) -> str:
     return "PRICE LEARNING (internal, evidence-backed):\n- " + "\n- ".join(lines)
 
 
+def _render_conversation_director(conversation_director: dict) -> str:
+    """Render persistent progression separately from commercial authority."""
+    if not conversation_director:
+        return ""
+
+    lines = [
+        f"current phase: {conversation_director.get('phase', 'OPENING')}",
+        f"previous phase: {conversation_director.get('previous_phase') or 'none'}",
+        f"required move: {conversation_director.get('action', 'RESPOND_AND_OPEN')}",
+        f"turns in this phase: {conversation_director.get('turns_in_phase', 1)}",
+        f"transition reason: {conversation_director.get('transition_reason', 'unknown')}",
+    ]
+    recent = [
+        str(value) for value in conversation_director.get("recent_actions") or []
+    ]
+    if recent:
+        lines.append("recent moves: " + ", ".join(recent))
+        lines.append("do not repeat the most recent conversational move or wording")
+
+    if conversation_director.get("question_due"):
+        lines.append(
+            "MANDATORY: all 3 reply options must contain exactly one natural, "
+            "context-specific question"
+        )
+    if conversation_director.get("must_not_ask_question"):
+        lines.append("MANDATORY: do not ask a question in any reply option")
+
+    if conversation_director.get("offer_eligible"):
+        lines.append(
+            "A soft commercial bridge is eligible, but only the commercial policy "
+            "may authorize an actual offer, package, price, or media send"
+        )
+
+    lines.extend(
+        [
+            "Follow this progression move in all 3 options; auto mode may send option 1.",
+            "The director controls pacing, never pricing or package authorization.",
+        ]
+    )
+    return "CONVERSATION DIRECTOR (internal):\n- " + "\n- ".join(lines)
+
+
 def _render_session_strategy(session_strategy: dict) -> str:
     """Render next-best-action guidance below the authoritative business rules."""
     if not session_strategy:
@@ -258,6 +300,10 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     affordability_block = _render_affordability(affordability)
     price_learning = getattr(ctx, "price_learning", None) or {}
     price_learning_block = _render_price_learning(price_learning)
+    conversation_director = getattr(ctx, "conversation_director", None) or {}
+    conversation_director_block = _render_conversation_director(
+        conversation_director
+    )
     session_strategy = getattr(ctx, "session_strategy", None) or {}
     session_strategy_block = _render_session_strategy(session_strategy)
     learned_by_key: dict[str, list] = {}
@@ -574,6 +620,8 @@ WELCOME MESSAGE (your opening style):
         fan_context_parts.append(affordability_block)
     if price_learning_block:
         fan_context_parts.append(price_learning_block)
+    if conversation_director_block:
+        fan_context_parts.append(conversation_director_block)
     if session_strategy_block:
         fan_context_parts.append(session_strategy_block)
     if notes:

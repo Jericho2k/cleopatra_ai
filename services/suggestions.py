@@ -38,6 +38,7 @@ from services.price_learning import (
     refresh_price_learning,
 )
 from services.adaptive_session_planner import plan_next_action
+from services.conversation_director import direct_conversation
 from services.session_lifecycle import (
     decrement_cooldown,
     mark_step_declined,
@@ -280,6 +281,19 @@ async def get_suggestions(
             except Exception as e:
                 print(f"[SESSION PLAN ERROR] {e}")
 
+    conversation_director = await direct_conversation(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        conversation_history=conversation_history,
+        latest_fan_message=fan_message,
+        situation=situation,
+        lifecycle=buyer_lifecycle,
+        active_session=active_session,
+        conversation_stage=conversation_stage.value,
+        trigger_type="assisted_message",
+    )
+    situation["conversation_director"] = conversation_director
+
     session_strategy = await plan_next_action(
         creator_id=creator_id,
         fan_id=fan_id,
@@ -289,6 +303,7 @@ async def get_suggestions(
         price_learning=price_learning,
         active_session=active_session,
         conversation_stage=conversation_stage.value,
+        conversation_director=conversation_director,
         trigger_type="assisted_message",
     )
     situation["session_strategy"] = session_strategy
@@ -311,6 +326,7 @@ async def get_suggestions(
         affordability=affordability,
         price_learning=price_learning,
         session_strategy=session_strategy,
+        conversation_director=conversation_director,
     )
 
     route = select_writer_route(ctx)
@@ -333,6 +349,9 @@ async def get_suggestions(
             "price_learning_confidence": price_learning.get("confidence"),
             "session_strategy_goal": session_strategy.get("goal"),
             "session_strategy_action": session_strategy.get("next_action"),
+            "conversation_director_phase": conversation_director.get("phase"),
+            "conversation_director_action": conversation_director.get("action"),
+            "conversation_director_reason": conversation_director.get("transition_reason"),
         },
         target_override=route.primary_target,
         fallback_target_override=route.fallback_target,
@@ -878,6 +897,20 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         situation["price_learning"] = price_learning
 
         decision_context = decision.model_dump(mode="json") if decision else None
+        conversation_director = await direct_conversation(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            conversation_history=conversation_history,
+            latest_fan_message=latest_message,
+            situation=situation,
+            commercial_decision=decision_context,
+            lifecycle=buyer_lifecycle,
+            active_session=active_session,
+            conversation_stage=conversation_stage.value,
+            trigger_type="auto_message",
+        )
+        situation["conversation_director"] = conversation_director
+
         session_strategy = await plan_next_action(
             creator_id=creator_id,
             fan_id=fan_id,
@@ -888,6 +921,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             price_learning=price_learning,
             active_session=active_session,
             conversation_stage=conversation_stage.value,
+            conversation_director=conversation_director,
             trigger_type="auto_message",
         )
         situation["session_strategy"] = session_strategy
@@ -910,6 +944,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             affordability=affordability,
             price_learning=price_learning,
             session_strategy=session_strategy,
+            conversation_director=conversation_director,
         )
 
         route = select_writer_route(ctx)
@@ -932,6 +967,9 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             "price_learning_confidence": price_learning.get("confidence"),
             "session_strategy_goal": session_strategy.get("goal"),
             "session_strategy_action": session_strategy.get("next_action"),
+            "conversation_director_phase": conversation_director.get("phase"),
+            "conversation_director_action": conversation_director.get("action"),
+            "conversation_director_reason": conversation_director.get("transition_reason"),
             },
             target_override=route.primary_target,
             fallback_target_override=route.fallback_target,

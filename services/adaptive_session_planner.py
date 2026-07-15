@@ -41,6 +41,7 @@ async def plan_next_action(
     price_learning: dict[str, Any] | None = None,
     active_session: dict[str, Any] | None = None,
     conversation_stage: str | None = None,
+    conversation_director: dict[str, Any] | None = None,
     trigger_type: str = "message",
 ) -> dict[str, Any]:
     if not adaptive_planner_enabled():
@@ -54,6 +55,7 @@ async def plan_next_action(
         price_learning=price_learning,
         active_session=active_session,
         conversation_stage=conversation_stage,
+        conversation_director=conversation_director,
     )
     context = strategy.to_context()
     try:
