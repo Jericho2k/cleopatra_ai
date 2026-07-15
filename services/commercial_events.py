@@ -26,6 +26,81 @@ def _money_cents(value) -> int | None:
         return None
 
 
+_PASSIVE_COMPLIMENT_RE = re.compile(
+    r"\b(cute|sexy|hot|gorgeous|beautiful|pretty|stunning|adorable|fine|"
+    r"attractive|good\s+in|look(?:s|ing)?\s+(?:so\s+)?(?:good|cute|sexy|hot))\b",
+    re.IGNORECASE,
+)
+
+_DIRECT_COMMERCIAL_INTENT_RE = re.compile(
+    r"\b("
+    r"show\s+me|send\s+me|give\s+me|let\s+me\s+see|"
+    r"can\s+i\s+(?:see|get|have|buy)|"
+    r"i\s+(?:want|wanna|need)(?:\s+to)?\b|"
+    r"want\s+(?:to\s+)?(?:see|watch|hear|buy|unlock|get)|"
+    r"more\s+(?:pics?|photos?|videos?|content)|"
+    r"(?:pics?|photos?|videos?|content|set|session|custom)\s+(?:please|now|more)|"
+    r"how\s+much|what(?:'s|\s+is)\s+the\s+price|price|unlock|buy|purchase|"
+    r"what\s+would\s+you\s+do|tell\s+me\s+what|make\s+me|"
+    r"do\s+you\s+have\s+(?:more|a\s+video|pics?|photos?|content)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _has_direct_commercial_intent(text: str) -> bool:
+    return bool(_DIRECT_COMMERCIAL_INTENT_RE.search(text or ""))
+
+
+def _is_passive_compliment(text: str) -> bool:
+    # A compliment can show warmth without asking to buy or receive anything.
+    return bool(_PASSIVE_COMPLIMENT_RE.search(text or ""))
+
+
+def _has_structured_commercial_response(out: dict) -> bool:
+    offer_response = str(out.get("offer_response") or "none").lower()
+    purchase_signal = str(out.get("purchase_signal") or "none").lower()
+    return bool(
+        offer_response not in {"", "none"}
+        or str(out.get("selected_offer_price_usd") or "").strip()
+        or str(out.get("selected_offer_position") or "").strip()
+        or str(out.get("counteroffer_usd") or "").strip()
+        or str(out.get("budget_stated_usd") or "").strip()
+        or str(out.get("current_budget_limit_usd") or "").strip()
+        or _truthy(out.get("cannot_afford_any_offer_now"))
+        or _truthy(out.get("deferred_purchase_intent"))
+        or _truthy(out.get("resend_requested"))
+        or purchase_signal in {"bought", "money_available", "declined"}
+    )
+
+
+def _normalize_compliment_only_interest(out: dict, text: str) -> None:
+    # Prevent a sexual compliment from becoming an immediate PPV request.
+    # Direct requests, accepted offers, counteroffers, budget statements,
+    # purchases, and affordability events remain untouched.
+    if not _is_passive_compliment(text):
+        return
+    if _has_direct_commercial_intent(text):
+        return
+    if _has_structured_commercial_response(out):
+        return
+
+    out["wants_explicit"] = "false"
+    out["wants_media"] = "false"
+    if str(out.get("purchase_signal") or "").lower() in {
+        "ready_to_buy",
+        "selected",
+        "uncertain",
+    }:
+        out["purchase_signal"] = "none"
+    if str(out.get("strategic_move") or "").lower() in {
+        "push_for_ppv",
+        "hint_at_content",
+    }:
+        out["strategic_move"] = "acknowledge_compliment_and_redirect"
+    out["commercial_interest_signal"] = "warm_compliment"
+
+
 def normalize_commercial_facts(
     result: dict,
     latest_message: str,
@@ -129,6 +204,7 @@ def normalize_commercial_facts(
             out["payday_raw"] = payday
             out["payday_confidence"] = 0.95
 
+    _normalize_compliment_only_interest(out, text)
     return out
 
 
@@ -157,6 +233,7 @@ def _fallback_situation() -> dict:
         "payday_confidence": 0.0,
         "budget_stated_usd": "",
         "desired_experience": "",
+        "commercial_interest_signal": "none",
     }
 
 

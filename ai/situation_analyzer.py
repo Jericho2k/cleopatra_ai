@@ -75,6 +75,18 @@ COMMERCIAL INTERPRETATION RULES:
 - declined means he refused the available offer(s), not merely that he chose the cheaper one.
 - deferred means he wants a specific offer later rather than now.
 - money_available means previously unavailable money is available now.
+- A compliment alone is NOT a content request. "you look sexy", "cute", "hot", or
+  "that last post was sexy" means wants_explicit=false, wants_media=false,
+  purchase_signal=none unless the same message directly asks to see, receive,
+  unlock, buy, or continue content.
+- wants_media=true only for a direct request for photos, video, content, a set,
+  a custom, a session, an unlock, or a clear affirmative response to an exact
+  offer.
+- wants_explicit=true only when the fan actively asks for explicit text/action,
+  describes what he wants to do or see, or directly escalates the interaction.
+  A sexual adjective by itself is warm interest, not offer readiness.
+- "show me more", "send the video", "how much", "can I see the full set", and
+  "I want you so bad" are active intent. "and sexy 🥵" by itself is not.
 
 SAFETY:
 - Crisis is not sexual roughness or consensual roleplay. Flag self_harm for plausible self-directed harm language and harm_to_others only for real intent toward a real person.
@@ -158,6 +170,7 @@ def _fallback_result() -> dict:
         "payday_confidence": 0.0,
         "budget_stated_usd": "",
         "desired_experience": "",
+        "commercial_interest_signal": "none",
     }
 
 
