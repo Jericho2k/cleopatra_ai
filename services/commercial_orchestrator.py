@@ -19,7 +19,12 @@ from models.commercial import (
     FanStatus,
     PackageOption,
 )
-from services.commercial_events import extract_events, selected_package_event, stated_budget_cents
+from services.commercial_events import (
+    augment_pending_offer_events,
+    extract_events,
+    selected_package_event,
+    stated_budget_cents,
+)
 from services.commercial_policy import CommercialContext, decide_next_action
 from services.price_learning import select_recommended_packages
 from services.payday import resolve_payday
@@ -118,6 +123,13 @@ async def orchestrate(
     state = await get_fan_state(fan_id)
     now = datetime.now(timezone.utc)
 
+    if state.status == FanStatus.OFFER_PENDING and state.offered_packages:
+        augment_pending_offer_events(
+            events,
+            str(situation.get("_latest_fan_message") or ""),
+            state.offered_packages,
+        )
+
     # Reset a consumed free allowance only after the configured cooldown has
     # genuinely elapsed. The next qualifying message can then start a new window.
     if state.free_session_ended_at:
@@ -146,15 +158,20 @@ async def orchestrate(
         price_learning,
         max_options=2 if policy.offer_two_packages else 1,
     )
-    _resolve_selected_package(events, state.offered_packages or package_options)
+    active_offer_options = (
+        state.offered_packages
+        if state.status == FanStatus.OFFER_PENDING and state.offered_packages
+        else package_options
+    )
+    _resolve_selected_package(events, active_offer_options)
 
     session = normalize_session(active_session)
     ctx = CommercialContext(
         fan_has_bought_before=fan_has_bought_before,
-        approved_sets_available=approved_sets_available and bool(package_options or state.offered_packages),
+        approved_sets_available=approved_sets_available and bool(active_offer_options),
         within_daily_caps=within_daily_caps,
         frozen_for_review=frozen_for_review,
-        package_options=package_options,
+        package_options=active_offer_options,
         now=now,
         session_exists=bool(session),
         paused_session_available=bool(session and session.get("status") == "paused"),
@@ -198,6 +215,9 @@ async def orchestrate(
             decision.selected_package_set_ids = set_ids
             decision.session_budget_cents = package.price_cents
             decision.mention_price = package.price_cents // 100
+            # Give the writer the exact selected snapshot entry, including its
+            # approved description. Selection still does not equal purchase.
+            decision.package_options = [package]
 
         if decision.action == ActionType.CREATE_PAID_SESSION and package:
             state.status = FanStatus.PAID_SESSION_ACTIVE
@@ -322,14 +342,21 @@ def _resolve_selected_package(
         return
 
     package: PackageOption | None = None
-    if event.amount_cents is not None:
-        package = min(offered_packages, key=lambda item: abs(item.price_cents - event.amount_cents))
-        if abs(package.price_cents - event.amount_cents) > 100:
-            package = None
-    elif event.package_position == "first":
-        package = offered_packages[0]
-    elif event.package_position == "second" and len(offered_packages) >= 2:
-        package = offered_packages[1]
+    package_id = str(event.metadata.get("package_id") or "")
+    if package_id:
+        package = next(
+            (item for item in offered_packages if item.package_id == package_id),
+            None,
+        )
+    if package is None:
+        if event.amount_cents is not None:
+            package = min(offered_packages, key=lambda item: abs(item.price_cents - event.amount_cents))
+            if abs(package.price_cents - event.amount_cents) > 100:
+                package = None
+        elif event.package_position == "first":
+            package = offered_packages[0]
+        elif event.package_position == "second" and len(offered_packages) >= 2:
+            package = offered_packages[1]
 
     if package:
         set_ids = list(package.set_ids or ([package.set_id] if package.set_id else []))
@@ -339,6 +366,8 @@ def _resolve_selected_package(
             "set_id": set_ids[0] if set_ids else None,
             "set_ids": set_ids,
             "label": package.label,
+            "experience": package.experience,
+            "legal_description": package.legal_description or package.experience,
         })
 
 

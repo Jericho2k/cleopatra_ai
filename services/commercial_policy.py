@@ -230,6 +230,38 @@ def decide_next_action(
             reason="offer declined without affordability pause",
         )
 
+    if state.status == FanStatus.OFFER_PENDING and state.offered_packages:
+        if _has(events, EventType.OFFER_SELECTION_AMBIGUOUS):
+            return CommercialDecision(
+                action=ActionType.PRESENT_SESSION_OPTIONS,
+                goal=(
+                    "ask one concise clarification using only the exact active "
+                    "options; do not guess which one he meant"
+                ),
+                package_options=state.offered_packages,
+                must_not_send_media=True,
+                may_be_explicit=True,
+                new_status=FanStatus.OFFER_PENDING,
+                max_messages=1,
+                conversation_continuation="required",
+                reason="pending offer selection is ambiguous",
+            )
+        if _has(events, EventType.OFFER_DETAILS_REQUESTED):
+            return CommercialDecision(
+                action=ActionType.RESUME_PREVIOUS_OFFER,
+                goal=(
+                    "explain or restate the exact active options in their original "
+                    "order; preserve every package, price and approved experience"
+                ),
+                package_options=state.offered_packages,
+                must_not_send_media=True,
+                may_be_explicit=True,
+                new_status=FanStatus.OFFER_PENDING,
+                max_messages=2,
+                conversation_continuation="required",
+                reason="pending offer detail request resumes exact snapshot",
+            )
+
     if state.status in {FanStatus.PAUSED_NO_BUDGET, FanStatus.PAUSED_UNTIL_PAYDAY}:
         if policy.sexting_mode == SextingMode.FREE_TEXT_ALLOWED and not free_mode_on_cooldown(policy, state, ctx.now):
             return CommercialDecision(

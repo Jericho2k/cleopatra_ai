@@ -45,6 +45,8 @@ class EventType(str, Enum):
     BUDGET_LIMIT_STATED = "BUDGET_LIMIT_STATED"  # accepts/limits current spend to X
     COUNTEROFFER_STATED = "COUNTEROFFER_STATED"  # explicit negotiated amount, not an offered package
     PACKAGE_SELECTED = "PACKAGE_SELECTED"
+    OFFER_DETAILS_REQUESTED = "OFFER_DETAILS_REQUESTED"
+    OFFER_SELECTION_AMBIGUOUS = "OFFER_SELECTION_AMBIGUOUS"
     OFFER_DECLINED = "OFFER_DECLINED"
     DEFERRED_PURCHASE = "DEFERRED_PURCHASE"
     READY_TO_BUY = "READY_TO_BUY"
@@ -74,6 +76,7 @@ class PackageOption(BaseModel):
     set_id: str | None = None
     set_ids: list[str] = Field(default_factory=list)
     experience: str | None = None
+    legal_description: str | None = None
 
 
 class CreatorPolicy(BaseModel):
@@ -107,6 +110,8 @@ class FanCommercialState(BaseModel):
     confirmed_budget_cents: int | None = None
     budget_source: str | None = None  # fan_explicit | package_selected
 
+    # Exact ordered offer snapshot. While OFFER_PENDING this list is immutable
+    # except when a brand-new approved offer is intentionally presented.
     offered_packages: list[PackageOption] = Field(default_factory=list)
     selected_package_id: str | None = None
     selected_package_set_id: str | None = None

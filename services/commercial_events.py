@@ -7,7 +7,7 @@ not MONEY_UNAVAILABLE.
 """
 import re
 
-from models.commercial import CommercialEvent, EventType
+from models.commercial import CommercialEvent, EventType, PackageOption
 
 
 def _truthy(value) -> bool:
@@ -46,6 +46,221 @@ _DIRECT_COMMERCIAL_INTENT_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+
+_OFFER_DETAIL_RE = re.compile(
+    r"\b("
+    r"what\s+are\s+(?:those|they|my\s+options|the\s+(?:two\s+)?options)|"
+    r"what(?:'s|\s+is)\s+(?:the\s+)?difference|"
+    r"how\s+are\s+they\s+different|"
+    r"tell\s+me\s+more(?:\s+about\s+(?:those|them|the\s+options|the\s+(?:first|second|quick|full)\s+(?:one|option|session)))?(?:\s*[?.!])?$|"
+    r"more\s+about\s+(?:those|them|the\s+options|the\s+(?:first|second|quick|full)\s+(?:one|option|session))|"
+    r"what\s+do\s+i\s+get|what\s+do\s+(?:those|they)\s+include|what(?:'s|\s+is)\s+included|"
+    r"explain\s+(?:them|those|the\s+options)|"
+    r"i(?:'m|\s+am)\s+all\s+ears|go\s+on"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_OFFER_DETAIL_QUESTION_RE = re.compile(
+    r"\b(?:what|which|how)\b.*\b(?:first|second|1st|2nd|options?|quick|full|session)\b",
+    re.IGNORECASE,
+)
+
+_GENERIC_OFFER_ACCEPT_RE = re.compile(
+    r"\b(?:i(?:'m|\s+am)\s+in|let(?:'s|\s+us)\s+do\s+it|sounds\s+good|"
+    r"i(?:'ll|\s+will)\s+take\s+it|i\s+want\s+it|deal|that\s+one|this\s+one)\b",
+    re.IGNORECASE,
+)
+
+_SELECTION_WORD_RE = re.compile(
+    r"\b(?:take|choose|pick|want|go\s+with|give\s+me|send\s+me|"
+    r"option|one|session|package|set|quick|full|cheaper|lower|higher|second|first)\b",
+    re.IGNORECASE,
+)
+
+_OFFER_TOKEN_STOPWORDS = {
+    "a", "an", "and", "at", "for", "from", "i", "in", "is", "it", "me",
+    "my", "of", "on", "one", "option", "package", "private", "session", "set",
+    "that", "the", "this", "to", "want", "with", "you", "your",
+}
+
+
+def _offer_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", str(value or "").lower())
+        if len(token) > 1 and token not in _OFFER_TOKEN_STOPWORDS
+    }
+
+
+def _event_for_package(package: PackageOption, raw_expression: str, *, reason: str) -> CommercialEvent:
+    set_ids = list(package.set_ids or ([package.set_id] if package.set_id else []))
+    return CommercialEvent(
+        type=EventType.PACKAGE_SELECTED,
+        raw_expression=raw_expression,
+        amount_cents=package.price_cents,
+        confidence=0.99,
+        metadata={
+            "package_id": package.package_id,
+            "set_id": set_ids[0] if set_ids else None,
+            "set_ids": set_ids,
+            "label": package.label,
+            "experience": package.experience,
+            "legal_description": package.legal_description or package.experience,
+            "selection_reason": reason,
+        },
+    )
+
+
+def _unique_price_package(packages: list[PackageOption], *, lowest: bool) -> PackageOption | None:
+    if not packages:
+        return None
+    target = (min if lowest else max)(package.price_cents for package in packages)
+    matches = [package for package in packages if package.price_cents == target]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _semantic_offer_match(
+    text: str,
+    packages: list[PackageOption],
+) -> tuple[PackageOption | None, bool]:
+    text_tokens = _offer_tokens(text)
+    if not text_tokens:
+        return None, False
+    scored: list[tuple[int, PackageOption]] = []
+    for package in packages:
+        package_tokens = _offer_tokens(
+            " ".join(
+                value
+                for value in (
+                    package.label,
+                    package.legal_description or "",
+                    package.experience or "",
+                )
+                if value
+            )
+        )
+        score = len(text_tokens & package_tokens)
+        if score:
+            scored.append((score, package))
+    if not scored:
+        return None, False
+    best_score = max(score for score, _ in scored)
+    best = [package for score, package in scored if score == best_score]
+    return (best[0], False) if len(best) == 1 else (None, True)
+
+
+def resolve_pending_offer_reference(
+    latest_message: str,
+    offered_packages: list[PackageOption],
+) -> tuple[PackageOption | None, bool, str]:
+    """Resolve a fan reference only against the persisted ordered snapshot.
+
+    Returns ``(package, ambiguous, reason)``. No package outside the snapshot can
+    ever be selected here.
+    """
+    text = str(latest_message or "").strip().lower()
+    if not text or not offered_packages:
+        return None, False, "no_active_snapshot"
+
+    # Exact price references are authoritative only when they uniquely match the
+    # active snapshot.
+    mentioned_cents = [value * 100 for value in _extract_money_values(text)]
+    for cents in mentioned_cents:
+        matches = [package for package in offered_packages if package.price_cents == cents]
+        if len(matches) == 1 and _SELECTION_WORD_RE.search(text):
+            return matches[0], False, "exact_price"
+        if len(matches) > 1:
+            return None, True, "duplicate_price"
+
+    if re.search(r"\b(?:first|1st)\b", text):
+        return offered_packages[0], False, "ordinal_first"
+    if re.search(r"\b(?:second|2nd)\b", text):
+        if len(offered_packages) >= 2:
+            return offered_packages[1], False, "ordinal_second"
+        return None, True, "missing_second_option"
+
+    if re.search(r"\b(?:cheaper|cheapest|lower|lowest|smaller)\b", text):
+        package = _unique_price_package(offered_packages, lowest=True)
+        return (package, package is None, "price_rank_low")
+    if re.search(r"\b(?:pricier|expensive|higher|highest|bigger|premium)\b", text):
+        package = _unique_price_package(offered_packages, lowest=False)
+        return (package, package is None, "price_rank_high")
+
+    semantic, tied = _semantic_offer_match(text, offered_packages)
+    selectionish = bool(_SELECTION_WORD_RE.search(text) or len(_offer_tokens(text)) <= 3)
+    if semantic and selectionish:
+        return semantic, False, "label_or_experience"
+    if tied and selectionish:
+        return None, True, "ambiguous_label_or_experience"
+
+    if _GENERIC_OFFER_ACCEPT_RE.search(text):
+        if len(offered_packages) == 1:
+            return offered_packages[0], False, "single_option_acceptance"
+        return None, True, "generic_reference"
+
+    return None, False, "no_selection_reference"
+
+
+def is_pending_offer_detail_request(latest_message: str) -> bool:
+    text = str(latest_message or "").strip().lower()
+    return bool(_OFFER_DETAIL_RE.search(text) or _OFFER_DETAIL_QUESTION_RE.search(text))
+
+
+def augment_pending_offer_events(
+    events: list[CommercialEvent],
+    latest_message: str,
+    offered_packages: list[PackageOption],
+) -> None:
+    """Attach the latest message to the exact persisted offer snapshot.
+
+    Detail questions outrank accidental analyzer selection. Selection references
+    are resolved deterministically by index, exact price, unique label, or unique
+    approved experience. Ambiguity is explicit and never guessed.
+    """
+    if not offered_packages:
+        return
+
+    if is_pending_offer_detail_request(latest_message):
+        events[:] = [event for event in events if event.type != EventType.PACKAGE_SELECTED]
+        if not any(event.type == EventType.OFFER_DETAILS_REQUESTED for event in events):
+            events.append(
+                CommercialEvent(
+                    type=EventType.OFFER_DETAILS_REQUESTED,
+                    raw_expression=str(latest_message or ""),
+                    confidence=0.99,
+                    metadata={"snapshot_package_ids": [p.package_id for p in offered_packages]},
+                )
+            )
+        return
+
+    package, ambiguous, reason = resolve_pending_offer_reference(
+        latest_message,
+        offered_packages,
+    )
+    existing = selected_package_event(events)
+    if package:
+        replacement = _event_for_package(package, str(latest_message or ""), reason=reason)
+        if existing:
+            events[events.index(existing)] = replacement
+        else:
+            events.append(replacement)
+        return
+
+    if ambiguous:
+        events[:] = [event for event in events if event.type != EventType.PACKAGE_SELECTED]
+        events.append(
+            CommercialEvent(
+                type=EventType.OFFER_SELECTION_AMBIGUOUS,
+                raw_expression=str(latest_message or ""),
+                confidence=0.99,
+                metadata={
+                    "reason": reason,
+                    "snapshot_package_ids": [p.package_id for p in offered_packages],
+                },
+            )
+        )
 
 
 def _has_direct_commercial_intent(text: str) -> bool:
@@ -205,6 +420,7 @@ def normalize_commercial_facts(
             out["payday_confidence"] = 0.95
 
     _normalize_compliment_only_interest(out, text)
+    out["_latest_fan_message"] = latest_message
     return out
 
 

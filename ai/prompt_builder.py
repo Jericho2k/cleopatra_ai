@@ -893,21 +893,43 @@ Return ONLY a JSON array of 3 strings. No markdown.
         options = decision.get("package_options") or []
         if options:
             rendered = []
-            for option in options:
+            for index, option in enumerate(options, start=1):
                 if isinstance(option, dict):
                     label = option.get("label") or "private experience"
                     cents = int(option.get("price_cents") or 0)
-                    experience = str(option.get("experience") or "").strip()
-                    item = f"{label}: ${cents / 100:g}"
-                    if experience:
-                        item += f" — approved experience: {experience}"
+                    legal_description = str(
+                        option.get("legal_description") or option.get("experience") or ""
+                    ).strip()
+                    item = f"{index}) {label}: ${cents / 100:g}"
+                    if legal_description:
+                        item += f" — approved experience: {legal_description}"
                     rendered.append(item)
                 else:
-                    rendered.append(f"${option}")
-            lines.append(
-                "Offer ONLY these exact options: " + "; ".join(rendered) + ". "
-                "Do not invent another price or package. Let him choose without asking his budget."
-            )
+                    rendered.append(f"{index}) ${option}")
+
+            exact_options = "; ".join(rendered)
+            if act == "CREATE_PAID_SESSION":
+                lines.append(
+                    "EXACT SELECTED OPTION: " + exact_options + ". "
+                    "This is a selection, not proof of payment. Confirm the choice naturally and "
+                    "continue only through the purchase-gated flow. Do not reopen the option menu."
+                )
+            elif act == "RESUME_PREVIOUS_OFFER":
+                lines.append(
+                    "EXACT PERSISTED OFFER SNAPSHOT, ORIGINAL ORDER: " + exact_options + ". "
+                    "Explain or restate only these options. Do not rebuild, replace, reorder, or "
+                    "rename them."
+                )
+            elif "clarification" in goal.lower() or "ambiguous" in str(decision.get("reason") or "").lower():
+                lines.append(
+                    "EXACT ACTIVE OPTIONS, ORIGINAL ORDER: " + exact_options + ". "
+                    "Ask one concise clarification that distinguishes only these options. Do not guess."
+                )
+            else:
+                lines.append(
+                    "Offer ONLY these exact ordered options: " + exact_options + ". "
+                    "Do not invent another price or package. Let him choose without asking his budget."
+                )
             lines.append(
                 "The approved experience descriptions above are the only concrete content you may "
                 "tease or promise. Do not name a requested theme unless it appears in an approved "

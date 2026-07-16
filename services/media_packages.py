@@ -252,13 +252,15 @@ def package_from_sequence(
     if not sequence:
         return None
     set_ids = [str(row["id"]) for row in sequence]
+    legal_description = describe_sequence(sequence)
     return PackageOption(
         package_id=f"package:{package_key}:{'-'.join(set_ids)}",
         label=label,
         price_cents=resolve_sequence_price(sequence, int(target_cents)),
         set_id=set_ids[0],
         set_ids=set_ids,
-        experience=describe_sequence(sequence),
+        experience=legal_description,
+        legal_description=legal_description,
     )
 
 

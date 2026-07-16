@@ -176,14 +176,23 @@ def derive_session_strategy(
     if action == "CREATE_PAID_SESSION":
         return SessionStrategy(
             goal=SessionGoal.CLOSE,
-            phase="PURCHASE_CONFIRMED",
+            phase="OFFER_SELECTED",
             next_action=NextBestAction.CREATE_PAID_SESSION,
-            writer_goal="confirm the exact approved selection and move into delivery",
-            writer_avoid=["renegotiation", "different package", "different price", "extra qualification"],
+            writer_goal=(
+                "confirm the exact approved selection and start only the purchase-gated "
+                "offer flow; do not describe it as already purchased"
+            ),
+            writer_avoid=[
+                "claiming payment is confirmed",
+                "renegotiation",
+                "different package",
+                "different price",
+                "extra qualification",
+            ],
             must_not_ask_question=True,
             max_messages=2,
             route_hint="commercial_complex",
-            reason_codes=["approved_offer_selected"],
+            reason_codes=["approved_offer_selected", "selection_is_not_purchase"],
             **shared,
         )
 
@@ -227,6 +236,27 @@ def derive_session_strategy(
         )
 
     if action == "RESUME_PREVIOUS_OFFER":
+        if offer_ids:
+            return SessionStrategy(
+                goal=SessionGoal.PRESENT_OFFER,
+                phase="OFFER",
+                next_action=NextBestAction.PRESENT_APPROVED_OPTIONS,
+                writer_goal=(
+                    "explain or restate the exact persisted approved options in their "
+                    "original order"
+                ),
+                writer_avoid=[
+                    "new package",
+                    "new price",
+                    "reordered options",
+                    "invented content",
+                    "rapport reset",
+                ],
+                max_messages=2,
+                route_hint="commercial_complex",
+                reason_codes=["pending_offer_snapshot_continuity"],
+                **shared,
+            )
         return SessionStrategy(
             goal=SessionGoal.CLOSE,
             phase="REENGAGEMENT",
