@@ -20,6 +20,84 @@ def normalize_text(value: Any) -> str:
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return " ".join(text.split())
 
+_EXPERIENCE_STOPWORDS = {
+    "a", "an", "and", "at", "be", "can", "content", "do", "for",
+    "from", "have", "her", "him", "i", "in", "it", "me", "more",
+    "my", "of", "on", "one", "pics", "pictures", "please", "private",
+    "send", "session", "set", "show", "something", "the", "this",
+    "to", "video", "videos", "want", "wanted", "wants", "wanna",
+    "with", "you", "your",
+}
+
+
+def experience_tokens(value: Any) -> set[str]:
+    """Return the meaningful semantic tokens in a requested experience."""
+    return {
+        token
+        for token in normalize_text(value).split()
+        if len(token) > 1 and token not in _EXPERIENCE_STOPWORDS
+    }
+
+
+def row_experience_tokens(row: dict[str, Any]) -> set[str]:
+    values = [
+        row.get("title"),
+        row.get("location"),
+        row.get("outfit"),
+        *(row.get("tags") or []),
+    ]
+    return {
+        token
+        for value in values
+        for token in normalize_text(value).split()
+        if len(token) > 1
+    }
+
+
+def sequence_intent_score(
+    sequence: list[dict[str, Any]],
+    desired_experience: str | None,
+) -> float:
+    """Score a coherent sequence against the fan's current concrete request.
+
+    A positive match is deliberately much stronger than price proximity. Price
+    targets are soft; a requested shower set must not silently become a cheaper
+    unrelated set merely because the latter is closer to the default target.
+    """
+    desired = experience_tokens(desired_experience)
+    if not desired:
+        return 0.0
+    available = {token for row in sequence for token in row_experience_tokens(row)}
+    overlap = desired & available
+    if not overlap:
+        return 0.0
+    coverage = len(overlap) / len(desired)
+    return (coverage * 8.0) + (len(overlap) * 2.0)
+
+
+def _clean_experience_part(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\b(level|lvl|part|set|scene|bundle)\s*\d+\b", "", text, flags=re.I)
+    return " ".join(text.split()).strip(" -·|—,")
+
+
+def describe_sequence(sequence: list[dict[str, Any]]) -> str | None:
+    """Produce writer-safe semantic context for the exact approved package."""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for row in sequence:
+        raw_title = str(row.get("title") or "")
+        title_stem = re.split(r"\s*[·|—]\s*", raw_title, maxsplit=1)[0]
+        values = [title_stem, row.get("location"), row.get("outfit"), *(row.get("tags") or [])]
+        for value in values:
+            cleaned = _clean_experience_part(value)
+            key = cleaned.lower()
+            if not cleaned or key in seen:
+                continue
+            seen.add(key)
+            parts.append(cleaned)
+    return ", ".join(parts)[:240] or None
+
 
 def continuity_key(row: dict[str, Any]) -> str:
     location = normalize_text(row.get("location"))
@@ -87,6 +165,8 @@ def choose_sequence(
     max_steps: int,
     preferred_tags: list[str] | None = None,
     excluded_set_ids: set[str] | None = None,
+    desired_experience: str | None = None,
+    hard_ceiling_cents: int | None = None,
 ) -> list[dict[str, Any]]:
     excluded = excluded_set_ids or set()
     preferred = {normalize_text(tag) for tag in (preferred_tags or []) if normalize_text(tag)}
@@ -94,7 +174,10 @@ def choose_sequence(
     if not candidates:
         return []
 
+    ceiling = int(hard_ceiling_cents) if hard_ceiling_cents else None
+    effective_target = min(target_cents, ceiling) if ceiling else target_cents
     best: tuple[float, list[dict[str, Any]]] | None = None
+
     for group in group_coherent_sets(candidates):
         upper = min(max(1, max_steps), len(group))
         lower = min(max(1, min_steps), upper)
@@ -103,8 +186,12 @@ def choose_sequence(
             # contiguous window avoids stitching unrelated sub-shoots together.
             for start in range(0, len(group) - count + 1):
                 sequence = group[start : start + count]
+                resolved_price = resolve_sequence_price(sequence, effective_target)
+                if ceiling is not None and resolved_price > ceiling:
+                    continue
+
                 raw_total = sum(price_cents(row) for row in sequence)
-                distance = abs(raw_total - target_cents) / max(target_cents, 1)
+                distance = abs(raw_total - effective_target) / max(effective_target, 1)
                 continuity_bonus = 0.35 * (count - 1)
                 tag_overlap = 0
                 if preferred:
@@ -115,16 +202,18 @@ def choose_sequence(
                         if normalize_text(tag)
                     }
                     tag_overlap = len(preferred & sequence_tags)
-                score = tag_overlap * 2.0 + continuity_bonus - distance
+
+                # A concrete current request is an offer anchor, not a mild
+                # preference. The large multiplier makes semantic fulfilment
+                # outrank closeness to a soft package target.
+                intent_score = sequence_intent_score(sequence, desired_experience)
+                score = intent_score * 100.0 + tag_overlap * 2.0 + continuity_bonus - distance
                 if best is None or score > best[0]:
                     best = (score, sequence)
 
-    # If no group can satisfy the requested minimum, prefer the strongest single
-    # coherent set instead of inventing continuity.
-    if best is None:
-        row = min(candidates, key=lambda item: abs(price_cents(item) - target_cents))
-        return [row]
-    return best[1]
+    # A real explicit current ceiling may make every approved sequence
+    # unavailable. Returning no package is safer than silently breaking it.
+    return best[1] if best else []
 
 
 def allocate_budget(total_cents: int, rows: list[dict[str, Any]]) -> list[int]:
@@ -163,15 +252,13 @@ def package_from_sequence(
     if not sequence:
         return None
     set_ids = [str(row["id"]) for row in sequence]
-    tags = [str(tag) for row in sequence for tag in (row.get("tags") or [])]
-    experience = ", ".join(dict.fromkeys(tags))[:200] or None
     return PackageOption(
         package_id=f"package:{package_key}:{'-'.join(set_ids)}",
         label=label,
         price_cents=resolve_sequence_price(sequence, int(target_cents)),
         set_id=set_ids[0],
         set_ids=set_ids,
-        experience=experience,
+        experience=describe_sequence(sequence),
     )
 
 
@@ -181,18 +268,25 @@ def build_offer_packages(
     *,
     preferred_tags: list[str] | None = None,
     price_learning: dict[str, Any] | None = None,
+    desired_experience: str | None = None,
+    hard_ceiling_cents: int | None = None,
 ) -> list[PackageOption]:
     if not rows:
         return []
+
     quick_target_cents = approved_target_from_learning(
         price_learning, fallback_cents=policy.quick_package_target_cents
     )
+    if hard_ceiling_cents:
+        quick_target_cents = min(quick_target_cents, int(hard_ceiling_cents))
     quick_sequence = choose_sequence(
         rows,
         target_cents=quick_target_cents,
         min_steps=policy.session_min_steps,
         max_steps=min(policy.session_max_steps, 3),
         preferred_tags=preferred_tags,
+        desired_experience=desired_experience,
+        hard_ceiling_cents=hard_ceiling_cents,
     )
     quick = package_from_sequence(
         quick_sequence,
@@ -210,12 +304,16 @@ def build_offer_packages(
             fallback_cents=policy.full_package_target_cents,
             use_ceiling=True,
         )
+        if hard_ceiling_cents:
+            full_target_cents = min(full_target_cents, int(hard_ceiling_cents))
         full_sequence = choose_sequence(
             rows,
             target_cents=full_target_cents,
             min_steps=max(policy.session_min_steps, len(quick_sequence) + 1),
             max_steps=policy.session_max_steps,
             preferred_tags=preferred_tags,
+            desired_experience=desired_experience,
+            hard_ceiling_cents=hard_ceiling_cents,
         )
         full = package_from_sequence(
             full_sequence,

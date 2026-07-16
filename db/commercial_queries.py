@@ -130,6 +130,8 @@ async def get_offerable_packages(
     fan_id: str,
     policy: CreatorPolicy,
     price_learning: dict | None = None,
+    desired_experience: str | None = None,
+    hard_ceiling_cents: int | None = None,
 ) -> list[PackageOption]:
     """Build up to two coherent, multi-step packages from approved vault sets."""
     def _get():
@@ -188,7 +190,12 @@ async def get_offerable_packages(
 
     rows, preferred_tags = await asyncio.to_thread(_get)
     return build_offer_packages(
-        rows, policy, preferred_tags=preferred_tags, price_learning=price_learning
+        rows,
+        policy,
+        preferred_tags=preferred_tags,
+        price_learning=price_learning,
+        desired_experience=desired_experience,
+        hard_ceiling_cents=hard_ceiling_cents,
     )
 
 

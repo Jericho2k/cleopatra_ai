@@ -70,6 +70,37 @@ def _augment_events_with_safe_learned_context(
         )
 
 
+def _current_hard_ceiling(
+    situation: dict,
+    events: list[CommercialEvent],
+) -> int | None:
+    """Return only an explicit, current affordability ceiling.
+
+    Historical purchases and price-learning estimates are intentionally ignored.
+    """
+    affordability = situation.get("affordability") or {}
+    values = [
+        affordability.get("current_limit_cents"),
+        affordability.get("current_available_cents"),
+    ]
+    for event in events:
+        if event.type in {
+            EventType.BUDGET_STATED,
+            EventType.BUDGET_LIMIT_STATED,
+            EventType.COUNTEROFFER_STATED,
+        }:
+            values.append(event.amount_cents)
+    parsed: list[int] = []
+    for value in values:
+        try:
+            cents = int(value)
+        except (TypeError, ValueError):
+            continue
+        if cents > 0:
+            parsed.append(cents)
+    return min(parsed) if parsed else None
+
+
 async def orchestrate(
     creator_id: str,
     fan_id: str,
@@ -99,8 +130,16 @@ async def orchestrate(
             state.free_session_ended_at = None
 
     price_learning = situation.get("price_learning") or {}
+    current_desired = str(situation.get("desired_experience") or "").strip()
+    desired_experience = current_desired or str(state.desired_experience or "").strip()
+    hard_ceiling_cents = _current_hard_ceiling(situation, events)
     package_options = await get_offerable_packages(
-        creator_id, fan_id, policy, price_learning=price_learning
+        creator_id,
+        fan_id,
+        policy,
+        price_learning=price_learning,
+        desired_experience=desired_experience or None,
+        hard_ceiling_cents=hard_ceiling_cents,
     )
     package_options = select_recommended_packages(
         package_options,
@@ -128,9 +167,8 @@ async def orchestrate(
     if decision.new_status:
         state.status = decision.new_status
 
-    desired = str(situation.get("desired_experience") or "").strip()
-    if desired:
-        state.desired_experience = desired
+    if current_desired:
+        state.desired_experience = current_desired
 
     if decision.action in {ActionType.PRESENT_SESSION_OPTIONS, ActionType.END_TEASER_AND_OFFER}:
         state.offered_packages = decision.package_options

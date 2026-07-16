@@ -897,17 +897,29 @@ Return ONLY a JSON array of 3 strings. No markdown.
                 if isinstance(option, dict):
                     label = option.get("label") or "private experience"
                     cents = int(option.get("price_cents") or 0)
-                    rendered.append(f"{label}: ${cents / 100:g}")
+                    experience = str(option.get("experience") or "").strip()
+                    item = f"{label}: ${cents / 100:g}"
+                    if experience:
+                        item += f" — approved experience: {experience}"
+                    rendered.append(item)
                 else:
                     rendered.append(f"${option}")
             lines.append(
                 "Offer ONLY these exact options: " + "; ".join(rendered) + ". "
                 "Do not invent another price or package. Let him choose without asking his budget."
             )
+            lines.append(
+                "The approved experience descriptions above are the only concrete content you may "
+                "tease or promise. Do not name a requested theme unless it appears in an approved "
+                "experience; otherwise stay generic or present the approved alternative honestly."
+            )
         if decision.get("mention_price") is not None:
             lines.append(f"The exact price is ${decision['mention_price']}.")
         if decision.get("mention_previous_interest"):
-            lines.append("Reference the specific experience he wanted earlier.")
+            lines.append(
+                "Reference his earlier interest only when it matches an approved experience above; "
+                "otherwise do not name or promise that theme."
+            )
         if decision.get("must_not_ask_question"):
             lines.append("Do not ask a question in this response.")
         max_messages = decision.get("max_messages")
