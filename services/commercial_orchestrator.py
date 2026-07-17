@@ -220,7 +220,9 @@ async def orchestrate(
             decision.package_options = [package]
 
         if decision.action == ActionType.CREATE_PAID_SESSION and package:
-            state.status = FanStatus.PAID_SESSION_ACTIVE
+            # Selection authorizes creation of a locked PPV. It is not a paid
+            # session until the platform confirms the unlock.
+            state.status = FanStatus.OFFER_SELECTED
             state.free_session_ended_at = now if state.free_session_started_at else state.free_session_ended_at
             try:
                 await clear_fan_decline_lock(fan_id)

@@ -158,21 +158,6 @@ def derive_session_strategy(
             **shared,
         )
 
-    if action == "SEND_NEXT_PPV_STEP" or (
-        active_session.get("status") == "active" and active_session.get("awaiting_purchase_index") is None
-    ):
-        return SessionStrategy(
-            goal=SessionGoal.DELIVER,
-            phase="PAID_SESSION",
-            next_action=NextBestAction.SEND_NEXT_STEP,
-            writer_goal="continue the approved paid progression without changing price or content",
-            writer_avoid=["new package", "discount", "unapproved media", "price change"],
-            must_not_ask_question=True,
-            route_hint="commercial_complex",
-            reason_codes=["active_paid_session"],
-            **shared,
-        )
-
     if action == "CREATE_PAID_SESSION":
         return SessionStrategy(
             goal=SessionGoal.CLOSE,
@@ -193,6 +178,72 @@ def derive_session_strategy(
             max_messages=2,
             route_hint="commercial_complex",
             reason_codes=["approved_offer_selected", "selection_is_not_purchase"],
+            **shared,
+        )
+
+    if (
+        active_session.get("status") == "active"
+        and active_session.get("awaiting_purchase_index") is not None
+    ):
+        return SessionStrategy(
+            goal=SessionGoal.HOLD,
+            phase="PAYMENT_PENDING",
+            next_action=NextBestAction.CONTINUE_CHAT,
+            writer_goal=(
+                "stay natural while the selected PPV remains locked; never imply it was "
+                "purchased, opened, seen, or enjoyed"
+            ),
+            writer_avoid=[
+                "reaction to unseen content",
+                "another PPV",
+                "delivery language",
+                "claiming payment",
+            ],
+            must_not_ask_question=True,
+            max_messages=1,
+            route_hint="commercial_complex",
+            reason_codes=["payment_pending_unlock_confirmation"],
+            **shared,
+        )
+
+    if (
+        action == "SEND_NEXT_PPV_STEP"
+        and _enum_value(decision.get("new_status")) == "OFFER_SELECTED"
+    ):
+        return SessionStrategy(
+            goal=SessionGoal.CLOSE,
+            phase="OFFER_SELECTED",
+            next_action=NextBestAction.SEND_NEXT_STEP,
+            writer_goal=(
+                "send the exact selected step as a locked purchase-gated PPV; "
+                "do not describe it as already purchased or delivered"
+            ),
+            writer_avoid=[
+                "claiming payment is confirmed",
+                "reaction to unseen content",
+                "different package",
+                "different price",
+            ],
+            must_not_ask_question=True,
+            max_messages=1,
+            route_hint="commercial_complex",
+            reason_codes=["recovered_selected_ppv", "selection_is_not_purchase"],
+            **shared,
+        )
+
+    if action == "SEND_NEXT_PPV_STEP" or (
+        active_session.get("status") == "active"
+        and active_session.get("awaiting_purchase_index") is None
+    ):
+        return SessionStrategy(
+            goal=SessionGoal.DELIVER,
+            phase="PAID_SESSION",
+            next_action=NextBestAction.SEND_NEXT_STEP,
+            writer_goal="continue the approved paid progression without changing price or content",
+            writer_avoid=["new package", "discount", "unapproved media", "price change"],
+            must_not_ask_question=True,
+            route_hint="commercial_complex",
+            reason_codes=["active_paid_session"],
             **shared,
         )
 

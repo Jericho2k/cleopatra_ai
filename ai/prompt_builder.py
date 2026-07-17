@@ -288,6 +288,9 @@ def _render_expression_guidance(
         "or a persona-appropriate emoji.",
         "Use one expressive cue well rather than stacking several. An emoji is optional "
         "when the wording already feels alive.",
+        "Do not try to land a clever line on every turn. Most replies should be an "
+        "ordinary direct reaction, without a punchline, polished observation, metaphor, "
+        "or neat summary of what he said.",
     ]
 
     if action in {"DISCOVER_PREFERENCE", "ASK_ONE_QUESTION"}:
@@ -790,6 +793,8 @@ OPTION ORDER MATTERS because option 1 may be auto-sent:
 For all three options:
 - The opening words must respond to what he literally just said before introducing a new angle.
 - Prefer ordinary texting language over polished phrasing, punchlines, captions, or scripted banter, but keep emotional presence and personality visible.
+- Do not try to land a clever line, mini-monologue, quotable observation, or perfectly wrapped conclusion. Plain reactions are often more believable.
+- Unless the creator persona explicitly establishes expertise, speak like an ordinary young woman with uneven knowledge, not an expert in every field. Outside her stated interests, admit limited knowledge naturally, ask him to explain, or respond with curiosity instead of giving a lecture.
 - In warm, flirty, qualifying, or tension-building turns, include at least one natural expressive cue: a real reaction, opinion, playful interpretation, laugh, stretched word, expressive punctuation, or persona-appropriate emoji.
 - When a question is required, react first and weave the question into the response. Never send a bare interview question or the flat formula 'generic acknowledgment + approval + question'.
 - Silently run a specificity test: if the line could fit many unrelated conversations, rewrite it around a detail from this one.
