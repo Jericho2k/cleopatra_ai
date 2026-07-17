@@ -9,6 +9,7 @@ import json
 import os
 import random
 import re
+import uuid
 
 import httpx
 
@@ -21,9 +22,19 @@ from ai.prompt_builder import build_prompt
 from services.commercial_orchestrator import orchestrate
 from models.commercial import ActionType, FanStatus
 from db.fan_intelligence_queries import get_fan_intelligence_context
-from db.commercial_queries import get_creator_policy, get_fan_state, save_fan_state
+from db.commercial_queries import (
+    cancel_actions_for_fan,
+    get_creator_policy,
+    get_fan_state,
+    save_fan_state,
+    schedule_action,
+)
 from services.session_planner import plan_session_for_fan
 from services.human_delivery import build_delivery_schedule
+from services.followup_lifecycle import (
+    complete_session_state,
+    next_reconcile_at,
+)
 from services.fan_intelligence import learn_from_fan_message
 from services.affordability import (
     get_affordability_context,
@@ -745,7 +756,11 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             and _fan_wants_content(latest_message, situation)
         )
 
-        if not active_session and should_plan:
+        session_is_executable = bool(
+            active_session
+            and active_session.get("status") in {"active", "paused"}
+        )
+        if not session_is_executable and should_plan:
             cap_ok, cap_reason = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
             if not cap_ok:
                 print(f"[CAP] fan={fan_id} plan suppressed: {cap_reason}")
@@ -1080,6 +1095,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 ppv_match = None
                 part = re.sub(r"\[PPV:[^\]]+\]", "", part).strip()
             if ppv_match:
+                delivery_reference = uuid.uuid4().hex
                 text_out = part[: ppv_match.start()].strip()
                 media_id = ppv_match.group(1)
                 price = float(ppv_match.group(2))
@@ -1110,68 +1126,24 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         "access_type": "ppv",
                         "set_id": (current_step or {}).get("set_id"),
                         "step_index": (active_session or {}).get("current_index"),
+                        "payment_reference": delivery_reference,
                     }
                 }
             else:
                 text_out = re.sub(r"\[PPV:[^\]]+\]", "", part).strip()
                 ppv_media_context = None
 
-            await save_message(
-                fan_id=fan_id,
-                creator_id=creator_id,
-                role="creator",
-                content=text_out,
-                was_ai_suggested=True,
-                media_context=ppv_media_context,
-            )
-
-            # After PPV sent: store the pending purchase check. Any reaction
-            # follow-up is purchase-gated and is scheduled only after confirmation.
-            if ppv_match:
-                try:
-                    db = get_supabase()
-                    await asyncio.to_thread(
-                        lambda mid=media_id, pr=price: db.table("fans").update({
-                            "pending_ppv_check": {
-                                "media_id": mid,
-                                "media_ids": media_ids,
-                                "set_id": (current_step or {}).get("set_id"),
-                                "step_index": (active_session or {}).get("current_index"),
-                                "price": pr,
-                                "sent_at": __import__("datetime").datetime.utcnow().isoformat(),
-                            }
-                        }).eq("id", fan_id).execute()
-                    )
-                    print(
-                        f"[PAYMENT] fan={fan_id} state=PAYMENT_PENDING "
-                        f"media={media_id} price={price}"
-                    )
-                except Exception as e:
-                    print(f"[PPV PENDING ERROR] {e}")
-
-            # Sending creates a purchase gate. The plan advances only after a
-            # confirmed purchase webhook, never merely because media was sent.
-            if ppv_match and active_session:
-                try:
-                    session = await get_fan_session(fan_id)
-                    if session:
-                        session = mark_step_sent(session)
-                        await save_fan_session(fan_id, session)
-                        active_session = session
-                        state = await get_fan_state(fan_id)
-                        state.status = FanStatus.PAYMENT_PENDING
-                        await save_fan_state(fan_id, creator_id, state)
-                        print(
-                            f"[SESSION] sent step={session.get('awaiting_purchase_index')} "
-                            f"fan={fan_id}; state=PAYMENT_PENDING awaiting confirmed unlock"
-                        )
-                except Exception as exc:
-                    print(f"[SESSION SEND STATE ERROR] {exc}")
-
-            if group_id and apifansly_account_id:
+            # Platform acceptance is authoritative. Never create a local sent
+            # message or PAYMENT_PENDING state for a delivery that failed.
+            if not group_id or not apifansly_account_id:
+                print(f"[AUTO DELIVERY ERROR] fan={fan_id}: no live delivery route")
                 if ppv_match:
-                    # Fansly requires non-empty content — use text_out if present,
-                    # otherwise fall back to a natural delivery line
+                    await freeze_fan_for_review(fan_id, "ppv_delivery_route_missing")
+                return
+
+            platform_message_id = None
+            try:
+                if ppv_match:
                     ppv_content = text_out if text_out else random.choice([
                         "here it is 😏",
                         "just for you...",
@@ -1187,18 +1159,120 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                             },
                             json={
                                 "content": ppv_content,
-                                "mediaIds": media_ids,   # bundle — confirm apifansly's multi-media field name later
-                                "mediaId": media_id,     # fallback for single-media
+                                "mediaIds": media_ids,
+                                "mediaId": media_id,
                                 "access_type": "ppv",
                                 "price": price,
                             },
                             timeout=10,
                         )
-                    print(f"[PPV SEND] status={ppv_resp.status_code} media={media_id} price={price} body={ppv_resp.text[:300]}")
+                    ppv_resp.raise_for_status()
+                    try:
+                        response_body = ppv_resp.json()
+                        platform_message_id = str(
+                            response_body.get("id")
+                            or response_body.get("data", {}).get("id")
+                            or ""
+                        ) or None
+                    except Exception:
+                        platform_message_id = None
+                    print(
+                        f"[PPV SEND] status={ppv_resp.status_code} media={media_id} "
+                        f"price={price} reference={delivery_reference}"
+                    )
                 else:
                     from main import send_fansly_message
 
-                    await send_fansly_message(apifansly_account_id, str(group_id), text_out)
+                    delivered = await send_fansly_message(
+                        apifansly_account_id, str(group_id), text_out
+                    )
+                    if not delivered:
+                        raise RuntimeError("platform rejected text delivery")
+            except Exception as exc:
+                print(f"[AUTO DELIVERY ERROR] fan={fan_id}: {exc}")
+                if ppv_match:
+                    await freeze_fan_for_review(fan_id, "ppv_send_failed")
+                return
+
+            try:
+                await save_message(
+                    fan_id=fan_id,
+                    creator_id=creator_id,
+                    role="creator",
+                    content=text_out,
+                    was_ai_suggested=True,
+                    media_context=ppv_media_context,
+                )
+            except Exception as exc:
+                # Delivery already happened. Freeze rather than retrying and
+                # risking a duplicate message on the live account.
+                await freeze_fan_for_review(fan_id, "delivery_sent_but_not_persisted")
+                print(f"[AUTO PERSIST ERROR] fan={fan_id}: {exc}")
+                return
+
+            if ppv_match:
+                try:
+                    from datetime import datetime, timedelta, timezone
+
+                    policy = await get_creator_policy(creator_id)
+                    sent_at = datetime.now(timezone.utc)
+                    expires_at = sent_at + timedelta(
+                        hours=policy.ppv_payment_window_hours
+                    )
+                    pending_check = {
+                        "reference": delivery_reference,
+                        "media_id": media_id,
+                        "media_ids": media_ids,
+                        "set_id": (current_step or {}).get("set_id"),
+                        "step_index": (active_session or {}).get("current_index"),
+                        "price": price,
+                        "sent_at": sent_at.isoformat(),
+                        "expires_at": expires_at.isoformat(),
+                        "verification_attempts": 0,
+                        "platform_message_id": platform_message_id,
+                    }
+                    db = get_supabase()
+                    await asyncio.to_thread(
+                        lambda: db.table("fans").update({
+                            "pending_ppv_check": pending_check
+                        }).eq("id", fan_id).execute()
+                    )
+
+                    session = await get_fan_session(fan_id)
+                    if session:
+                        session = mark_step_sent(
+                            session,
+                            message_id=platform_message_id,
+                        )
+                        await save_fan_session(fan_id, session)
+                        active_session = session
+
+                    state = await get_fan_state(fan_id)
+                    state.status = FanStatus.PAYMENT_PENDING
+                    await save_fan_state(fan_id, creator_id, state)
+
+                    reconcile_at = next_reconcile_at(
+                        sent_at,
+                        expires_at=expires_at,
+                        recheck_minutes=policy.ppv_recheck_minutes,
+                    )
+                    await schedule_action(
+                        creator_id=creator_id,
+                        fan_id=fan_id,
+                        action_type="PPV_RECONCILE",
+                        execute_at=reconcile_at,
+                        payload={"payment_reference": delivery_reference},
+                        dedupe_key=f"ppv-reconcile:{fan_id}:{delivery_reference}",
+                    )
+                    print(
+                        f"[PAYMENT] fan={fan_id} state=PAYMENT_PENDING "
+                        f"reference={delivery_reference} reconcile_at={reconcile_at.isoformat()} "
+                        f"expires_at={expires_at.isoformat()}"
+                    )
+                except Exception as exc:
+                    await freeze_fan_for_review(fan_id, "ppv_sent_but_reconciliation_not_persisted")
+                    print(f"[PPV PERSIST ERROR] fan={fan_id}: {exc}")
+                    return
 
             print(f"[AUTO REPLY] Sent part {i+1}: {text_out[:50]}")
 
@@ -1245,10 +1319,21 @@ async def _send_post_purchase_reaction(fan_id: str, creator_id: str) -> None:
         group_id = (fan_row.data or {}).get("fansly_group_id")
         account_id = (creator_row.data or {}).get("apifansly_account_id")
         line = random.choice(_REACTION_FISHING_LINES)
-        await save_message(fan_id, creator_id, "creator", line, was_ai_suggested=True)
-        if group_id and account_id:
-            from main import send_fansly_message
-            await send_fansly_message(account_id, str(group_id), line)
+        if not group_id or not account_id:
+            print(f"[PPV REACTION] fan={fan_id} skipped=no_live_delivery_route")
+            return
+        from main import send_fansly_message
+
+        delivered = await send_fansly_message(account_id, str(group_id), line)
+        if not delivered:
+            print(f"[PPV REACTION] fan={fan_id} skipped=platform_rejected")
+            return
+        try:
+            await save_message(fan_id, creator_id, "creator", line, was_ai_suggested=True)
+        except Exception as exc:
+            await freeze_fan_for_review(fan_id, "reaction_sent_but_not_persisted")
+            print(f"[PPV REACTION PERSIST ERROR] fan={fan_id}: {exc}")
+            return
         print(f"[PPV REACTION] fan={fan_id} purchase_confirmed=true line={line}")
     except Exception as e:
         print(f"[PPV REACTION ERROR] {e}")
@@ -1277,6 +1362,8 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
     sales_log = list(row.get("sales_log") or [])
     not_sold = list(row.get("not_sold_log") or [])
     pending = row.get("pending_ppv_check") or {}
+    completed_session: dict | None = None
+    lifecycle_context: dict = {}
 
     session = await get_fan_session(fan_id)
     if amount is None:
@@ -1318,6 +1405,9 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
         }).eq("id", fan_id).execute()
     )
     await mark_ppv_purchased(fan_id, str(media_id))
+    if creator_id:
+        await cancel_actions_for_fan(fan_id, "PPV_RECONCILE")
+        await cancel_actions_for_fan(fan_id, "ABANDONED_PPV_FOLLOWUP")
     if creator_id and not already_recorded:
         try:
             await record_confirmed_purchase(
@@ -1341,21 +1431,54 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
                 cooldown_messages=policy.post_purchase_cooldown_messages,
             )
             state = await get_fan_state(fan_id)
+            if state.next_followup_type == "ABANDONED_PPV_FOLLOWUP":
+                state.next_followup_at = None
+                state.next_followup_type = None
+                state.next_followup_payload = {}
+                state.next_followup_dedupe_key = None
             if completed:
                 from datetime import datetime, timezone
-                state.status = FanStatus.IDLE
-                state.last_session_completed_at = datetime.now(timezone.utc)
-                state.last_session_revenue_cents = int(updated.get("revenue_cents", 0) or 0)
-                state.confirmed_budget_cents = None
-                state.budget_source = None
-                state.offered_packages = []
-                state.selected_package_id = None
-                state.selected_package_set_id = None
-                state.selected_package_set_ids = []
-                state.selected_package_label = None
-                state.selected_package_price_cents = None
+                completed_session = updated
+                await save_fan_session(fan_id, updated)
+                lifecycle_context = await refresh_fan_lifecycle(
+                    creator_id=creator_id,
+                    fan_id=fan_id,
+                    active_session=None,
+                    trigger_type="session_completed",
+                )
+                state, followup_obligation = complete_session_state(
+                    state,
+                    updated,
+                    policy=policy,
+                    fan_id=fan_id,
+                    buyer_stage=str(lifecycle_context.get("stage") or "UNKNOWN"),
+                    now=datetime.now(timezone.utc),
+                )
+
+                # Persist the obligation before clearing the completed executable
+                # session. The worker can recreate a missing action after a restart.
+                await save_fan_state(fan_id, creator_id, state)
                 await save_fan_session(fan_id, None)
-                print(f"[SESSION] completed fan={fan_id} revenue_cents={state.last_session_revenue_cents}")
+                if followup_obligation:
+                    try:
+                        await schedule_action(
+                            creator_id=creator_id,
+                            fan_id=fan_id,
+                            action_type=followup_obligation.action_type,
+                            execute_at=followup_obligation.execute_at,
+                            payload=followup_obligation.payload,
+                            dedupe_key=followup_obligation.dedupe_key,
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[FOLLOWUP REPAIR NEEDED] fan={fan_id} "
+                            f"type=POST_SESSION_FOLLOWUP error={exc}"
+                        )
+                print(
+                    f"[SESSION] completed fan={fan_id} "
+                    f"revenue_cents={state.last_session_revenue_cents} "
+                    f"followup_at={state.next_followup_at}"
+                )
             else:
                 state.status = FanStatus.PAID_SESSION_ACTIVE
                 await save_fan_session(fan_id, updated)
@@ -1363,11 +1486,13 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
                     f"[SESSION] purchase confirmed fan={fan_id}; "
                     f"next={updated.get('current_index')}/{len(updated.get('plan') or [])}"
                 )
-            await save_fan_state(fan_id, creator_id, state)
+                await save_fan_state(fan_id, creator_id, state)
         except Exception as exc:
             # Purchase accounting remains recorded; lifecycle mismatch is loudly
             # logged for human review rather than double-charging on a retry.
+            await freeze_fan_for_review(fan_id, "session_purchase_reconcile_failed")
             print(f"[SESSION PURCHASE RECONCILE ERROR] fan={fan_id}: {exc}")
+            raise
 
     if creator_id and not already_recorded:
         spawn(
@@ -1387,12 +1512,13 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
             print(f"[WHALE HANDOFF ERROR] fan={fan_id} error={exc}")
 
     if creator_id:
-        await refresh_fan_lifecycle(
-            creator_id=creator_id,
-            fan_id=fan_id,
-            active_session=await get_fan_session(fan_id),
-            trigger_type="purchase_confirmed",
-        )
+        if completed_session is None:
+            await refresh_fan_lifecycle(
+                creator_id=creator_id,
+                fan_id=fan_id,
+                active_session=await get_fan_session(fan_id),
+                trigger_type="purchase_confirmed",
+            )
         await refresh_price_learning(
             creator_id=creator_id,
             fan_id=fan_id,
@@ -1405,115 +1531,51 @@ async def _verify_ppv_purchase(
     creator_id: str,
     pending: dict,
 ) -> None:
-    """Call earnings API to verify if fan purchased the PPV."""
-    import httpx
+    """Immediate verification hook; durable retries stay in scheduled_actions."""
     try:
-        db = get_supabase()
-        creator_row = await asyncio.to_thread(
-            lambda: db.table("creators")
-            .select("apifansly_account_id, fansly_account_id")
-            .eq("id", creator_id)
-            .single()
-            .execute()
+        from services.followup_lifecycle import pending_reference
+        from services.ppv_reconciliation import (
+            PPVReconcileDisposition,
+            reconcile_pending_ppv,
         )
-        apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
-        fan_row = await asyncio.to_thread(
-            lambda: db.table("fans")
-            .select("platform_fan_id, not_sold_log")
-            .eq("id", fan_id)
-            .single()
-            .execute()
+
+        reference = pending_reference(pending)
+        result = await reconcile_pending_ppv(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            expected_reference=reference,
         )
-        platform_fan_id = (fan_row.data or {}).get("platform_fan_id")
-        api_key = os.environ.get("APIFANSLY_API_KEY")
-        expected_price = float(pending.get("price", 0))
-        sent_at_str = pending.get("sent_at", "")
-
-        # Convert sent_at to unix ms for the 'after' param
-        try:
-            from datetime import datetime, timezone
-            sent_dt = datetime.fromisoformat(sent_at_str.replace("Z", "+00:00"))
-            after_ms = int(sent_dt.timestamp() * 1000)
-        except Exception:
-            after_ms = 0
-
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/earnings/fans/{platform_fan_id}/stats",
-                headers={"x-api-key": api_key},
-                params={"after": after_ms},
-                timeout=15,
+        if result.disposition == PPVReconcileDisposition.PENDING and result.retry_at:
+            await schedule_action(
+                creator_id=creator_id,
+                fan_id=fan_id,
+                action_type="PPV_RECONCILE",
+                execute_at=result.retry_at,
+                payload={"payment_reference": reference},
+                dedupe_key=f"ppv-reconcile:{fan_id}:{reference}",
             )
-            data = resp.json()
-            transactions = data.get("data", {}).get("data", {}).get("response", [])
-
-        # Look for media purchase (type 2110) matching expected price
-        purchased = False
-        actual_amount = 0
-        for tx in transactions:
-            if tx.get("type") == 2110:
-                gross = tx.get("totalGross", 0)
-                # Match within 10% tolerance
-                if abs(gross - expected_price) / max(expected_price, 1) < 0.1:
-                    purchased = True
-                    actual_amount = gross
-                    break
-
-        media_id = pending.get("media_id", "")
-
-        if purchased:
-            print(f"[PPV VERIFY] fan={fan_id} PURCHASED media={media_id} amount=${actual_amount}")
-            await record_ppv_purchase(fan_id, media_id, actual_amount)
-        else:
-            print(f"[PPV VERIFY] fan={fan_id} did NOT purchase media={media_id}")
-            # Log to not_sold
-            not_sold = (fan_row.data or {}).get("not_sold_log") or []
-            from datetime import datetime
-            not_sold.append({
-                "date": datetime.utcnow().strftime("%d.%m.%Y"),
-                "item": f"PPV media {media_id}",
-                "amount": expected_price,
-                "reason": "fan indicated no purchase",
-                "chatter": "AI",
-            })
-            await asyncio.to_thread(
-                lambda: db.table("fans").update({
-                    "not_sold_log": not_sold,
-                    "pending_ppv_check": None,
-                }).eq("id", fan_id).execute()
-            )
-            session = await get_fan_session(fan_id)
-            if session and session.get("awaiting_purchase_index") is not None:
-                session = mark_step_declined(
-                    session,
-                    reason="payment_not_confirmed",
-                    pause=True,
-                )
-                await save_fan_session(fan_id, session)
-            state = await get_fan_state(fan_id)
-            state.status = FanStatus.OFFER_SELECTED
-            await save_fan_state(fan_id, creator_id, state)
-            print(
-                f"[PAYMENT] fan={fan_id} state=OFFER_SELECTED "
-                f"transition=PAYMENT_PENDING_EXPIRED media={media_id}"
-            )
-
-    except Exception as e:
-        print(f"[PPV VERIFY ERROR] {e}")
+        print(
+            f"[PPV VERIFY] fan={fan_id} disposition={result.disposition.value} "
+            f"reference={reference} reason={result.reason}"
+        )
+    except Exception as exc:
+        # The durable action remains pending and will retry with backoff.
+        print(f"[PPV VERIFY ERROR] fan={fan_id}: {exc}")
 
 
 async def sweep_stale_ppv_checks() -> None:
     """
-    Background sweep: find fans with a pending_ppv_check older than 20 minutes
-    that were never resolved by the reaction-triggered path, and verify them now.
-    Called every 15 minutes from the lifespan scheduler.
+    Repair durable reconciliation actions for pending PPVs after restarts or
+    partial persistence failures. Verification itself happens in the worker.
     """
     from datetime import datetime, timezone, timedelta
 
     try:
         db = get_supabase()
 
-        # Pull all fans that still have a pending check, along with their creator_id
+        from db.commercial_queries import ensure_action_pending
+        from services.followup_lifecycle import pending_reference
+
         rows = await asyncio.to_thread(
             lambda: db.table("fans")
             .select("id, creator_id, pending_ppv_check")
@@ -1525,7 +1587,7 @@ async def sweep_stale_ppv_checks() -> None:
             return
 
         now = datetime.now(timezone.utc)
-        cutoff = now - timedelta(minutes=20)
+        cutoff = now - timedelta(minutes=5)
         stale = []
 
         for row in rows.data:
@@ -1547,11 +1609,19 @@ async def sweep_stale_ppv_checks() -> None:
         if not stale:
             return
 
-        print(f"[PPV SWEEP] Found {len(stale)} stale pending check(s) to verify")
+        print(f"[PPV SWEEP] repairing {len(stale)} pending reconciliation action(s)")
 
         for fan_id, creator_id, pending in stale:
             try:
-                await _verify_ppv_purchase(fan_id, creator_id, pending)
+                reference = pending_reference(pending)
+                await ensure_action_pending(
+                    creator_id=creator_id,
+                    fan_id=fan_id,
+                    action_type="PPV_RECONCILE",
+                    execute_at=now,
+                    payload={"payment_reference": reference},
+                    dedupe_key=f"ppv-reconcile:{fan_id}:{reference}",
+                )
             except Exception as e:
                 print(f"[PPV SWEEP ERROR] fan={fan_id} error={e}")
 

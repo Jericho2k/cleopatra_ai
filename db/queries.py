@@ -64,6 +64,38 @@ async def get_fan_by_id(fan_id: str) -> Fan | None:
     return await asyncio.to_thread(_get)
 
 
+async def get_creator_auto_mode_default(creator_id: str) -> bool:
+    def _get() -> bool:
+        response = (
+            get_supabase().table("creators")
+            .select("auto_mode")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+        return bool((response.data or {}).get("auto_mode", False))
+
+    return await asyncio.to_thread(_get)
+
+
+async def get_creator_sleep_hours(creator_id: str) -> tuple[int, int]:
+    def _get() -> tuple[int, int]:
+        response = (
+            get_supabase().table("creators")
+            .select("sleep_hours_start, sleep_hours_end")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+        row = response.data or {}
+        return (
+            int(row.get("sleep_hours_start") if row.get("sleep_hours_start") is not None else 0),
+            int(row.get("sleep_hours_end") if row.get("sleep_hours_end") is not None else 7),
+        )
+
+    return await asyncio.to_thread(_get)
+
+
 async def create_fan(creator_id: str, platform_fan_id: str, display_name: str) -> Fan:
     def _create():
         db = get_supabase()

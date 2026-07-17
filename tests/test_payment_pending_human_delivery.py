@@ -191,4 +191,8 @@ def test_reaction_prompt_is_purchase_gated_in_send_orchestration():
     assert "_send_post_purchase_reaction" in source
     assert "purchase_confirmed=true" in source
     assert "state.status = FanStatus.PAYMENT_PENDING" in source
-    assert "transition=PAYMENT_PENDING_EXPIRED" in source
+    assert 'action_type="PPV_RECONCILE"' in source
+    assert "ppv_resp.raise_for_status()" in source
+    assert source.index("ppv_resp.raise_for_status()") < source.index(
+        "pending_ppv_check\": pending_check"
+    )

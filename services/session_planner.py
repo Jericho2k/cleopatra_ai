@@ -137,13 +137,16 @@ async def plan_session_for_fan(
         "confirmed_budget_cents": budget_cents,
         "total_budget_cents": budget_cents,
         "revenue_cents": 0,
+        "payment_state": "OFFER_SELECTED",
         "post_ppv_cooldown": False,
         "cooldown_messages_remaining": 0,
         "require_purchase_before_next_step": policy.require_purchase_before_next_step,
     }
     await save_fan_session(fan_id, session)
 
-    state.status = FanStatus.PAID_SESSION_ACTIVE
+    # A plan authorizes the first locked PPV; it is not a paid session until
+    # the platform confirms an unlock.
+    state.status = FanStatus.OFFER_SELECTED
     state.confirmed_budget_cents = budget_cents
     state.selected_package_set_ids = [item["set_id"] for item in plan]
     from db.commercial_queries import save_fan_state

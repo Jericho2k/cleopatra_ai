@@ -26,6 +26,7 @@ from services.commercial_events import (
     stated_budget_cents,
 )
 from services.commercial_policy import CommercialContext, decide_next_action
+from services.followup_lifecycle import complete_session_state
 from services.price_learning import select_recommended_packages
 from services.payday import resolve_payday
 from services.session_lifecycle import (
@@ -251,7 +252,7 @@ async def orchestrate(
     if decision.action == ActionType.RESUME_PREVIOUS_OFFER and session and session.get("status") == "paused":
         resumed = resume_session(session)
         await save_fan_session(fan_id, resumed)
-        state.status = FanStatus.PAID_SESSION_ACTIVE
+        state.status = FanStatus.OFFER_SELECTED
 
     # Self-heal legacy/stale sessions whose index already passed the final step.
     if (
@@ -260,18 +261,31 @@ async def orchestrate(
         and not has_pending_purchase(session)
         and not has_remaining_steps(session)
     ):
-        state.status = FanStatus.IDLE
-        state.last_session_completed_at = now
-        state.last_session_revenue_cents = int(session.get("revenue_cents", 0) or 0)
-        state.confirmed_budget_cents = None
-        state.budget_source = None
-        state.offered_packages = []
-        state.selected_package_id = None
-        state.selected_package_set_id = None
-        state.selected_package_set_ids = []
-        state.selected_package_label = None
-        state.selected_package_price_cents = None
+        state, followup_obligation = complete_session_state(
+            state,
+            session,
+            policy=policy,
+            fan_id=fan_id,
+            buyer_stage="UNKNOWN",
+            now=now,
+        )
+        await save_fan_state(fan_id, creator_id, state)
         await save_fan_session(fan_id, None)
+        if followup_obligation:
+            try:
+                await schedule_action(
+                    creator_id=creator_id,
+                    fan_id=fan_id,
+                    action_type=followup_obligation.action_type,
+                    execute_at=followup_obligation.execute_at,
+                    payload=followup_obligation.payload,
+                    dedupe_key=followup_obligation.dedupe_key,
+                )
+            except Exception as exc:
+                print(
+                    f"[FOLLOWUP REPAIR NEEDED] fan={fan_id} "
+                    f"type=POST_SESSION_FOLLOWUP error={exc}"
+                )
 
     payday_event = next((event for event in events if event.type == EventType.PAYDAY_MENTIONED), None)
     if payday_event:
@@ -294,22 +308,41 @@ async def orchestrate(
 
         if decision.schedule_payday_followup:
             if when and confidence >= 0.6:
+                payday_payload = {
+                    "desired_experience": state.desired_experience or "",
+                    "last_offer_price_cents": state.last_declined_price_cents,
+                    "selected_package_id": state.selected_package_id,
+                    "selected_package": next(
+                        (
+                            package.model_dump(mode="json")
+                            for package in state.offered_packages
+                            if package.package_id == state.selected_package_id
+                        ),
+                        None,
+                    ),
+                    "payday_at": when.isoformat(),
+                    "payday_raw": raw,
+                }
+                payday_dedupe_key = f"payday:{fan_id}"
                 await schedule_action(
                     creator_id=creator_id,
                     fan_id=fan_id,
                     action_type="PAYDAY_REENGAGEMENT",
                     execute_at=when,
-                    payload={
-                        "desired_experience": state.desired_experience or "",
-                        "last_offer_price_cents": state.last_declined_price_cents,
-                        "selected_package_id": state.selected_package_id,
-                        "payday_raw": raw,
-                    },
-                    dedupe_key=f"payday:{fan_id}",
+                    payload=payday_payload,
+                    dedupe_key=payday_dedupe_key,
                 )
+                state.next_followup_at = when
+                state.next_followup_type = "PAYDAY_REENGAGEMENT"
+                state.next_followup_payload = payday_payload
+                state.next_followup_dedupe_key = payday_dedupe_key
                 print(f"[COMMERCIAL] fan={fan_id} payday follow-up {when.isoformat()}")
             else:
                 state.status = FanStatus.PAUSED_NO_BUDGET
+                state.next_followup_at = None
+                state.next_followup_type = None
+                state.next_followup_payload = {}
+                state.next_followup_dedupe_key = None
                 print(f"[COMMERCIAL] fan={fan_id} payday '{raw}' unresolved")
 
     selected_resolved_now = bool(
@@ -324,6 +357,11 @@ async def orchestrate(
     if resolved_now:
         try:
             await cancel_actions_for_fan(fan_id, "PAYDAY_REENGAGEMENT")
+            if state.next_followup_type == "PAYDAY_REENGAGEMENT":
+                state.next_followup_at = None
+                state.next_followup_type = None
+                state.next_followup_payload = {}
+                state.next_followup_dedupe_key = None
         except Exception as exc:
             print(f"[COMMERCIAL] cancel follow-up failed fan={fan_id}: {exc}")
 

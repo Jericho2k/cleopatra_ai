@@ -99,6 +99,13 @@ class CreatorPolicy(BaseModel):
     session_max_steps: int = 4
     post_purchase_cooldown_messages: int = 2
     require_purchase_before_next_step: bool = True
+    ppv_recheck_minutes: int = Field(default=20, ge=5, le=1_440)
+    ppv_payment_window_hours: int = Field(default=24, ge=1, le=168)
+    abandoned_ppv_followup_enabled: bool = True
+    abandoned_ppv_followup_delay_hours: int = Field(default=18, ge=1, le=720)
+    post_session_followup_enabled: bool = True
+    post_session_followup_delay_hours: int = Field(default=18, ge=1, le=720)
+    followup_recent_activity_suppression_hours: int = Field(default=6, ge=0, le=168)
 
 
 class FanCommercialState(BaseModel):
@@ -132,6 +139,16 @@ class FanCommercialState(BaseModel):
     free_session_ended_at: datetime | None = None
     last_session_completed_at: datetime | None = None
     last_session_revenue_cents: int = 0
+    last_session_package_id: str | None = None
+    last_session_set_ids: list[str] = Field(default_factory=list)
+    last_session_experience: str | None = None
+    last_abandoned_ppv_at: datetime | None = None
+    last_abandoned_media_id: str | None = None
+    next_followup_at: datetime | None = None
+    next_followup_type: str | None = None
+    next_followup_payload: dict = Field(default_factory=dict)
+    next_followup_dedupe_key: str | None = None
+    last_followup_at: datetime | None = None
 
 
 class ActionType(str, Enum):

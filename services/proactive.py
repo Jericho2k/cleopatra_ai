@@ -6,9 +6,7 @@ sessions and other lifecycle actions later).
 The caller supplies a GOAL — a decided commercial action — and this module only
 expresses it. The model does not get to decide whether to sell here.
 """
-import os
-
-import httpx
+import asyncio
 
 from ai.generator import generate_replies
 from ai.prompt_builder import build_prompt
@@ -21,6 +19,7 @@ from db.queries import (
     save_message,
 )
 from models.schemas import ConversationContext, Persona, StageType
+from core.supabase import get_supabase
 
 
 async def send_proactive_message(creator_id: str, fan_id: str, goal: str) -> bool:
@@ -86,17 +85,39 @@ async def send_proactive_message(creator_id: str, fan_id: str, goal: str) -> boo
     if not text:
         return False
 
-    await save_message(fan_id, creator_id, "creator", text)
-
     group_id = getattr(fan, "fansly_group_id", None)
-    apifansly_account_id = os.environ.get("APIFANSLY_ACCOUNT_ID")
-    if group_id and apifansly_account_id:
-        try:
-            from main import send_fansly_message
-            await send_fansly_message(apifansly_account_id, str(group_id), text)
-        except Exception as e:
-            print(f"[PROACTIVE SEND ERROR] fan={fan_id}: {e}")
-            return False
+    creator_row = await asyncio.to_thread(
+        lambda: get_supabase().table("creators")
+        .select("apifansly_account_id")
+        .eq("id", creator_id)
+        .single()
+        .execute()
+    )
+    apifansly_account_id = (creator_row.data or {}).get("apifansly_account_id")
+    if not group_id or not apifansly_account_id:
+        print(f"[PROACTIVE SEND ERROR] fan={fan_id}: no live delivery route")
+        return False
+
+    try:
+        from main import send_fansly_message
+        delivered = await send_fansly_message(apifansly_account_id, str(group_id), text)
+        if not delivered:
+            raise RuntimeError("platform rejected proactive delivery")
+    except Exception as e:
+        print(f"[PROACTIVE SEND ERROR] fan={fan_id}: {e}")
+        return False
+
+    # Persist only after the platform accepted delivery. If the platform send
+    # succeeded but the local write failed, freeze automation rather than retrying
+    # and risking a duplicate proactive message.
+    try:
+        await save_message(fan_id, creator_id, "creator", text)
+    except Exception as exc:
+        from db.queries import freeze_fan_for_review
+
+        await freeze_fan_for_review(fan_id, "proactive_sent_but_not_persisted")
+        print(f"[PROACTIVE PERSIST ERROR] fan={fan_id}: {exc}")
+        return True
 
     print(f"[PROACTIVE] fan={fan_id} sent: {text[:60]}")
     return True

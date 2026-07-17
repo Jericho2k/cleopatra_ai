@@ -30,6 +30,17 @@ def normalize_session(session: dict[str, Any] | None) -> dict[str, Any] | None:
     result.setdefault("post_ppv_cooldown", False)
     result.setdefault("cooldown_messages_remaining", 0)
     result.setdefault("revenue_cents", 0)
+    if "payment_state" not in result:
+        if result.get("status") == "completed":
+            result["payment_state"] = "COMPLETED"
+        elif result.get("status") in {"abandoned", "paused"}:
+            result["payment_state"] = str(result.get("status")).upper()
+        elif result.get("awaiting_purchase_index") is not None:
+            result["payment_state"] = "PAYMENT_PENDING"
+        elif int(result.get("revenue_cents", 0) or 0) > 0:
+            result["payment_state"] = "ACTIVE"
+        else:
+            result["payment_state"] = "OFFER_SELECTED"
     return result
 
 
@@ -97,6 +108,7 @@ def mark_step_sent(
     if message_id:
         item["message_id"] = message_id
     result["awaiting_purchase_index"] = idx
+    result["payment_state"] = "PAYMENT_PENDING"
     result["updated_at"] = utc_now_iso()
     return result
 
@@ -141,10 +153,13 @@ def mark_step_purchased(
     completed = result["current_index"] >= len(plan)
     if completed:
         result["status"] = "completed"
+        result["payment_state"] = "COMPLETED"
         result["completed_at"] = result.get("completed_at") or utc_now_iso()
         result["post_ppv_cooldown"] = False
         result["cooldown_messages_remaining"] = 0
     else:
+        result["status"] = "active"
+        result["payment_state"] = "ACTIVE"
         result["post_ppv_cooldown"] = cooldown_messages > 0
         result["cooldown_messages_remaining"] = max(0, int(cooldown_messages))
     result["updated_at"] = utc_now_iso()
@@ -168,6 +183,7 @@ def mark_step_declined(
             plan[int(idx)]["declined_at"] = utc_now_iso()
     result["awaiting_purchase_index"] = None
     result["status"] = "paused" if pause else "abandoned"
+    result["payment_state"] = "PAUSED" if pause else "ABANDONED"
     result["end_reason"] = reason
     result["ended_at"] = utc_now_iso()
     result["post_ppv_cooldown"] = False
@@ -182,6 +198,7 @@ def resume_session(session: dict[str, Any]) -> dict[str, Any]:
     if result.get("status") not in {"paused", "active"}:
         raise SessionLifecycleError(f"Cannot resume {result.get('status')} session")
     result["status"] = "active"
+    result["payment_state"] = "OFFER_SELECTED"
     result["resumed_at"] = utc_now_iso()
     result["updated_at"] = utc_now_iso()
     return result

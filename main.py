@@ -2321,6 +2321,34 @@ async def read_commercial_state(fan_id: str) -> dict:
     return {"fan_id": fan_id, "state": state.model_dump(mode="json")}
 
 
+class CancelFollowupRequest(BaseModel):
+    action_type: str | None = None
+
+
+@app.get("/fan/{fan_id}/full-auto-status")
+async def read_full_auto_status(fan_id: str) -> dict:
+    from services.full_auto_operations import get_fan_full_auto_snapshot
+
+    return await get_fan_full_auto_snapshot(fan_id)
+
+
+@app.get("/creator/{creator_id}/full-auto-health")
+async def read_full_auto_health(creator_id: str) -> dict:
+    from services.full_auto_operations import get_creator_full_auto_health
+
+    return await get_creator_full_auto_health(creator_id)
+
+
+@app.post("/fan/{fan_id}/cancel-followup")
+async def cancel_followup(
+    fan_id: str,
+    request: CancelFollowupRequest,
+) -> dict:
+    from services.full_auto_operations import cancel_fan_followup
+
+    return await cancel_fan_followup(fan_id, request.action_type)
+
+
 @app.post("/plan-session/{creator_id}/{fan_id}")
 async def plan_session(
     creator_id: str,

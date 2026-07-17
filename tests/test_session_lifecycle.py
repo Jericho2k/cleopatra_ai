@@ -7,6 +7,7 @@ from services.session_lifecycle import (
     decrement_cooldown,
     has_pending_purchase,
     mark_step_purchased,
+    mark_step_declined,
     mark_step_sent,
 )
 
@@ -29,6 +30,7 @@ def test_send_does_not_advance_before_purchase():
     assert updated["awaiting_purchase_index"] == 0
     assert updated["plan"][0]["sent"] is True
     assert has_pending_purchase(updated) is True
+    assert updated["payment_state"] == "PAYMENT_PENDING"
 
 
 def test_purchase_advances_and_starts_cooldown():
@@ -39,6 +41,7 @@ def test_purchase_advances_and_starts_cooldown():
     assert updated["awaiting_purchase_index"] is None
     assert updated["post_ppv_cooldown"] is True
     assert updated["cooldown_messages_remaining"] == 2
+    assert updated["payment_state"] == "ACTIVE"
 
 
 def test_final_purchase_completes_session_and_is_idempotent():
@@ -48,6 +51,7 @@ def test_final_purchase_completes_session_and_is_idempotent():
     done, completed = mark_step_purchased(second, media_id="m3", amount_cents=4000)
     assert completed is True
     assert done["status"] == "completed"
+    assert done["payment_state"] == "COMPLETED"
     assert done["revenue_cents"] == 6000
     duplicate, duplicate_completed = mark_step_purchased(done, media_id="m3", amount_cents=4000)
     assert duplicate_completed is True
@@ -61,3 +65,19 @@ def test_cooldown_decrements_on_fan_messages():
     assert updated["cooldown_messages_remaining"] == 1
     updated = decrement_cooldown(updated)
     assert updated["post_ppv_cooldown"] is False
+
+
+def test_late_purchase_resumes_exact_abandoned_session():
+    sent = mark_step_sent(session())
+    abandoned = mark_step_declined(sent, reason="payment_window_expired", pause=False)
+    assert abandoned["status"] == "abandoned"
+    updated, completed = mark_step_purchased(
+        abandoned,
+        media_id="m1",
+        amount_cents=2000,
+        cooldown_messages=0,
+    )
+    assert completed is False
+    assert updated["status"] == "active"
+    assert updated["payment_state"] == "ACTIVE"
+    assert updated["current_index"] == 1

@@ -97,6 +97,23 @@ async def save_fan_state(
             if state.last_session_completed_at else None
         ),
         "last_session_revenue_cents": state.last_session_revenue_cents,
+        "last_session_package_id": state.last_session_package_id,
+        "last_session_set_ids": state.last_session_set_ids,
+        "last_session_experience": state.last_session_experience,
+        "last_abandoned_ppv_at": (
+            state.last_abandoned_ppv_at.isoformat()
+            if state.last_abandoned_ppv_at else None
+        ),
+        "last_abandoned_media_id": state.last_abandoned_media_id,
+        "next_followup_at": (
+            state.next_followup_at.isoformat() if state.next_followup_at else None
+        ),
+        "next_followup_type": state.next_followup_type,
+        "next_followup_payload": state.next_followup_payload,
+        "next_followup_dedupe_key": state.next_followup_dedupe_key,
+        "last_followup_at": (
+            state.last_followup_at.isoformat() if state.last_followup_at else None
+        ),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -206,6 +223,8 @@ async def schedule_action(
     execute_at: datetime,
     payload: dict,
     dedupe_key: str,
+    *,
+    replace_existing: bool = True,
 ) -> None:
     row = {
         "creator_id": creator_id,
@@ -224,9 +243,53 @@ async def schedule_action(
         get_supabase().table("scheduled_actions").upsert(
             row,
             on_conflict="dedupe_key",
+            ignore_duplicates=not replace_existing,
         ).execute()
 
     await asyncio.to_thread(_upsert)
+
+
+async def ensure_action_pending(
+    creator_id: str,
+    fan_id: str,
+    action_type: str,
+    execute_at: datetime,
+    payload: dict,
+    dedupe_key: str,
+) -> None:
+    """Repair a missing/terminal durable action without disturbing a live claim."""
+    row = {
+        "creator_id": creator_id,
+        "fan_id": fan_id,
+        "action_type": action_type,
+        "execute_at": execute_at.isoformat(),
+        "payload": payload,
+        "dedupe_key": dedupe_key,
+        "status": "PENDING",
+        "attempts": 0,
+        "locked_at": None,
+        "last_error": None,
+    }
+
+    def _ensure():
+        db = get_supabase()
+        existing = (
+            db.table("scheduled_actions")
+            .select("id, status")
+            .eq("dedupe_key", dedupe_key)
+            .limit(1)
+            .execute()
+        ).data or []
+        if not existing:
+            db.table("scheduled_actions").insert(row).execute()
+            return
+        current = existing[0]
+        if current.get("status") == "COMPLETED":
+            db.table("scheduled_actions").update(row).eq(
+                "id", current["id"]
+            ).execute()
+
+    await asyncio.to_thread(_ensure)
 
 
 async def cancel_actions_for_fan(
@@ -238,7 +301,7 @@ async def cancel_actions_for_fan(
             get_supabase().table("scheduled_actions")
             .update({"status": "CANCELLED"})
             .eq("fan_id", fan_id)
-            .eq("status", "PENDING")
+            .in_("status", ["PENDING", "FAILED"])
         )
         if action_type:
             query = query.eq("action_type", action_type)
@@ -273,13 +336,15 @@ async def claim_due_actions(limit: int = 20, stale_minutes: int = 10) -> list[di
 
         claimed = []
         for row in due + stale:
-            response = (
+            query = (
                 db.table("scheduled_actions")
                 .update({"status": "PROCESSING", "locked_at": now.isoformat()})
                 .eq("id", row["id"])
                 .eq("status", row["status"])
-                .execute()
             )
+            if row["status"] == "PROCESSING" and row.get("locked_at"):
+                query = query.eq("locked_at", row["locked_at"])
+            response = query.execute()
             if response.data:
                 claimed.append(row)
         return claimed
@@ -290,7 +355,7 @@ async def claim_due_actions(limit: int = 20, stale_minutes: int = 10) -> list[di
 async def complete_action(action_id: str) -> None:
     def _done():
         get_supabase().table("scheduled_actions").update(
-            {"status": "COMPLETED"}
+            {"status": "COMPLETED", "locked_at": None}
         ).eq("id", action_id).execute()
 
     await asyncio.to_thread(_done)
@@ -303,13 +368,80 @@ async def fail_action(
     max_attempts: int = 3,
 ) -> None:
     status = "FAILED" if attempts + 1 >= max_attempts else "PENDING"
+    retry_at = datetime.now(timezone.utc) + timedelta(
+        minutes=min(60, 5 * (2 ** max(0, int(attempts))))
+    )
 
     def _fail():
-        get_supabase().table("scheduled_actions").update({
+        payload = {
             "status": status,
             "attempts": attempts + 1,
             "last_error": error[:500],
             "locked_at": None,
-        }).eq("id", action_id).execute()
+        }
+        if status == "PENDING":
+            payload["execute_at"] = retry_at.isoformat()
+        get_supabase().table("scheduled_actions").update(payload).eq(
+            "id", action_id
+        ).execute()
 
     await asyncio.to_thread(_fail)
+
+
+async def reschedule_action(
+    action_id: str,
+    execute_at: datetime,
+    *,
+    payload: dict | None = None,
+) -> None:
+    update = {
+        "status": "PENDING",
+        "execute_at": execute_at.isoformat(),
+        "locked_at": None,
+        "last_error": None,
+    }
+    if payload is not None:
+        update["payload"] = payload
+
+    def _reschedule():
+        get_supabase().table("scheduled_actions").update(update).eq(
+            "id", action_id
+        ).execute()
+
+    await asyncio.to_thread(_reschedule)
+
+
+async def get_scheduled_actions_for_fan(
+    fan_id: str,
+    *,
+    statuses: tuple[str, ...] = ("PENDING", "PROCESSING", "FAILED"),
+) -> list[dict]:
+    def _get():
+        query = (
+            get_supabase().table("scheduled_actions")
+            .select("*")
+            .eq("fan_id", fan_id)
+            .order("execute_at")
+        )
+        if statuses:
+            query = query.in_("status", list(statuses))
+        return query.execute().data or []
+
+    return await asyncio.to_thread(_get)
+
+
+async def get_followup_obligations(limit: int = 100) -> list[dict]:
+    def _get():
+        return (
+            get_supabase().table("fan_commercial_states")
+            .select(
+                "fan_id, creator_id, next_followup_at, next_followup_type, "
+                "next_followup_payload, next_followup_dedupe_key"
+            )
+            .not_.is_("next_followup_at", "null")
+            .not_.is_("next_followup_type", "null")
+            .limit(limit)
+            .execute()
+        ).data or []
+
+    return await asyncio.to_thread(_get)
