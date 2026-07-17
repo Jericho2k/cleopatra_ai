@@ -54,7 +54,7 @@ def test_selected_cheaper_package_beats_payday_mention():
     assert decision.action == ActionType.CREATE_PAID_SESSION
     assert decision.session_budget_cents == 2800
     assert decision.schedule_payday_followup is False
-    assert decision.new_status == FanStatus.PAID_SESSION_ACTIVE
+    assert decision.new_status == FanStatus.OFFER_SELECTED
 
 
 def test_cannot_afford_any_option_schedules_payday():

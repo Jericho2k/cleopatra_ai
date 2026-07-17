@@ -26,7 +26,7 @@ def test_active_session_waits_for_purchase():
     )
     assert decision.action == ActionType.CONTINUE_NORMAL_CHAT
     assert decision.must_not_send_media is True
-    assert decision.may_be_explicit is True
+    assert decision.may_be_explicit is False
 
 
 def test_active_session_sends_next_after_purchase_cooldown():
@@ -65,4 +65,4 @@ def test_money_available_resumes_paused_session():
         CommercialContext(paused_session_available=True),
     )
     assert decision.action == ActionType.RESUME_PREVIOUS_OFFER
-    assert decision.new_status == FanStatus.PAID_SESSION_ACTIVE
+    assert decision.new_status == FanStatus.OFFER_SELECTED

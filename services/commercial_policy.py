@@ -125,7 +125,7 @@ def decide_next_action(
             must_not_send_media=True,
             may_be_explicit=policy.sexting_mode != SextingMode.PAID_ONLY,
             mention_previous_interest=True,
-            new_status=(FanStatus.PAID_SESSION_ACTIVE if ctx.paused_session_available else FanStatus.IDLE),
+            new_status=(FanStatus.OFFER_SELECTED if ctx.paused_session_available else FanStatus.IDLE),
             max_messages=1,
             conversation_continuation="optional",
             reason="money available lifts pause",
@@ -166,7 +166,7 @@ def decide_next_action(
             must_not_send_media=False,
             may_be_explicit=True,
             mention_price=(selected.amount_cents // 100 if selected.amount_cents else None),
-            new_status=FanStatus.PAID_SESSION_ACTIVE,
+            new_status=FanStatus.OFFER_SELECTED,
             session_budget_cents=selected.amount_cents,
             selected_package_set_id=selected_set_ids[0],
             selected_package_set_ids=selected_set_ids,
@@ -262,6 +262,54 @@ def decide_next_action(
                 reason="pending offer detail request resumes exact snapshot",
             )
 
+    if state.status == FanStatus.OFFER_SELECTED:
+        if ctx.session_has_pending_purchase:
+            return CommercialDecision(
+                action=ActionType.CONTINUE_NORMAL_CHAT,
+                goal=(
+                    "the selected PPV is locked and awaiting confirmation; do not "
+                    "imply it was purchased, opened, seen, or enjoyed"
+                ),
+                must_not_send_media=True,
+                may_be_explicit=False,
+                new_status=FanStatus.PAYMENT_PENDING,
+                must_not_ask_question=True,
+                max_messages=1,
+                conversation_continuation="none",
+                reason="selected offer self-healed to payment pending",
+            )
+        if ctx.session_exists and ctx.session_has_remaining_steps:
+            return CommercialDecision(
+                action=ActionType.SEND_NEXT_PPV_STEP,
+                goal=(
+                    "send the exact selected first step as a locked purchase-gated PPV; "
+                    "do not call it purchased or change its content or price"
+                ),
+                must_not_send_media=False,
+                may_be_explicit=True,
+                new_status=FanStatus.OFFER_SELECTED,
+                must_not_ask_question=True,
+                max_messages=1,
+                conversation_continuation="none",
+                reason="recover unsent selected PPV",
+            )
+
+    if state.status == FanStatus.PAYMENT_PENDING:
+        return CommercialDecision(
+            action=ActionType.CONTINUE_NORMAL_CHAT,
+            goal=(
+                "acknowledge his latest message while the selected PPV is still locked; "
+                "do not imply he purchased it, opened it, saw it, or reacted to unseen content"
+            ),
+            must_not_send_media=True,
+            may_be_explicit=False,
+            new_status=FanStatus.PAYMENT_PENDING,
+            must_not_ask_question=True,
+            max_messages=1,
+            conversation_continuation="none",
+            reason="selected PPV is awaiting confirmed unlock",
+        )
+
     if state.status in {FanStatus.PAUSED_NO_BUDGET, FanStatus.PAUSED_UNTIL_PAYDAY}:
         if policy.sexting_mode == SextingMode.FREE_TEXT_ALLOWED and not free_mode_on_cooldown(policy, state, ctx.now):
             return CommercialDecision(
@@ -283,10 +331,17 @@ def decide_next_action(
         if ctx.session_has_pending_purchase:
             return CommercialDecision(
                 action=ActionType.CONTINUE_NORMAL_CHAT,
-                goal="stay in the paid-session mood while waiting for the current PPV purchase; do not send another step",
+                goal=(
+                    "the selected PPV is still locked; do not imply it was purchased, "
+                    "opened, seen, or enjoyed"
+                ),
                 must_not_send_media=True,
-                may_be_explicit=True,
-                reason="awaiting purchase of current step",
+                may_be_explicit=False,
+                new_status=FanStatus.PAYMENT_PENDING,
+                must_not_ask_question=True,
+                max_messages=1,
+                conversation_continuation="none",
+                reason="legacy paid-session state self-healed to payment pending",
             )
         if ctx.session_cooldown_active:
             return CommercialDecision(
@@ -344,7 +399,7 @@ def decide_next_action(
                 goal="use the confirmed amount to build the paid experience",
                 must_not_send_media=False,
                 may_be_explicit=True,
-                new_status=FanStatus.PAID_SESSION_ACTIVE,
+                new_status=FanStatus.OFFER_SELECTED,
                 session_budget_cents=state.confirmed_budget_cents,
                 selected_package_set_ids=state.selected_package_set_ids,
                 selected_package_set_id=state.selected_package_set_id,

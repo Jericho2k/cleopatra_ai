@@ -18,6 +18,7 @@ class ConversationPhase(str, Enum):
     SOFT_OFFER = "SOFT_OFFER"
     OFFER = "OFFER"
     OBJECTION = "OBJECTION"
+    PAYMENT_PENDING = "PAYMENT_PENDING"
     PAID_SESSION = "PAID_SESSION"
     FOLLOW_UP = "FOLLOW_UP"
     PAUSED = "PAUSED"
@@ -34,6 +35,7 @@ class DirectorAction(str, Enum):
     PIVOT_ENERGY = "PIVOT_ENERGY"
     PRESENT_APPROVED_OPTIONS = "PRESENT_APPROVED_OPTIONS"
     HANDLE_OBJECTION = "HANDLE_OBJECTION"
+    WAIT_FOR_PAYMENT = "WAIT_FOR_PAYMENT"
     CONTINUE_PAID_SESSION = "CONTINUE_PAID_SESSION"
     POST_SESSION_FOLLOWUP = "POST_SESSION_FOLLOWUP"
     PAUSE_SELLING = "PAUSE_SELLING"
@@ -189,6 +191,7 @@ def advance_conversation_director(
         qualification_complete=qualification_complete,
         offer_eligible=phase in {
             ConversationPhase.OFFER,
+            ConversationPhase.PAYMENT_PENDING,
             ConversationPhase.PAID_SESSION,
         }
         or (
@@ -312,14 +315,21 @@ def _authoritative_state(
         return ConversationPhase.SAFETY, DirectorAction.HAND_OFF, "crisis_or_handoff", True
     if commercial_action in {"PAUSE_NO_BUDGET", "PAUSE_UNTIL_PAYDAY"}:
         return ConversationPhase.PAUSED, DirectorAction.PAUSE_SELLING, "commercial_pause", True
-    if active_session.get("status") == "active" or commercial_action in {
-        "CREATE_PAID_SESSION",
-        "SEND_NEXT_PPV_STEP",
-    }:
+    if commercial_action == "CREATE_PAID_SESSION" or (
+        active_session.get("status") == "active"
+        and active_session.get("awaiting_purchase_index") is not None
+    ):
+        return (
+            ConversationPhase.PAYMENT_PENDING,
+            DirectorAction.WAIT_FOR_PAYMENT,
+            "offer_selected_or_unlock_pending",
+            True,
+        )
+    if active_session.get("status") == "active" or commercial_action == "SEND_NEXT_PPV_STEP":
         return (
             ConversationPhase.PAID_SESSION,
             DirectorAction.CONTINUE_PAID_SESSION,
-            "active_or_confirmed_paid_session",
+            "confirmed_paid_session",
             False,
         )
     if commercial_action in {
