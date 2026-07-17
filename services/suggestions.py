@@ -23,6 +23,7 @@ from models.commercial import ActionType, FanStatus
 from db.fan_intelligence_queries import get_fan_intelligence_context
 from db.commercial_queries import get_creator_policy, get_fan_state, save_fan_state
 from services.session_planner import plan_session_for_fan
+from services.human_delivery import build_delivery_schedule
 from services.fan_intelligence import learn_from_fan_message
 from services.affordability import (
     get_affordability_context,
@@ -82,6 +83,21 @@ together_client = AsyncOpenAI(
 )
 
 _pending_auto_replies: dict[str, asyncio.Task] = {}
+
+
+async def _sleep_while_current(fan_id: str, seconds: float, *, phase: str) -> bool:
+    """Sleep in short slices so a newer fan message can cancel simulated typing."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, float(seconds))
+    while True:
+        current_task = _pending_auto_replies.get(fan_id)
+        if current_task and current_task is not asyncio.current_task():
+            print(f"[AUTO TIMING] fan={fan_id} cancelled phase={phase} newer_task=true")
+            return False
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return True
+        await asyncio.sleep(min(0.5, remaining))
 
 
 _CONTENT_REQUEST_RE = re.compile(
@@ -573,7 +589,9 @@ async def _update_fan_ai_summary(
 async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
     """Wait for fan to finish typing, then generate and send one reply."""
     try:
-        delay = 20  # TEST MODE — slightly longer to catch fast multi-message fans
+        # Short jittered debounce catches rapid multi-message bursts. A separate
+        # length-aware delay is applied after generation to simulate reading/typing.
+        delay = random.uniform(7.0, 12.0)
         await asyncio.sleep(delay)
 
         situation: dict | None = None  # initialized early — assigned properly later
@@ -1021,6 +1039,14 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
             group_id = await get_or_fetch_group_id(apifansly_account_id, str(platform_fan_id), fan_id)
 
+        parts = [p.strip() for p in reply.split("|") if p.strip()]
+        timing = build_delivery_schedule(latest_message, parts)
+        print(
+            f"[AUTO TIMING] fan={fan_id} parts={len(parts)} "
+            f"initial={timing.initial_delay_seconds:.2f}s "
+            f"between={list(timing.inter_part_delays_seconds)}"
+        )
+
         if group_id and apifansly_account_id:
             try:
                 async with httpx.AsyncClient() as client:
@@ -1032,13 +1058,18 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             except Exception:
                 pass
 
-        await asyncio.sleep(random.randint(3, 8))
-
-        parts = [p.strip() for p in reply.split("|") if p.strip()]
+        if not await _sleep_while_current(
+            fan_id, timing.initial_delay_seconds, phase="before_part_1"
+        ):
+            return
 
         for i, part in enumerate(parts):
             if i > 0:
-                await asyncio.sleep(random.randint(5, 15))
+                inter_delay = timing.inter_part_delays_seconds[i - 1]
+                if not await _sleep_while_current(
+                    fan_id, inter_delay, phase=f"before_part_{i + 1}"
+                ):
+                    return
 
             ppv_match = re.search(r"\[PPV:([^:]+):(\d+(?:\.\d+)?)\]", part)
             if ppv_match and commercial_enabled and (
@@ -1094,7 +1125,8 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 media_context=ppv_media_context,
             )
 
-            # After PPV sent: store pending check + queue reaction fishing follow-up
+            # After PPV sent: store the pending purchase check. Any reaction
+            # follow-up is purchase-gated and is scheduled only after confirmation.
             if ppv_match:
                 try:
                     db = get_supabase()
@@ -1110,8 +1142,10 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                             }
                         }).eq("id", fan_id).execute()
                     )
-                    # Send reaction fishing follow-up after short delay
-                    spawn(_send_reaction_fishing(fan_id, creator_id, group_id, apifansly_account_id), name="send_reaction_fishing")
+                    print(
+                        f"[PAYMENT] fan={fan_id} state=PAYMENT_PENDING "
+                        f"media={media_id} price={price}"
+                    )
                 except Exception as e:
                     print(f"[PPV PENDING ERROR] {e}")
 
@@ -1124,9 +1158,12 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         session = mark_step_sent(session)
                         await save_fan_session(fan_id, session)
                         active_session = session
+                        state = await get_fan_state(fan_id)
+                        state.status = FanStatus.PAYMENT_PENDING
+                        await save_fan_state(fan_id, creator_id, state)
                         print(
                             f"[SESSION] sent step={session.get('awaiting_purchase_index')} "
-                            f"fan={fan_id}; awaiting purchase"
+                            f"fan={fan_id}; state=PAYMENT_PENDING awaiting confirmed unlock"
                         )
                 except Exception as exc:
                     print(f"[SESSION SEND STATE ERROR] {exc}")
@@ -1186,21 +1223,33 @@ _REACTION_FISHING_LINES = [
 ]
 
 
-async def _send_reaction_fishing(
-    fan_id: str,
-    creator_id: str,
-    group_id: str | None,
-    apifansly_account_id: str | None,
-) -> None:
-    """Send a natural follow-up line after PPV to fish for purchase reaction."""
+async def _send_post_purchase_reaction(fan_id: str, creator_id: str) -> None:
+    """Send a reaction prompt only after the platform confirmed the unlock."""
     try:
-        await asyncio.sleep(random.randint(30, 90))
+        await asyncio.sleep(random.uniform(20.0, 55.0))
+        db = get_supabase()
+        fan_row = await asyncio.to_thread(
+            lambda: db.table("fans")
+            .select("fansly_group_id")
+            .eq("id", fan_id)
+            .single()
+            .execute()
+        )
+        creator_row = await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("apifansly_account_id")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+        group_id = (fan_row.data or {}).get("fansly_group_id")
+        account_id = (creator_row.data or {}).get("apifansly_account_id")
         line = random.choice(_REACTION_FISHING_LINES)
         await save_message(fan_id, creator_id, "creator", line, was_ai_suggested=True)
-        if group_id and apifansly_account_id:
+        if group_id and account_id:
             from main import send_fansly_message
-            await send_fansly_message(apifansly_account_id, group_id, line)
-        print(f"[PPV REACTION] Sent fishing line to fan={fan_id}: {line}")
+            await send_fansly_message(account_id, str(group_id), line)
+        print(f"[PPV REACTION] fan={fan_id} purchase_confirmed=true line={line}")
     except Exception as e:
         print(f"[PPV REACTION ERROR] {e}")
 
@@ -1320,6 +1369,12 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
             # logged for human review rather than double-charging on a retry.
             print(f"[SESSION PURCHASE RECONCILE ERROR] fan={fan_id}: {exc}")
 
+    if creator_id and not already_recorded:
+        spawn(
+            _send_post_purchase_reaction(fan_id, creator_id),
+            name="send_post_purchase_reaction",
+        )
+
     # Whale handoff only on the threshold crossing, not duplicate webhooks.
     if creator_id and not row.get("needs_human_review") and not already_recorded:
         try:
@@ -1426,6 +1481,21 @@ async def _verify_ppv_purchase(
                     "not_sold_log": not_sold,
                     "pending_ppv_check": None,
                 }).eq("id", fan_id).execute()
+            )
+            session = await get_fan_session(fan_id)
+            if session and session.get("awaiting_purchase_index") is not None:
+                session = mark_step_declined(
+                    session,
+                    reason="payment_not_confirmed",
+                    pause=True,
+                )
+                await save_fan_session(fan_id, session)
+            state = await get_fan_state(fan_id)
+            state.status = FanStatus.OFFER_SELECTED
+            await save_fan_state(fan_id, creator_id, state)
+            print(
+                f"[PAYMENT] fan={fan_id} state=OFFER_SELECTED "
+                f"transition=PAYMENT_PENDING_EXPIRED media={media_id}"
             )
 
     except Exception as e:
