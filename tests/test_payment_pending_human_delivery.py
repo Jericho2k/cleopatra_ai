@@ -190,9 +190,13 @@ def test_reaction_prompt_is_purchase_gated_in_send_orchestration():
     assert "_send_reaction_fishing" not in source
     assert "_send_post_purchase_reaction" in source
     assert "purchase_confirmed=true" in source
-    assert "state.status = FanStatus.PAYMENT_PENDING" in source
-    assert 'action_type="PPV_RECONCILE"' in source
+    persistence = (
+        Path(__file__).resolve().parents[1] / "services" / "ppv_persistence.py"
+    ).read_text(encoding="utf-8")
+    assert "persist_ppv_reconciliation(" in source
+    assert "state.status = FanStatus.PAYMENT_PENDING" in persistence
+    assert 'action_type="PPV_RECONCILE"' in persistence
     assert "ppv_resp.raise_for_status()" in source
     assert source.index("ppv_resp.raise_for_status()") < source.index(
-        "pending_ppv_check\": pending_check"
+        "persist_ppv_reconciliation("
     )

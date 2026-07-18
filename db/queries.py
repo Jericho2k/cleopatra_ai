@@ -641,6 +641,18 @@ async def freeze_fan_for_review(fan_id: str, reason: str) -> None:
     await asyncio.to_thread(_update)
 
 
+async def clear_fan_review(fan_id: str) -> None:
+    """Clear a review hold only after its backend resolution has completed."""
+    def _update():
+        get_supabase().table("fans").update({
+            "needs_human_review": False,
+            "review_reason": None,
+            "frozen_at": None,
+        }).eq("id", fan_id).execute()
+
+    await asyncio.to_thread(_update)
+
+
 async def set_fan_decline_lock(fan_id: str, price: float | None) -> None:
     """Mark that the fan declined on affordability. While locked, auto-mode does NOT
     sell to this fan (no PPV, no cheaper-item resurfacing). Cleared when he signals

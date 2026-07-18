@@ -14,6 +14,10 @@ from db.commercial_queries import (
     save_fan_state,
 )
 from db.queries import get_fan_session
+from services.db_reliability import (
+    is_transient_db_error,
+    retry_transient_db_operation,
+)
 
 
 FOLLOWUP_ACTIONS = {
@@ -29,38 +33,8 @@ class FullAutoStatusUnavailable(RuntimeError):
     """The operational snapshot could not be read after transient DB retries."""
 
 
-_TRANSIENT_ERROR_NAMES = {
-    "ConnectError",
-    "ConnectTimeout",
-    "PoolTimeout",
-    "ReadError",
-    "ReadTimeout",
-    "RemoteProtocolError",
-    "WriteError",
-    "WriteTimeout",
-}
-_TRANSIENT_ERROR_MARKERS = (
-    "connection terminated",
-    "connection reset",
-    "connection refused",
-    "connection closed",
-    "server disconnected",
-    "temporarily unavailable",
-)
-
-
 def _is_transient_operation_error(exc: BaseException) -> bool:
-    current: BaseException | None = exc
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if type(current).__name__ in _TRANSIENT_ERROR_NAMES:
-            return True
-        message = str(current).lower()
-        if any(marker in message for marker in _TRANSIENT_ERROR_MARKERS):
-            return True
-        current = current.__cause__ or current.__context__
-    return False
+    return is_transient_db_error(exc)
 
 
 async def _retry_transient_operation(
@@ -70,22 +44,20 @@ async def _retry_transient_operation(
     attempts: int = 3,
     delay_seconds: float = 0.15,
 ) -> Any:
-    for attempt in range(1, attempts + 1):
-        try:
-            return await operation()
-        except Exception as exc:
-            if not _is_transient_operation_error(exc):
-                raise
-            if attempt >= attempts:
-                raise FullAutoStatusUnavailable(
-                    f"{label} unavailable after {attempts} attempts"
-                ) from exc
-            print(
-                f"[FULL AUTO STATUS] transient read failure label={label} "
-                f"attempt={attempt}/{attempts}: {exc}"
-            )
-            await asyncio.sleep(delay_seconds * attempt)
-    raise FullAutoStatusUnavailable(f"{label} unavailable")
+    try:
+        return await retry_transient_db_operation(
+            operation,
+            label=label,
+            attempts=attempts,
+            delay_seconds=delay_seconds,
+            log_prefix="FULL AUTO STATUS",
+        )
+    except Exception as exc:
+        if _is_transient_operation_error(exc):
+            raise FullAutoStatusUnavailable(
+                f"{label} unavailable after {attempts} attempts"
+            ) from exc
+        raise
 
 
 def ppv_media_bundles(messages: list[dict[str, Any]]) -> dict[str, list[str]]:
@@ -194,46 +166,35 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
     from services.fan_lifecycle import get_fan_lifecycle_context
     from services.price_learning import get_price_learning_context
 
-    (
-        creator,
-        state,
-        session,
-        actions,
-        memberships,
-        creator_message_count,
-        ppv_messages,
-        fan_intelligence,
-        buyer_lifecycle,
-        affordability,
-        price_learning,
-    ) = await asyncio.gather(
-        _retry_transient_operation(
-            lambda: asyncio.to_thread(_creator), label="creator settings"
-        ),
-        _retry_transient_operation(
-            lambda: get_fan_state(fan_id), label="commercial state"
-        ),
-        _retry_transient_operation(
-            lambda: get_fan_session(fan_id), label="session state"
-        ),
-        _retry_transient_operation(
-            lambda: get_scheduled_actions_for_fan(fan_id), label="scheduled actions"
-        ),
-        _retry_transient_operation(
-            lambda: asyncio.to_thread(_memberships), label="fan lists"
-        ),
-        _retry_transient_operation(
-            lambda: asyncio.to_thread(_creator_message_count),
-            label="creator message count",
-        ),
-        _retry_transient_operation(
-            lambda: asyncio.to_thread(_ppv_messages), label="PPV history"
-        ),
-        _safe_context(get_fan_intelligence_context(fan_id)),
-        _safe_context(get_fan_lifecycle_context(fan_id)),
-        _safe_context(get_affordability_context(fan_id)),
-        _safe_context(get_price_learning_context(fan_id)),
+    # These calls intentionally run sequentially. The Supabase client is shared,
+    # and fanning many reads out across threads caused one HTTP/2 disconnect to
+    # take down both the dashboard snapshot and a concurrent PPV persistence write.
+    creator = await _retry_transient_operation(
+        lambda: asyncio.to_thread(_creator), label="creator settings"
     )
+    state = await _retry_transient_operation(
+        lambda: get_fan_state(fan_id), label="commercial state"
+    )
+    session = await _retry_transient_operation(
+        lambda: get_fan_session(fan_id), label="session state"
+    )
+    actions = await _retry_transient_operation(
+        lambda: get_scheduled_actions_for_fan(fan_id), label="scheduled actions"
+    )
+    memberships = await _retry_transient_operation(
+        lambda: asyncio.to_thread(_memberships), label="fan lists"
+    )
+    creator_message_count = await _retry_transient_operation(
+        lambda: asyncio.to_thread(_creator_message_count),
+        label="creator message count",
+    )
+    ppv_messages = await _retry_transient_operation(
+        lambda: asyncio.to_thread(_ppv_messages), label="PPV history"
+    )
+    fan_intelligence = await _safe_context(get_fan_intelligence_context(fan_id))
+    buyer_lifecycle = await _safe_context(get_fan_lifecycle_context(fan_id))
+    affordability = await _safe_context(get_affordability_context(fan_id))
+    price_learning = await _safe_context(get_price_learning_context(fan_id))
     from services.auto_audience import AutoAudiencePolicy, evaluate_auto_eligibility
 
     try:

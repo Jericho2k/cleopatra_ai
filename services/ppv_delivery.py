@@ -9,21 +9,16 @@ import uuid
 import httpx
 
 from core.supabase import get_supabase
-from db.commercial_queries import (
-    get_creator_policy,
-    get_fan_state,
-    save_fan_state,
-    schedule_action,
-)
+from db.commercial_queries import get_creator_policy
 from db.queries import (
     freeze_fan_for_review,
     get_fan_session,
-    save_fan_session,
-    save_message,
 )
-from models.commercial import FanStatus
-from services.followup_lifecycle import next_reconcile_at
-from services.session_lifecycle import mark_step_sent
+from services.db_reliability import retry_transient_db_operation
+from services.ppv_persistence import (
+    persist_ppv_reconciliation,
+    save_ppv_message_receipt,
+)
 from services.vault_operations import normalize_media_ids
 
 
@@ -147,7 +142,11 @@ async def send_locked_ppv(
 
     sent_at = datetime.now(timezone.utc)
     try:
-        policy = await get_creator_policy(creator_id)
+        policy = await retry_transient_db_operation(
+            lambda: get_creator_policy(creator_id),
+            label=f"PPV delivery policy fan={fan_id}",
+            log_prefix="PPV PERSIST RETRY",
+        )
         expires_at = sent_at + timedelta(hours=policy.ppv_payment_window_hours)
         pending = {
             "reference": reference,
@@ -163,51 +162,37 @@ async def send_locked_ppv(
             "verification_attempts": 0,
             "platform_message_id": platform_message_id,
         }
-        await save_message(
+        media_context = {
+            "ppv": {
+                "media_ids": exact_media_ids,
+                "media_id": exact_media_ids[0],
+                "price": price_dollars,
+                "price_cents": int(price_cents),
+                "access_type": "ppv",
+                "set_id": set_id,
+                "step_index": step_index,
+                "payment_reference": reference,
+                "source": source,
+            }
+        }
+        await save_ppv_message_receipt(
             fan_id=fan_id,
             creator_id=creator_id,
-            role="creator",
             content=content,
             was_ai_suggested=was_ai_suggested,
-            media_context={
-                "ppv": {
-                    "media_ids": exact_media_ids,
-                    "media_id": exact_media_ids[0],
-                    "price": price_dollars,
-                    "price_cents": int(price_cents),
-                    "access_type": "ppv",
-                    "set_id": set_id,
-                    "step_index": step_index,
-                    "payment_reference": reference,
-                    "source": source,
-                }
-            },
+            platform_message_id=platform_message_id,
+            media_context=media_context,
         )
-        await asyncio.to_thread(
-            lambda: db.table("fans")
-            .update({"pending_ppv_check": pending})
-            .eq("id", fan_id)
-            .execute()
-        )
-        if session and step_index is not None:
-            session = mark_step_sent(session, message_id=platform_message_id)
-            await save_fan_session(fan_id, session)
-
-        state = await get_fan_state(fan_id)
-        state.status = FanStatus.PAYMENT_PENDING
-        await save_fan_state(fan_id, creator_id, state)
-        reconcile_at = next_reconcile_at(
-            sent_at,
-            expires_at=expires_at,
-            recheck_minutes=policy.ppv_recheck_minutes,
-        )
-        await schedule_action(
+        session, reconcile_at = await persist_ppv_reconciliation(
             creator_id=creator_id,
             fan_id=fan_id,
-            action_type="PPV_RECONCILE",
-            execute_at=reconcile_at,
-            payload={"payment_reference": reference},
-            dedupe_key=f"ppv-reconcile:{fan_id}:{reference}",
+            pending=pending,
+            session=session,
+            platform_message_id=platform_message_id,
+        )
+        print(
+            f"[PPV PERSIST] fan={fan_id} reference={reference} "
+            f"state=PAYMENT_PENDING reconcile_at={reconcile_at.isoformat()}"
         )
     except Exception as exc:
         await freeze_fan_for_review(fan_id, "ppv_sent_but_reconciliation_not_persisted")

@@ -2709,6 +2709,11 @@ class ResolvePPVApprovalRequest(BaseModel):
     resolved_by: str | None = None
 
 
+class ResolveFanReviewRequest(BaseModel):
+    resolution: str
+    amount: float | None = None
+
+
 @app.get("/fan/{fan_id}/full-auto-status")
 async def read_full_auto_status(fan_id: str) -> dict:
     from services.full_auto_operations import (
@@ -2724,6 +2729,21 @@ async def read_full_auto_status(fan_id: str) -> dict:
             status_code=503,
             detail="Full Auto status is temporarily unavailable. Please retry.",
         ) from exc
+
+
+@app.post("/fan/{fan_id}/resolve-review")
+async def resolve_review(fan_id: str, request: ResolveFanReviewRequest) -> dict:
+    """Resolve a frozen conversation through a deterministic backend action."""
+    from services.ppv_recovery import PPVRecoveryError, resolve_fan_review
+
+    try:
+        return await resolve_fan_review(
+            fan_id,
+            resolution=request.resolution,
+            amount=request.amount,
+        )
+    except PPVRecoveryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.get("/creator/{creator_id}/full-auto-health")

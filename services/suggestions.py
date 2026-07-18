@@ -32,9 +32,13 @@ from db.commercial_queries import (
 from services.session_planner import plan_session_for_fan
 from services.human_delivery import build_delivery_schedule
 from services.ppv_delivery import create_ppv_approval_request
+from services.db_reliability import retry_transient_db_operation
+from services.ppv_persistence import (
+    persist_ppv_reconciliation,
+    save_ppv_message_receipt,
+)
 from services.followup_lifecycle import (
     complete_session_state,
-    next_reconcile_at,
 )
 from services.fan_intelligence import learn_from_fan_message
 from services.affordability import (
@@ -56,7 +60,6 @@ from services.session_lifecycle import (
     decrement_cooldown,
     mark_step_declined,
     mark_step_purchased,
-    mark_step_sent,
 )
 from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
@@ -1130,10 +1133,12 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         "media_ids": media_ids,
                         "media_id": media_id,
                         "price": price,
+                        "price_cents": int(round(price * 100)),
                         "access_type": "ppv",
                         "set_id": (current_step or {}).get("set_id"),
                         "step_index": (active_session or {}).get("current_index"),
                         "payment_reference": delivery_reference,
+                        "source": "auto",
                     }
                 }
 
@@ -1178,7 +1183,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                     )
                     print(
                         f"[AUTO TEST DELIVERY] fan={fan_id} "
-                        f"kind={'ppv' if ppv_match else 'text'} persisted_locally=true"
+                        f"kind={'ppv' if ppv_match else 'text'} accepted=true"
                     )
                 elif ppv_match:
                     ppv_content = text_out if text_out else random.choice([
@@ -1232,14 +1237,30 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 return
 
             try:
-                await save_message(
-                    fan_id=fan_id,
-                    creator_id=creator_id,
-                    role="creator",
-                    content=text_out,
-                    was_ai_suggested=True,
-                    media_context=ppv_media_context,
-                )
+                if ppv_match:
+                    await save_ppv_message_receipt(
+                        fan_id=fan_id,
+                        creator_id=creator_id,
+                        content=text_out,
+                        was_ai_suggested=True,
+                        platform_message_id=platform_message_id,
+                        media_context=ppv_media_context or {},
+                    )
+                else:
+                    await save_message(
+                        fan_id=fan_id,
+                        creator_id=creator_id,
+                        role="creator",
+                        content=text_out,
+                        was_ai_suggested=True,
+                        fansly_message_id=platform_message_id,
+                        media_context=ppv_media_context,
+                    )
+                if local_test_delivery:
+                    print(
+                        f"[AUTO TEST DELIVERY] fan={fan_id} "
+                        f"kind={'ppv' if ppv_match else 'text'} message_persisted=true"
+                    )
             except Exception as exc:
                 # Delivery already happened. Freeze rather than retrying and
                 # risking a duplicate message on the live account.
@@ -1251,7 +1272,11 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 try:
                     from datetime import datetime, timedelta, timezone
 
-                    policy = await get_creator_policy(creator_id)
+                    policy = await retry_transient_db_operation(
+                        lambda: get_creator_policy(creator_id),
+                        label=f"PPV delivery policy fan={fan_id}",
+                        log_prefix="PPV PERSIST RETRY",
+                    )
                     sent_at = datetime.now(timezone.utc)
                     expires_at = sent_at + timedelta(
                         hours=policy.ppv_payment_window_hours
@@ -1263,43 +1288,19 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         "set_id": (current_step or {}).get("set_id"),
                         "step_index": (active_session or {}).get("current_index"),
                         "price": price,
+                        "price_cents": int(round(price * 100)),
+                        "source": "auto",
                         "sent_at": sent_at.isoformat(),
                         "expires_at": expires_at.isoformat(),
                         "verification_attempts": 0,
                         "platform_message_id": platform_message_id,
                     }
-                    db = get_supabase()
-                    await asyncio.to_thread(
-                        lambda: db.table("fans").update({
-                            "pending_ppv_check": pending_check
-                        }).eq("id", fan_id).execute()
-                    )
-
-                    session = await get_fan_session(fan_id)
-                    if session:
-                        session = mark_step_sent(
-                            session,
-                            message_id=platform_message_id,
-                        )
-                        await save_fan_session(fan_id, session)
-                        active_session = session
-
-                    state = await get_fan_state(fan_id)
-                    state.status = FanStatus.PAYMENT_PENDING
-                    await save_fan_state(fan_id, creator_id, state)
-
-                    reconcile_at = next_reconcile_at(
-                        sent_at,
-                        expires_at=expires_at,
-                        recheck_minutes=policy.ppv_recheck_minutes,
-                    )
-                    await schedule_action(
+                    active_session, reconcile_at = await persist_ppv_reconciliation(
                         creator_id=creator_id,
                         fan_id=fan_id,
-                        action_type="PPV_RECONCILE",
-                        execute_at=reconcile_at,
-                        payload={"payment_reference": delivery_reference},
-                        dedupe_key=f"ppv-reconcile:{fan_id}:{delivery_reference}",
+                        pending=pending_check,
+                        session=active_session,
+                        platform_message_id=platform_message_id,
                     )
                     print(
                         f"[PAYMENT] fan={fan_id} state=PAYMENT_PENDING "
