@@ -557,15 +557,6 @@ _cors_origins = [
     o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if o.strip()
 ]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://[a-z0-9-]+\.vercel\.app",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # --- API authentication ---------------------------------------------------
 # Path-based policy so we don't have to touch ~33 route decorators:
 #   • OPTIONS (CORS preflight) and health/root  -> always open
@@ -601,6 +592,19 @@ async def api_auth_middleware(request, call_next):
         return JSONResponse({"detail": "Missing or invalid credentials"}, status_code=401)
 
     return await call_next(request)
+
+
+# Keep CORS outside the authentication middleware so browser clients can read
+# authentication failures. Otherwise a rejected credential looks like a generic
+# network error because the early 401 response has no Access-Control-Allow-Origin.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?|https://[a-z0-9-]+\.vercel\.app",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 
