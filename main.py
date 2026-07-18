@@ -11,7 +11,7 @@ import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -49,6 +49,12 @@ from services.suggestions import (
     _update_fan_memory,
     get_suggestions,
     schedule_auto_reply,
+)
+from services.vault_operations import (
+    MANUAL_RECATEGORIZATION_DAILY_LIMIT,
+    categorize_new_batch_enabled,
+    manual_recategorization_usage,
+    normalize_media_ids,
 )
 
 
@@ -416,10 +422,13 @@ async def _scheduled_actions_scheduler():
 
 
 async def vault_autosync_scheduler():
-    """Once a day, sync any creator whose vault is >7 days stale, then categorize
-    only the genuinely-new items. The persisted last_vault_sync_at timestamp acts
-    as the cross-worker guard: the first worker to stamp it wins; others see the
-    cooldown via sync_vault_start and skip. Expensive ops stay bounded."""
+    """Once a day, sync creators whose vault is stale.
+
+    ``_run_vault_sync`` owns the exact IDs imported by that run and, when the
+    creator opted in, categorizes only those IDs. The scheduler must never scan
+    every uncategorized record after a sync because that can accidentally rerun
+    the initial-vault job.
+    """
     while True:
         await asyncio.sleep(24 * 60 * 60)
         try:
@@ -438,16 +447,6 @@ async def vault_autosync_scheduler():
                 if res.get("status") != "started":
                     continue
                 print(f"[CRON] auto-sync started creator={cid}")
-                # Let the sync finish, then categorize only new (uncategorized) items.
-                for _ in range(600):  # up to ~10 min
-                    await asyncio.sleep(1)
-                    st = _vault_sync_state.get(cid, {}).get("status")
-                    if st in ("done", "error", "idle", None):
-                        break
-                pending = await _count_uncategorized(cid)
-                if pending > 0:
-                    print(f"[CRON] auto-categorize creator={cid} new={pending}")
-                    await categorize_vault(cid, force=True)
         except Exception as e:
             print(f"[CRON VAULT AUTOSYNC ERROR] {e}")
 
@@ -1299,12 +1298,15 @@ async def _run_vault_sync(creator_id: str) -> None:
     try:
         creator_row = await asyncio.to_thread(
             lambda: db.table("creators")
-            .select("apifansly_account_id")
+            .select("apifansly_account_id, auto_categorize_new_media")
             .eq("id", creator_id)
             .single()
             .execute()
         )
         apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+        auto_categorize_new = bool(
+            (creator_row.data or {}).get("auto_categorize_new_media", True)
+        )
         api_key = os.environ.get("APIFANSLY_API_KEY")
 
         existing_rows = await asyncio.to_thread(
@@ -1328,6 +1330,7 @@ async def _run_vault_sync(creator_id: str) -> None:
             already = len(existing_ids)
             new_total = max(total - already, 0)
             synced = 0
+            new_item_ids: list[str] = []
 
             _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": 0, "album": "Starting..."}
 
@@ -1396,11 +1399,31 @@ async def _run_vault_sync(creator_id: str) -> None:
                     consecutive_dupe_batches = consecutive_dupe_batches + 1 if all_dupes else 0
 
                     if batch:
-                        await asyncio.to_thread(
+                        saved_rows = await asyncio.to_thread(
                             lambda b=batch: db.table("creator_vault_media")
                             .upsert(b, on_conflict="creator_id,media_id")
                             .execute()
                         )
+                        returned_ids = [
+                            str(row.get("id"))
+                            for row in (saved_rows.data or [])
+                            if row.get("id")
+                        ]
+                        if not returned_ids:
+                            media_ids = [str(row["media_id"]) for row in batch]
+                            looked_up = await asyncio.to_thread(
+                                lambda mids=media_ids: db.table("creator_vault_media")
+                                .select("id")
+                                .eq("creator_id", creator_id)
+                                .in_("media_id", mids)
+                                .execute()
+                            )
+                            returned_ids = [
+                                str(row.get("id"))
+                                for row in (looked_up.data or [])
+                                if row.get("id")
+                            ]
+                        new_item_ids.extend(returned_ids)
                         synced += len(batch)
 
                     _vault_sync_state[creator_id] = {"status": "running", "synced": synced, "total": new_total, "album": album_title}
@@ -1409,8 +1432,45 @@ async def _run_vault_sync(creator_id: str) -> None:
                     if not cursor or consecutive_dupe_batches >= 3:
                         break
 
-        _vault_sync_state[creator_id] = {"status": "done", "synced": synced, "total": new_total, "album": ""}
-        print(f"[VAULT SYNC] done synced={synced}")
+        new_item_ids = normalize_media_ids(new_item_ids)
+        categorized_new = 0
+        category_errors = 0
+        if categorize_new_batch_enabled(auto_categorize_new, new_item_ids):
+            _vault_sync_state[creator_id] = {
+                "status": "categorizing_new",
+                "synced": synced,
+                "total": new_total,
+                "album": "Categorizing newly imported media…",
+            }
+            _categorize_state[creator_id] = {
+                "status": "running",
+                "mode": "new",
+                "done": 0,
+                "total": len(new_item_ids),
+                "errors": 0,
+            }
+            await _run_vault_categorization(
+                creator_id,
+                item_ids=new_item_ids,
+                mark_initial=False,
+            )
+            category_state = _categorize_state.get(creator_id, {})
+            categorized_new = int(category_state.get("done") or 0)
+            category_errors = int(category_state.get("errors") or 0)
+
+        _vault_sync_state[creator_id] = {
+            "status": "done",
+            "synced": synced,
+            "total": new_total,
+            "album": "",
+            "auto_categorize_new_media": auto_categorize_new,
+            "categorized_new": categorized_new,
+            "categorization_errors": category_errors,
+        }
+        print(
+            f"[VAULT SYNC] done synced={synced} categorized_new={categorized_new} "
+            f"category_errors={category_errors}"
+        )
 
     except Exception as e:
         import traceback
@@ -1426,12 +1486,15 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
     db = get_supabase()
     creator_row = await asyncio.to_thread(
         lambda: db.table("creators")
-        .select("apifansly_account_id")
+        .select("apifansly_account_id, auto_categorize_new_media")
         .eq("id", creator_id)
         .single()
         .execute()
     )
     apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+    auto_categorize_new = bool(
+        (creator_row.data or {}).get("auto_categorize_new_media", True)
+    )
     api_key = os.environ.get("APIFANSLY_API_KEY")
 
     form = await request.form()
@@ -1515,8 +1578,8 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
         )
         saved = db_result.data or row
         print(f"[UPLOAD] saved to DB media_id={media_id}")
-        # Auto-categorize in background
-        if saved.get("id"):
+        # User-uploaded media follows the same opt-in rule as synced media.
+        if saved.get("id") and auto_categorize_new:
             spawn(_categorize_single_item_and_save(saved), name="categorize_single_item")
         return {"status": "ok", "item": saved}
 
@@ -1796,30 +1859,140 @@ _categorize_state: dict = {}
 
 
 @app.post("/categorize-vault/{creator_id}")
-async def categorize_vault(creator_id: str, force: bool = False) -> dict:
+async def categorize_vault(
+    creator_id: str,
+    mode: str = "auto",
+    force: bool = False,
+) -> dict:
+    """Start either the one-time initial job or a new-media-only job.
+
+    ``force`` remains accepted for compatibility with older dashboard builds,
+    but it cannot unlock a completed initial-vault run or reprocess categorized
+    media. That invariant is enforced by the selected rows, not by the UI.
+    """
+    del force
     if _categorize_state.get(creator_id, {}).get("status") == "running":
         return {"status": "already_running", "state": _categorize_state[creator_id]}
 
-    # Cost guard #1: never spend API on a vault that has nothing uncategorized.
+    db = get_supabase()
+    creator = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("vault_initial_categorized_at")
+        .eq("id", creator_id)
+        .single()
+        .execute()
+    )
+    initial_completed_at = (creator.data or {}).get("vault_initial_categorized_at")
+    resolved_mode = mode.strip().lower()
+    if resolved_mode == "auto":
+        resolved_mode = "new" if initial_completed_at else "initial"
+    if resolved_mode not in {"initial", "new"}:
+        raise HTTPException(status_code=400, detail="mode must be 'initial' or 'new'")
+    if resolved_mode == "initial" and initial_completed_at:
+        return {
+            "status": "initial_already_completed",
+            "initial_completed_at": initial_completed_at,
+        }
+
+    # Both modes select only uncategorized rows. The initial mode is additionally
+    # locked forever after its first successful pass.
     pending = await _count_uncategorized(creator_id)
     if pending == 0:
-        return {"status": "nothing_to_categorize", "uncategorized": 0}
+        return {
+            "status": "nothing_to_categorize",
+            "mode": resolved_mode,
+            "uncategorized": 0,
+        }
 
-    # Cost guard #2: cooldown against button-mashing (overridable with force=true).
-    if not force:
-        cd = await _vault_cooldown_remaining(creator_id, "last_categorize_at")
-        if not cd["allowed"]:
-            return {"status": "cooldown", **cd, "uncategorized": pending}
-
-    _categorize_state[creator_id] = {"status": "running", "done": 0, "total": pending, "errors": 0}
+    _categorize_state[creator_id] = {
+        "status": "running",
+        "mode": resolved_mode,
+        "done": 0,
+        "total": pending,
+        "errors": 0,
+    }
     await _stamp_vault_op(creator_id, "last_categorize_at")
-    spawn(_run_vault_categorization(creator_id), name="run_vault_categorization")
-    return {"status": "started", "uncategorized": pending}
+    spawn(
+        _run_vault_categorization(
+            creator_id,
+            mark_initial=resolved_mode == "initial",
+        ),
+        name=f"run_vault_categorization:{resolved_mode}",
+    )
+    return {"status": "started", "mode": resolved_mode, "uncategorized": pending}
 
 
 @app.get("/categorize-vault-status/{creator_id}")
 async def categorize_vault_status(creator_id: str) -> dict:
     return _categorize_state.get(creator_id, {"status": "idle", "done": 0, "total": 0})
+
+
+class VaultCategorizationSettingsRequest(BaseModel):
+    auto_categorize_new_media: bool
+
+
+@app.put("/creator/{creator_id}/vault-categorization-settings")
+async def update_vault_categorization_settings(
+    creator_id: str,
+    settings: VaultCategorizationSettingsRequest,
+) -> dict:
+    db = get_supabase()
+    result = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .update({"auto_categorize_new_media": settings.auto_categorize_new_media})
+        .eq("id", creator_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="creator not found")
+    return {
+        "status": "ok",
+        "auto_categorize_new_media": settings.auto_categorize_new_media,
+    }
+
+
+async def _manual_recategorization_usage(creator_id: str) -> dict:
+    db = get_supabase()
+    result = await asyncio.to_thread(
+        lambda: db.rpc(
+            "vault_recategorization_usage",
+            {
+                "p_creator_id": creator_id,
+                "p_daily_limit": MANUAL_RECATEGORIZATION_DAILY_LIMIT,
+            },
+        ).execute()
+    )
+    row = (result.data or [{}])[0]
+    return manual_recategorization_usage(
+        int(row.get("used") or 0),
+        int(row.get("daily_limit") or MANUAL_RECATEGORIZATION_DAILY_LIMIT),
+    )
+
+
+@app.get("/creator/{creator_id}/vault-categorization-overview")
+async def vault_categorization_overview(creator_id: str) -> dict:
+    db = get_supabase()
+    creator = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("vault_initial_categorized_at, auto_categorize_new_media")
+        .eq("id", creator_id)
+        .single()
+        .execute()
+    )
+    if not creator.data:
+        raise HTTPException(status_code=404, detail="creator not found")
+    return {
+        "initial_completed_at": creator.data.get("vault_initial_categorized_at"),
+        "auto_categorize_new_media": bool(
+            creator.data.get("auto_categorize_new_media", True)
+        ),
+        "uncategorized": await _count_uncategorized(creator_id),
+        "manual_reanalysis": await _manual_recategorization_usage(creator_id),
+        "active_run": _categorize_state.get(
+            creator_id,
+            {"status": "idle", "done": 0, "total": 0},
+        ),
+    }
 
 
 @app.get("/vault-media-url/{creator_id}/{media_id}")
@@ -1844,31 +2017,52 @@ async def get_vault_media_url(creator_id: str, media_id: str) -> dict:
     }
 
 
-async def _run_vault_categorization(creator_id: str) -> None:
+async def _run_vault_categorization(
+    creator_id: str,
+    *,
+    item_ids: list[str] | None = None,
+    mark_initial: bool = False,
+) -> None:
     db = get_supabase()
     try:
-        # Paginate to get ALL uncategorized items past 1000 limit
-        all_items = []
-        page_size = 1000
-        from_idx = 0
-        while True:
-            rows = await asyncio.to_thread(
-                lambda f=from_idx: db.table("creator_vault_media")
-                .select("id, url, mimetype, filename, album_title")
-                .eq("creator_id", creator_id)
-                .or_("content_category.is.null,content_category.eq.")
-                .range(f, f + page_size - 1)
-                .execute()
-            )
-            batch = rows.data or []
-            all_items.extend(batch)
-            if len(batch) < page_size:
-                break
-            from_idx += page_size
+        all_items: list[dict] = []
+        target_ids = normalize_media_ids(item_ids)
+        if target_ids:
+            # URL-safe chunks also make the exact new-media contract explicit.
+            for start in range(0, len(target_ids), 250):
+                chunk = target_ids[start:start + 250]
+                rows = await asyncio.to_thread(
+                    lambda ids=chunk: db.table("creator_vault_media")
+                    .select("id, url, mimetype, filename, album_title")
+                    .eq("creator_id", creator_id)
+                    .in_("id", ids)
+                    .or_("content_category.is.null,content_category.eq.")
+                    .execute()
+                )
+                all_items.extend(rows.data or [])
+        else:
+            # Initial setup only: paginate every still-uncategorized item once.
+            page_size = 1000
+            from_idx = 0
+            while True:
+                rows = await asyncio.to_thread(
+                    lambda f=from_idx: db.table("creator_vault_media")
+                    .select("id, url, mimetype, filename, album_title")
+                    .eq("creator_id", creator_id)
+                    .or_("content_category.is.null,content_category.eq.")
+                    .range(f, f + page_size - 1)
+                    .execute()
+                )
+                batch = rows.data or []
+                all_items.extend(batch)
+                if len(batch) < page_size:
+                    break
+                from_idx += page_size
 
         total = len(all_items)
         _categorize_state[creator_id]["total"] = total
-        print(f"[CATEGORIZE] creator={creator_id} uncategorized={total}")
+        mode = "new" if target_ids else "initial"
+        print(f"[CATEGORIZE] creator={creator_id} mode={mode} items={total}")
 
         done = 0
         errors = 0
@@ -1904,7 +2098,12 @@ async def _run_vault_categorization(creator_id: str) -> None:
             print(f"[CATEGORIZE] done={done}/{total} errors={errors}")
             await asyncio.sleep(1.5)  # respect rate limit between batches
 
-        _categorize_state[creator_id]["status"] = "done"
+        if mark_initial and errors == 0:
+            await _stamp_vault_op(creator_id, "vault_initial_categorized_at")
+        _categorize_state[creator_id].update({
+            "status": "done",
+            "initial_locked": bool(mark_initial and errors == 0),
+        })
         print(f"[CATEGORIZE] complete done={done} errors={errors}")
 
     except Exception as e:
@@ -1934,7 +2133,7 @@ async def recategorize_item(item_id: str) -> dict:
     db = get_supabase()
     row = await asyncio.to_thread(
         lambda: db.table("creator_vault_media")
-        .select("id, url, mimetype, filename, album_title")
+        .select("id, creator_id, url, mimetype, filename, album_title")
         .eq("id", item_id)
         .single()
         .execute()
@@ -1942,6 +2141,35 @@ async def recategorize_item(item_id: str) -> dict:
     item = row.data
     if not item:
         return {"status": "error", "message": "item not found"}
+
+    creator_id = str(item.get("creator_id") or "")
+    try:
+        claim = await asyncio.to_thread(
+            lambda: db.rpc(
+                "claim_vault_recategorization",
+                {
+                    "p_creator_id": creator_id,
+                    "p_media_id": str(item_id),
+                    "p_daily_limit": MANUAL_RECATEGORIZATION_DAILY_LIMIT,
+                },
+            ).execute()
+        )
+    except Exception as exc:
+        if "daily vault re-categorization limit reached" in str(exc).lower():
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "The daily AI re-analysis limit has been reached. "
+                    "Manual metadata editing is still available."
+                ),
+            ) from exc
+        raise
+
+    claim_row = (claim.data or [{}])[0]
+    usage = manual_recategorization_usage(
+        int(claim_row.get("used") or 0),
+        MANUAL_RECATEGORIZATION_DAILY_LIMIT,
+    )
 
     result = await _categorize_single_item(item)
     await asyncio.to_thread(
@@ -1966,7 +2194,7 @@ async def recategorize_item(item_id: str) -> dict:
         .single()
         .execute()
     )
-    return {"status": "ok", "item": updated.data}
+    return {"status": "ok", "item": updated.data, "manual_reanalysis": usage}
 
 
 @app.get("/media/{account_id}/{content_id}")
