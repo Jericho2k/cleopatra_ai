@@ -53,6 +53,30 @@ def _matching_purchase(transactions: list[dict], expected_price: float) -> float
     return None
 
 
+def _abandoned_log_entry(
+    pending: dict[str, Any],
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    """Preserve the complete offered bundle for operator history and previews."""
+    media_ids = [
+        str(value)
+        for value in (pending.get("media_ids") or [pending.get("media_id")])
+        if value
+    ]
+    media_id = str(pending.get("media_id") or (media_ids[0] if media_ids else ""))
+    return {
+        "date": now.strftime("%d.%m.%Y"),
+        "item": f"PPV media {media_id}",
+        "media_id": media_id,
+        "media_ids": media_ids,
+        "amount": float(pending.get("price") or 0),
+        "reason": "payment window expired without a confirmed unlock",
+        "payment_reference": pending_reference(pending),
+        "chatter": "Operator" if pending.get("source") == "operator" else "AI",
+    }
+
+
 async def _load_platform_context(creator_id: str, fan_id: str) -> tuple[dict, dict]:
     def _load() -> tuple[dict, dict]:
         db = get_supabase()
@@ -143,15 +167,7 @@ async def _finalize_abandonment(
             return False
         not_sold = list(latest.get("not_sold_log") or fan_row.get("not_sold_log") or [])
         if not any(str(entry.get("payment_reference") or "") == reference for entry in not_sold):
-            not_sold.append({
-                "date": now.strftime("%d.%m.%Y"),
-                "item": f"PPV media {media_id}",
-                "media_id": media_id,
-                "amount": expected_price,
-                "reason": "payment window expired without a confirmed unlock",
-                "payment_reference": reference,
-                "chatter": "AI",
-            })
+            not_sold.append(_abandoned_log_entry(pending, now=now))
         db.table("fans").update({
             "not_sold_log": not_sold,
             "pending_ppv_check": None,

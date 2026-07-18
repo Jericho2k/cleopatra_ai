@@ -24,6 +24,30 @@ FOLLOWUP_ACTIONS = {
 }
 
 
+def ppv_media_bundles(messages: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Index every PPV media id to the complete immutable bundle it belonged to."""
+    bundles: dict[str, list[str]] = {}
+    for message in messages:
+        ppv = (message.get("media_context") or {}).get("ppv") or {}
+        media_ids = list(dict.fromkeys(
+            str(value)
+            for value in (ppv.get("media_ids") or [ppv.get("media_id")])
+            if value
+        ))
+        for media_id in media_ids:
+            bundles.setdefault(media_id, media_ids)
+    return bundles
+
+
+async def _safe_context(awaitable: Any) -> dict[str, Any]:
+    try:
+        value = await awaitable
+        return value if isinstance(value, dict) else {}
+    except Exception as exc:
+        print(f"[FULL AUTO STATUS] optional context unavailable: {exc}")
+        return {}
+
+
 def summarize_operation_rows(
     states: list[dict[str, Any]],
     fans: list[dict[str, Any]],
@@ -85,13 +109,48 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
         )
         return int(response.count or 0)
 
-    creator, state, session, actions, memberships, creator_message_count = await asyncio.gather(
+    def _ppv_messages() -> list[dict]:
+        return (
+            get_supabase().table("messages")
+            .select("media_context")
+            .eq("fan_id", fan_id)
+            .eq("creator_id", creator_id)
+            .eq("role", "creator")
+            .not_.is_("media_context", "null")
+            .order("sent_at", desc=True)
+            .limit(1000)
+            .execute()
+        ).data or []
+
+    from db.fan_intelligence_queries import get_fan_intelligence_context
+    from services.affordability import get_affordability_context
+    from services.fan_lifecycle import get_fan_lifecycle_context
+    from services.price_learning import get_price_learning_context
+
+    (
+        creator,
+        state,
+        session,
+        actions,
+        memberships,
+        creator_message_count,
+        ppv_messages,
+        fan_intelligence,
+        buyer_lifecycle,
+        affordability,
+        price_learning,
+    ) = await asyncio.gather(
         asyncio.to_thread(_creator),
         get_fan_state(fan_id),
         get_fan_session(fan_id),
         get_scheduled_actions_for_fan(fan_id),
         asyncio.to_thread(_memberships),
         asyncio.to_thread(_creator_message_count),
+        asyncio.to_thread(_ppv_messages),
+        _safe_context(get_fan_intelligence_context(fan_id)),
+        _safe_context(get_fan_lifecycle_context(fan_id)),
+        _safe_context(get_affordability_context(fan_id)),
+        _safe_context(get_price_learning_context(fan_id)),
     )
     from services.auto_audience import AutoAudiencePolicy, evaluate_auto_eligibility
 
@@ -140,6 +199,11 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
         "pending_ppv": pending,
         "scheduled_actions": actions,
         "last_active": fan.get("last_active"),
+        "ppv_media_bundles": ppv_media_bundles(ppv_messages),
+        "fan_intelligence": fan_intelligence,
+        "buyer_lifecycle": buyer_lifecycle,
+        "affordability": affordability,
+        "price_learning": price_learning,
     }
 
 

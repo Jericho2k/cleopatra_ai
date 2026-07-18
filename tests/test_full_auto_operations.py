@@ -1,4 +1,4 @@
-from services.full_auto_operations import summarize_operation_rows
+from services.full_auto_operations import ppv_media_bundles, summarize_operation_rows
 
 
 def test_operational_summary_counts_only_actionable_states():
@@ -23,4 +23,21 @@ def test_operational_summary_counts_only_actionable_states():
         "human_review": 1,
         "failed_actions": 1,
         "processing_actions": 1,
+    }
+
+
+def test_ppv_media_bundles_indexes_every_item_to_the_full_bundle():
+    bundles = ppv_media_bundles([
+        {
+            "media_context": {
+                "ppv": {"media_id": "first", "media_ids": ["first", "second", "first"]}
+            }
+        },
+        {"media_context": {"ppv": {"media_id": "solo"}}},
+        {"media_context": None},
+    ])
+    assert bundles == {
+        "first": ["first", "second"],
+        "second": ["first", "second"],
+        "solo": ["solo"],
     }

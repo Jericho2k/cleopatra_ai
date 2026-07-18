@@ -38,6 +38,17 @@ def test_matching_purchase_filters_transaction_type_and_price():
     assert reconciliation._matching_purchase(transactions, 20) is None
 
 
+def test_abandoned_log_preserves_complete_ppv_bundle():
+    entry = reconciliation._abandoned_log_entry(
+        pending(media_ids=["media-1", "media-2"], source="operator"),
+        now=NOW,
+    )
+    assert entry["media_id"] == "media-1"
+    assert entry["media_ids"] == ["media-1", "media-2"]
+    assert entry["chatter"] == "Operator"
+    assert entry["payment_reference"] == "ref-1"
+
+
 def test_unpurchased_ppv_stays_pending_until_real_expiry(monkeypatch):
     current = pending()
     persisted = []
