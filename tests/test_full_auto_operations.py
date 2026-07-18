@@ -1,4 +1,13 @@
-from services.full_auto_operations import ppv_media_bundles, summarize_operation_rows
+import asyncio
+
+import pytest
+
+from services.full_auto_operations import (
+    FullAutoStatusUnavailable,
+    _retry_transient_operation,
+    ppv_media_bundles,
+    summarize_operation_rows,
+)
 
 
 def test_operational_summary_counts_only_actionable_states():
@@ -41,3 +50,42 @@ def test_ppv_media_bundles_indexes_every_item_to_the_full_bundle():
         "second": ["first", "second"],
         "solo": ["solo"],
     }
+
+
+def test_operational_reads_retry_transient_protocol_disconnects():
+    class RemoteProtocolError(RuntimeError):
+        pass
+
+    calls = 0
+
+    async def operation():
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RemoteProtocolError("connection terminated")
+        return {"status": "ok"}
+
+    result = asyncio.run(_retry_transient_operation(
+        operation,
+        label="test snapshot",
+        delay_seconds=0,
+    ))
+
+    assert result == {"status": "ok"}
+    assert calls == 3
+
+
+def test_operational_reads_fail_cleanly_after_transient_retries():
+    class RemoteProtocolError(RuntimeError):
+        pass
+
+    async def operation():
+        raise RemoteProtocolError("server disconnected")
+
+    with pytest.raises(FullAutoStatusUnavailable):
+        asyncio.run(_retry_transient_operation(
+            operation,
+            label="test snapshot",
+            attempts=2,
+            delay_seconds=0,
+        ))

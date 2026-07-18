@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -22,6 +23,69 @@ FOLLOWUP_ACTIONS = {
     "OFFER_EXPIRY",
     "ABANDONED_OFFER_FOLLOWUP",
 }
+
+
+class FullAutoStatusUnavailable(RuntimeError):
+    """The operational snapshot could not be read after transient DB retries."""
+
+
+_TRANSIENT_ERROR_NAMES = {
+    "ConnectError",
+    "ConnectTimeout",
+    "PoolTimeout",
+    "ReadError",
+    "ReadTimeout",
+    "RemoteProtocolError",
+    "WriteError",
+    "WriteTimeout",
+}
+_TRANSIENT_ERROR_MARKERS = (
+    "connection terminated",
+    "connection reset",
+    "connection refused",
+    "connection closed",
+    "server disconnected",
+    "temporarily unavailable",
+)
+
+
+def _is_transient_operation_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if type(current).__name__ in _TRANSIENT_ERROR_NAMES:
+            return True
+        message = str(current).lower()
+        if any(marker in message for marker in _TRANSIENT_ERROR_MARKERS):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+async def _retry_transient_operation(
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    label: str,
+    attempts: int = 3,
+    delay_seconds: float = 0.15,
+) -> Any:
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except Exception as exc:
+            if not _is_transient_operation_error(exc):
+                raise
+            if attempt >= attempts:
+                raise FullAutoStatusUnavailable(
+                    f"{label} unavailable after {attempts} attempts"
+                ) from exc
+            print(
+                f"[FULL AUTO STATUS] transient read failure label={label} "
+                f"attempt={attempt}/{attempts}: {exc}"
+            )
+            await asyncio.sleep(delay_seconds * attempt)
+    raise FullAutoStatusUnavailable(f"{label} unavailable")
 
 
 def ppv_media_bundles(messages: list[dict[str, Any]]) -> dict[str, list[str]]:
@@ -75,7 +139,10 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
             .execute()
         ).data or {}
 
-    fan = await asyncio.to_thread(_fan)
+    fan = await _retry_transient_operation(
+        lambda: asyncio.to_thread(_fan),
+        label="fan profile",
+    )
     if not fan:
         return {"status": "not_found", "fan_id": fan_id}
 
@@ -140,13 +207,28 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
         affordability,
         price_learning,
     ) = await asyncio.gather(
-        asyncio.to_thread(_creator),
-        get_fan_state(fan_id),
-        get_fan_session(fan_id),
-        get_scheduled_actions_for_fan(fan_id),
-        asyncio.to_thread(_memberships),
-        asyncio.to_thread(_creator_message_count),
-        asyncio.to_thread(_ppv_messages),
+        _retry_transient_operation(
+            lambda: asyncio.to_thread(_creator), label="creator settings"
+        ),
+        _retry_transient_operation(
+            lambda: get_fan_state(fan_id), label="commercial state"
+        ),
+        _retry_transient_operation(
+            lambda: get_fan_session(fan_id), label="session state"
+        ),
+        _retry_transient_operation(
+            lambda: get_scheduled_actions_for_fan(fan_id), label="scheduled actions"
+        ),
+        _retry_transient_operation(
+            lambda: asyncio.to_thread(_memberships), label="fan lists"
+        ),
+        _retry_transient_operation(
+            lambda: asyncio.to_thread(_creator_message_count),
+            label="creator message count",
+        ),
+        _retry_transient_operation(
+            lambda: asyncio.to_thread(_ppv_messages), label="PPV history"
+        ),
         _safe_context(get_fan_intelligence_context(fan_id)),
         _safe_context(get_fan_lifecycle_context(fan_id)),
         _safe_context(get_affordability_context(fan_id)),
@@ -235,7 +317,10 @@ async def get_creator_full_auto_health(creator_id: str) -> dict[str, Any]:
         ).data or []
         return states, fans, actions
 
-    states, fans, actions = await asyncio.to_thread(_load)
+    states, fans, actions = await _retry_transient_operation(
+        lambda: asyncio.to_thread(_load),
+        label="creator full-auto health",
+    )
     names = {
         str(row.get("id")): row.get("display_name") or str(row.get("id"))
         for row in fans

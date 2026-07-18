@@ -2646,21 +2646,32 @@ async def preview_auto_audience(creator_id: str) -> dict:
         )
 
     reasons: Counter[str] = Counter()
+    reasons_if_creator_on: Counter[str] = Counter()
     eligible = 0
+    eligible_if_creator_on = 0
     for fan in (fan_result.data or []):
         fan_id = str(fan["id"])
+        eligibility_inputs = {
+            "fan_auto_override": fan.get("auto_mode"),
+            "needs_human_review": bool(fan.get("needs_human_review", False)),
+            "policy": policy,
+            "fan_list_ids": memberships.get(fan_id, set()),
+            "total_spent": int(fan.get("total_spent") or 0),
+            "spend_tier": str(fan.get("spend_tier") or "cold"),
+            "is_new_fan": fan_id not in creator_message_fans,
+        }
         result = evaluate_auto_eligibility(
             creator_auto=bool(creator.get("auto_mode", False)),
-            fan_auto_override=fan.get("auto_mode"),
-            needs_human_review=bool(fan.get("needs_human_review", False)),
-            policy=policy,
-            fan_list_ids=memberships.get(fan_id, set()),
-            total_spent=int(fan.get("total_spent") or 0),
-            spend_tier=str(fan.get("spend_tier") or "cold"),
-            is_new_fan=fan_id not in creator_message_fans,
+            **eligibility_inputs,
+        )
+        enabled_result = evaluate_auto_eligibility(
+            creator_auto=True,
+            **eligibility_inputs,
         )
         reasons[result.reason] += 1
+        reasons_if_creator_on[enabled_result.reason] += 1
         eligible += int(result.eligible)
+        eligible_if_creator_on += int(enabled_result.eligible)
     total = len(fan_result.data or [])
     return {
         "creator_id": creator_id,
@@ -2669,6 +2680,9 @@ async def preview_auto_audience(creator_id: str) -> dict:
         "ineligible": total - eligible,
         "total": total,
         "reasons": dict(reasons),
+        "eligible_if_creator_on": eligible_if_creator_on,
+        "ineligible_if_creator_on": total - eligible_if_creator_on,
+        "reasons_if_creator_on": dict(reasons_if_creator_on),
     }
 
 
@@ -2697,16 +2711,36 @@ class ResolvePPVApprovalRequest(BaseModel):
 
 @app.get("/fan/{fan_id}/full-auto-status")
 async def read_full_auto_status(fan_id: str) -> dict:
-    from services.full_auto_operations import get_fan_full_auto_snapshot
+    from services.full_auto_operations import (
+        FullAutoStatusUnavailable,
+        get_fan_full_auto_snapshot,
+    )
 
-    return await get_fan_full_auto_snapshot(fan_id)
+    try:
+        return await get_fan_full_auto_snapshot(fan_id)
+    except FullAutoStatusUnavailable as exc:
+        print(f"[FULL AUTO STATUS] temporarily unavailable fan={fan_id}: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Full Auto status is temporarily unavailable. Please retry.",
+        ) from exc
 
 
 @app.get("/creator/{creator_id}/full-auto-health")
 async def read_full_auto_health(creator_id: str) -> dict:
-    from services.full_auto_operations import get_creator_full_auto_health
+    from services.full_auto_operations import (
+        FullAutoStatusUnavailable,
+        get_creator_full_auto_health,
+    )
 
-    return await get_creator_full_auto_health(creator_id)
+    try:
+        return await get_creator_full_auto_health(creator_id)
+    except FullAutoStatusUnavailable as exc:
+        print(f"[FULL AUTO HEALTH] temporarily unavailable creator={creator_id}: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Full Auto health is temporarily unavailable. Please retry.",
+        ) from exc
 
 
 @app.get("/creator/{creator_id}/ppv-approvals")
