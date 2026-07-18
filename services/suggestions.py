@@ -31,6 +31,7 @@ from db.commercial_queries import (
 )
 from services.session_planner import plan_session_for_fan
 from services.human_delivery import build_delivery_schedule
+from services.ppv_delivery import create_ppv_approval_request
 from services.followup_lifecycle import (
     complete_session_state,
     next_reconcile_at,
@@ -1129,6 +1130,28 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         "payment_reference": delivery_reference,
                     }
                 }
+
+                approval_policy = await get_creator_policy(creator_id)
+                if approval_policy.require_operator_ppv_approval:
+                    state_for_approval = await get_fan_state(fan_id)
+                    approval = await create_ppv_approval_request(
+                        creator_id=creator_id,
+                        fan_id=fan_id,
+                        message_content=text_out,
+                        media_ids=media_ids,
+                        price_cents=int(round(price * 100)),
+                        set_id=(current_step or {}).get("set_id"),
+                        step_index=(active_session or {}).get("current_index"),
+                        approved_experience=(
+                            state_for_approval.desired_experience
+                            or state_for_approval.selected_package_label
+                        ),
+                    )
+                    print(
+                        f"[PPV APPROVAL] fan={fan_id} request={approval.get('id')} "
+                        f"media={media_ids} price_cents={int(round(price * 100))}"
+                    )
+                    return
             else:
                 text_out = re.sub(r"\[PPV:[^\]]+\]", "", part).strip()
                 ppv_media_context = None
@@ -1389,8 +1412,9 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
             "date": datetime.utcnow().strftime("%d.%m.%Y"),
             "item": f"PPV media {media_id}",
             "media_id": str(media_id),
+            "media_ids": pending.get("media_ids") or [str(media_id)],
             "amount": amount_dollars,
-            "chatter": "AI",
+            "chatter": "Operator" if pending.get("source") == "operator" else "AI",
         })
         not_sold = [entry for entry in not_sold if str(media_id) not in str(entry.get("item", ""))]
         new_spent = old_spent + amount_dollars
@@ -1493,6 +1517,18 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
             await freeze_fan_for_review(fan_id, "session_purchase_reconcile_failed")
             print(f"[SESSION PURCHASE RECONCILE ERROR] fan={fan_id}: {exc}")
             raise
+    elif creator_id:
+        # A one-off operator PPV has no executable paid-session plan. Once the
+        # purchase is confirmed, clear the payment hold without inventing a
+        # session lifecycle.
+        state = await get_fan_state(fan_id)
+        state.status = FanStatus.IDLE
+        state.selected_package_id = None
+        state.selected_package_set_id = None
+        state.selected_package_set_ids = []
+        state.selected_package_label = None
+        state.selected_package_price_cents = None
+        await save_fan_state(fan_id, creator_id, state)
 
     if creator_id and not already_recorded:
         spawn(

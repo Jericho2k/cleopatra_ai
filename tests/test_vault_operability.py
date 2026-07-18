@@ -6,6 +6,7 @@ from services.vault_operations import (
     manual_recategorization_usage,
     normalize_media_ids,
 )
+from models.commercial import CreatorPolicy
 
 
 def test_new_media_batch_is_exact_and_never_implies_full_vault():
@@ -36,3 +37,11 @@ def test_migration_claim_is_atomic_and_creator_scoped():
     assert "vault_initial_categorized_at" in migration
     assert "auto_categorize_new_media" in migration
 
+
+def test_purchase_gating_legacy_switches_cannot_disable_safety():
+    policy = CreatorPolicy(
+        media_always_paid=False,
+        require_purchase_before_next_step=False,
+    )
+    assert policy.media_always_paid is True
+    assert policy.require_purchase_before_next_step is True

@@ -7,7 +7,6 @@ import asyncio
 from core.tasks import spawn
 import json
 import os
-import random
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -148,6 +147,19 @@ async def process_incoming_fan_message(
     message_id: str | None,
 ) -> None:
     """Shared pipeline: history already includes the new fan message."""
+    try:
+        from services.ppv_delivery import cancel_pending_ppv_approvals
+
+        cancelled = await cancel_pending_ppv_approvals(
+            fan_id,
+            reason="fan_returned_before_operator_approval",
+        )
+        if cancelled:
+            print(f"[PPV APPROVAL] fan={fan_id} cancelled={cancelled} reason=fan_returned")
+    except Exception as exc:
+        # Approval-table availability must not block inbound conversation during
+        # a rolling migration. The prepared PPV still cannot be sent by this path.
+        print(f"[PPV APPROVAL CANCEL ERROR] fan={fan_id}: {exc}")
     try:
         from services.commercial_orchestrator import acknowledge_fan_return
 
@@ -378,21 +390,9 @@ async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
 
 session_store: SessionStore = None
 fansly_poller: FanslyPoller = None
-reengagement_task: asyncio.Task | None = None
 ppv_sweep_task: asyncio.Task | None = None
 vault_autosync_task: asyncio.Task | None = None
-
-
-async def reengagement_scheduler():
-    """Runs re-engagement check every 6 hours."""
-    while True:
-        await asyncio.sleep(6 * 60 * 60)
-        try:
-            print("[CRON] Running re-engagement check...")
-            result = await run_reengagement()
-            print(f"[CRON] Re-engagement done: {result}")
-        except Exception as e:
-            print(f"[CRON ERROR] {e}")
+scheduled_actions_task: asyncio.Task | None = None
 
 
 async def ppv_sweep_scheduler():
@@ -453,7 +453,7 @@ async def vault_autosync_scheduler():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global session_store, fansly_poller, reengagement_task, ppv_sweep_task, vault_autosync_task
+    global session_store, fansly_poller, ppv_sweep_task, vault_autosync_task, scheduled_actions_task
 
     supabase = get_supabase()
     session_store = SessionStore(
@@ -467,7 +467,6 @@ async def lifespan(app: FastAPI):
         on_new_message=handle_new_fan_message,
     )
     await fansly_poller.start_all()
-    reengagement_task = asyncio.create_task(reengagement_scheduler())
     ppv_sweep_task = asyncio.create_task(ppv_sweep_scheduler())
     vault_autosync_task = asyncio.create_task(vault_autosync_scheduler())
     scheduled_actions_task = asyncio.create_task(_scheduled_actions_scheduler())
@@ -476,12 +475,12 @@ async def lifespan(app: FastAPI):
 
     if fansly_poller:
         await fansly_poller.stop_all()
-    if reengagement_task:
-        reengagement_task.cancel()
     if ppv_sweep_task:
         ppv_sweep_task.cancel()
     if vault_autosync_task:
         vault_autosync_task.cancel()
+    if scheduled_actions_task:
+        scheduled_actions_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -605,137 +604,6 @@ async def save_reply(req: ReplyRequest) -> dict:
         await send_fansly_message(apifansly_id, group_id, req.content)
 
     return {"status": "ok"}
-
-
-@app.post("/reengagement")
-async def run_reengagement() -> dict:
-    db = get_supabase()
-    settings_rows = await asyncio.to_thread(
-        lambda: db.table("reengagement_settings")
-        .select("*, creators(id, apifansly_account_id)")
-        .eq("enabled", True)
-        .execute()
-    )
-
-    total = 0
-    for setting in (settings_rows.data or []):
-        creator_id = setting["creator_id"]
-        hours = setting.get("hours_threshold", 48)
-        use_ai = setting.get("use_ai", True)
-        templates = setting.get("templates", [])
-        ai_instructions = setting.get("ai_instructions", "")
-        _ = ai_instructions  # Placeholder for future prompt customization.
-        exclude_list_id = setting.get("exclude_list_id")
-
-        excluded_ids = set()
-        if exclude_list_id:
-            excl = await asyncio.to_thread(
-                lambda lid=exclude_list_id: db.table("fan_list_members")
-                .select("fan_id")
-                .eq("list_id", lid)
-                .execute()
-            )
-            excluded_ids = {m["fan_id"] for m in (excl.data or [])}
-
-        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
-        jitter_hours = random.uniform(-2, 2)
-        jitter_cutoff = (
-            datetime.now(timezone.utc) - timedelta(hours=hours + jitter_hours)
-        ).isoformat()
-
-        fans = await asyncio.to_thread(
-            lambda cid=creator_id: db.table("fans")
-            .select("id, display_name, fansly_group_id, auto_mode")
-            .eq("creator_id", cid)
-            .execute()
-        )
-
-        for fan in (fans.data or []):
-            fan_id = fan["id"]
-
-            if fan_id in excluded_ids:
-                continue
-            if fan.get("auto_mode") is False:
-                continue
-
-            # The old generic inactivity cron must never compete with a precise
-            # payday/session/offer obligation or interrupt an active flow.
-            commercial = await asyncio.to_thread(
-                lambda fid=fan_id: db.table("fan_commercial_states")
-                .select("status, next_followup_at, next_followup_type, last_followup_at")
-                .eq("fan_id", fid)
-                .maybe_single()
-                .execute()
-            )
-            from services.followup_lifecycle import legacy_reengagement_allowed
-
-            if not legacy_reengagement_allowed(commercial.data, cutoff=cutoff):
-                continue
-
-            last_msg = await asyncio.to_thread(
-                lambda fid=fan_id, cid=creator_id: db.table("messages")
-                .select("role, sent_at")
-                .eq("fan_id", fid)
-                .eq("creator_id", cid)
-                .order("sent_at", desc=True)
-                .limit(1)
-                .maybe_single()
-                .execute()
-            )
-
-            if not last_msg.data:
-                continue
-            if last_msg.data["role"] != "creator":
-                continue
-            if last_msg.data["sent_at"] > jitter_cutoff:
-                continue
-
-            last_log = await asyncio.to_thread(
-                lambda fid=fan_id, cid=creator_id: db.table("reengagement_log")
-                .select("template_index, sent_at")
-                .eq("fan_id", fid)
-                .eq("creator_id", cid)
-                .order("sent_at", desc=True)
-                .limit(1)
-                .maybe_single()
-                .execute()
-            )
-
-            if last_log.data:
-                last_sent = last_log.data["sent_at"]
-                if last_sent > cutoff:
-                    continue
-
-            if use_ai:
-                schedule_auto_reply(fan_id, creator_id)
-                total += 1
-            else:
-                if not templates:
-                    continue
-
-                last_index = last_log.data["template_index"] if last_log.data else -1
-                next_index = last_index + 1
-                if next_index >= len(templates):
-                    continue
-
-                template = templates[next_index]
-                msg = template.replace("{name}", fan.get("display_name") or "")
-                apifansly_id = (setting.get("creators") or {}).get("apifansly_account_id")
-                group_id = fan.get("fansly_group_id")
-
-                if msg and apifansly_id and group_id:
-                    await send_fansly_message(apifansly_id, group_id, msg)
-                    await save_message(fan_id, creator_id, "creator", msg, False)
-                    await asyncio.to_thread(
-                        lambda fid=fan_id, cid=creator_id, idx=next_index: db.table("reengagement_log").insert({
-                            "fan_id": fid,
-                            "creator_id": cid,
-                            "template_index": idx,
-                        }).execute()
-                    )
-                    total += 1
-
-    return {"status": "ok", "reengaged": total}
 
 
 @app.post("/connect-creator")
@@ -2575,6 +2443,17 @@ class CancelFollowupRequest(BaseModel):
     action_type: str | None = None
 
 
+class OperatorPPVRequest(BaseModel):
+    media_ids: list[str]
+    price_cents: int
+    message_content: str = ""
+    set_id: str | None = None
+
+
+class ResolvePPVApprovalRequest(BaseModel):
+    resolved_by: str | None = None
+
+
 @app.get("/fan/{fan_id}/full-auto-status")
 async def read_full_auto_status(fan_id: str) -> dict:
     from services.full_auto_operations import get_fan_full_auto_snapshot
@@ -2587,6 +2466,203 @@ async def read_full_auto_health(creator_id: str) -> dict:
     from services.full_auto_operations import get_creator_full_auto_health
 
     return await get_creator_full_auto_health(creator_id)
+
+
+@app.get("/creator/{creator_id}/ppv-approvals")
+async def read_ppv_approvals(creator_id: str, status: str = "pending") -> dict:
+    from services.ppv_delivery import list_ppv_approval_requests
+
+    if status not in {"pending", "sending", "sent", "rejected", "cancelled", "failed"}:
+        raise HTTPException(status_code=400, detail="invalid approval status")
+    return {
+        "creator_id": creator_id,
+        "status": status,
+        "requests": await list_ppv_approval_requests(creator_id, status=status),
+    }
+
+
+@app.post("/ppv-approvals/{request_id}/approve")
+async def approve_ppv_approval(
+    request_id: str,
+    request: ResolvePPVApprovalRequest,
+) -> dict:
+    from services.ppv_delivery import PPVDeliveryError, approve_ppv_request
+
+    try:
+        return await approve_ppv_request(request_id, resolved_by=request.resolved_by)
+    except PPVDeliveryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/ppv-approvals/{request_id}/reject")
+async def reject_ppv_approval(
+    request_id: str,
+    request: ResolvePPVApprovalRequest,
+) -> dict:
+    from services.ppv_delivery import PPVDeliveryError, reject_ppv_request
+
+    try:
+        return await reject_ppv_request(request_id, resolved_by=request.resolved_by)
+    except PPVDeliveryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/fan/{fan_id}/operator-ppv-options")
+async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
+    """Return approved sets and vault media with authoritative sale/send state."""
+    db = get_supabase()
+    fan_row = await asyncio.to_thread(
+        lambda: db.table("fans")
+        .select("creator_id, sales_log, pending_ppv_check")
+        .eq("id", fan_id)
+        .single()
+        .execute()
+    )
+    fan = fan_row.data or {}
+    if str(fan.get("creator_id") or "") != str(creator_id):
+        raise HTTPException(status_code=404, detail="fan not found for creator")
+
+    vault_rows, set_rows, message_rows = await asyncio.gather(
+        asyncio.to_thread(
+            lambda: db.table("creator_vault_media")
+            .select(
+                "id, fansly_media_id, media_id, url, thumbnail_url, mimetype, filename, "
+                "album_title, content_category, ai_description, price_min, price_max, is_active"
+            )
+            .eq("creator_id", creator_id)
+            .order("created_at", desc=True)
+            .execute()
+        ),
+        asyncio.to_thread(
+            lambda: db.table("vault_sets")
+            .select(
+                "id, title, media_ids, suggested_price, base_price_cents, min_price_cents, "
+                "max_price_cents, dynamic_pricing_enabled, tags, status"
+            )
+            .eq("creator_id", creator_id)
+            .eq("status", "approved")
+            .order("created_at", desc=True)
+            .execute()
+        ),
+        asyncio.to_thread(
+            lambda: db.table("messages")
+            .select("media_context")
+            .eq("creator_id", creator_id)
+            .eq("fan_id", fan_id)
+            .eq("role", "creator")
+            .order("sent_at", desc=True)
+            .limit(1000)
+            .execute()
+        ),
+    )
+
+    sent_ids: set[str] = set()
+    for message in (message_rows.data or []):
+        ppv = (message.get("media_context") or {}).get("ppv") or {}
+        sent_ids.update(normalize_media_ids(ppv.get("media_ids") or [ppv.get("media_id")]))
+    purchased_ids: set[str] = set()
+    for sale in (fan.get("sales_log") or []):
+        purchased_ids.update(
+            normalize_media_ids(sale.get("media_ids") or [sale.get("media_id")])
+        )
+    pending_ids = set(
+        normalize_media_ids(
+            (fan.get("pending_ppv_check") or {}).get("media_ids")
+            or [(fan.get("pending_ppv_check") or {}).get("media_id")]
+        )
+    )
+
+    media = []
+    for row in (vault_rows.data or []):
+        external_id = str(row.get("fansly_media_id") or row.get("media_id") or "")
+        status = (
+            "sold" if external_id in purchased_ids
+            else "payment_pending" if external_id in pending_ids
+            else "sent" if external_id in sent_ids
+            else "unused"
+        )
+        media.append({**row, "external_media_id": external_id, "fan_sale_status": status})
+
+    return {
+        "fan_id": fan_id,
+        "creator_id": creator_id,
+        "has_payment_pending": bool(fan.get("pending_ppv_check")),
+        "media": media,
+        "approved_sets": set_rows.data or [],
+    }
+
+
+@app.post("/fan/{fan_id}/operator-ppv")
+async def send_operator_ppv(
+    fan_id: str,
+    creator_id: str,
+    request: OperatorPPVRequest,
+) -> dict:
+    from services.ppv_delivery import (
+        PPVDeliveryError,
+        cancel_pending_ppv_approvals,
+        send_locked_ppv,
+    )
+
+    exact_ids = normalize_media_ids(request.media_ids)
+    if not exact_ids:
+        raise HTTPException(status_code=400, detail="select at least one media item")
+    if request.price_cents <= 0 or request.price_cents > 1_000_000:
+        raise HTTPException(status_code=400, detail="enter a valid PPV price")
+
+    db = get_supabase()
+    rows = await asyncio.to_thread(
+        lambda: db.table("creator_vault_media")
+        .select("fansly_media_id, media_id, price_min, price_max, is_active")
+        .eq("creator_id", creator_id)
+        .in_("fansly_media_id", exact_ids)
+        .execute()
+    )
+    found = {
+        str(row.get("fansly_media_id") or row.get("media_id") or ""): row
+        for row in (rows.data or [])
+    }
+    if set(found) != set(exact_ids):
+        raise HTTPException(status_code=400, detail="one or more media items are not in this creator's vault")
+    if any(row.get("is_active") is False for row in found.values()):
+        raise HTTPException(status_code=400, detail="inactive media cannot be sent")
+
+    if request.set_id:
+        set_row = await asyncio.to_thread(
+            lambda: db.table("vault_sets")
+            .select("media_ids, status, min_price_cents, max_price_cents")
+            .eq("id", request.set_id)
+            .eq("creator_id", creator_id)
+            .single()
+            .execute()
+        )
+        approved_set = set_row.data or {}
+        if approved_set.get("status") != "approved":
+            raise HTTPException(status_code=400, detail="the selected set is not approved")
+        if set(normalize_media_ids(approved_set.get("media_ids") or [])) != set(exact_ids):
+            raise HTTPException(status_code=400, detail="selected media no longer matches the approved set")
+        minimum = int(approved_set.get("min_price_cents") or 0)
+        maximum = int(approved_set.get("max_price_cents") or 0)
+        if minimum and request.price_cents < minimum:
+            raise HTTPException(status_code=400, detail=f"price is below the set minimum (${minimum / 100:g})")
+        if maximum and request.price_cents > maximum:
+            raise HTTPException(status_code=400, detail=f"price is above the set maximum (${maximum / 100:g})")
+
+    await cancel_pending_ppv_approvals(fan_id, reason="operator_sent_manual_ppv")
+    try:
+        return await send_locked_ppv(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            media_ids=exact_ids,
+            price_cents=request.price_cents,
+            message_content=request.message_content,
+            source="operator",
+            was_ai_suggested=False,
+            set_id=request.set_id,
+            step_index=None,
+        )
+    except PPVDeliveryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/fan/{fan_id}/cancel-followup")

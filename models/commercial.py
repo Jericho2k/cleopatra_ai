@@ -8,7 +8,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SextingMode(str, Enum):
@@ -99,6 +99,7 @@ class CreatorPolicy(BaseModel):
     session_max_steps: int = 4
     post_purchase_cooldown_messages: int = 2
     require_purchase_before_next_step: bool = True
+    require_operator_ppv_approval: bool = False
     ppv_recheck_minutes: int = Field(default=20, ge=5, le=1_440)
     ppv_payment_window_hours: int = Field(default=24, ge=1, le=168)
     abandoned_ppv_followup_enabled: bool = True
@@ -109,6 +110,18 @@ class CreatorPolicy(BaseModel):
     post_session_followup_enabled: bool = True
     post_session_followup_delay_hours: int = Field(default=18, ge=1, le=720)
     followup_recent_activity_suppression_hours: int = Field(default=6, ge=0, le=168)
+
+    @model_validator(mode="after")
+    def enforce_purchase_gating_invariants(self) -> "CreatorPolicy":
+        """Media access and multi-step progression are never optional in v1.
+
+        Older rows and clients may still submit these legacy fields as false.
+        Normalizing them here prevents a stale dashboard from weakening the
+        purchase-gated delivery contract.
+        """
+        self.media_always_paid = True
+        self.require_purchase_before_next_step = True
+        return self
 
 
 class FanCommercialState(BaseModel):
