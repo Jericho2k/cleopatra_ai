@@ -40,6 +40,7 @@ from models.schemas import (
     SuggestionResponse,
 )
 from services.fan_intelligence import learn_from_fan_message
+from services.auto_audience import AutoAudiencePolicy
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
 from services.suggestions import (
@@ -183,30 +184,65 @@ async def process_incoming_fan_message(
         ),
         name=f"fan_intelligence:{fan_id}",
     )
-    fan_auto = fan_profile.auto_mode
-    if fan_auto is None:
-        effective_auto = auto_mode
-    else:
-        effective_auto = fan_auto
+    audience_row, memberships = await asyncio.gather(
+        asyncio.to_thread(
+            lambda: get_supabase()
+            .from_("creators")
+            .select("auto_audience_policy")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        ),
+        asyncio.to_thread(
+        lambda: get_supabase()
+        .from_("fan_list_members")
+        .select("list_id, fan_lists(exclude_from_auto)")
+        .eq("fan_id", fan_id)
+        .execute()
+        ),
+    )
+    from services.auto_audience import AutoAudiencePolicy, evaluate_auto_eligibility
+
+    try:
+        audience_policy = AutoAudiencePolicy(
+            **((audience_row.data or {}).get("auto_audience_policy") or {})
+        )
+    except Exception:
+        audience_policy = AutoAudiencePolicy()
+    fan_list_ids = {
+        str(row.get("list_id"))
+        for row in (memberships.data or [])
+        if row.get("list_id")
+    }
+    legacy_excluded_ids = {
+        str(row.get("list_id"))
+        for row in (memberships.data or [])
+        if row.get("list_id") and row.get("fan_lists", {}).get("exclude_from_auto", False)
+    }
+    if legacy_excluded_ids:
+        audience_policy.exclude_list_ids = list(
+            dict.fromkeys([*audience_policy.exclude_list_ids, *legacy_excluded_ids])
+        )
+    is_new_fan = not any(message.role == "creator" for message in conversation_history)
+    eligibility = evaluate_auto_eligibility(
+        creator_auto=bool(auto_mode),
+        fan_auto_override=fan_profile.auto_mode,
+        needs_human_review=bool(getattr(fan_profile, "needs_human_review", False)),
+        policy=audience_policy,
+        fan_list_ids=fan_list_ids,
+        total_spent=int(getattr(fan_profile, "total_spent", 0) or 0),
+        spend_tier=str(getattr(fan_profile, "spend_tier", "cold") or "cold"),
+        is_new_fan=is_new_fan,
+    )
+    effective_auto = eligibility.eligible
 
     print(
         f"[AUTO MODE] creator={creator_id} creator_auto={auto_mode} "
-        f"fan_auto={fan_auto} effective_auto={effective_auto} fan={fan_id}"
+        f"fan_auto={fan_profile.auto_mode} effective_auto={effective_auto} "
+        f"reason={eligibility.reason} fan={fan_id}"
     )
 
-    excluded = await asyncio.to_thread(
-        lambda: get_supabase()
-        .from_("fan_list_members")
-        .select("fan_lists(exclude_from_auto)")
-        .eq("fan_id", fan_id)
-        .execute()
-    )
-    is_excluded = any(
-        row.get("fan_lists", {}).get("exclude_from_auto", False)
-        for row in (excluded.data or [])
-    )
-
-    if effective_auto and not is_excluded:
+    if effective_auto:
         schedule_auto_reply(fan_id, creator_id)
         fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
         print(
@@ -393,6 +429,7 @@ fansly_poller: FanslyPoller = None
 ppv_sweep_task: asyncio.Task | None = None
 vault_autosync_task: asyncio.Task | None = None
 scheduled_actions_task: asyncio.Task | None = None
+chat_reconcile_task: asyncio.Task | None = None
 
 
 async def ppv_sweep_scheduler():
@@ -451,9 +488,32 @@ async def vault_autosync_scheduler():
             print(f"[CRON VAULT AUTOSYNC ERROR] {e}")
 
 
+async def chat_reconciliation_scheduler():
+    """Incrementally reconcile Fansly chat lists with a durable DB lease."""
+    while True:
+        await asyncio.sleep(10 * 60)
+        try:
+            db = get_supabase()
+            creators = await asyncio.to_thread(
+                lambda: db.table("creators")
+                .select("id")
+                .not_.is_("apifansly_account_id", "null")
+                .execute()
+            )
+            for creator in (creators.data or []):
+                result = await sync_chats(str(creator["id"]), incremental=True)
+                if result.get("status") == "ok" and result.get("new_chats"):
+                    print(
+                        f"[CHAT RECONCILE] creator={creator['id']} "
+                        f"new={result['new_chats']} synced={result.get('synced', 0)}"
+                    )
+        except Exception as exc:
+            print(f"[CRON CHAT RECONCILE ERROR] {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global session_store, fansly_poller, ppv_sweep_task, vault_autosync_task, scheduled_actions_task
+    global session_store, fansly_poller, ppv_sweep_task, vault_autosync_task, scheduled_actions_task, chat_reconcile_task
 
     supabase = get_supabase()
     session_store = SessionStore(
@@ -470,6 +530,7 @@ async def lifespan(app: FastAPI):
     ppv_sweep_task = asyncio.create_task(ppv_sweep_scheduler())
     vault_autosync_task = asyncio.create_task(vault_autosync_scheduler())
     scheduled_actions_task = asyncio.create_task(_scheduled_actions_scheduler())
+    chat_reconcile_task = asyncio.create_task(chat_reconciliation_scheduler())
 
     yield
 
@@ -481,6 +542,8 @@ async def lifespan(app: FastAPI):
         vault_autosync_task.cancel()
     if scheduled_actions_task:
         scheduled_actions_task.cancel()
+    if chat_reconcile_task:
+        chat_reconcile_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -734,7 +797,11 @@ async def sync_chats_background(creator_id: str) -> None:
 
 
 @app.post("/sync-chats/{creator_id}")
-async def sync_chats(creator_id: str) -> dict:
+async def sync_chats(
+    creator_id: str,
+    incremental: bool = False,
+    force: bool = False,
+) -> dict:
     import httpx
 
     db = get_supabase()
@@ -749,6 +816,30 @@ async def sync_chats(creator_id: str) -> dict:
     apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
     if not apifansly_id:
         return {"status": "error", "message": "no apifansly account"}
+
+    if incremental and not force:
+        claim = await asyncio.to_thread(
+            lambda: db.rpc(
+                "claim_chat_reconciliation",
+                {"p_creator_id": creator_id, "p_min_interval_minutes": 9},
+            ).execute()
+        )
+        if not bool(claim.data):
+            return {"status": "cooldown", "synced": 0, "new_chats": 0}
+
+    existing_platform_ids: set[str] = set()
+    if incremental:
+        existing = await asyncio.to_thread(
+            lambda: db.table("fans")
+            .select("platform_fan_id")
+            .eq("creator_id", creator_id)
+            .execute()
+        )
+        existing_platform_ids = {
+            str(row.get("platform_fan_id"))
+            for row in (existing.data or [])
+            if row.get("platform_fan_id")
+        }
 
     api_key = os.environ.get("APIFANSLY_API_KEY")
 
@@ -789,10 +880,23 @@ async def sync_chats(creator_id: str) -> dict:
 
             all_chats.extend(chats)
 
+            if incremental:
+                page_ids = {
+                    str(chat.get("partnerAccountId", ""))
+                    for chat in chats
+                    if chat.get("partnerAccountId")
+                }
+                # Fansly returns the most recently active chats first. Once a
+                # whole page is already known, older pages cannot contain a new
+                # chat-list entry for this reconciliation pass.
+                if page_ids and page_ids.issubset(existing_platform_ids):
+                    break
+
             if not cursor:
                 break
 
         synced = 0
+        new_chats = 0
         for chat in all_chats:
             platform_fan_id = str(chat.get("partnerAccountId", ""))
             account_data = account_lookup.get(platform_fan_id, {})
@@ -813,6 +917,7 @@ async def sync_chats(creator_id: str) -> dict:
             fan = await get_fan(creator_id, platform_fan_id)
             if not fan:
                 fan = await create_fan(creator_id, platform_fan_id, fan_name)
+                new_chats += 1
 
             update_payload = {
                 "fansly_group_id": group_id,
@@ -826,8 +931,17 @@ async def sync_chats(creator_id: str) -> dict:
             )
             synced += 1
 
-        print(f"[SYNC CHATS] total_chats={len(all_chats)} synced={synced}")
-        return {"status": "ok", "synced": synced}
+        await _stamp_vault_op(creator_id, "last_chat_reconcile_at")
+        print(
+            f"[SYNC CHATS] incremental={incremental} total_chats={len(all_chats)} "
+            f"synced={synced} new={new_chats}"
+        )
+        return {
+            "status": "ok",
+            "mode": "incremental" if incremental else "full",
+            "synced": synced,
+            "new_chats": new_chats,
+        }
 
 
 @app.post("/load-history/{creator_id}/{fan_id}")
@@ -2429,6 +2543,129 @@ async def update_commercial_policy(creator_id: str, policy: CreatorPolicy) -> di
 
     saved = await save_creator_policy(creator_id, policy)
     return {"status": "ok", "creator_id": creator_id, "policy": saved.model_dump(mode="json")}
+
+
+@app.get("/creator/{creator_id}/auto-audience-policy")
+async def read_auto_audience_policy(creator_id: str) -> dict:
+    db = get_supabase()
+    result = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("auto_audience_policy")
+        .eq("id", creator_id)
+        .single()
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="creator not found")
+    try:
+        policy = AutoAudiencePolicy(**(result.data.get("auto_audience_policy") or {}))
+    except Exception:
+        policy = AutoAudiencePolicy()
+    return {"creator_id": creator_id, "policy": policy.model_dump(mode="json")}
+
+
+@app.put("/creator/{creator_id}/auto-audience-policy")
+async def update_auto_audience_policy(
+    creator_id: str,
+    policy: AutoAudiencePolicy,
+) -> dict:
+    db = get_supabase()
+    result = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .update({"auto_audience_policy": policy.model_dump(mode="json")})
+        .eq("id", creator_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="creator not found")
+    return {"status": "ok", "creator_id": creator_id, "policy": policy.model_dump(mode="json")}
+
+
+@app.get("/creator/{creator_id}/auto-audience-preview")
+async def preview_auto_audience(creator_id: str) -> dict:
+    from collections import Counter
+    from services.auto_audience import AutoAudiencePolicy, evaluate_auto_eligibility
+
+    db = get_supabase()
+    creator_result, fan_result, lists_result, messages_result = await asyncio.gather(
+        asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("auto_mode, auto_audience_policy")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        ),
+        asyncio.to_thread(
+            lambda: db.table("fans")
+            .select("id, auto_mode, total_spent, spend_tier, needs_human_review")
+            .eq("creator_id", creator_id)
+            .execute()
+        ),
+        asyncio.to_thread(
+            lambda: db.table("fan_list_members")
+            .select("fan_id, list_id, fan_lists(exclude_from_auto, creator_id)")
+            .execute()
+        ),
+        asyncio.to_thread(
+            lambda: db.table("messages")
+            .select("fan_id")
+            .eq("creator_id", creator_id)
+            .eq("role", "creator")
+            .execute()
+        ),
+    )
+    creator = creator_result.data or {}
+    if not creator:
+        raise HTTPException(status_code=404, detail="creator not found")
+    try:
+        policy = AutoAudiencePolicy(**(creator.get("auto_audience_policy") or {}))
+    except Exception:
+        policy = AutoAudiencePolicy()
+    creator_message_fans = {
+        str(row.get("fan_id")) for row in (messages_result.data or []) if row.get("fan_id")
+    }
+    memberships: dict[str, set[str]] = {}
+    legacy_exclusions: set[str] = set()
+    for row in (lists_result.data or []):
+        joined = row.get("fan_lists") or {}
+        if str(joined.get("creator_id") or "") != str(creator_id):
+            continue
+        fan_key = str(row.get("fan_id") or "")
+        list_key = str(row.get("list_id") or "")
+        if fan_key and list_key:
+            memberships.setdefault(fan_key, set()).add(list_key)
+            if joined.get("exclude_from_auto"):
+                legacy_exclusions.add(list_key)
+    if legacy_exclusions:
+        policy.exclude_list_ids = list(
+            dict.fromkeys([*policy.exclude_list_ids, *legacy_exclusions])
+        )
+
+    reasons: Counter[str] = Counter()
+    eligible = 0
+    for fan in (fan_result.data or []):
+        fan_id = str(fan["id"])
+        result = evaluate_auto_eligibility(
+            creator_auto=bool(creator.get("auto_mode", False)),
+            fan_auto_override=fan.get("auto_mode"),
+            needs_human_review=bool(fan.get("needs_human_review", False)),
+            policy=policy,
+            fan_list_ids=memberships.get(fan_id, set()),
+            total_spent=int(fan.get("total_spent") or 0),
+            spend_tier=str(fan.get("spend_tier") or "cold"),
+            is_new_fan=fan_id not in creator_message_fans,
+        )
+        reasons[result.reason] += 1
+        eligible += int(result.eligible)
+    total = len(fan_result.data or [])
+    return {
+        "creator_id": creator_id,
+        "creator_auto_mode": bool(creator.get("auto_mode", False)),
+        "eligible": eligible,
+        "ineligible": total - eligible,
+        "total": total,
+        "reasons": dict(reasons),
+    }
 
 
 @app.get("/fan/{fan_id}/commercial-state")

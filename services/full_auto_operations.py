@@ -44,7 +44,7 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
             get_supabase().table("fans")
             .select(
                 "id, creator_id, auto_mode, needs_human_review, review_reason, "
-                "pending_ppv_check, last_active"
+                "pending_ppv_check, last_active, total_spent, spend_tier"
             )
             .eq("id", fan_id)
             .single()
@@ -60,21 +60,69 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
     def _creator() -> dict:
         return (
             get_supabase().table("creators")
-            .select("auto_mode")
+            .select("auto_mode, auto_audience_policy")
             .eq("id", creator_id)
             .single()
             .execute()
         ).data or {}
 
-    creator, state, session, actions = await asyncio.gather(
+    def _memberships() -> list[dict]:
+        return (
+            get_supabase().table("fan_list_members")
+            .select("list_id, fan_lists(exclude_from_auto)")
+            .eq("fan_id", fan_id)
+            .execute()
+        ).data or []
+
+    def _creator_message_count() -> int:
+        response = (
+            get_supabase().table("messages")
+            .select("id", count="exact", head=True)
+            .eq("fan_id", fan_id)
+            .eq("creator_id", creator_id)
+            .eq("role", "creator")
+            .execute()
+        )
+        return int(response.count or 0)
+
+    creator, state, session, actions, memberships, creator_message_count = await asyncio.gather(
         asyncio.to_thread(_creator),
         get_fan_state(fan_id),
         get_fan_session(fan_id),
         get_scheduled_actions_for_fan(fan_id),
+        asyncio.to_thread(_memberships),
+        asyncio.to_thread(_creator_message_count),
+    )
+    from services.auto_audience import AutoAudiencePolicy, evaluate_auto_eligibility
+
+    try:
+        audience_policy = AutoAudiencePolicy(**(creator.get("auto_audience_policy") or {}))
+    except Exception:
+        audience_policy = AutoAudiencePolicy()
+    list_ids = {
+        str(row.get("list_id")) for row in memberships if row.get("list_id")
+    }
+    legacy_exclusions = {
+        str(row.get("list_id"))
+        for row in memberships
+        if row.get("list_id") and (row.get("fan_lists") or {}).get("exclude_from_auto")
+    }
+    audience_policy.exclude_list_ids = list(
+        dict.fromkeys([*audience_policy.exclude_list_ids, *legacy_exclusions])
     )
     fan_auto = fan.get("auto_mode")
     creator_auto = bool(creator.get("auto_mode", False))
-    effective_auto = creator_auto if fan_auto is None else bool(fan_auto)
+    eligibility = evaluate_auto_eligibility(
+        creator_auto=creator_auto,
+        fan_auto_override=fan_auto,
+        needs_human_review=bool(fan.get("needs_human_review")),
+        policy=audience_policy,
+        fan_list_ids=list_ids,
+        total_spent=int(fan.get("total_spent") or 0),
+        spend_tier=str(fan.get("spend_tier") or "cold"),
+        is_new_fan=creator_message_count == 0,
+    )
+    effective_auto = eligibility.eligible
     pending = fan.get("pending_ppv_check") or None
 
     return {
@@ -84,6 +132,7 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
         "effective_auto_mode": effective_auto,
         "fan_auto_mode": fan_auto,
         "creator_auto_mode": creator_auto,
+        "auto_mode_reason": eligibility.reason,
         "needs_human_review": bool(fan.get("needs_human_review")),
         "review_reason": fan.get("review_reason"),
         "commercial_state": state.model_dump(mode="json"),
