@@ -97,6 +97,11 @@ together_client = AsyncOpenAI(
 _pending_auto_replies: dict[str, asyncio.Task] = {}
 
 
+def _is_local_test_fan(platform_fan_id: object) -> bool:
+    """Only explicitly namespaced test fans may bypass live platform delivery."""
+    return str(platform_fan_id or "").startswith("test_")
+
+
 async def _sleep_while_current(fan_id: str, seconds: float, *, phase: str) -> bool:
     """Sleep in short slices so a newer fan message can cancel simulated typing."""
     loop = asyncio.get_running_loop()
@@ -1048,6 +1053,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         group_id = (fan_row.data or {}).get("fansly_group_id")
         platform_fan_id = (fan_row.data or {}).get("platform_fan_id")
         apifansly_account_id = (creator_row.data or {}).get("apifansly_account_id")
+        local_test_delivery = _is_local_test_fan(platform_fan_id)
 
         # If no group_id yet, try to find it from chats list
         if not group_id and apifansly_account_id and platform_fan_id:
@@ -1158,7 +1164,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
             # Platform acceptance is authoritative. Never create a local sent
             # message or PAYMENT_PENDING state for a delivery that failed.
-            if not group_id or not apifansly_account_id:
+            if (not group_id or not apifansly_account_id) and not local_test_delivery:
                 print(f"[AUTO DELIVERY ERROR] fan={fan_id}: no live delivery route")
                 if ppv_match:
                     await freeze_fan_for_review(fan_id, "ppv_delivery_route_missing")
@@ -1166,7 +1172,15 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
             platform_message_id = None
             try:
-                if ppv_match:
+                if local_test_delivery:
+                    platform_message_id = (
+                        f"local-test:{delivery_reference}" if ppv_match else None
+                    )
+                    print(
+                        f"[AUTO TEST DELIVERY] fan={fan_id} "
+                        f"kind={'ppv' if ppv_match else 'text'} persisted_locally=true"
+                    )
+                elif ppv_match:
                     ppv_content = text_out if text_out else random.choice([
                         "here it is 😏",
                         "just for you...",
