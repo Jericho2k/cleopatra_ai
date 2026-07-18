@@ -26,7 +26,10 @@ from services.commercial_events import (
     stated_budget_cents,
 )
 from services.commercial_policy import CommercialContext, decide_next_action
-from services.followup_lifecycle import complete_session_state
+from services.followup_lifecycle import (
+    complete_session_state,
+    pending_offer_expiry_obligation,
+)
 from services.price_learning import select_recommended_packages
 from services.payday import resolve_payday
 from services.session_lifecycle import (
@@ -107,6 +110,102 @@ def _current_hard_ceiling(
     return min(parsed) if parsed else None
 
 
+def _clear_followup_obligation(state) -> None:
+    state.next_followup_at = None
+    state.next_followup_type = None
+    state.next_followup_payload = {}
+    state.next_followup_dedupe_key = None
+
+
+async def _sync_pending_offer_expiry(
+    *,
+    creator_id: str,
+    fan_id: str,
+    state,
+    policy,
+    anchor: datetime,
+) -> None:
+    """Make fan state and the durable queue agree about one pending offer."""
+    if state.status != FanStatus.OFFER_PENDING or not state.offered_packages:
+        try:
+            await cancel_actions_for_fan(fan_id, "OFFER_EXPIRY")
+        except Exception as exc:
+            print(f"[OFFER EXPIRY] cancellation failed fan={fan_id}: {exc}")
+        if state.next_followup_type == "OFFER_EXPIRY":
+            _clear_followup_obligation(state)
+        return
+
+    previous_type = state.next_followup_type
+    state.last_offer_at = anchor
+    obligation = pending_offer_expiry_obligation(
+        state,
+        policy=policy,
+        fan_id=fan_id,
+    )
+    if obligation is None:
+        return
+
+    if previous_type and previous_type != "OFFER_EXPIRY":
+        try:
+            await cancel_actions_for_fan(fan_id, previous_type)
+        except Exception as exc:
+            print(
+                f"[OFFER EXPIRY] superseded action cancellation failed "
+                f"fan={fan_id} type={previous_type}: {exc}"
+            )
+    try:
+        await cancel_actions_for_fan(fan_id, "OFFER_EXPIRY")
+        await schedule_action(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            action_type=obligation.action_type,
+            execute_at=obligation.execute_at,
+            payload=obligation.payload,
+            dedupe_key=obligation.dedupe_key,
+        )
+    except Exception as exc:
+        # The state obligation is persisted by the caller and repaired by the
+        # worker, so a queue write failure cannot lose the expiry promise.
+        print(f"[OFFER EXPIRY] scheduling repair needed fan={fan_id}: {exc}")
+    state.next_followup_at = obligation.execute_at
+    state.next_followup_type = obligation.action_type
+    state.next_followup_payload = obligation.payload
+    state.next_followup_dedupe_key = obligation.dedupe_key
+
+
+async def acknowledge_fan_return(
+    creator_id: str,
+    fan_id: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Cancel a due abandoned-offer nudge or refresh a still-live offer.
+
+    This runs as soon as a fan message is persisted, including when auto mode is
+    off, so a scheduled proactive message can never race an active conversation.
+    """
+    state = await get_fan_state(fan_id)
+    changed = False
+    if state.next_followup_type == "ABANDONED_OFFER_FOLLOWUP":
+        await cancel_actions_for_fan(fan_id, "ABANDONED_OFFER_FOLLOWUP")
+        _clear_followup_obligation(state)
+        changed = True
+
+    if state.status == FanStatus.OFFER_PENDING and state.offered_packages:
+        policy = await get_creator_policy(creator_id)
+        await _sync_pending_offer_expiry(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            state=state,
+            policy=policy,
+            anchor=now or datetime.now(timezone.utc),
+        )
+        changed = True
+
+    if changed:
+        await save_fan_state(fan_id, creator_id, state)
+
+
 async def orchestrate(
     creator_id: str,
     fan_id: str,
@@ -123,6 +222,16 @@ async def orchestrate(
     policy = await get_creator_policy(creator_id)
     state = await get_fan_state(fan_id)
     now = datetime.now(timezone.utc)
+
+    # Orchestrate is called because the fan is actively talking. Any proactive
+    # abandoned-offer nudge is obsolete even through an alternate ingestion path.
+    if state.next_followup_type == "ABANDONED_OFFER_FOLLOWUP":
+        try:
+            await cancel_actions_for_fan(fan_id, "ABANDONED_OFFER_FOLLOWUP")
+        except Exception as exc:
+            print(f"[OFFER FOLLOWUP] cancellation failed fan={fan_id}: {exc}")
+        else:
+            _clear_followup_obligation(state)
 
     if state.status == FanStatus.OFFER_PENDING and state.offered_packages:
         augment_pending_offer_events(
@@ -364,6 +473,14 @@ async def orchestrate(
                 state.next_followup_dedupe_key = None
         except Exception as exc:
             print(f"[COMMERCIAL] cancel follow-up failed fan={fan_id}: {exc}")
+
+    await _sync_pending_offer_expiry(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        state=state,
+        policy=policy,
+        anchor=now,
+    )
 
     await save_fan_state(fan_id, creator_id, state)
     print(

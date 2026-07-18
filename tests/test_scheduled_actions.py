@@ -140,6 +140,111 @@ def test_post_session_goal_uses_buyer_stage_without_selling(monkeypatch):
     assert "a new price" in captured[0].lower()
 
 
+def test_creator_auto_mode_falls_back_when_old_queries_module_lacks_helper(monkeypatch):
+    import core.supabase as supabase_module
+    import db.queries as queries
+
+    class Query:
+        def table(self, _name):
+            return self
+
+        def select(self, _columns):
+            return self
+
+        def eq(self, _column, _value):
+            return self
+
+        def single(self):
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data={"auto_mode": True})
+
+    monkeypatch.delattr(queries, "get_creator_auto_mode_default")
+    monkeypatch.setattr(supabase_module, "get_supabase", lambda: Query())
+
+    assert run(worker._creator_auto_mode_default("creator-1")) is True
+
+
+def test_repair_requeues_the_known_payday_import_failure(monkeypatch):
+    import db.commercial_queries as commercial_queries
+
+    updates = []
+
+    class Query:
+        operation = "select"
+
+        def table(self, _name):
+            return self
+
+        def select(self, _columns):
+            self.operation = "select"
+            return self
+
+        def update(self, payload):
+            self.operation = "update"
+            updates.append(payload)
+            return self
+
+        def eq(self, _column, _value):
+            return self
+
+        def limit(self, _value):
+            return self
+
+        def execute(self):
+            if self.operation == "select":
+                return SimpleNamespace(data=[{
+                    "id": "action-1",
+                    "status": "FAILED",
+                    "last_error": (
+                        "cannot import name 'get_creator_auto_mode_default' "
+                        "from 'db.queries'"
+                    ),
+                }])
+            return SimpleNamespace(data=[{"id": "action-1"}])
+
+    query = Query()
+    monkeypatch.setattr(commercial_queries, "get_supabase", lambda: query)
+
+    run(commercial_queries.ensure_action_pending(
+        creator_id="creator-1",
+        fan_id="fan-1",
+        action_type="PAYDAY_REENGAGEMENT",
+        execute_at=NOW,
+        payload={"payday_at": NOW.isoformat()},
+        dedupe_key="payday:fan-1",
+    ))
+
+    assert updates
+    assert updates[0]["status"] == "PENDING"
+    assert updates[0]["attempts"] == 0
+
+
+def test_stale_same_type_action_cannot_clear_newer_offer_obligation(monkeypatch):
+    state = FanCommercialState(
+        status=FanStatus.OFFER_PENDING,
+        next_followup_at=NOW,
+        next_followup_type="OFFER_EXPIRY",
+        next_followup_payload={"offer_reference": "new"},
+        next_followup_dedupe_key="offer-expiry:fan-1:new",
+    )
+    saved = []
+    monkeypatch.setattr(worker, "get_fan_state", lambda _fan_id: async_value(state))
+    monkeypatch.setattr(
+        worker,
+        "save_fan_state",
+        lambda fan_id, creator_id, value: async_append(saved, (fan_id, creator_id, value)),
+    )
+    stale = action("OFFER_EXPIRY")
+    stale["dedupe_key"] = "offer-expiry:fan-1:old"
+
+    run(worker._record_message_action_resolution(stale, sent=False))
+
+    assert saved[0][2].next_followup_type == "OFFER_EXPIRY"
+    assert saved[0][2].next_followup_dedupe_key == "offer-expiry:fan-1:new"
+
+
 async def async_value(value):
     return value
 

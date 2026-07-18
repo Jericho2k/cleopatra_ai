@@ -142,6 +142,14 @@ async def process_incoming_fan_message(
     message_id: str | None,
 ) -> None:
     """Shared pipeline: history already includes the new fan message."""
+    try:
+        from services.commercial_orchestrator import acknowledge_fan_return
+
+        await acknowledge_fan_return(creator_id, fan_id)
+    except Exception as exc:
+        # Conversation can continue. The worker also revalidates recent fan
+        # activity before any proactive message is sent.
+        print(f"[OFFER FOLLOWUP CANCEL ERROR] fan={fan_id}: {exc}")
     conversation_history = await get_conversation_history(fan_id)
     fan_profile = await get_fan_by_id(fan_id)
     if fan_profile is None:
@@ -649,6 +657,20 @@ async def run_reengagement() -> dict:
             if fan_id in excluded_ids:
                 continue
             if fan.get("auto_mode") is False:
+                continue
+
+            # The old generic inactivity cron must never compete with a precise
+            # payday/session/offer obligation or interrupt an active flow.
+            commercial = await asyncio.to_thread(
+                lambda fid=fan_id: db.table("fan_commercial_states")
+                .select("status, next_followup_at, next_followup_type, last_followup_at")
+                .eq("fan_id", fid)
+                .maybe_single()
+                .execute()
+            )
+            from services.followup_lifecycle import legacy_reengagement_allowed
+
+            if not legacy_reengagement_allowed(commercial.data, cutoff=cutoff):
                 continue
 
             last_msg = await asyncio.to_thread(

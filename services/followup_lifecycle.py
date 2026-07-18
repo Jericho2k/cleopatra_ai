@@ -66,6 +66,23 @@ def next_awake_time(
     return target.astimezone(timezone.utc) if in_sleep else as_utc(value)
 
 
+def legacy_reengagement_allowed(
+    commercial_state: dict[str, Any] | None,
+    *,
+    cutoff: datetime,
+) -> bool:
+    """Keep the legacy inactivity cron subordinate to durable lifecycle work."""
+    if not commercial_state:
+        return True
+    if commercial_state.get("next_followup_at") or commercial_state.get("next_followup_type"):
+        return False
+    status = str(commercial_state.get("status") or FanStatus.IDLE.value)
+    if status != FanStatus.IDLE.value:
+        return False
+    last_followup = as_utc(commercial_state.get("last_followup_at"))
+    return not last_followup or last_followup <= as_utc(cutoff)
+
+
 def payment_expires_at(
     pending: dict[str, Any],
     *,
@@ -99,6 +116,128 @@ def pending_reference(pending: dict[str, Any]) -> str:
         for key in ("media_id", "set_id", "step_index", "price", "sent_at")
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
+def offer_reference(state: FanCommercialState) -> str:
+    """Identify one immutable offer presentation without exposing vault IDs."""
+    offered_at = as_utc(state.last_offer_at)
+    material = [offered_at.isoformat() if offered_at else ""]
+    for package in state.offered_packages:
+        material.extend(
+            [
+                package.package_id,
+                str(package.price_cents),
+                ",".join(package.set_ids or ([package.set_id] if package.set_id else [])),
+            ]
+        )
+    return hashlib.sha256("|".join(material).encode("utf-8")).hexdigest()[:24]
+
+
+def pending_offer_payload(state: FanCommercialState) -> dict[str, Any]:
+    """Freeze the exact approved offer wording/context for a later follow-up."""
+    packages = [package.model_dump(mode="json") for package in state.offered_packages]
+    experiences = list(
+        dict.fromkeys(
+            str(package.experience or package.legal_description or "").strip()
+            for package in state.offered_packages
+            if str(package.experience or package.legal_description or "").strip()
+        )
+    )
+    desired = str(state.desired_experience or "").strip()
+    primary = ""
+    desired_words = {
+        word for word in desired.lower().replace(",", " ").split() if len(word) >= 4
+    }
+    if desired_words:
+        primary = next(
+            (
+                experience
+                for experience in experiences
+                if desired_words.intersection(experience.lower().replace(",", " ").split())
+            ),
+            "",
+        )
+    if not primary and experiences:
+        primary = experiences[0]
+    return {
+        "offer_reference": offer_reference(state),
+        "offered_at": as_utc(state.last_offer_at).isoformat() if state.last_offer_at else None,
+        "desired_experience": desired,
+        "primary_experience": primary,
+        "approved_experiences": experiences,
+        "offered_packages": packages,
+    }
+
+
+def pending_offer_expiry_obligation(
+    state: FanCommercialState,
+    *,
+    policy: CreatorPolicy,
+    fan_id: str,
+) -> FollowupObligation | None:
+    if (
+        state.status != FanStatus.OFFER_PENDING
+        or not state.offered_packages
+        or as_utc(state.last_offer_at) is None
+    ):
+        return None
+    payload = pending_offer_payload(state)
+    execute_at = followup_at(state.last_offer_at, policy.pending_offer_expiry_hours)
+    reference = payload["offer_reference"]
+    return FollowupObligation(
+        action_type="OFFER_EXPIRY",
+        execute_at=execute_at,
+        payload=payload,
+        dedupe_key=f"offer-expiry:{fan_id}:{reference}",
+    )
+
+
+def expire_pending_offer_state(
+    state: FanCommercialState,
+    *,
+    payload: dict[str, Any],
+    policy: CreatorPolicy,
+    fan_id: str,
+    now: datetime | None = None,
+) -> tuple[FanCommercialState, FollowupObligation | None, bool]:
+    """Expire only the exact offer snapshot named by the durable action."""
+    output = state.model_copy(deep=True)
+    if output.status != FanStatus.OFFER_PENDING or not output.offered_packages:
+        return output, None, False
+    if str(payload.get("offer_reference") or "") != offer_reference(output):
+        return output, None, False
+
+    expired_at = as_utc(now) or datetime.now(timezone.utc)
+    preserved = pending_offer_payload(output)
+    preserved["expired_at"] = expired_at.isoformat()
+    output.status = FanStatus.IDLE
+    output.offered_packages = []
+    output.selected_package_id = None
+    output.selected_package_set_id = None
+    output.selected_package_set_ids = []
+    output.selected_package_label = None
+    output.selected_package_price_cents = None
+
+    obligation = None
+    if policy.abandoned_offer_followup_enabled:
+        execute_at = followup_at(expired_at, policy.abandoned_offer_followup_delay_hours)
+        dedupe_key = f"abandoned-offer:{fan_id}:{preserved['offer_reference']}"
+        obligation = FollowupObligation(
+            action_type="ABANDONED_OFFER_FOLLOWUP",
+            execute_at=execute_at,
+            payload=preserved,
+            dedupe_key=dedupe_key,
+        )
+        output.next_followup_at = execute_at
+        output.next_followup_type = obligation.action_type
+        output.next_followup_payload = preserved
+        output.next_followup_dedupe_key = dedupe_key
+    else:
+        output.next_followup_at = None
+        output.next_followup_type = None
+        output.next_followup_payload = {}
+        output.next_followup_dedupe_key = None
+    return output, obligation, True
 
 
 def post_session_payload(

@@ -23,6 +23,7 @@ from db.commercial_queries import (
     get_followup_obligations,
     reschedule_action,
     save_fan_state,
+    schedule_action,
 )
 from models.commercial import FanStatus
 
@@ -64,6 +65,37 @@ def _same_time(first, second) -> bool:
     return bool(left and right and abs((left - right).total_seconds()) < 2)
 
 
+async def _creator_auto_mode_default(creator_id: str) -> bool:
+    """Read creator auto mode across mixed-version/rolling deployments.
+
+    The helper originally lived only in ``db.queries``. A worker can briefly run
+    against an older imported module during a deployment, so a missing symbol must
+    not permanently fail a promised follow-up.
+    """
+    try:
+        from db import queries
+
+        getter = getattr(queries, "get_creator_auto_mode_default", None)
+        if getter is not None:
+            return bool(await getter(creator_id))
+    except (ImportError, AttributeError):
+        pass
+
+    from core.supabase import get_supabase
+
+    def _get() -> bool:
+        response = (
+            get_supabase().table("creators")
+            .select("auto_mode")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+        return bool((response.data or {}).get("auto_mode", False))
+
+    return await asyncio.to_thread(_get)
+
+
 async def _should_still_send(action: dict) -> ActionCheck:
     """Revalidate a proactive message immediately before delivery."""
     from db.queries import (
@@ -85,11 +117,10 @@ async def _should_still_send(action: dict) -> ActionCheck:
         return ActionCheck(False, "fan frozen for human review")
 
     # Auto mode must still be on for this fan.
-    from db.queries import get_creator_auto_mode_default
     fan_auto = getattr(fan, "auto_mode", None)
     if fan_auto is None:
         try:
-            fan_auto = await get_creator_auto_mode_default(creator_id)
+            fan_auto = await _creator_auto_mode_default(creator_id)
         except Exception:
             fan_auto = False
     if not fan_auto:
@@ -127,6 +158,15 @@ async def _should_still_send(action: dict) -> ActionCheck:
             return ActionCheck(False, "a newer PPV outcome replaced this one")
         if state.status in {FanStatus.PAYMENT_PENDING, FanStatus.PAID_SESSION_ACTIVE}:
             return ActionCheck(False, f"fan entered a new paid flow (status={state.status.value})")
+    elif action_type == "ABANDONED_OFFER_FOLLOWUP":
+        if not policy.abandoned_offer_followup_enabled:
+            return ActionCheck(False, "abandoned-offer follow-up disabled for creator")
+        if str(payload.get("offered_at") or "") != (
+            state.last_offer_at.isoformat() if state.last_offer_at else ""
+        ):
+            return ActionCheck(False, "a newer offer replaced this one")
+        if state.status != FanStatus.IDLE:
+            return ActionCheck(False, f"fan entered a new flow (status={state.status.value})")
     else:
         return ActionCheck(False, f"unsupported proactive action {action_type}")
 
@@ -229,6 +269,55 @@ async def _run_abandoned_ppv_followup(action: dict) -> HandlerResult:
     return await _send_goal(action, goal)
 
 
+async def _run_abandoned_offer_followup(action: dict) -> HandlerResult:
+    payload = action.get("payload") or {}
+    approved = payload.get("primary_experience") or "the private options"
+    goal = (
+        f"He was shown approved options around {approved}, but left before choosing one. "
+        "Reopen the conversation lightly and naturally. You may reference only that approved "
+        "experience, without claiming he selected it, repeating a price, discounting, pressuring, "
+        "or sending media. Make it easy to resume or just chat. One short message."
+    )
+    return await _send_goal(action, goal)
+
+
+async def _run_offer_expiry(action: dict) -> HandlerResult:
+    """Turn the exact still-pending offer into a later follow-up obligation."""
+    from services.followup_lifecycle import expire_pending_offer_state
+
+    state = await get_fan_state(action["fan_id"])
+    policy = await get_creator_policy(action["creator_id"])
+    expired, followup, changed = expire_pending_offer_state(
+        state,
+        payload=action.get("payload") or {},
+        policy=policy,
+        fan_id=action["fan_id"],
+        now=datetime.now(timezone.utc),
+    )
+    if not changed:
+        return HandlerResult(reason="offer already changed or returned")
+
+    # Persist the obligation first. If scheduling fails, the repair pass recreates
+    # it from fan state on the next worker tick.
+    await save_fan_state(action["fan_id"], action["creator_id"], expired)
+    if followup:
+        try:
+            await schedule_action(
+                creator_id=action["creator_id"],
+                fan_id=action["fan_id"],
+                action_type=followup.action_type,
+                execute_at=followup.execute_at,
+                payload=followup.payload,
+                dedupe_key=followup.dedupe_key,
+            )
+        except Exception as exc:
+            print(
+                f"[FOLLOWUP REPAIR NEEDED] fan={action['fan_id']} "
+                f"type=ABANDONED_OFFER_FOLLOWUP error={exc}"
+            )
+    return HandlerResult(reason="pending offer expired")
+
+
 async def _run_ppv_reconcile(action: dict) -> HandlerResult:
     from services.ppv_reconciliation import (
         PPVReconcileDisposition,
@@ -250,6 +339,8 @@ HANDLERS = {
     "PAYDAY_REENGAGEMENT": _run_payday_reengagement,
     "POST_SESSION_FOLLOWUP": _run_post_session_followup,
     "ABANDONED_PPV_FOLLOWUP": _run_abandoned_ppv_followup,
+    "OFFER_EXPIRY": _run_offer_expiry,
+    "ABANDONED_OFFER_FOLLOWUP": _run_abandoned_offer_followup,
     "PPV_RECONCILE": _run_ppv_reconcile,
 }
 
@@ -259,7 +350,12 @@ async def _record_message_action_resolution(action: dict, *, sent: bool) -> None
     if action_type == "PPV_RECONCILE":
         return
     state = await get_fan_state(action["fan_id"])
-    if state.next_followup_type == action_type:
+    current_dedupe = str(state.next_followup_dedupe_key or "")
+    action_dedupe = str(action.get("dedupe_key") or "")
+    if (
+        state.next_followup_type == action_type
+        and (not current_dedupe or current_dedupe == action_dedupe)
+    ):
         state.next_followup_at = None
         state.next_followup_type = None
         state.next_followup_payload = {}
@@ -271,7 +367,12 @@ async def _record_message_action_resolution(action: dict, *, sent: bool) -> None
 
 async def _record_followup_postponed(action: dict, retry_at: datetime) -> None:
     state = await get_fan_state(action["fan_id"])
-    if state.next_followup_type == action.get("action_type"):
+    current_dedupe = str(state.next_followup_dedupe_key or "")
+    action_dedupe = str(action.get("dedupe_key") or "")
+    if (
+        state.next_followup_type == action.get("action_type")
+        and (not current_dedupe or current_dedupe == action_dedupe)
+    ):
         state.next_followup_at = retry_at
         await save_fan_state(action["fan_id"], action["creator_id"], state)
 
@@ -310,7 +411,7 @@ async def process_once() -> int:
                                   action.get("attempts", 0))
                 continue
 
-            if action["action_type"] != "PPV_RECONCILE":
+            if action["action_type"] not in {"PPV_RECONCILE", "OFFER_EXPIRY"}:
                 check = await _should_still_send(action)
                 if not check.ok:
                     if check.retry_at:

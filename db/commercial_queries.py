@@ -275,7 +275,7 @@ async def ensure_action_pending(
         db = get_supabase()
         existing = (
             db.table("scheduled_actions")
-            .select("id, status")
+            .select("id, status, last_error")
             .eq("dedupe_key", dedupe_key)
             .limit(1)
             .execute()
@@ -284,7 +284,11 @@ async def ensure_action_pending(
             db.table("scheduled_actions").insert(row).execute()
             return
         current = existing[0]
-        if current.get("status") == "COMPLETED":
+        recoverable_compatibility_failure = (
+            current.get("status") == "FAILED"
+            and "get_creator_auto_mode_default" in str(current.get("last_error") or "")
+        )
+        if current.get("status") == "COMPLETED" or recoverable_compatibility_failure:
             db.table("scheduled_actions").update(row).eq(
                 "id", current["id"]
             ).execute()

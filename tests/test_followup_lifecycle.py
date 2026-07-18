@@ -5,6 +5,7 @@ from services.followup_lifecycle import (
     abandoned_ppv_payload,
     complete_session_state,
     followup_at,
+    legacy_reengagement_allowed,
     next_awake_time,
     next_reconcile_at,
     payment_expires_at,
@@ -48,6 +49,27 @@ def test_followup_moves_out_of_overnight_sleep_window():
         sleep_end_hour=7,
         timezone_name="UTC",
     ) == awake
+
+
+def test_legacy_reengagement_yields_to_durable_or_active_lifecycle():
+    cutoff = datetime(2026, 7, 18, 12, 0, tzinfo=timezone.utc)
+    assert legacy_reengagement_allowed(None, cutoff=cutoff) is True
+    assert legacy_reengagement_allowed(
+        {"status": "IDLE", "next_followup_at": "2026-07-19T12:00:00+00:00"},
+        cutoff=cutoff,
+    ) is False
+    assert legacy_reengagement_allowed(
+        {"status": "OFFER_PENDING"},
+        cutoff=cutoff,
+    ) is False
+    assert legacy_reengagement_allowed(
+        {"status": "IDLE", "last_followup_at": "2026-07-18T13:00:00+00:00"},
+        cutoff=cutoff,
+    ) is False
+    assert legacy_reengagement_allowed(
+        {"status": "IDLE", "last_followup_at": "2026-07-17T13:00:00+00:00"},
+        cutoff=cutoff,
+    ) is True
 
 
 def test_pending_payment_uses_explicit_expiry_or_policy_window():

@@ -103,6 +103,9 @@ class CreatorPolicy(BaseModel):
     ppv_payment_window_hours: int = Field(default=24, ge=1, le=168)
     abandoned_ppv_followup_enabled: bool = True
     abandoned_ppv_followup_delay_hours: int = Field(default=18, ge=1, le=720)
+    pending_offer_expiry_hours: int = Field(default=24, ge=1, le=168)
+    abandoned_offer_followup_enabled: bool = True
+    abandoned_offer_followup_delay_hours: int = Field(default=18, ge=1, le=720)
     post_session_followup_enabled: bool = True
     post_session_followup_delay_hours: int = Field(default=18, ge=1, le=720)
     followup_recent_activity_suppression_hours: int = Field(default=6, ge=0, le=168)
