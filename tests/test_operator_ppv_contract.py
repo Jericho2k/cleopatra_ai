@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from main import read_operator_ppv_options
 from models.commercial import CreatorPolicy
 from services.ppv_delivery import PPVDeliveryError, send_locked_ppv
 
@@ -56,3 +57,14 @@ def test_auto_prepared_approval_keeps_exact_media_and_price():
     assert "price_cents=int(round(price * 100))" in source
     assert "if approval_policy.require_operator_ppv_approval" in source
 
+
+def test_operator_ppv_options_matches_production_vault_schema():
+    source = inspect.getsource(read_operator_ppv_options)
+    vault_query = source[
+        source.index('lambda: db.table("creator_vault_media")'):
+        source.index('lambda: db.table("vault_sets")')
+    ]
+
+    assert '.table("creator_vault_media")' in vault_query
+    assert '.order("created_at"' not in vault_query
+    assert "Could not load the creator vault for this PPV." in source

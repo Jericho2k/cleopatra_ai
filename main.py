@@ -2763,39 +2763,45 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
     if str(fan.get("creator_id") or "") != str(creator_id):
         raise HTTPException(status_code=404, detail="fan not found for creator")
 
-    vault_rows, set_rows, message_rows = await asyncio.gather(
-        asyncio.to_thread(
-            lambda: db.table("creator_vault_media")
-            .select(
-                "id, fansly_media_id, media_id, url, thumbnail_url, mimetype, filename, "
-                "album_title, content_category, ai_description, price_min, price_max, is_active"
-            )
-            .eq("creator_id", creator_id)
-            .order("created_at", desc=True)
-            .execute()
-        ),
-        asyncio.to_thread(
-            lambda: db.table("vault_sets")
-            .select(
-                "id, title, media_ids, suggested_price, base_price_cents, min_price_cents, "
-                "max_price_cents, dynamic_pricing_enabled, tags, status"
-            )
-            .eq("creator_id", creator_id)
-            .eq("status", "approved")
-            .order("created_at", desc=True)
-            .execute()
-        ),
-        asyncio.to_thread(
-            lambda: db.table("messages")
-            .select("media_context")
-            .eq("creator_id", creator_id)
-            .eq("fan_id", fan_id)
-            .eq("role", "creator")
-            .order("sent_at", desc=True)
-            .limit(1000)
-            .execute()
-        ),
-    )
+    try:
+        vault_rows, set_rows, message_rows = await asyncio.gather(
+            asyncio.to_thread(
+                lambda: db.table("creator_vault_media")
+                .select(
+                    "id, fansly_media_id, media_id, url, thumbnail_url, mimetype, filename, "
+                    "album_title, content_category, ai_description, price_min, price_max, is_active"
+                )
+                .eq("creator_id", creator_id)
+                .execute()
+            ),
+            asyncio.to_thread(
+                lambda: db.table("vault_sets")
+                .select(
+                    "id, title, media_ids, suggested_price, base_price_cents, min_price_cents, "
+                    "max_price_cents, dynamic_pricing_enabled, tags, status"
+                )
+                .eq("creator_id", creator_id)
+                .eq("status", "approved")
+                .order("created_at", desc=True)
+                .execute()
+            ),
+            asyncio.to_thread(
+                lambda: db.table("messages")
+                .select("media_context")
+                .eq("creator_id", creator_id)
+                .eq("fan_id", fan_id)
+                .eq("role", "creator")
+                .order("sent_at", desc=True)
+                .limit(1000)
+                .execute()
+            ),
+        )
+    except Exception as exc:
+        print(f"[OPERATOR PPV OPTIONS] fan={fan_id} creator={creator_id} error={exc}", flush=True)
+        raise HTTPException(
+            status_code=502,
+            detail="Could not load the creator vault for this PPV.",
+        ) from exc
 
     sent_ids: set[str] = set()
     for message in (message_rows.data or []):
