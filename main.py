@@ -56,6 +56,14 @@ from services.vault_operations import (
     manual_recategorization_usage,
     normalize_media_ids,
 )
+from services.vault_metadata import (
+    VAULT_CLASSIFIER_VERSION,
+    build_set_description,
+    classification_confidence,
+    media_description,
+    semantic_tags,
+    useful_text,
+)
 
 
 _processed_messages: set = set()
@@ -1570,24 +1578,39 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
         return {"status": "ok", "item": saved}
 
 
+def _classification_update_payload(result: dict) -> dict:
+    return {
+        "content_category": result["content_category"],
+        "ai_description": result["ai_description"],
+        "price_min": result["price_min"],
+        "price_max": result["price_max"],
+        "explicitness_level": result.get("explicitness", 3),
+        "good_for": result.get("good_for", "standalone"),
+        "tags": result.get("tags", []),
+        "scene_id": result.get("scene_id", ""),
+        "scene_location": result.get("scene_location", ""),
+        "scene_outfit": result.get("scene_outfit", ""),
+        "scene_lighting": result.get("scene_lighting", ""),
+        "classification_version": result.get(
+            "classification_version", VAULT_CLASSIFIER_VERSION
+        ),
+        "classification_model": result.get("classification_model", ""),
+        "classification_source": result.get("classification_source", ""),
+        "classification_confidence": result.get("classification_confidence", 0),
+        "classification_metadata": result.get("classification_metadata", {}),
+        "classified_at": result.get("classified_at") or datetime.now(timezone.utc).isoformat(),
+    }
+
+
 async def _categorize_single_item_and_save(item: dict) -> None:
     try:
         result = await _categorize_single_item(item)
         db = get_supabase()
         await asyncio.to_thread(
-            lambda: db.table("creator_vault_media").update({
-                "content_category": result["content_category"],
-                "ai_description": result["ai_description"],
-                "price_min": result["price_min"],
-                "price_max": result["price_max"],
-                "explicitness_level": result.get("explicitness", 3),
-                "good_for": result.get("good_for", "standalone"),
-                "tags": result.get("tags", []),
-                "scene_id": result.get("scene_id", ""),
-                "scene_location": result.get("scene_location", ""),
-                "scene_outfit": result.get("scene_outfit", ""),
-                "scene_lighting": result.get("scene_lighting", ""),
-            }).eq("id", item["id"]).execute()
+            lambda: db.table("creator_vault_media")
+            .update(_classification_update_payload(result))
+            .eq("id", item["id"])
+            .execute()
         )
         print(f"[UPLOAD CATEGORIZE] item={item['id']} category={result['content_category']}")
     except Exception as e:
@@ -1601,12 +1624,15 @@ VAULT_CATEGORIES = {
     "lingerie_photo":   {"min": 10,  "max": 80,  "label": "Lingerie photo"},
     "lingerie_video":   {"min": 15,  "max": 90,  "label": "Lingerie video"},
     "nude_photo":       {"min": 15,  "max": 80,  "label": "Nude photo"},
+    "nude_video":       {"min": 20,  "max": 110, "label": "Nude video"},
     "striptease_video": {"min": 15,  "max": 100, "label": "Striptease video"},
     "closeup_photo":    {"min": 25,  "max": 130, "label": "Closeup photo"},
     "closeup_video":    {"min": 25,  "max": 130, "label": "Closeup video"},
     "dictate_video":    {"min": 15,  "max": 50,  "label": "Dictate / dirty talk video"},
     "solo_toy_video":   {"min": 30,  "max": 150, "label": "Solo / toy / orgasm video"},
     "solo_toy_photo":   {"min": 20,  "max": 80,  "label": "Solo / toy photo"},
+    "explicit_photo":   {"min": 25,  "max": 130, "label": "Explicit solo photo"},
+    "explicit_video":   {"min": 35,  "max": 170, "label": "Explicit solo video"},
     "bg_content":       {"min": 50,  "max": 300, "label": "BG (boy-girl) content"},
     "task":             {"min": 10,  "max": 50,  "label": "Task / custom request"},
     "other":            {"min": 0,   "max": 0,   "label": "Other / unclear"},
@@ -1619,153 +1645,168 @@ CATEGORY_LIST = "\n".join([
 
 
 async def _categorize_single_item(item: dict) -> dict:
-    """Run Claude Vision on one vault item and return category + description."""
+    """Classify one vault item into the versioned provider-neutral contract.
+
+    Images are resized before upload to control vision-token cost.  Videos use
+    their real platform thumbnail rather than guessing from a filename.  A
+    provider/fetch/parse failure is raised so the retry loop can leave the item
+    stale instead of permanently saving an empty ``other`` classification.
+    """
     from anthropic import AsyncAnthropic
+    import base64
+    import io
     import httpx
+    from PIL import Image
 
     client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    url = item.get("url", "")
-    mimetype = item.get("mimetype", "")
+    model = os.environ.get("VAULT_CLASSIFIER_MODEL", "claude-sonnet-4-6")
+    url = str(item.get("url") or "")
+    mimetype = str(item.get("mimetype") or "")
     item_id = item.get("id", "")
     is_video = mimetype.startswith("video") if mimetype else False
 
     try:
-        if is_video:
-            # For videos we can't send frames easily — use filename + album as context
-            filename = item.get("filename", "")
-            album = item.get("album_title", "")
-            prompt = (
-                f"This is a video file. Filename: '{filename}'. Album: '{album}'.\n"
-                f"Based on the filename and album name only, classify this into one of these categories:\n{CATEGORY_LIST}\n\n"
-                "Return ONLY valid JSON:\n"
-                '{"category": "category_key", "description": "one sentence description of likely content", "mood": "playful|intimate|explicit|teasing"}'
-            )
-            response = await client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=150,
-                messages=[{"role": "user", "content": prompt}],
-            )
-        else:
-            # Fetch image and send to Claude Vision
-            img_b64 = None
-            media_type = mimetype if mimetype in ["image/jpeg", "image/png", "image/webp", "image/gif"] else "image/jpeg"
-            try:
-                async with httpx.AsyncClient() as hc:
-                    img_resp = await hc.get(url, timeout=15)
-                    if img_resp.status_code == 200 and len(img_resp.content) > 1000:
-                        img_data = img_resp.content
-                        # Resize if over 4MB to stay under Claude's 5MB limit
-                        if len(img_data) > 4 * 1024 * 1024:
-                            try:
-                                from PIL import Image
-                                import io
-                                img_obj = Image.open(io.BytesIO(img_data))
-                                img_obj.thumbnail((1024, 1024), Image.LANCZOS)
-                                buf = io.BytesIO()
-                                img_obj.save(buf, format="JPEG", quality=85)
-                                img_data = buf.getvalue()
-                                media_type = "image/jpeg"
-                                print(f"[CATEGORIZE] resized large image item={item_id} to {len(img_data)} bytes")
-                            except Exception as resize_err:
-                                print(f"[CATEGORIZE] resize failed item={item_id}: {resize_err}")
-                        img_b64 = __import__("base64").b64encode(img_data).decode()
-            except Exception as fetch_err:
-                print(f"[CATEGORIZE] image fetch failed for item={item_id}: {fetch_err}")
+        image_url = str(item.get("thumbnail_url") or "") if is_video else url
+        source = "video_thumbnail" if is_video else "image"
+        if not image_url:
+            raise RuntimeError(f"no visual source available for {source}")
 
-            if img_b64:
-                response = await client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=400,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": img_b64,
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": (
-                                    f"Classify this OnlyFans creator image. Pick one category:\n{CATEGORY_LIST}\n\n"
-                                    "Rate EXPLICITNESS strictly on what is ACTUALLY VISIBLE in THIS image:\n"
-                                    "-1 = junk/noise (screenshot, text, meme, unrelated)\n"
-                                    " 0 = casual/SFW (normal selfie, street clothes, nothing suggestive)\n"
-                                    " 1 = teaser (blurred, pixelated, censored, or fully covered)\n"
-                                    " 2 = suggestive but not provocative (hint of skin, flirty, still clothed)\n"
-                                    " 3 = sexy: lingerie / bikini / see-through, nothing explicit shown\n"
-                                    " 4 = nude: breasts, butt, or genitals exposed\n"
-                                    " 5 = explicit/lewd: spread, penetration, sex-act still — max\n"
-                                    "Lingerie with nothing exposed is 3, NEVER 5. A clothed selfie is 0.\n\n"
-                                    "Return ONLY a single line of JSON, no newlines, no formatting:\n"
-                                    '{"category":"category_key","description":"1-2 sentences","mood":"playful","explicitness":3,"good_for":"opener","tags":["tag1"],"scene_location":"bedroom","scene_outfit":"red lingerie","scene_lighting":"dim","scene_id":"bedroom-red-lingerie"}'
-                                ),
-                            },
-                        ],
-                    }],
-                )
-            else:
-                # CDN URL expired or fetch failed — fall back to filename+album
-                filename = item.get("filename", "")
-                album = item.get("album_title", "")
-                print(f"[CATEGORIZE] falling back to filename analysis for item={item_id}")
-                response = await client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=300,
-                    messages=[{"role": "user", "content": (
-                        f"This is an OnlyFans image. Filename: '{filename}'. Album: '{album}'.\n"
-                        f"Based on filename and album only, classify into one of:\n{CATEGORY_LIST}\n\n"
-                        "Return ONLY valid JSON:\n"
-                        "{\n"
-                        '  "category": "category_key",\n'
-                        '  "description": "best guess description based on filename/album",\n'
-                        '  "mood": "playful|intimate|explicit|teasing",\n'
-                        '  "explicitness": 3,\n'
-                        '  "good_for": "opener|mid_session|closer|standalone",\n'
-                        '  "tags": [],\n'
-                        '  "scene": {"location": "unknown", "outfit": "unknown", "hair": "unknown", "lighting": "unknown", "scene_id": "unknown"}\n'
-                        "}"
-                    )}],
-                )
+        async with httpx.AsyncClient(follow_redirects=True) as hc:
+            image_response = await hc.get(image_url, timeout=25)
+        if image_response.status_code != 200 or len(image_response.content) <= 1000:
+            raise RuntimeError(
+                f"visual fetch failed status={image_response.status_code} bytes={len(image_response.content)}"
+            )
+
+        # Classification does not need original-resolution media.  Normalizing
+        # every asset to a compact JPEG makes cost predictable and also handles
+        # thumbnails whose declared MIME type is missing or inaccurate.
+        image = Image.open(io.BytesIO(image_response.content))
+        image.seek(0)
+        image = image.convert("RGB")
+        image.thumbnail((896, 896), Image.Resampling.LANCZOS)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=84, optimize=True)
+        image_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+
+        asset_kind = "video thumbnail" if is_video else "image"
+        prompt = f"""Classify this adult creator {asset_kind} for private vault search and package matching.
+The creator and all depicted participants must be adults. Describe only what is visibly supported; never invent an act, location, outfit, or prop. A video thumbnail is partial evidence, so describe the visible frame and lower confidence when the complete video cannot be inferred.
+
+Filename: {item.get('filename') or 'unknown'}
+Album/folder: {item.get('album_title') or 'unknown'}
+Allowed category keys:
+{CATEGORY_LIST}
+
+EXPLICITNESS is strictly what is visible:
+- 0 = ordinary SFW clothing/selfie
+- 1 = censored, blurred, implied, or fully covered teaser
+- 2 = suggestive/flirty but clothed
+- 3 = lingerie, bikini, or see-through with no explicit nudity
+- 4 = exposed breasts, butt, or genitals without an explicit sex act
+- 5 = explicit sexual activity, toy use, spread pose, oral sex, or penetration
+Lingerie alone is never above 3. Do not infer explicitness from the album name.
+
+Return ONLY one JSON object with exactly these keys:
+{{"category":"category_key","description":"2-4 factual sentences covering the visible subject, clothing/nudity, pose/action, environment and distinguishing details","mood":"playful|intimate|teasing|explicit|casual","explicitness":0,"good_for":"opener|mid_session|closer|standalone","tags":["specific searchable themes"],"sexual_activity":["only visibly supported activities"],"body_focus":["visible focal areas"],"action":"specific visible action or none","pose":"specific pose","framing":"selfie|portrait|full body|close-up|wide|other","props":["visible props"],"colors":["dominant outfit/scene colors"],"scene_location":"specific location or unknown","scene_outfit":"specific outfit/nudity state or unknown","scene_lighting":"natural|bright|dim|flash|colored|unknown","scene_id":"short stable shoot slug derived from album/location/outfit","confidence":0.0}}
+"""
+        response = await client.messages.create(
+            model=model,
+            max_tokens=850,
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_b64,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }],
+        )
 
         content = response.content[0].text.strip()
         content = content.replace("```json", "").replace("```", "").strip()
         print(f"[CATEGORIZE RAW] item={item_id} response={content[:300]}")
         data = json.loads(content)
+        if not isinstance(data, dict):
+            raise ValueError("classifier did not return a JSON object")
         category = data.get("category", "other")
         if category not in VAULT_CATEGORIES:
             category = "other"
-        description = data.get("description", "")
-        mood = data.get("mood", "")
-        price_info = VAULT_CATEGORIES[category]
 
         explicitness = min(max(int(data.get("explicitness", 0)), -1), 5)
+        # Deterministically repair category/media mismatches and impossible old
+        # combinations before they can become sellable set metadata.
+        if is_video:
+            category = {
+                "lingerie_photo": "lingerie_video",
+                "nude_photo": "nude_video",
+                "closeup_photo": "closeup_video",
+                "solo_toy_photo": "solo_toy_video",
+                "explicit_photo": "explicit_video",
+            }.get(category, category)
+        else:
+            category = {
+                "lingerie_video": "lingerie_photo",
+                "nude_video": "nude_photo",
+                "closeup_video": "closeup_photo",
+                "solo_toy_video": "solo_toy_photo",
+                "explicit_video": "explicit_photo",
+                "striptease_video": "lingerie_photo",
+                "dictate_video": "task",
+            }.get(category, category)
+        if category.startswith("lingerie_") and explicitness >= 4:
+            category = ("explicit_video" if is_video else "explicit_photo") if explicitness == 5 else ("nude_video" if is_video else "nude_photo")
+        if category in {"teaser_clothed", "teaser_bundle"} and explicitness >= 3:
+            if explicitness == 3:
+                category = "lingerie_video" if is_video else "lingerie_photo"
+            elif explicitness == 4:
+                category = "nude_video" if is_video else "nude_photo"
+            else:
+                category = "explicit_video" if is_video else "explicit_photo"
+
+        price_info = VAULT_CATEGORIES[category]
         good_for = data.get("good_for", "standalone")
         if good_for not in ["opener", "mid_session", "closer", "standalone"]:
             good_for = "standalone"
-        tags = data.get("tags", [])
-        if not isinstance(tags, list):
-            tags = []
-        scene_id = data.get("scene_id", "")
-        location = data.get("scene_location", "")
-        outfit = data.get("scene_outfit", "")
-        lighting = data.get("scene_lighting", "")
-
-        full_description = f"[{mood}|{good_for}|explicit:{explicitness}] {description}"
-        if outfit:
-            full_description += f" Outfit: {outfit}."
-        if location:
-            full_description += f" Location: {location}."
-        if tags:
-            full_description += f" Tags: {', '.join(tags)}."
+        data["explicitness"] = explicitness
+        data["category"] = category
+        data["good_for"] = good_for
+        tags = semantic_tags(data)
+        scene_id = useful_text(data.get("scene_id"))
+        location = useful_text(data.get("scene_location"))
+        outfit = useful_text(data.get("scene_outfit"))
+        lighting = useful_text(data.get("scene_lighting"))
+        confidence = classification_confidence(data.get("confidence"), source=source)
+        metadata = {
+            key: data.get(key)
+            for key in (
+                "description", "mood", "sexual_activity", "body_focus", "action",
+                "pose", "framing", "props", "colors",
+            )
+        }
+        metadata.update({
+            "category": category,
+            "explicitness": explicitness,
+            "good_for": good_for,
+            "tags": tags,
+            "scene_location": location,
+            "scene_outfit": outfit,
+            "scene_lighting": lighting,
+            "scene_id": scene_id,
+            "evidence_source": source,
+        })
 
         return {
             "id": item_id,
             "content_category": category,
-            "ai_description": full_description,
+            "ai_description": media_description(metadata, source=source),
             "price_min": price_info["min"],
             "price_max": price_info["max"],
             "explicitness": explicitness,
@@ -1775,17 +1816,17 @@ async def _categorize_single_item(item: dict) -> dict:
             "scene_location": location,
             "scene_outfit": outfit,
             "scene_lighting": lighting,
+            "classification_version": VAULT_CLASSIFIER_VERSION,
+            "classification_model": model,
+            "classification_source": source,
+            "classification_confidence": confidence,
+            "classification_metadata": metadata,
+            "classified_at": datetime.now(timezone.utc).isoformat(),
         }
 
     except Exception as e:
         print(f"[CATEGORIZE] item={item_id} error={e}")
-        return {
-            "id": item_id,
-            "content_category": "other",
-            "ai_description": "",
-            "price_min": 0,
-            "price_max": 0,
-        }
+        raise
 
 
 _VAULT_COOLDOWN_DAYS = 7
@@ -1841,6 +1882,48 @@ async def _count_uncategorized(creator_id: str) -> int:
     return r.count or 0
 
 
+async def _count_stale_classifications(creator_id: str) -> int:
+    db = get_supabase()
+    result = await asyncio.to_thread(
+        lambda: db.table("creator_vault_media")
+        .select("id", count="exact", head=True)
+        .eq("creator_id", creator_id)
+        .lt("classification_version", VAULT_CLASSIFIER_VERSION)
+        .execute()
+    )
+    return result.count or 0
+
+
+async def _stale_approved_set_media_ids(creator_id: str) -> list[str]:
+    """Return DB row IDs for stale media already used by approved sets."""
+    db = get_supabase()
+    set_rows = await asyncio.to_thread(
+        lambda: db.table("vault_sets")
+        .select("media_ids")
+        .eq("creator_id", creator_id)
+        .eq("status", "approved")
+        .execute()
+    )
+    external_ids = normalize_media_ids(
+        media_id
+        for row in (set_rows.data or [])
+        for media_id in (row.get("media_ids") or [])
+    )
+    result: list[str] = []
+    for start in range(0, len(external_ids), 250):
+        chunk = external_ids[start:start + 250]
+        rows = await asyncio.to_thread(
+            lambda ids=chunk: db.table("creator_vault_media")
+            .select("id")
+            .eq("creator_id", creator_id)
+            .in_("fansly_media_id", ids)
+            .lt("classification_version", VAULT_CLASSIFIER_VERSION)
+            .execute()
+        )
+        result.extend(str(row["id"]) for row in (rows.data or []) if row.get("id"))
+    return normalize_media_ids(result)
+
+
 _categorize_state: dict = {}
 
 
@@ -1849,12 +1932,15 @@ async def categorize_vault(
     creator_id: str,
     mode: str = "auto",
     force: bool = False,
+    confirm_upgrade: bool = False,
+    upgrade_scope: str = "all",
 ) -> dict:
-    """Start either the one-time initial job or a new-media-only job.
+    """Start initial, new-media-only, or explicit version-upgrade work.
 
     ``force`` remains accepted for compatibility with older dashboard builds,
     but it cannot unlock a completed initial-vault run or reprocess categorized
-    media. That invariant is enforced by the selected rows, not by the UI.
+    media.  A classifier-version upgrade is a separate, confirmed operation and
+    can only select rows older than the current metadata contract.
     """
     del force
     if _categorize_state.get(creator_id, {}).get("status") == "running":
@@ -1872,22 +1958,50 @@ async def categorize_vault(
     resolved_mode = mode.strip().lower()
     if resolved_mode == "auto":
         resolved_mode = "new" if initial_completed_at else "initial"
-    if resolved_mode not in {"initial", "new"}:
-        raise HTTPException(status_code=400, detail="mode must be 'initial' or 'new'")
+    if resolved_mode not in {"initial", "new", "upgrade"}:
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be 'initial', 'new', or 'upgrade'",
+        )
     if resolved_mode == "initial" and initial_completed_at:
         return {
             "status": "initial_already_completed",
             "initial_completed_at": initial_completed_at,
         }
 
-    # Both modes select only uncategorized rows. The initial mode is additionally
-    # locked forever after its first successful pass.
-    pending = await _count_uncategorized(creator_id)
+    upgrade_item_ids: list[str] | None = None
+    if resolved_mode == "upgrade":
+        upgrade_scope = upgrade_scope.strip().lower()
+        if upgrade_scope not in {"approved", "all"}:
+            raise HTTPException(
+                status_code=400,
+                detail="upgrade_scope must be 'approved' or 'all'",
+            )
+        if upgrade_scope == "approved":
+            upgrade_item_ids = await _stale_approved_set_media_ids(creator_id)
+            pending = len(upgrade_item_ids)
+        else:
+            pending = await _count_stale_classifications(creator_id)
+    else:
+        pending = await _count_uncategorized(creator_id)
+    if resolved_mode == "upgrade" and pending and not confirm_upgrade:
+        return {
+            "status": "confirmation_required",
+            "mode": "upgrade",
+            "items": pending,
+            "upgrade_scope": upgrade_scope,
+            "classifier_version": VAULT_CLASSIFIER_VERSION,
+            "message": (
+                "This is a one-time paid re-analysis of legacy metadata. "
+                "Retry with confirm_upgrade=true to start it."
+            ),
+        }
     if pending == 0:
         return {
             "status": "nothing_to_categorize",
             "mode": resolved_mode,
             "uncategorized": 0,
+            "stale_classifications": 0,
         }
 
     _categorize_state[creator_id] = {
@@ -1901,11 +2015,19 @@ async def categorize_vault(
     spawn(
         _run_vault_categorization(
             creator_id,
+            item_ids=upgrade_item_ids,
             mark_initial=resolved_mode == "initial",
+            upgrade_legacy=resolved_mode == "upgrade",
         ),
         name=f"run_vault_categorization:{resolved_mode}",
     )
-    return {"status": "started", "mode": resolved_mode, "uncategorized": pending}
+    return {
+        "status": "started",
+        "mode": resolved_mode,
+        "items": pending,
+        "upgrade_scope": upgrade_scope if resolved_mode == "upgrade" else None,
+        "classifier_version": VAULT_CLASSIFIER_VERSION,
+    }
 
 
 @app.get("/categorize-vault-status/{creator_id}")
@@ -1967,12 +2089,16 @@ async def vault_categorization_overview(creator_id: str) -> dict:
     )
     if not creator.data:
         raise HTTPException(status_code=404, detail="creator not found")
+    stale_approved = await _stale_approved_set_media_ids(creator_id)
     return {
         "initial_completed_at": creator.data.get("vault_initial_categorized_at"),
         "auto_categorize_new_media": bool(
             creator.data.get("auto_categorize_new_media", True)
         ),
         "uncategorized": await _count_uncategorized(creator_id),
+        "stale_classifications": await _count_stale_classifications(creator_id),
+        "stale_approved_classifications": len(stale_approved),
+        "classifier_version": VAULT_CLASSIFIER_VERSION,
         "manual_reanalysis": await _manual_recategorization_usage(creator_id),
         "active_run": _categorize_state.get(
             creator_id,
@@ -2008,37 +2134,60 @@ async def _run_vault_categorization(
     *,
     item_ids: list[str] | None = None,
     mark_initial: bool = False,
+    upgrade_legacy: bool = False,
 ) -> None:
     db = get_supabase()
     try:
         all_items: list[dict] = []
         target_ids = normalize_media_ids(item_ids)
+        select_fields = "id, url, thumbnail_url, mimetype, filename, album_title"
         if target_ids:
             # URL-safe chunks also make the exact new-media contract explicit.
             for start in range(0, len(target_ids), 250):
                 chunk = target_ids[start:start + 250]
-                rows = await asyncio.to_thread(
-                    lambda ids=chunk: db.table("creator_vault_media")
-                    .select("id, url, mimetype, filename, album_title")
-                    .eq("creator_id", creator_id)
-                    .in_("id", ids)
-                    .or_("content_category.is.null,content_category.eq.")
-                    .execute()
-                )
+                if upgrade_legacy:
+                    rows = await asyncio.to_thread(
+                        lambda ids=chunk: db.table("creator_vault_media")
+                        .select(select_fields)
+                        .eq("creator_id", creator_id)
+                        .in_("id", ids)
+                        .lt("classification_version", VAULT_CLASSIFIER_VERSION)
+                        .execute()
+                    )
+                else:
+                    rows = await asyncio.to_thread(
+                        lambda ids=chunk: db.table("creator_vault_media")
+                        .select(select_fields)
+                        .eq("creator_id", creator_id)
+                        .in_("id", ids)
+                        .or_("content_category.is.null,content_category.eq.")
+                        .execute()
+                    )
                 all_items.extend(rows.data or [])
         else:
-            # Initial setup only: paginate every still-uncategorized item once.
+            # Collect the complete target list before writing any rows. This
+            # prevents offset pagination from skipping rows as their version is
+            # updated during a legacy upgrade.
             page_size = 1000
             from_idx = 0
             while True:
-                rows = await asyncio.to_thread(
-                    lambda f=from_idx: db.table("creator_vault_media")
-                    .select("id, url, mimetype, filename, album_title")
-                    .eq("creator_id", creator_id)
-                    .or_("content_category.is.null,content_category.eq.")
-                    .range(f, f + page_size - 1)
-                    .execute()
-                )
+                def _load_page(offset: int = from_idx):
+                    query = (
+                        db.table("creator_vault_media")
+                        .select(select_fields)
+                        .eq("creator_id", creator_id)
+                    )
+                    if upgrade_legacy:
+                        query = query.lt(
+                            "classification_version", VAULT_CLASSIFIER_VERSION
+                        )
+                    else:
+                        query = query.or_(
+                            "content_category.is.null,content_category.eq."
+                        )
+                    return query.range(offset, offset + page_size - 1).execute()
+
+                rows = await asyncio.to_thread(_load_page)
                 batch = rows.data or []
                 all_items.extend(batch)
                 if len(batch) < page_size:
@@ -2047,7 +2196,7 @@ async def _run_vault_categorization(
 
         total = len(all_items)
         _categorize_state[creator_id]["total"] = total
-        mode = "new" if target_ids else "initial"
+        mode = "new" if target_ids else ("upgrade" if upgrade_legacy else "initial")
         print(f"[CATEGORIZE] creator={creator_id} mode={mode} items={total}")
 
         done = 0
@@ -2065,19 +2214,10 @@ async def _run_vault_categorization(
                     errors += 1
                     continue
                 await asyncio.to_thread(
-                    lambda r=result: db.table("creator_vault_media").update({
-                        "content_category": r["content_category"],
-                        "ai_description": r["ai_description"],
-                        "price_min": r["price_min"],
-                        "price_max": r["price_max"],
-                        "explicitness_level": r.get("explicitness", 3),
-                        "good_for": r.get("good_for", "standalone"),
-                        "tags": r.get("tags", []),
-                        "scene_id": r.get("scene_id", ""),
-                        "scene_location": r.get("scene_location", ""),
-                        "scene_outfit": r.get("scene_outfit", ""),
-                        "scene_lighting": r.get("scene_lighting", ""),
-                    }).eq("id", r["id"]).execute()
+                    lambda r=result: db.table("creator_vault_media")
+                    .update(_classification_update_payload(r))
+                    .eq("id", r["id"])
+                    .execute()
                 )
                 done += 1
             _categorize_state[creator_id].update({"done": done, "errors": errors})
@@ -2086,9 +2226,17 @@ async def _run_vault_categorization(
 
         if mark_initial and errors == 0:
             await _stamp_vault_op(creator_id, "vault_initial_categorized_at")
+        try:
+            refreshed_sets = await _refresh_vault_set_descriptions(creator_id)
+        except Exception as refresh_error:
+            refreshed_sets = 0
+            print(
+                f"[SET METADATA] creator={creator_id} refresh failed: {refresh_error}"
+            )
         _categorize_state[creator_id].update({
             "status": "done",
             "initial_locked": bool(mark_initial and errors == 0),
+            "sets_refreshed": refreshed_sets,
         })
         print(f"[CATEGORIZE] complete done={done} errors={errors}")
 
@@ -2097,6 +2245,64 @@ async def _run_vault_categorization(
         print(f"[CATEGORIZE ERROR] {e}")
         traceback.print_exc()
         _categorize_state[creator_id]["status"] = "error"
+
+
+async def _refresh_vault_set_descriptions(creator_id: str) -> int:
+    """Rebuild existing set semantics from their exact current media rows."""
+    db = get_supabase()
+    set_result = await asyncio.to_thread(
+        lambda: db.table("vault_sets")
+        .select("id, media_ids")
+        .eq("creator_id", creator_id)
+        .execute()
+    )
+    sets = set_result.data or []
+    external_ids = normalize_media_ids(
+        media_id
+        for vault_set in sets
+        for media_id in (vault_set.get("media_ids") or [])
+    )
+    media_by_id: dict[str, dict] = {}
+    fields = (
+        "fansly_media_id, content_category, ai_description, explicitness_level, "
+        "scene_location, scene_outfit, scene_lighting, mimetype, tags"
+    )
+    for start in range(0, len(external_ids), 250):
+        chunk = external_ids[start:start + 250]
+        result = await asyncio.to_thread(
+            lambda ids=chunk: db.table("creator_vault_media")
+            .select(fields)
+            .eq("creator_id", creator_id)
+            .in_("fansly_media_id", ids)
+            .execute()
+        )
+        for row in result.data or []:
+            media_id = str(row.get("fansly_media_id") or "")
+            if media_id:
+                media_by_id[media_id] = row
+
+    refreshed = 0
+    for vault_set in sets:
+        items = [
+            media_by_id[str(media_id)]
+            for media_id in (vault_set.get("media_ids") or [])
+            if str(media_id) in media_by_id
+        ]
+        if not items:
+            continue
+        description = build_set_description(items)
+        await asyncio.to_thread(
+            lambda sid=vault_set["id"], text=description: db.table("vault_sets")
+            .update({
+                "description": text,
+                "metadata_version": VAULT_CLASSIFIER_VERSION,
+            })
+            .eq("id", sid)
+            .execute()
+        )
+        refreshed += 1
+    print(f"[SET METADATA] creator={creator_id} refreshed={refreshed}")
+    return refreshed
 
 
 async def _categorize_single_item_with_retry(item: dict, max_retries: int = 3) -> dict:
@@ -2119,7 +2325,7 @@ async def recategorize_item(item_id: str) -> dict:
     db = get_supabase()
     row = await asyncio.to_thread(
         lambda: db.table("creator_vault_media")
-        .select("id, creator_id, url, mimetype, filename, album_title")
+        .select("id, creator_id, url, thumbnail_url, mimetype, filename, album_title")
         .eq("id", item_id)
         .single()
         .execute()
@@ -2159,19 +2365,10 @@ async def recategorize_item(item_id: str) -> dict:
 
     result = await _categorize_single_item(item)
     await asyncio.to_thread(
-        lambda: db.table("creator_vault_media").update({
-            "content_category": result["content_category"],
-            "ai_description": result["ai_description"],
-            "price_min": result["price_min"],
-            "price_max": result["price_max"],
-            "explicitness_level": result.get("explicitness", 3),
-            "good_for": result.get("good_for", "standalone"),
-            "tags": result.get("tags", []),
-            "scene_id": result.get("scene_id", ""),
-            "scene_location": result.get("scene_location", ""),
-            "scene_outfit": result.get("scene_outfit", ""),
-            "scene_lighting": result.get("scene_lighting", ""),
-        }).eq("id", item_id).execute()
+        lambda: db.table("creator_vault_media")
+        .update(_classification_update_payload(result))
+        .eq("id", item_id)
+        .execute()
     )
     updated = await asyncio.to_thread(
         lambda: db.table("creator_vault_media")
@@ -2831,7 +3028,7 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
             asyncio.to_thread(
                 lambda: db.table("vault_sets")
                 .select(
-                    "id, title, media_ids, suggested_price, base_price_cents, min_price_cents, "
+                    "id, title, description, media_ids, suggested_price, base_price_cents, min_price_cents, "
                     "max_price_cents, dynamic_pricing_enabled, tags, status"
                 )
                 .eq("creator_id", creator_id)
@@ -3174,7 +3371,11 @@ async def generate_sets(creator_id: str) -> dict:
     while True:
         rows = await asyncio.to_thread(
             lambda p=page: db.table("creator_vault_media")
-            .select("fansly_media_id, content_category, explicitness_level, scene_id, scene_location, scene_outfit, album_title, mimetype, price_min, price_max, tags, good_for")
+            .select(
+                "fansly_media_id, content_category, ai_description, explicitness_level, "
+                "scene_id, scene_location, scene_outfit, scene_lighting, album_title, "
+                "mimetype, price_min, price_max, tags, good_for, classification_metadata"
+            )
             .eq("creator_id", creator_id)
             .range(p * 1000, p * 1000 + 999)
             .execute()
@@ -3194,11 +3395,12 @@ async def generate_sets(creator_id: str) -> dict:
     )
 
     to_insert = [{
-        "creator_id": creator_id,
+        "creator_id": creator_id, "description": s["description"],
         "title": s["title"], "location": s["location"], "outfit": s["outfit"],
         "explicit_min": s["explicit_min"], "explicit_max": s["explicit_max"],
         "media_ids": s["media_ids"], "preview_media_id": s["preview_media_id"],
         "suggested_price": s["suggested_price"], "tags": s["tags"],
+        "metadata_version": s["metadata_version"],
         "status": "draft", "source": "ai",
     } for s in proposed]
 

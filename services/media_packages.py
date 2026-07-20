@@ -42,6 +42,7 @@ def experience_tokens(value: Any) -> set[str]:
 def row_experience_tokens(row: dict[str, Any]) -> set[str]:
     values = [
         row.get("title"),
+        row.get("description"),
         row.get("location"),
         row.get("outfit"),
         *(row.get("tags") or []),
@@ -88,7 +89,13 @@ def describe_sequence(sequence: list[dict[str, Any]]) -> str | None:
     for row in sequence:
         raw_title = str(row.get("title") or "")
         title_stem = re.split(r"\s*[·|—]\s*", raw_title, maxsplit=1)[0]
-        values = [title_stem, row.get("location"), row.get("outfit"), *(row.get("tags") or [])]
+        values = [
+            title_stem,
+            row.get("description"),
+            row.get("location"),
+            row.get("outfit"),
+            *(row.get("tags") or []),
+        ]
         for value in values:
             cleaned = _clean_experience_part(value)
             key = cleaned.lower()

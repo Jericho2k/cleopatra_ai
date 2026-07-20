@@ -1,0 +1,97 @@
+from pathlib import Path
+
+from db.queries import propose_sets
+from services.media_packages import sequence_intent_score
+from services.vault_metadata import (
+    VAULT_CLASSIFIER_VERSION,
+    build_set_description,
+    classification_confidence,
+    media_description,
+)
+
+
+def test_video_thumbnail_confidence_cannot_claim_full_video_certainty():
+    assert classification_confidence(0.99, source="video_thumbnail") == 0.72
+    assert classification_confidence(0.91, source="image") == 0.91
+
+
+def test_rich_media_description_preserves_searchable_visual_facts():
+    description = media_description(
+        {
+            "description": "The creator poses beneath a running shower.",
+            "scene_location": "bathroom shower",
+            "scene_outfit": "wet white shirt",
+            "action": "showering",
+            "pose": "standing",
+            "framing": "full body",
+            "scene_lighting": "bright",
+            "tags": ["shower", "wet look"],
+            "explicitness": 3,
+        },
+        source="image",
+    )
+    assert "running shower" in description
+    assert "wet white shirt" in description
+    assert "showering" in description
+    assert "shower, wet look" in description
+
+
+def test_set_description_is_built_from_exact_media_and_matches_intent():
+    items = [
+        {
+            "content_category": "lingerie_photo",
+            "explicitness_level": level,
+            "scene_location": "bathroom shower",
+            "scene_outfit": "red lingerie",
+            "tags": ["shower", "wet", "red lingerie"],
+            "ai_description": f"A shower sequence frame at level {level}.",
+            "mimetype": "image/jpeg",
+        }
+        for level in (2, 3, 4)
+    ]
+    description = build_set_description(items)
+    assert "bathroom shower" in description
+    assert "red lingerie" in description
+    assert "progresses from explicitness 2/5 to 4/5" in description
+    assert sequence_intent_score(
+        [{"title": "Private sequence", "description": description}],
+        "show me the shower set",
+    ) > 0
+
+
+def test_automatic_set_builder_keeps_video_sets_and_writes_description():
+    items = [
+        {
+            "fansly_media_id": f"video-{index}",
+            "content_category": "lingerie_video",
+            "explicitness_level": 3,
+            "scene_id": "bathroom-blue-lingerie",
+            "scene_location": "bathroom",
+            "scene_outfit": "blue lingerie",
+            "album_title": "Bathroom shoot",
+            "mimetype": "video/mp4",
+            "price_min": 15,
+            "price_max": 90,
+            "tags": ["shower", "blue lingerie"],
+            "good_for": "mid_session",
+            "ai_description": "A short blue-lingerie bathroom video.",
+        }
+        for index in range(3)
+    ]
+    proposed = propose_sets(items)
+    assert len(proposed) == 1
+    assert proposed[0]["media_ids"] == ["video-0", "video-1", "video-2"]
+    assert "including 3 videos" in proposed[0]["description"]
+    assert proposed[0]["metadata_version"] == VAULT_CLASSIFIER_VERSION
+
+
+def test_migration_and_analyzer_expose_the_v2_contract():
+    root = Path(__file__).resolve().parents[1]
+    migration = (root / "db" / "vault_metadata_v2.sql").read_text()
+    analyzer = (root / "ai" / "situation_analyzer.py").read_text()
+    assert "classification_version" in migration
+    assert "classification_confidence" in migration
+    assert "add column if not exists description" in migration
+    assert '"shower set"' in analyzer
+    assert "Never collapse a concrete" in analyzer
+

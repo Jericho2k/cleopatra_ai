@@ -156,7 +156,7 @@ async def get_offerable_packages(
         rows = (
             db.table("vault_sets")
             .select(
-                "id, title, location, outfit, suggested_price, tags, "
+                "id, title, description, location, outfit, suggested_price, tags, "
                 "explicit_min, explicit_max, media_ids, base_price_cents, "
                 "min_price_cents, max_price_cents, dynamic_pricing_enabled"
             )

@@ -61,7 +61,7 @@ Return ONLY valid JSON with exactly these fields:
   "payday_raw": "exact timing words only, e.g. Friday/next week/the 1st, or empty",
   "payday_confidence": 0.0,
   "budget_stated_usd": "number only if the fan explicitly says what he has available now, otherwise empty",
-  "desired_experience": "joi/sexting/photos/video/other/empty"
+  "desired_experience": "the fan's concrete requested theme/action/location/outfit/body focus/format in a short natural phrase, or empty"
 }}
 
 COMMERCIAL INTERPRETATION RULES:
@@ -87,6 +87,10 @@ COMMERCIAL INTERPRETATION RULES:
   A sexual adjective by itself is warm interest, not offer readiness.
 - "show me more", "send the video", "how much", "can I see the full set", and
   "I want you so bad" are active intent. "and sexy 🥵" by itself is not.
+- desired_experience must preserve the fan's specific searchable words. Examples:
+  "show me the shower set" -> "shower set"; "any feet videos?" -> "feet video";
+  "I want the red lingerie one" -> "red lingerie". Never collapse a concrete
+  request into "other". Leave it empty when no specific experience was requested.
 
 SAFETY:
 - Crisis is not sexual roughness or consensual roleplay. Flag self_harm for plausible self-directed harm language and harm_to_others only for real intent toward a real person.

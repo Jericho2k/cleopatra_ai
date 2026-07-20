@@ -6,6 +6,7 @@ from datetime import datetime
 
 from core.supabase import get_supabase
 from models.schemas import ExchangeExample, Fan, Message, Persona
+from services.vault_metadata import VAULT_CLASSIFIER_VERSION, build_set_description
 
 
 def _row_to_fan(row: dict) -> Fan:
@@ -492,8 +493,6 @@ def _collect_tags(items, limit=8):
 def propose_sets(vault_items, max_per_set=6, min_per_set=3, min_level=2):
     groups = {}
     for it in vault_items:
-        if (it.get("mimetype") or "").startswith("video"):
-            continue
         key = _set_key_coarse(it)
         if not key:
             continue
@@ -532,12 +531,14 @@ def propose_sets(vault_items, max_per_set=6, min_per_set=3, min_level=2):
                 title = f"{base}{(' · ' + cat_label) if cat_label else ''} · lvl {lvl}{part}"
                 sets.append({
                     "title": title[:80],
+                    "description": build_set_description(chunk),
                     "location": loc or None, "outfit": outfit or None,
                     "explicit_min": lvl, "explicit_max": lvl,
                     "media_ids": [i["fansly_media_id"] for i in chunk if i.get("fansly_media_id")],
                     "preview_media_id": chunk[0].get("fansly_media_id"),
                     "suggested_price": price,
                     "tags": _collect_tags(chunk),
+                    "metadata_version": VAULT_CLASSIFIER_VERSION,
                 })
     sets.sort(key=lambda s: (s["explicit_max"], len(s["media_ids"])), reverse=True)
     return sets
