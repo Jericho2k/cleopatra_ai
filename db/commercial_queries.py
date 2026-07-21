@@ -114,6 +114,15 @@ async def save_fan_state(
         "last_followup_at": (
             state.last_followup_at.isoformat() if state.last_followup_at else None
         ),
+        "last_inactivity_reengagement_at": (
+            state.last_inactivity_reengagement_at.isoformat()
+            if state.last_inactivity_reengagement_at else None
+        ),
+        "inactivity_reengagement_window_started_at": (
+            state.inactivity_reengagement_window_started_at.isoformat()
+            if state.inactivity_reengagement_window_started_at else None
+        ),
+        "inactivity_reengagement_count": state.inactivity_reengagement_count,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 

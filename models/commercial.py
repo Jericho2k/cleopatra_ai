@@ -110,6 +110,10 @@ class CreatorPolicy(BaseModel):
     post_session_followup_enabled: bool = True
     post_session_followup_delay_hours: int = Field(default=18, ge=1, le=720)
     followup_recent_activity_suppression_hours: int = Field(default=6, ge=0, le=168)
+    inactivity_reengagement_enabled: bool = False
+    inactivity_reengagement_delay_hours: int = Field(default=48, ge=6, le=720)
+    inactivity_reengagement_cooldown_hours: int = Field(default=168, ge=24, le=2_160)
+    inactivity_reengagement_max_per_30_days: int = Field(default=2, ge=1, le=10)
 
     @model_validator(mode="after")
     def enforce_purchase_gating_invariants(self) -> "CreatorPolicy":
@@ -165,6 +169,9 @@ class FanCommercialState(BaseModel):
     next_followup_payload: dict = Field(default_factory=dict)
     next_followup_dedupe_key: str | None = None
     last_followup_at: datetime | None = None
+    last_inactivity_reengagement_at: datetime | None = None
+    inactivity_reengagement_window_started_at: datetime | None = None
+    inactivity_reengagement_count: int = 0
 
 
 class ActionType(str, Enum):

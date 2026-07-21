@@ -94,15 +94,20 @@ async def send_proactive_message(creator_id: str, fan_id: str, goal: str) -> boo
         .execute()
     )
     apifansly_account_id = (creator_row.data or {}).get("apifansly_account_id")
-    if not group_id or not apifansly_account_id:
+    local_test_delivery = str(getattr(fan, "platform_fan_id", "") or "").startswith("test_")
+    if (not group_id or not apifansly_account_id) and not local_test_delivery:
         print(f"[PROACTIVE SEND ERROR] fan={fan_id}: no live delivery route")
         return False
 
     try:
-        from main import send_fansly_message
-        delivered = await send_fansly_message(apifansly_account_id, str(group_id), text)
-        if not delivered:
-            raise RuntimeError("platform rejected proactive delivery")
+        if local_test_delivery:
+            print(f"[PROACTIVE TEST DELIVERY] fan={fan_id} accepted=true")
+        else:
+            from main import send_fansly_message
+
+            delivered = await send_fansly_message(apifansly_account_id, str(group_id), text)
+            if not delivered:
+                raise RuntimeError("platform rejected proactive delivery")
     except Exception as e:
         print(f"[PROACTIVE SEND ERROR] fan={fan_id}: {e}")
         return False

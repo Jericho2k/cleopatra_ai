@@ -1088,6 +1088,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         ):
             return
 
+        last_plain_message_id: str | None = None
         for i, part in enumerate(parts):
             if i > 0:
                 inter_delay = timing.inter_part_delays_seconds[i - 1]
@@ -1247,7 +1248,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         media_context=ppv_media_context or {},
                     )
                 else:
-                    await save_message(
+                    last_plain_message_id = await save_message(
                         fan_id=fan_id,
                         creator_id=creator_id,
                         role="creator",
@@ -1313,6 +1314,25 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                     return
 
             print(f"[AUTO REPLY] Sent part {i+1}: {text_out[:50]}")
+
+        if last_plain_message_id:
+            try:
+                from services.inactivity_reengagement import (
+                    schedule_inactivity_reengagement,
+                )
+
+                await schedule_inactivity_reengagement(
+                    creator_id=creator_id,
+                    fan_id=fan_id,
+                    source_message_id=last_plain_message_id,
+                )
+            except Exception as exc:
+                # The reply is already safely delivered and persisted. Failure to
+                # schedule an optional future nudge must never duplicate it.
+                print(
+                    f"[INACTIVITY REENGAGEMENT ERROR] fan={fan_id} "
+                    f"schedule_failed={exc}"
+                )
 
     except asyncio.CancelledError:
         raise
@@ -1629,7 +1649,7 @@ async def sweep_stale_ppv_checks() -> None:
 
         rows = await asyncio.to_thread(
             lambda: db.table("fans")
-            .select("id, creator_id, pending_ppv_check")
+            .select("id, creator_id, pending_ppv_check, needs_human_review, review_reason")
             .not_.is_("pending_ppv_check", "null")
             .execute()
         )
@@ -1642,6 +1662,8 @@ async def sweep_stale_ppv_checks() -> None:
         stale = []
 
         for row in rows.data:
+            if row.get("needs_human_review"):
+                continue
             pending = row.get("pending_ppv_check") or {}
             sent_at_str = pending.get("sent_at", "")
             if not sent_at_str:

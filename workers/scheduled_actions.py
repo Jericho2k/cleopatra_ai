@@ -167,6 +167,12 @@ async def _should_still_send(action: dict) -> ActionCheck:
             return ActionCheck(False, "a newer offer replaced this one")
         if state.status != FanStatus.IDLE:
             return ActionCheck(False, f"fan entered a new flow (status={state.status.value})")
+    elif action_type == "INACTIVITY_REENGAGEMENT":
+        from services.inactivity_reengagement import validate_inactivity_action
+
+        inactivity = await validate_inactivity_action(action, state, policy)
+        if not inactivity.ok:
+            return ActionCheck(False, inactivity.reason)
     else:
         return ActionCheck(False, f"unsupported proactive action {action_type}")
 
@@ -281,6 +287,16 @@ async def _run_abandoned_offer_followup(action: dict) -> HandlerResult:
     return await _send_goal(action, goal)
 
 
+async def _run_inactivity_reengagement(action: dict) -> HandlerResult:
+    goal = (
+        "The fan has been quiet after an ordinary conversation and is still eligible for Full Auto. "
+        "Reopen naturally using one small callback from the recent conversation when possible. "
+        "Do not mention that he disappeared, guilt him, sell, quote a price, promise content, or send "
+        "media. Sound casual rather than witty or campaign-like. One short message."
+    )
+    return await _send_goal(action, goal)
+
+
 async def _run_offer_expiry(action: dict) -> HandlerResult:
     """Turn the exact still-pending offer into a later follow-up obligation."""
     from services.followup_lifecycle import expire_pending_offer_state
@@ -341,6 +357,7 @@ HANDLERS = {
     "ABANDONED_PPV_FOLLOWUP": _run_abandoned_ppv_followup,
     "OFFER_EXPIRY": _run_offer_expiry,
     "ABANDONED_OFFER_FOLLOWUP": _run_abandoned_offer_followup,
+    "INACTIVITY_REENGAGEMENT": _run_inactivity_reengagement,
     "PPV_RECONCILE": _run_ppv_reconcile,
 }
 
@@ -361,7 +378,12 @@ async def _record_message_action_resolution(action: dict, *, sent: bool) -> None
         state.next_followup_payload = {}
         state.next_followup_dedupe_key = None
     if sent:
-        state.last_followup_at = datetime.now(timezone.utc)
+        sent_at = datetime.now(timezone.utc)
+        state.last_followup_at = sent_at
+        if action_type == "INACTIVITY_REENGAGEMENT":
+            from services.inactivity_reengagement import record_inactivity_sent
+
+            record_inactivity_sent(state, now=sent_at)
     await save_fan_state(action["fan_id"], action["creator_id"], state)
 
 

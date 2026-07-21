@@ -191,6 +191,11 @@ async def acknowledge_fan_return(
         _clear_followup_obligation(state)
         changed = True
 
+    if state.next_followup_type == "INACTIVITY_REENGAGEMENT":
+        await cancel_actions_for_fan(fan_id, "INACTIVITY_REENGAGEMENT")
+        _clear_followup_obligation(state)
+        changed = True
+
     if state.status == FanStatus.OFFER_PENDING and state.offered_packages:
         policy = await get_creator_policy(creator_id)
         await _sync_pending_offer_expiry(

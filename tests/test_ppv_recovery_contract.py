@@ -10,6 +10,7 @@ import pytest
 from services.db_reliability import retry_transient_db_operation
 from services.full_auto_operations import get_fan_full_auto_snapshot
 from services.ppv_persistence import pending_from_message_receipt
+from services import ppv_recovery
 from services.ppv_recovery import PPVRecoveryError, resolve_fan_review
 
 
@@ -84,6 +85,42 @@ def test_ambiguous_ppv_review_cannot_be_blindly_resumed(monkeypatch):
     monkeypatch.setattr("services.ppv_recovery._load_fan_review", load_fan)
     with pytest.raises(PPVRecoveryError, match="ambiguous delivery outcome"):
         asyncio.run(resolve_fan_review("fan", resolution="resume_ai"))
+
+
+def test_unavailable_purchase_verification_requires_explicit_outcome(monkeypatch):
+    calls = []
+
+    async def load_fan(_fan_id: str):
+        return {
+            "creator_id": "creator",
+            "review_reason": "ppv_purchase_verification_unavailable",
+        }
+
+    async def finalize(**kwargs):
+        calls.append(("finalize", kwargs))
+        return True
+
+    async def cancel(*args):
+        calls.append(("cancel", args))
+
+    async def clear(*args):
+        calls.append(("clear", args))
+
+    async def no_retry(operation, **_kwargs):
+        return await operation()
+
+    monkeypatch.setattr(ppv_recovery, "_load_fan_review", load_fan)
+    monkeypatch.setattr(ppv_recovery, "retry_transient_db_operation", no_retry)
+    monkeypatch.setattr(ppv_recovery, "cancel_actions_for_fan", cancel)
+    monkeypatch.setattr(ppv_recovery, "clear_fan_review", clear)
+    monkeypatch.setattr(
+        "services.ppv_reconciliation.finalize_pending_ppv_as_not_purchased",
+        finalize,
+    )
+
+    result = asyncio.run(resolve_fan_review("fan", resolution="mark_not_purchased"))
+    assert result["status"] == "not_purchased"
+    assert [call[0] for call in calls] == ["finalize", "cancel", "clear"]
 
 
 def test_status_snapshot_avoids_parallel_shared_client_reads():

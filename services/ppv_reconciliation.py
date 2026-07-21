@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
@@ -34,6 +34,7 @@ class PPVReconcileDisposition(str, Enum):
     PENDING = "PENDING"
     ABANDONED = "ABANDONED"
     STALE = "STALE"
+    REVIEW_REQUIRED = "REVIEW_REQUIRED"
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,52 @@ async def _persist_pending_check(
     await asyncio.to_thread(_update)
 
 
+async def _verification_unavailable(
+    *,
+    fan_id: str,
+    pending: dict[str, Any],
+    now: datetime,
+    expires_at: datetime,
+    recheck_minutes: int,
+    error: Exception,
+) -> PPVReconcileResult:
+    """Bound verification failures and stop automation when truth is unknown."""
+    status_code = (
+        error.response.status_code
+        if isinstance(error, httpx.HTTPStatusError) and error.response is not None
+        else None
+    )
+    failures = int(pending.get("verification_failures") or 0) + 1
+    message = f"purchase verification HTTP {status_code}" if status_code else type(error).__name__
+    pending.update({
+        "verification_failures": failures,
+        "last_verification_error": message,
+        "last_verification_error_at": now.isoformat(),
+    })
+    await _persist_pending_check(fan_id, pending)
+    permanent = status_code is not None and status_code not in {408, 425, 429} and status_code < 500
+    if permanent or failures >= 3:
+        from db.queries import freeze_fan_for_review
+
+        await freeze_fan_for_review(fan_id, "ppv_purchase_verification_unavailable")
+        return PPVReconcileResult(
+            PPVReconcileDisposition.REVIEW_REQUIRED,
+            f"{message}; operator must confirm purchased or not purchased",
+        )
+    retry_at = now + timedelta(minutes=max(5, int(recheck_minutes)))
+    if now < expires_at:
+        retry_at = next_reconcile_at(
+            now,
+            expires_at=expires_at,
+            recheck_minutes=recheck_minutes,
+        )
+    return PPVReconcileResult(
+        PPVReconcileDisposition.PENDING,
+        f"{message}; retrying before human review",
+        retry_at=retry_at,
+    )
+
+
 async def _finalize_abandonment(
     *,
     creator_id: str,
@@ -197,7 +244,14 @@ async def _finalize_abandonment(
     state.last_abandoned_media_id = media_id or None
 
     if policy.abandoned_ppv_followup_enabled:
-        execute_at = followup_at(now, policy.abandoned_ppv_followup_delay_hours)
+        expired_at = payment_expires_at(
+            pending,
+            payment_window_hours=policy.ppv_payment_window_hours,
+        ) or now
+        execute_at = max(
+            now,
+            followup_at(expired_at, policy.abandoned_ppv_followup_delay_hours),
+        )
         payload = abandoned_ppv_payload(
             pending,
             desired_experience=state.desired_experience,
@@ -234,6 +288,26 @@ async def _finalize_abandonment(
     return True
 
 
+async def finalize_pending_ppv_as_not_purchased(
+    *,
+    creator_id: str,
+    fan_id: str,
+    now: datetime | None = None,
+) -> bool:
+    """Operator-confirmed terminal outcome when platform verification is unavailable."""
+    _creator_row, fan_row = await _load_platform_context(creator_id, fan_id)
+    pending = fan_row.get("pending_ppv_check") or {}
+    if not pending:
+        return False
+    return await _finalize_abandonment(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        pending=pending,
+        fan_row=fan_row,
+        now=now or datetime.now(timezone.utc),
+    )
+
+
 async def reconcile_pending_ppv(
     *,
     creator_id: str,
@@ -255,17 +329,6 @@ async def reconcile_pending_ppv(
             "pending PPV was superseded",
         )
 
-    amount = await _fetch_purchase_amount(
-        apifansly_id=str(creator_row.get("apifansly_account_id") or ""),
-        platform_fan_id=str(fan_row.get("platform_fan_id") or ""),
-        pending=pending,
-    )
-    if amount is not None:
-        from services.suggestions import record_ppv_purchase
-
-        await record_ppv_purchase(fan_id, str(pending.get("media_id") or ""), amount)
-        return PPVReconcileResult(PPVReconcileDisposition.PURCHASED, "purchase confirmed")
-
     expires_at = payment_expires_at(
         pending,
         payment_window_hours=policy.ppv_payment_window_hours,
@@ -273,7 +336,37 @@ async def reconcile_pending_ppv(
     if expires_at is None:
         raise RuntimeError("Pending PPV has no deterministic expiry")
 
+    platform_fan_id = str(fan_row.get("platform_fan_id") or "")
+    if platform_fan_id.startswith("test_"):
+        # Local test delivery has no platform transaction to query. Manual
+        # purchase simulation may still confirm it before deterministic expiry.
+        amount = None
+    else:
+        try:
+            amount = await _fetch_purchase_amount(
+                apifansly_id=str(creator_row.get("apifansly_account_id") or ""),
+                platform_fan_id=platform_fan_id,
+                pending=pending,
+            )
+        except (httpx.HTTPError, RuntimeError) as exc:
+            return await _verification_unavailable(
+                fan_id=fan_id,
+                pending=pending,
+                now=now,
+                expires_at=expires_at,
+                recheck_minutes=policy.ppv_recheck_minutes,
+                error=exc,
+            )
+    if amount is not None:
+        from services.suggestions import record_ppv_purchase
+
+        await record_ppv_purchase(fan_id, str(pending.get("media_id") or ""), amount)
+        return PPVReconcileResult(PPVReconcileDisposition.PURCHASED, "purchase confirmed")
+
     if now < expires_at:
+        pending.pop("verification_failures", None)
+        pending.pop("last_verification_error", None)
+        pending.pop("last_verification_error_at", None)
         pending.update({
             "reference": reference,
             "expires_at": expires_at.isoformat(),

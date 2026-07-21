@@ -25,6 +25,7 @@ from services.vault_operations import normalize_media_ids
 AMBIGUOUS_PPV_REVIEW_REASONS = {
     "ppv_sent_but_reconciliation_not_persisted",
     "delivery_sent_but_not_persisted",
+    "ppv_purchase_verification_unavailable",
 }
 
 
@@ -276,13 +277,37 @@ async def resolve_fan_review(
         return {**repaired, "status": "purchase_recorded", "amount": purchase_amount}
     if resolution == "mark_not_sent":
         return await _mark_receipt_not_sent(fan_id)
+    if resolution == "mark_not_purchased":
+        fan = await _load_fan_review(fan_id)
+        if str(fan.get("review_reason") or "") != "ppv_purchase_verification_unavailable":
+            raise PPVRecoveryError("This conversation is not awaiting purchase verification")
+        from services.ppv_reconciliation import finalize_pending_ppv_as_not_purchased
+
+        finalized = await finalize_pending_ppv_as_not_purchased(
+            creator_id=str(fan["creator_id"]),
+            fan_id=fan_id,
+        )
+        if not finalized:
+            raise PPVRecoveryError("The pending PPV changed before it could be resolved")
+        await retry_transient_db_operation(
+            lambda: cancel_actions_for_fan(fan_id, "PPV_RECONCILE"),
+            label=f"cancel unresolved PPV reconcile fan={fan_id}",
+            log_prefix="PPV RECOVERY RETRY",
+        )
+        await retry_transient_db_operation(
+            lambda: clear_fan_review(fan_id),
+            label=f"clear not-purchased PPV review fan={fan_id}",
+            log_prefix="PPV RECOVERY RETRY",
+        )
+        print(f"[PPV RECOVERY] fan={fan_id} resolution=not_purchased")
+        return {"status": "not_purchased", "fan_id": fan_id}
     if resolution == "resume_ai":
         fan = await _load_fan_review(fan_id)
         reason = str(fan.get("review_reason") or "")
         if reason in AMBIGUOUS_PPV_REVIEW_REASONS:
             raise PPVRecoveryError(
                 "This PPV has an ambiguous delivery outcome. Repair it, mark it purchased, "
-                "or confirm it was not sent before resuming AI."
+                "or confirm the appropriate not-sent/not-purchased outcome before resuming AI."
             )
         await retry_transient_db_operation(
             lambda: clear_fan_review(fan_id),

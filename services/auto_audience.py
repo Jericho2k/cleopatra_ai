@@ -1,6 +1,7 @@
 """Deterministic creator-level audience rules for Full Auto."""
 from __future__ import annotations
 
+import asyncio
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -80,6 +81,77 @@ def evaluate_auto_eligibility(
     return AutoEligibility(eligible=matched, reason="rules_matched" if matched else "rules_not_matched")
 
 
+async def resolve_auto_eligibility_for_fan(
+    creator_id: str,
+    fan_id: str,
+) -> AutoEligibility:
+    """Resolve the same effective eligibility used by inbound Full Auto.
+
+    Proactive work must not approximate creator audience rules from only the
+    creator/fan switches. Lists, spend targeting, new-chat scope and human
+    review remain authoritative when a scheduled action eventually fires.
+    """
+    from core.supabase import get_supabase
+
+    def _load() -> tuple[dict, dict, list[dict], int]:
+        db = get_supabase()
+        creator = (
+            db.table("creators")
+            .select("auto_mode, auto_audience_policy")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        ).data or {}
+        fan = (
+            db.table("fans")
+            .select("auto_mode, needs_human_review, total_spent, spend_tier")
+            .eq("id", fan_id)
+            .single()
+            .execute()
+        ).data or {}
+        memberships = (
+            db.table("fan_list_members")
+            .select("list_id, fan_lists(exclude_from_auto)")
+            .eq("fan_id", fan_id)
+            .execute()
+        ).data or []
+        creator_messages = (
+            db.table("messages")
+            .select("id", count="exact", head=True)
+            .eq("fan_id", fan_id)
+            .eq("creator_id", creator_id)
+            .eq("role", "creator")
+            .execute()
+        )
+        return creator, fan, memberships, int(creator_messages.count or 0)
+
+    creator, fan, memberships, creator_message_count = await asyncio.to_thread(_load)
+    if not creator or not fan:
+        return AutoEligibility(eligible=False, reason="fan_or_creator_missing")
+    try:
+        policy = AutoAudiencePolicy(**(creator.get("auto_audience_policy") or {}))
+    except Exception:
+        policy = AutoAudiencePolicy()
+    list_ids = {
+        str(row.get("list_id")) for row in memberships if row.get("list_id")
+    }
+    legacy_exclusions = {
+        str(row.get("list_id"))
+        for row in memberships
+        if row.get("list_id") and (row.get("fan_lists") or {}).get("exclude_from_auto")
+    }
+    policy.exclude_list_ids = _unique([*policy.exclude_list_ids, *legacy_exclusions])
+    return evaluate_auto_eligibility(
+        creator_auto=bool(creator.get("auto_mode", False)),
+        fan_auto_override=fan.get("auto_mode"),
+        needs_human_review=bool(fan.get("needs_human_review")),
+        policy=policy,
+        fan_list_ids=list_ids,
+        total_spent=int(fan.get("total_spent") or 0),
+        spend_tier=str(fan.get("spend_tier") or "cold"),
+        is_new_fan=creator_message_count == 0,
+    )
+
+
 def _unique(values: list[str]) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
-
