@@ -26,6 +26,7 @@ from services.followup_lifecycle import (
     payment_expires_at,
     pending_reference,
 )
+from services.apifansly import headers as apifansly_headers, url as apifansly_url
 from services.session_lifecycle import mark_step_declined
 
 
@@ -119,8 +120,10 @@ async def _fetch_purchase_amount(
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/earnings/fans/{platform_fan_id}/stats",
-            headers={"x-api-key": api_key},
+            apifansly_url(
+                f"{apifansly_id}/earnings/fans/{platform_fan_id}/stats"
+            ),
+            headers=apifansly_headers(),
             params={"after": after_ms},
             timeout=15,
         )

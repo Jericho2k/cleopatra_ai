@@ -33,6 +33,10 @@ from services.session_planner import plan_session_for_fan
 from services.human_delivery import build_delivery_schedule
 from services.ppv_delivery import create_ppv_approval_request
 from services.db_reliability import retry_transient_db_operation
+from services.apifansly import (
+    headers as apifansly_headers,
+    url as apifansly_url,
+)
 from services.ppv_persistence import (
     persist_ppv_reconciliation,
     save_ppv_message_receipt,
@@ -826,11 +830,10 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                     try:
                         async with httpx.AsyncClient() as hc:
                             ppv_resp = await hc.post(
-                                f"https://v1.apifansly.com/api/fansly/{apifansly_id_resend}/chats/{group_id_resend}/messages",
-                                headers={
-                                    "x-api-key": os.environ.get("APIFANSLY_API_KEY"),
-                                    "Content-Type": "application/json",
-                                },
+                                apifansly_url(
+                                    f"{apifansly_id_resend}/chats/{group_id_resend}/messages"
+                                ),
+                                headers=apifansly_headers(json_content=True),
                                 json={
                                     "content": "sorry about that, here it is again 😏",
                                     "mediaId": media_id_resend,
@@ -1076,8 +1079,10 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             try:
                 async with httpx.AsyncClient() as client:
                     await client.post(
-                        f"https://v1.apifansly.com/api/fansly/{apifansly_account_id}/chats/{str(group_id)}/typing",
-                        headers={"x-api-key": os.environ.get("APIFANSLY_API_KEY")},
+                        apifansly_url(
+                            f"{apifansly_account_id}/chats/{str(group_id)}/typing"
+                        ),
+                        headers=apifansly_headers(),
                         timeout=5,
                     )
             except Exception:
@@ -1195,11 +1200,10 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                     ])
                     async with httpx.AsyncClient() as hc:
                         ppv_resp = await hc.post(
-                            f"https://v1.apifansly.com/api/fansly/{apifansly_account_id}/chats/{str(group_id)}/messages",
-                            headers={
-                                "x-api-key": os.environ.get("APIFANSLY_API_KEY"),
-                                "Content-Type": "application/json",
-                            },
+                            apifansly_url(
+                                f"{apifansly_account_id}/chats/{str(group_id)}/messages"
+                            ),
+                            headers=apifansly_headers(json_content=True),
                             json={
                                 "content": ppv_content,
                                 "mediaIds": media_ids,

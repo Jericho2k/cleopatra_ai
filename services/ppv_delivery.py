@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-import os
 import uuid
 
 import httpx
@@ -15,6 +14,11 @@ from db.queries import (
     get_fan_session,
 )
 from services.db_reliability import retry_transient_db_operation
+from services.apifansly import (
+    headers as apifansly_headers,
+    raise_for_response as raise_for_apifansly_response,
+    url as apifansly_url,
+)
 from services.ppv_persistence import (
     persist_ppv_reconciliation,
     save_ppv_message_receipt,
@@ -114,11 +118,8 @@ async def send_locked_ppv(
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"https://v1.apifansly.com/api/fansly/{account_id}/chats/{group_id}/messages",
-                headers={
-                    "x-api-key": os.environ.get("APIFANSLY_API_KEY"),
-                    "Content-Type": "application/json",
-                },
+                apifansly_url(f"{account_id}/chats/{group_id}/messages"),
+                headers=apifansly_headers(json_content=True),
                 json={
                     "content": content,
                     "mediaIds": exact_media_ids,
@@ -128,7 +129,11 @@ async def send_locked_ppv(
                 },
                 timeout=10,
             )
-        response.raise_for_status()
+        raise_for_apifansly_response(
+            response,
+            operation="locked PPV delivery",
+            account_id=account_id,
+        )
         try:
             body = response.json()
             platform_message_id = str(

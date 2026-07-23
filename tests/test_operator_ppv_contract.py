@@ -35,8 +35,9 @@ def test_locked_ppv_rejects_empty_media_before_any_delivery():
 def test_delivery_contract_persists_only_after_platform_acceptance():
     source = inspect.getsource(send_locked_ppv)
     persistence_source = inspect.getsource(persist_ppv_reconciliation)
-    assert source.index("response.raise_for_status()") < source.index("pending = {")
-    assert source.index("response.raise_for_status()") < source.index("save_ppv_message_receipt(")
+    acceptance_check = "raise_for_apifansly_response("
+    assert source.index(acceptance_check) < source.index("pending = {")
+    assert source.index(acceptance_check) < source.index("save_ppv_message_receipt(")
     assert "FanStatus.PAYMENT_PENDING" in persistence_source
     assert "PPV_RECONCILE" in persistence_source
     assert "ppv_sent_but_reconciliation_not_persisted" in source

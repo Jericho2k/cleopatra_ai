@@ -40,6 +40,14 @@ from models.schemas import (
     SuggestionResponse,
 )
 from services.fan_intelligence import learn_from_fan_message
+from services.apifansly import (
+    ApiFanslyAccountAccessError,
+    ApiFanslyConfigurationError,
+    headers as apifansly_headers,
+    raise_for_response as raise_for_apifansly_response,
+    response_message as apifansly_response_message,
+    url as apifansly_url,
+)
 from services.auto_audience import AutoAudiencePolicy
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
@@ -74,7 +82,6 @@ async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id:
     """Find the group_id for a fan by scanning recent chats."""
     import httpx
 
-    api_key = os.environ.get("APIFANSLY_API_KEY")
     try:
         async with httpx.AsyncClient() as client:
             cursor = None
@@ -83,10 +90,15 @@ async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id:
                 if cursor:
                     params["cursor"] = cursor
                 resp = await client.get(
-                    f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats",
-                    headers={"x-api-key": api_key},
+                    apifansly_url(f"{apifansly_id}/chats"),
+                    headers=apifansly_headers(),
                     params=params,
                     timeout=15,
+                )
+                raise_for_apifansly_response(
+                    resp,
+                    operation="chat lookup",
+                    account_id=apifansly_id,
                 )
                 data = resp.json()
                 data_inner = data.get("data", {}).get("data", {})
@@ -128,20 +140,20 @@ async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id:
 async def send_fansly_message(account_id: str, group_id: str, text: str) -> bool:
     import httpx
 
-    api_key = os.environ.get("APIFANSLY_API_KEY")
-
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"https://v1.apifansly.com/api/fansly/{account_id}/chats/{group_id}/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "Content-Type": "application/json",
-                },
+                apifansly_url(f"{account_id}/chats/{group_id}/messages"),
+                headers=apifansly_headers(json_content=True),
                 json={"content": text},
                 timeout=10,
             )
             print(f"[SEND] status={response.status_code} body={response.text[:200]}")
+            raise_for_apifansly_response(
+                response,
+                operation="message send",
+                account_id=account_id,
+            )
             return response.status_code == 201
     except Exception as e:
         print(f"[SEND ERROR] {e}")
@@ -345,6 +357,7 @@ class ConnectCreatorRequest(BaseModel):
     password: str
     user_id: str
     countryCode: str = "US"
+    creator_id: str | None = None
 
 
 class Connect2FARequest(BaseModel):
@@ -355,6 +368,7 @@ class Connect2FARequest(BaseModel):
     password: str
     countryCode: str = "US"
     user_id: str = ""
+    creator_id: str | None = None
 
 
 async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
@@ -683,15 +697,16 @@ async def save_reply(req: ReplyRequest) -> dict:
 
 @app.post("/connect-creator")
 async def connect_creator(req: ConnectCreatorRequest) -> dict:
-    print(f"[CONNECT] req={req.dict()}")
+    print(
+        f"[CONNECT] creator_id={req.creator_id or 'new'} "
+        f"name={req.name} country={req.countryCode}"
+    )
     import httpx
-
-    api_key = os.environ.get("APIFANSLY_API_KEY")
 
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            "https://v1.apifansly.com/api/fansly/connect",
-            headers={"x-api-key": api_key, "Content-Type": "application/json"},
+            apifansly_url("connect"),
+            headers=apifansly_headers(json_content=True),
             json={
                 "username": req.email,
                 "password": req.password,
@@ -700,8 +715,16 @@ async def connect_creator(req: ConnectCreatorRequest) -> dict:
             },
             timeout=30,
         )
+        if not response.is_success:
+            return {
+                "success": False,
+                "error": f"API Fansly connection failed: {apifansly_response_message(response)}",
+            }
         data = response.json()
-        print(f"[CONNECT] response={data}")
+        print(
+            f"[CONNECT] status={response.status_code} "
+            f"requires_2fa={bool(data.get('data', {}).get('requires_2fa'))}"
+        )
 
         if data.get("data", {}).get("requires_2fa"):
             return {
@@ -718,42 +741,56 @@ async def connect_creator(req: ConnectCreatorRequest) -> dict:
             return {"success": False, "error": "Failed to connect account"}
 
         db = get_supabase()
-        creator_row = await asyncio.to_thread(
-            lambda: db.table("creators").insert({
-                "platform_username": req.name,
-                "platform": "fansly",
-                "fansly_account_id": str(fansly_account_id),
-                "apifansly_account_id": apifansly_account_id,
-                "auto_mode": False,
-            }).execute()
-        )
+        creator_values = {
+            "platform_username": req.name,
+            "platform": "fansly",
+            "fansly_account_id": str(fansly_account_id),
+            "apifansly_account_id": apifansly_account_id,
+        }
+        if req.creator_id:
+            creator_row = await asyncio.to_thread(
+                lambda: db.table("creators")
+                .update(creator_values)
+                .eq("id", req.creator_id)
+                .execute()
+            )
+        else:
+            creator_row = await asyncio.to_thread(
+                lambda: db.table("creators").insert({
+                    **creator_values,
+                    "auto_mode": False,
+                }).execute()
+            )
 
         creator = creator_row.data[0] if creator_row.data else None
         if not creator:
-            return {"success": False, "error": "Failed to create creator"}
+            return {"success": False, "error": "Failed to save creator connection"}
 
-        await asyncio.to_thread(
-            lambda: db.table("chatter_creators").insert({
-                "chatter_id": req.user_id,
-                "creator_id": creator["id"],
-            }).execute()
-        )
+        if not req.creator_id:
+            await asyncio.to_thread(
+                lambda: db.table("chatter_creators").insert({
+                    "chatter_id": req.user_id,
+                    "creator_id": creator["id"],
+                }).execute()
+            )
 
         spawn(sync_chats_background(creator["id"]), name="sync_chats_background")
 
-        return {"success": True, "creator": creator}
+        return {
+            "success": True,
+            "creator": creator,
+            "reconnected": bool(req.creator_id),
+        }
 
 
 @app.post("/connect-creator-2fa")
 async def connect_creator_2fa(req: Connect2FARequest) -> dict:
     import httpx
 
-    api_key = os.environ.get("APIFANSLY_API_KEY")
-
     async with httpx.AsyncClient() as client:
         response = await client.post(
-            "https://v1.apifansly.com/api/fansly/verify-2fa",
-            headers={"x-api-key": api_key, "Content-Type": "application/json"},
+            apifansly_url("verify-2fa"),
+            headers=apifansly_headers(json_content=True),
             json={
                 "username": req.email,
                 "password": req.password,
@@ -764,8 +801,13 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
             },
             timeout=30,
         )
+        if not response.is_success:
+            return {
+                "success": False,
+                "error": f"API Fansly 2FA verification failed: {apifansly_response_message(response)}",
+            }
         data = response.json()
-        print(f"[2FA] response={data}")
+        print(f"[2FA] status={response.status_code} creator_id={req.creator_id or 'new'}")
 
         apifansly_account_id = data.get("data", {}).get("account_id")
         fansly_account_id = data.get("data", {}).get("data", {}).get("response", {}).get("accountId")
@@ -774,30 +816,46 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
             return {"success": False, "error": "2FA verification failed"}
 
         db = get_supabase()
-        creator_row = await asyncio.to_thread(
-            lambda: db.table("creators").insert({
-                "platform_username": req.name,
-                "platform": "fansly",
-                "fansly_account_id": str(fansly_account_id),
-                "apifansly_account_id": apifansly_account_id,
-                "auto_mode": False,
-            }).execute()
-        )
+        creator_values = {
+            "platform_username": req.name,
+            "platform": "fansly",
+            "fansly_account_id": str(fansly_account_id),
+            "apifansly_account_id": apifansly_account_id,
+        }
+        if req.creator_id:
+            creator_row = await asyncio.to_thread(
+                lambda: db.table("creators")
+                .update(creator_values)
+                .eq("id", req.creator_id)
+                .execute()
+            )
+        else:
+            creator_row = await asyncio.to_thread(
+                lambda: db.table("creators").insert({
+                    **creator_values,
+                    "auto_mode": False,
+                }).execute()
+            )
 
         creator = creator_row.data[0] if creator_row.data else None
         if not creator:
-            return {"success": False, "error": "Failed to create creator"}
+            return {"success": False, "error": "Failed to save creator connection"}
 
-        await asyncio.to_thread(
-            lambda: db.table("chatter_creators").insert({
-                "chatter_id": req.user_id,
-                "creator_id": creator["id"],
-            }).execute()
-        )
+        if not req.creator_id:
+            await asyncio.to_thread(
+                lambda: db.table("chatter_creators").insert({
+                    "chatter_id": req.user_id,
+                    "creator_id": creator["id"],
+                }).execute()
+            )
 
         spawn(sync_chats_background(creator["id"]), name="sync_chats_background")
 
-        return {"success": True, "creator": creator}
+        return {
+            "success": True,
+            "creator": creator,
+            "reconnected": bool(req.creator_id),
+        }
 
 
 async def sync_chats_background(creator_id: str) -> None:
@@ -853,8 +911,6 @@ async def sync_chats(
             if row.get("platform_fan_id")
         }
 
-    api_key = os.environ.get("APIFANSLY_API_KEY")
-
     async with httpx.AsyncClient() as client:
         all_chats = []
         account_lookup: dict[str, dict] = {}
@@ -866,11 +922,23 @@ async def sync_chats(
                 params["cursor"] = cursor
 
             response = await client.get(
-                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats",
-                headers={"x-api-key": api_key},
+                apifansly_url(f"{apifansly_id}/chats"),
+                headers=apifansly_headers(),
                 params=params,
                 timeout=30,
             )
+            try:
+                raise_for_apifansly_response(
+                    response,
+                    operation="chat synchronization",
+                    account_id=apifansly_id,
+                )
+            except ApiFanslyAccountAccessError as exc:
+                print(f"[SYNC AUTH ERROR] creator={creator_id}: {exc}")
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ApiFanslyConfigurationError as exc:
+                print(f"[SYNC CONFIG ERROR] creator={creator_id}: {exc}")
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
             data = response.json()
             data_inner = data.get("data", {}).get("data", {})
             response_data = data_inner.get("response", {})
@@ -984,8 +1052,6 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
     if not group_id or not apifansly_id:
         return {"status": "error", "message": "missing fan or creator info"}
 
-    api_key = os.environ.get("APIFANSLY_API_KEY")
-
     existing = await asyncio.to_thread(
         lambda: db.table("messages")
         .select("fansly_message_id")
@@ -1007,10 +1073,15 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
                 params["cursor"] = cursor
 
             response = await client.get(
-                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats/{group_id}/messages",
-                headers={"x-api-key": api_key},
+                apifansly_url(f"{apifansly_id}/chats/{group_id}/messages"),
+                headers=apifansly_headers(),
                 params=params,
                 timeout=30,
+            )
+            raise_for_apifansly_response(
+                response,
+                operation="chat history load",
+                account_id=apifansly_id,
             )
             data = response.json()
             data_inner = data.get("data", {}).get("data", {})
@@ -1151,11 +1222,10 @@ async def mark_all_read(creator_id: str) -> dict:
     if not apifansly_id:
         return {"status": "error"}
 
-    api_key = os.environ.get("APIFANSLY_API_KEY")
     async with httpx.AsyncClient() as client:
         await client.post(
-            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/chats/mark-as-read",
-            headers={"x-api-key": api_key},
+            apifansly_url(f"{apifansly_id}/chats/mark-as-read"),
+            headers=apifansly_headers(),
             timeout=10,
         )
     return {"status": "ok"}
@@ -1175,14 +1245,17 @@ async def sync_vault(creator_id: str) -> dict:
     )
 
     apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
-    api_key = os.environ.get("APIFANSLY_API_KEY")
-
     async with httpx.AsyncClient() as client:
         # Step 1: Get all albums
         resp = await client.get(
-            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums",
-            headers={"x-api-key": api_key},
+            apifansly_url(f"{apifansly_id}/vault/albums"),
+            headers=apifansly_headers(),
             timeout=30,
+        )
+        raise_for_apifansly_response(
+            resp,
+            operation="vault album synchronization",
+            account_id=apifansly_id,
         )
         albums_data = resp.json()
         albums = albums_data.get("data", {}).get("data", {}).get("response", {}).get("albums", [])
@@ -1204,10 +1277,15 @@ async def sync_vault(creator_id: str) -> dict:
                     params["cursor"] = cursor
 
                 media_resp = await client.get(
-                    f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums/{album_id}/media",
-                    headers={"x-api-key": api_key},
+                    apifansly_url(f"{apifansly_id}/vault/albums/{album_id}/media"),
+                    headers=apifansly_headers(),
                     params=params,
                     timeout=30,
+                )
+                raise_for_apifansly_response(
+                    media_resp,
+                    operation="vault media synchronization",
+                    account_id=apifansly_id,
                 )
                 media_data = media_resp.json()
                 print(f"[VAULT ALBUM RAW] {str(media_data)[:500]}")
@@ -1301,8 +1379,6 @@ async def _run_vault_sync(creator_id: str) -> None:
         auto_categorize_new = bool(
             (creator_row.data or {}).get("auto_categorize_new_media", True)
         )
-        api_key = os.environ.get("APIFANSLY_API_KEY")
-
         existing_rows = await asyncio.to_thread(
             lambda: db.table("creator_vault_media")
             .select("media_id")
@@ -1313,9 +1389,14 @@ async def _run_vault_sync(creator_id: str) -> None:
 
         async with httpx.AsyncClient() as client:
             resp = await client.get(
-                f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums",
-                headers={"x-api-key": api_key},
+                apifansly_url(f"{apifansly_id}/vault/albums"),
+                headers=apifansly_headers(),
                 timeout=30,
+            )
+            raise_for_apifansly_response(
+                resp,
+                operation="incremental vault album synchronization",
+                account_id=apifansly_id,
             )
             albums_data = resp.json()
             albums = albums_data.get("data", {}).get("data", {}).get("response", {}).get("albums", [])
@@ -1340,10 +1421,15 @@ async def _run_vault_sync(creator_id: str) -> None:
                         params["cursor"] = cursor
 
                     media_resp = await client.get(
-                        f"https://v1.apifansly.com/api/fansly/{apifansly_id}/vault/albums/{album_id}/media",
-                        headers={"x-api-key": api_key},
+                        apifansly_url(f"{apifansly_id}/vault/albums/{album_id}/media"),
+                        headers=apifansly_headers(),
                         params=params,
                         timeout=30,
+                    )
+                    raise_for_apifansly_response(
+                        media_resp,
+                        operation="incremental vault media synchronization",
+                        account_id=apifansly_id,
                     )
                     media_data = media_resp.json()
                     data_l1 = media_data.get("data", {})
@@ -1489,8 +1575,6 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
     auto_categorize_new = bool(
         (creator_row.data or {}).get("auto_categorize_new_media", True)
     )
-    api_key = os.environ.get("APIFANSLY_API_KEY")
-
     form = await request.form()
     file = form.get("file")
     album_title = str(form.get("album_title") or "Uncategorized")
@@ -1505,10 +1589,15 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
 
     async with httpx.AsyncClient() as client:
         upload_resp = await client.post(
-            f"https://v1.apifansly.com/api/fansly/{apifansly_id}/media/upload",
-            headers={"x-api-key": api_key},
+            apifansly_url(f"{apifansly_id}/media/upload"),
+            headers=apifansly_headers(),
             files={"file": (filename, file_bytes, mimetype)},
             timeout=60,
+        )
+        raise_for_apifansly_response(
+            upload_resp,
+            operation="media upload",
+            account_id=apifansly_id,
         )
         upload_data = upload_resp.json()
         print(f"[UPLOAD] initiate response: {upload_data}")
@@ -1522,9 +1611,14 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
         for attempt in range(30):
             await asyncio.sleep(2)
             status_resp = await client.get(
-                f"https://v1.apifansly.com/api/fansly/media/upload/{job_id}/status",
-                headers={"x-api-key": api_key},
+                apifansly_url(f"media/upload/{job_id}/status"),
+                headers=apifansly_headers(),
                 timeout=15,
+            )
+            raise_for_apifansly_response(
+                status_resp,
+                operation="media upload status",
+                account_id=apifansly_id,
             )
             status_data = status_resp.json()
             state = status_data.get("data", {}).get("state")
@@ -2384,12 +2478,16 @@ async def recategorize_item(item_id: str) -> dict:
 async def get_media_url(account_id: str, content_id: str) -> dict:
     import httpx
 
-    api_key = os.environ.get("APIFANSLY_API_KEY")
     async with httpx.AsyncClient() as client:
         response = await client.get(
-            f"https://v1.apifansly.com/api/fansly/{account_id}/media/{content_id}",
-            headers={"x-api-key": api_key},
+            apifansly_url(f"{account_id}/media/{content_id}"),
+            headers=apifansly_headers(),
             timeout=10,
+        )
+        raise_for_apifansly_response(
+            response,
+            operation="vault media URL lookup",
+            account_id=account_id,
         )
         print(f"[MEDIA] status={response.status_code} body={response.text[:300]}")
         return response.json()
@@ -2958,6 +3056,91 @@ async def read_full_auto_health(creator_id: str) -> dict:
             status_code=503,
             detail="Full Auto health is temporarily unavailable. Please retry.",
         ) from exc
+
+
+@app.get("/creator/{creator_id}/fansly-integration-health")
+async def read_fansly_integration_health(creator_id: str) -> dict:
+    """Verify that the current API key can access this creator connection."""
+    import httpx
+
+    db = get_supabase()
+    creator_row = await asyncio.to_thread(
+        lambda: db.table("creators")
+        .select("platform, fansly_account_id, apifansly_account_id")
+        .eq("id", creator_id)
+        .single()
+        .execute()
+    )
+    creator = creator_row.data or {}
+    account_id = str(creator.get("apifansly_account_id") or "").strip()
+    common = {
+        "creator_id": creator_id,
+        "platform": creator.get("platform"),
+        "connected": bool(account_id),
+        "stored_fansly_account_id": bool(creator.get("fansly_account_id")),
+    }
+    if not account_id:
+        return {
+            **common,
+            "configured": True,
+            "accessible": False,
+            "status": "not_connected",
+            "requires_reconnect": True,
+            "detail": "Connect this creator to API Fansly.",
+        }
+
+    try:
+        endpoint = apifansly_url(f"{account_id}/me")
+        request_headers = apifansly_headers()
+    except ApiFanslyConfigurationError as exc:
+        return {
+            **common,
+            "configured": False,
+            "accessible": False,
+            "status": "misconfigured",
+            "requires_reconnect": False,
+            "detail": str(exc),
+        }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                endpoint,
+                headers=request_headers,
+                timeout=20,
+            )
+        raise_for_apifansly_response(
+            response,
+            operation="integration health check",
+            account_id=account_id,
+        )
+    except ApiFanslyAccountAccessError as exc:
+        return {
+            **common,
+            "configured": True,
+            "accessible": False,
+            "status": "access_denied",
+            "requires_reconnect": True,
+            "detail": str(exc),
+        }
+    except (httpx.HTTPError, RuntimeError) as exc:
+        return {
+            **common,
+            "configured": True,
+            "accessible": False,
+            "status": "upstream_error",
+            "requires_reconnect": False,
+            "detail": str(exc),
+        }
+
+    return {
+        **common,
+        "configured": True,
+        "accessible": True,
+        "status": "healthy",
+        "requires_reconnect": False,
+        "detail": "API Fansly account access is healthy.",
+    }
 
 
 @app.get("/creator/{creator_id}/ppv-approvals")
