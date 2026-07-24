@@ -73,6 +73,11 @@ from services.rekognition_classifier import (
     RekognitionConfigurationError,
     classify_with_rekognition,
 )
+from services.shoot_fingerprint import (
+    build_shoot_clusters,
+    build_shoot_fingerprint,
+    cluster_debug_summary,
+)
 from services.suggestions import (
     _should_update_memory,
     _update_fan_ai_summary,
@@ -510,6 +515,70 @@ async def vault_autosync_scheduler():
             print(f"[CRON VAULT AUTOSYNC ERROR] {e}")
 
 
+_chat_reconcile_denied_bindings: set[tuple[str, str]] = set()
+
+
+async def _reconcile_chat_creators_once(
+    creators: list[dict],
+) -> dict[str, int]:
+    """Reconcile every usable creator without one stale binding stopping all.
+
+    A 409 means the API key cannot access that exact API Fansly connection ID.
+    Retrying it every ten minutes wastes credits and hides healthy creators'
+    work in error noise. The binding is suppressed only for this process and
+    exact ID; reconnecting the creator writes a new ID which is picked up on the
+    next pass without requiring a restart.
+    """
+    processed = 0
+    skipped = 0
+    failed = 0
+    for creator in creators:
+        creator_id = str(creator.get("id") or "")
+        account_id = str(creator.get("apifansly_account_id") or "")
+        if not creator_id or not account_id:
+            continue
+        binding = (creator_id, account_id)
+        for stale in list(_chat_reconcile_denied_bindings):
+            if stale[0] == creator_id and stale != binding:
+                _chat_reconcile_denied_bindings.discard(stale)
+        if binding in _chat_reconcile_denied_bindings:
+            skipped += 1
+            continue
+        try:
+            result = await sync_chats(creator_id, incremental=True)
+            processed += 1
+            if result.get("status") == "ok" and result.get("new_chats"):
+                print(
+                    f"[CHAT RECONCILE] creator={creator_id} "
+                    f"new={result['new_chats']} "
+                    f"synced={result.get('synced', 0)}"
+                )
+        except HTTPException as exc:
+            failed += 1
+            if exc.status_code == 409:
+                _chat_reconcile_denied_bindings.add(binding)
+                print(
+                    f"[CHAT RECONCILE PAUSED] creator={creator_id} "
+                    "reason=stored_apifansly_binding_inaccessible "
+                    "action=reconnect_creator"
+                )
+            else:
+                print(
+                    f"[CHAT RECONCILE CREATOR ERROR] creator={creator_id} "
+                    f"status={exc.status_code} detail={exc.detail}"
+                )
+        except Exception as exc:
+            failed += 1
+            print(
+                f"[CHAT RECONCILE CREATOR ERROR] creator={creator_id}: {exc}"
+            )
+    return {
+        "processed": processed,
+        "skipped_inaccessible": skipped,
+        "failed": failed,
+    }
+
+
 async def chat_reconciliation_scheduler():
     """Incrementally reconcile Fansly chat lists with a durable DB lease."""
     while True:
@@ -518,19 +587,13 @@ async def chat_reconciliation_scheduler():
             db = get_supabase()
             creators = await asyncio.to_thread(
                 lambda: db.table("creators")
-                .select("id")
+                .select("id, apifansly_account_id")
                 .not_.is_("apifansly_account_id", "null")
                 .execute()
             )
-            for creator in (creators.data or []):
-                result = await sync_chats(str(creator["id"]), incremental=True)
-                if result.get("status") == "ok" and result.get("new_chats"):
-                    print(
-                        f"[CHAT RECONCILE] creator={creator['id']} "
-                        f"new={result['new_chats']} synced={result.get('synced', 0)}"
-                    )
+            await _reconcile_chat_creators_once(creators.data or [])
         except Exception as exc:
-            print(f"[CRON CHAT RECONCILE ERROR] {exc}")
+            print(f"[CRON CHAT RECONCILE INFRA ERROR] {exc}")
 
 
 @asynccontextmanager
@@ -2073,6 +2136,12 @@ Return ONLY one JSON object with exactly these keys:
 
         if not isinstance(data, dict):
             raise ValueError("classifier did not return a JSON object")
+        shoot_fingerprint = await build_shoot_fingerprint(classifier_image)
+        local_visual = shoot_fingerprint.get("local") or {}
+        if not data.get("colors"):
+            data["colors"] = local_visual.get("palette_names") or []
+        if useful_text(data.get("scene_lighting")) == "":
+            data["scene_lighting"] = local_visual.get("lighting") or ""
         explicitness = explicitness_from_evidence(data)
         # Deterministically repair category/media mismatches and conservative
         # labels before they can become sellable set metadata.
@@ -2107,6 +2176,7 @@ Return ONLY one JSON object with exactly these keys:
         metadata["age_review_required"] = bool(
             provider_metadata.get("age_review_required")
         )
+        metadata["shoot_fingerprint"] = shoot_fingerprint
         metadata.update({
             "category": category,
             "explicitness": explicitness,
@@ -2121,6 +2191,11 @@ Return ONLY one JSON object with exactly these keys:
             "classifier_provider": provider,
             "provider_details": provider_metadata,
         })
+        print(
+            f"[SHOOT FINGERPRINT] item={item_id} "
+            f"status={shoot_fingerprint.get('status')} "
+            f"palette={local_visual.get('palette_names') or []}"
+        )
 
         return {
             "id": item_id,
@@ -4024,6 +4099,52 @@ async def generate_sets(creator_id: str) -> dict:
         inserted += len(chunk)
 
     return {"status": "ok", "drafts_created": inserted, "from_items": len(items)}
+
+
+@app.get(
+    "/debug-shoot-clusters/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
+async def debug_shoot_clusters(creator_id: str) -> dict:
+    """Explain photoshoot grouping without returning raw visual vectors."""
+    db = get_supabase()
+    items: list[dict] = []
+    page = 0
+    while True:
+        rows = await asyncio.to_thread(
+            lambda p=page: db.table("creator_vault_media")
+            .select(
+                "fansly_media_id, content_category, explicitness_level, "
+                "scene_location, scene_outfit, album_title, "
+                "classification_metadata"
+            )
+            .eq("creator_id", creator_id)
+            .range(p * 1000, p * 1000 + 999)
+            .execute()
+        )
+        batch = rows.data or []
+        items.extend(batch)
+        if len(batch) < 1000:
+            break
+        page += 1
+    clusters = build_shoot_clusters(items)
+    summaries = [
+        cluster_debug_summary(cluster)
+        for cluster in clusters
+    ]
+    return {
+        "status": "ok",
+        "from_items": len(items),
+        "visual_clusters": sum(
+            row["method"] == "visual_embedding" and len(row["media_ids"]) >= 2
+            for row in summaries
+        ),
+        "unresolved_items": sum(
+            row["method"] == "unresolved"
+            for row in summaries
+        ),
+        "clusters": summaries,
+    }
 
 
 @app.get(

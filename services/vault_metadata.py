@@ -12,7 +12,7 @@ from collections import Counter
 from typing import Any, Iterable
 
 
-VAULT_CLASSIFIER_VERSION = 4
+VAULT_CLASSIFIER_VERSION = 5
 
 _EMPTY_VALUES = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
 _MEDIA_CATEGORIES = {
@@ -213,6 +213,7 @@ def media_description(data: dict[str, Any], *, source: str) -> str:
     pose = useful_text(data.get("pose"))
     framing = useful_text(data.get("framing"))
     lighting = useful_text(data.get("scene_lighting"))
+    colours = normalize_string_list(data.get("colors"), limit=6)
     nudity = useful_text(data.get("nudity"))
     anatomy = normalize_string_list(data.get("visible_anatomy"))
     if location:
@@ -227,6 +228,8 @@ def media_description(data: dict[str, Any], *, source: str) -> str:
         details.append(f"framing: {framing}")
     if lighting:
         details.append(f"lighting: {lighting}")
+    if colours:
+        details.append(f"dominant palette: {', '.join(colours)}")
     if nudity:
         details.append(f"nudity: {nudity}")
     if anatomy:
@@ -260,6 +263,7 @@ def build_set_description(items: list[dict[str, Any]]) -> str:
     )
     location = _mode(item.get("scene_location") for item in items)
     outfit = _mode(item.get("scene_outfit") for item in items)
+    lighting = _mode(item.get("scene_lighting") for item in items)
     categories = normalize_string_list(
         [item.get("content_category") or item.get("category") for item in items],
         limit=8,
@@ -268,6 +272,52 @@ def build_set_description(items: list[dict[str, Any]]) -> str:
         [tag for item in items for tag in (item.get("tags") or [])],
         limit=14,
     )
+    metadata = [
+        item.get("classification_metadata")
+        if isinstance(item.get("classification_metadata"), dict)
+        else {}
+        for item in items
+    ]
+    local_fingerprints = [
+        ((value.get("shoot_fingerprint") or {}).get("local") or {})
+        for value in metadata
+    ]
+    palettes = normalize_string_list(
+        [
+            colour
+            for fingerprint in local_fingerprints
+            for colour in (fingerprint.get("palette_names") or [])
+        ],
+        limit=6,
+    )
+    visual_tones = normalize_string_list(
+        [fingerprint.get("visual_tone") for fingerprint in local_fingerprints],
+        limit=4,
+    )
+    structured = {
+        key: normalize_string_list(
+            [
+                value
+                for item_metadata in metadata
+                for value in (
+                    item_metadata.get(key)
+                    if isinstance(item_metadata.get(key), list)
+                    else [item_metadata.get(key)]
+                )
+            ],
+            limit=10,
+        )
+        for key in (
+            "action",
+            "pose",
+            "framing",
+            "props",
+            "nudity",
+            "visible_anatomy",
+            "sexual_activity",
+            "body_focus",
+        )
+    }
     levels = [
         int(item.get("explicitness_level") if item.get("explicitness_level") is not None else item.get("explicitness", 0))
         for item in items
@@ -276,7 +326,17 @@ def build_set_description(items: list[dict[str, Any]]) -> str:
     media_label = f"{count} media item{'s' if count != 1 else ''}"
     if videos:
         media_label += f", including {videos} video{'s' if videos != 1 else ''}"
-    opening = f"A coherent sequence of {media_label}"
+    visually_matched = sum(
+        bool(
+            (value.get("shoot_fingerprint") or {}).get("embedding")
+        )
+        for value in metadata
+    )
+    opening = (
+        f"A visually matched photoshoot sequence of {media_label}"
+        if visually_matched == count
+        else f"A coherent sequence of {media_label}"
+    )
     if location:
         opening += f" in a {location} setting"
     if outfit:
@@ -292,6 +352,35 @@ def build_set_description(items: list[dict[str, Any]]) -> str:
         parts.append(f"The sequence is consistently explicitness {levels[0]}/5.")
     if categories:
         parts.append("Content categories: " + ", ".join(categories) + ".")
+    if palettes:
+        parts.append("Dominant visual palette: " + ", ".join(palettes) + ".")
+    setting_details = []
+    if lighting:
+        setting_details.append(f"lighting: {lighting}")
+    if visual_tones:
+        setting_details.append(f"visual tone: {', '.join(visual_tones)}")
+    if structured["framing"]:
+        setting_details.append(
+            f"framing: {', '.join(structured['framing'])}"
+        )
+    if setting_details:
+        parts.append("Photoshoot look — " + "; ".join(setting_details) + ".")
+    content_details = []
+    for label, key in (
+        ("actions", "action"),
+        ("poses", "pose"),
+        ("props", "props"),
+        ("nudity", "nudity"),
+        ("visible anatomy", "visible_anatomy"),
+        ("activities", "sexual_activity"),
+        ("body focus", "body_focus"),
+    ):
+        if structured[key]:
+            content_details.append(
+                f"{label}: {', '.join(structured[key])}"
+            )
+    if content_details:
+        parts.append("Visible progression — " + "; ".join(content_details) + ".")
     if tags:
         parts.append("Themes and visible details: " + ", ".join(tags) + ".")
 

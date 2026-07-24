@@ -6,6 +6,7 @@ from datetime import datetime
 
 from core.supabase import get_supabase
 from models.schemas import ExchangeExample, Fan, Message, Persona
+from services.shoot_fingerprint import build_shoot_clusters, shoot_fingerprint
 from services.vault_metadata import VAULT_CLASSIFIER_VERSION, build_set_description
 
 
@@ -375,7 +376,7 @@ async def get_vault_for_session(
         r = (
             get_supabase()
             .table("creator_vault_media")
-            .select("id, fansly_media_id, ai_description, content_category, price_min, price_max, explicitness_level, good_for, scene_id, scene_location, scene_outfit, scene_lighting, tags, filename, mimetype, album_title")
+            .select("id, fansly_media_id, ai_description, content_category, price_min, price_max, explicitness_level, good_for, scene_id, scene_location, scene_outfit, scene_lighting, tags, filename, mimetype, album_title, classification_metadata")
             .eq("creator_id", creator_id)
             .neq("content_category", "")
             .neq("content_category", "other")
@@ -407,23 +408,10 @@ async def get_vault_for_session(
                 "album_title": row.get("album_title", ""),
                 "tags": row.get("tags") or [],
                 "is_video": (row.get("mimetype") or "").startswith("video"),
+                "classification_metadata": row.get("classification_metadata") or {},
             })
         return items
     return await asyncio.to_thread(_get)
-
-
-def _scene_key(item: dict) -> str:
-    """One shoot = one key. Priority: creator's own album folder, then the
-    classifier's scene_id, then a location+outfit signature as last resort."""
-    album = (item.get("album_title") or "").strip()
-    if album and not album.lower().startswith("album_"):   # named folder = a real shoot
-        return f"album:{album.lower()}"
-    sid = (item.get("scene_id") or "").strip().lower()
-    if sid and sid != "unknown":
-        return f"scene:{sid}"
-    loc = (item.get("scene_location") or "unknown").strip().lower()
-    outfit = (item.get("scene_outfit") or "unknown").strip().lower()
-    return f"sig:{loc}|{outfit}"
 
 
 def _mode(values: list[str]) -> str:
@@ -434,17 +422,16 @@ def _mode(values: list[str]) -> str:
 def build_scenes(vault_items: list[dict], min_items: int = 2) -> list[dict]:
     """Group flat vault items into coherent scenes (one shoot each), each
     internally ordered low -> high explicitness."""
-    groups: dict[str, list[dict]] = {}
-    for it in vault_items:
-        groups.setdefault(_scene_key(it), []).append(it)
-
     scenes = []
-    for key, items in groups.items():
+    for shoot in build_shoot_clusters(vault_items):
+        items = shoot["items"]
         if len(items) < min_items:
             continue
         items.sort(key=lambda x: x.get("explicitness", 3))
         scenes.append({
-            "scene_key": key,
+            "scene_key": shoot["shoot_id"],
+            "grouping_method": shoot["method"],
+            "grouping_confidence": shoot["confidence"],
             "location": _mode([i.get("scene_location") for i in items]),
             "outfit": _mode([i.get("scene_outfit") for i in items]),
             "categories": sorted({i.get("category", "") for i in items if i.get("category")}),
@@ -458,16 +445,6 @@ def build_scenes(vault_items: list[dict], min_items: int = 2) -> list[dict]:
 
 
 _JUNK_META = {"", "unclear", "unknown", "none", "n/a", "na", "null"}
-
-
-def _set_key_coarse(item: dict) -> str:
-    sid = (item.get("scene_id") or "").strip().lower()
-    if sid and sid not in _JUNK_META:
-        return f"scene:{sid}"
-    album = (item.get("album_title") or "").strip()
-    if album and not album.lower().startswith("album_"):
-        return f"album:{album.lower()}"
-    return ""   # no reliable shoot signal -> leave for manual, don't fake a set
 
 
 def _collect_tags(items, limit=8):
@@ -491,55 +468,113 @@ def _collect_tags(items, limit=8):
 
 
 def propose_sets(vault_items, max_per_set=6, min_per_set=3, min_level=2):
-    groups = {}
-    for it in vault_items:
-        key = _set_key_coarse(it)
-        if not key:
-            continue
-        groups.setdefault(key, []).append(it)
-
     sets = []
-    for key, items in groups.items():
-        base = key.split(":", 1)[-1].replace("-", " ").replace("_", " ").strip()
-        # split by explicitness AND content focus
-        sub: dict[tuple, list] = {}
-        for it in items:
-            lvl = it.get("explicitness_level") or 0
-            if lvl < min_level:
-                continue
-            cat = (it.get("content_category") or "").strip().lower()
-            sub.setdefault((lvl, cat), []).append(it)
+    for shoot in build_shoot_clusters(vault_items):
+        bucket = [
+            item
+            for item in shoot["items"]
+            if int(item.get("explicitness_level") or 0) >= min_level
+        ]
+        if len(bucket) < min_per_set:
+            continue
+        bucket.sort(
+            key=lambda item: (
+                int(item.get("explicitness_level") or 0),
+                str(item.get("good_for") or ""),
+                str(item.get("fansly_media_id") or ""),
+            )
+        )
+        chunk_count = max(1, -(-len(bucket) // max_per_set))
+        base_size, remainder = divmod(len(bucket), chunk_count)
+        chunks = []
+        start = 0
+        for chunk_index in range(chunk_count):
+            size = base_size + (1 if chunk_index < remainder else 0)
+            chunks.append(bucket[start:start + size])
+            start += size
 
-        for (lvl, cat), bucket in sorted(sub.items()):
-            if len(bucket) < min_per_set:
+        for chunk_index, chunk in enumerate(chunks):
+            if len(chunk) < min_per_set:
                 continue
-            n = len(bucket)
-            num = max(1, -(-n // max_per_set))
-            size = -(-n // num)
-            chunks = [bucket[i:i + size] for i in range(0, n, size)]
-            for ci, chunk in enumerate(chunks):
-                if len(chunk) < 2:
-                    continue
-                top = chunk[-1]
-                price = round((((top.get("price_min") or 15) + (top.get("price_max") or 40)) / 2) / 5) * 5
-                loc = _mode([i.get("scene_location") for i in chunk]).replace("_", " ").strip()
-                outfit = _mode([i.get("scene_outfit") for i in chunk]).strip()
-                if loc.lower() in _JUNK_META: loc = ""
-                if outfit.lower() in _JUNK_META: outfit = "nude"
-                cat_label = cat if cat and cat not in _JUNK_META else ""
-                part = f" ({ci + 1})" if len(chunks) > 1 else ""
-                title = f"{base}{(' · ' + cat_label) if cat_label else ''} · lvl {lvl}{part}"
-                sets.append({
-                    "title": title[:80],
-                    "description": build_set_description(chunk),
-                    "location": loc or None, "outfit": outfit or None,
-                    "explicit_min": lvl, "explicit_max": lvl,
-                    "media_ids": [i["fansly_media_id"] for i in chunk if i.get("fansly_media_id")],
-                    "preview_media_id": chunk[0].get("fansly_media_id"),
-                    "suggested_price": price,
-                    "tags": _collect_tags(chunk),
-                    "metadata_version": VAULT_CLASSIFIER_VERSION,
-                })
+            top = chunk[-1]
+            price = round(
+                (
+                    (
+                        (top.get("price_min") or 15)
+                        + (top.get("price_max") or 40)
+                    )
+                    / 2
+                )
+                / 5
+            ) * 5
+            loc = _mode(
+                [item.get("scene_location") for item in chunk]
+            ).replace("_", " ").strip()
+            outfit = _mode(
+                [item.get("scene_outfit") for item in chunk]
+            ).strip()
+            if loc.lower() in _JUNK_META:
+                loc = ""
+            if outfit.lower() in _JUNK_META:
+                outfit = ""
+            category = _mode(
+                [item.get("content_category") for item in chunk]
+            ).replace("_", " ").strip()
+            palette = []
+            for item in chunk:
+                local = shoot_fingerprint(item).get("local") or {}
+                for colour in local.get("palette_names") or []:
+                    if colour not in palette:
+                        palette.append(colour)
+            title_parts = [
+                value
+                for value in (
+                    loc.title() if loc else "",
+                    palette[0].title() if palette else "",
+                    outfit,
+                    category,
+                )
+                if value
+            ]
+            base = " · ".join(title_parts[:3]) or str(shoot["shoot_id"])
+            levels = [
+                int(item.get("explicitness_level") or 0) for item in chunk
+            ]
+            level_label = (
+                f"lvl {min(levels)}–{max(levels)}"
+                if min(levels) != max(levels)
+                else f"lvl {levels[0]}"
+            )
+            part = (
+                f" ({chunk_index + 1})"
+                if len(chunks) > 1
+                else ""
+            )
+            title = f"{base} · {level_label}{part}"
+            tags = _collect_tags(chunk)
+            for colour in palette[:4]:
+                if colour not in tags:
+                    tags.append(colour)
+            sets.append({
+                "title": title[:80],
+                "description": build_set_description(chunk),
+                "location": loc or None,
+                "outfit": outfit or None,
+                "explicit_min": min(levels),
+                "explicit_max": max(levels),
+                "media_ids": [
+                    item["fansly_media_id"]
+                    for item in chunk
+                    if item.get("fansly_media_id")
+                ],
+                "preview_media_id": chunk[0].get("fansly_media_id"),
+                "suggested_price": price,
+                "tags": tags[:12],
+                "metadata_version": VAULT_CLASSIFIER_VERSION,
+                "shoot_id": shoot["shoot_id"],
+                "shoot_method": shoot["method"],
+                "shoot_confidence": shoot["confidence"],
+            })
     sets.sort(key=lambda s: (s["explicit_max"], len(s["media_ids"])), reverse=True)
     return sets
 

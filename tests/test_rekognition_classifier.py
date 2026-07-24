@@ -197,12 +197,12 @@ def test_live_explicit_sample_is_sanitized_for_package_matching():
     ]
 
 
-def test_rekognition_is_the_v4_default_and_batch_has_cost_circuit_breaker():
+def test_rekognition_is_the_v5_default_and_batch_has_cost_circuit_breaker():
     root = Path(__file__).resolve().parents[1]
     env_example = (root / ".env.example").read_text()
     main_source = (root / "main.py").read_text()
 
-    assert VAULT_CLASSIFIER_VERSION == 4
+    assert VAULT_CLASSIFIER_VERSION == 5
     assert "VAULT_CLASSIFIER_PROVIDER=rekognition" in env_example
     assert 'or "rekognition"' in main_source
     assert "[CATEGORIZE ABORTED]" in main_source
