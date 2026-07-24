@@ -58,6 +58,32 @@ class Persona(BaseModel):
     example_phrases: str = ""
     hard_limits: str = ""
     emoji_style: str = ""
+    voice_calibration_enabled: bool = False
+    voice_calibration_samples: list[str] = Field(default_factory=list)
+    voice_calibration_message_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("voice_calibration_samples")
+    @classmethod
+    def normalize_voice_calibration_samples(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values or []:
+            sample = " ".join(str(value or "").split()).strip()
+            key = sample.casefold()
+            if not sample or key in seen:
+                continue
+            if len(sample) > 500:
+                sample = sample[:500].rstrip()
+            normalized.append(sample)
+            seen.add(key)
+            if len(normalized) == 30:
+                break
+        return normalized
+
+    @field_validator("voice_calibration_message_ids")
+    @classmethod
+    def normalize_voice_calibration_message_ids(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(str(value).strip() for value in (values or []) if str(value).strip()))[:30]
 
 
 class Message(BaseModel):

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from ai.generator import generate_replies
@@ -81,6 +81,10 @@ from services.shoot_fingerprint import (
     build_shoot_clusters,
     build_shoot_fingerprint,
     cluster_debug_summary,
+)
+from services.voice_calibration import (
+    list_voice_calibration_candidates,
+    save_voice_calibration,
 )
 from services.suggestions import (
     _should_update_memory,
@@ -353,6 +357,11 @@ class ReplyRequest(BaseModel):
     creator_id: str
     content: str
     was_ai_suggested: bool = False
+
+
+class VoiceCalibrationUpdateRequest(BaseModel):
+    enabled: bool = False
+    approved_message_ids: list[str] = Field(default_factory=list, max_length=30)
 
 
 class WebhookPayload(BaseModel):
@@ -3322,6 +3331,53 @@ async def update_commercial_policy(creator_id: str, policy: CreatorPolicy) -> di
 
     saved = await save_creator_policy(creator_id, policy)
     return {"status": "ok", "creator_id": creator_id, "policy": saved.model_dump(mode="json")}
+
+
+@app.get(
+    "/creator/{creator_id}/voice-calibration",
+    dependencies=[Depends(require_creator_path_access)],
+)
+async def read_voice_calibration(creator_id: str) -> dict:
+    persona, candidates = await asyncio.gather(
+        get_creator_persona(creator_id),
+        list_voice_calibration_candidates(creator_id),
+    )
+    persona = persona or Persona()
+    approved = set(persona.voice_calibration_message_ids)
+    return {
+        "creator_id": creator_id,
+        "beta": True,
+        "enabled": persona.voice_calibration_enabled,
+        "approved_message_ids": persona.voice_calibration_message_ids,
+        "approved_samples": persona.voice_calibration_samples,
+        "candidates": [
+            {**candidate, "approved": candidate["id"] in approved}
+            for candidate in candidates
+        ],
+    }
+
+
+@app.put(
+    "/creator/{creator_id}/voice-calibration",
+    dependencies=[Depends(require_creator_path_access)],
+)
+async def update_voice_calibration(
+    creator_id: str,
+    request: VoiceCalibrationUpdateRequest,
+) -> dict:
+    persona = await save_voice_calibration(
+        creator_id,
+        enabled=request.enabled,
+        approved_message_ids=request.approved_message_ids,
+    )
+    return {
+        "status": "ok",
+        "creator_id": creator_id,
+        "beta": True,
+        "enabled": persona.voice_calibration_enabled,
+        "approved_message_ids": persona.voice_calibration_message_ids,
+        "approved_samples": persona.voice_calibration_samples,
+    }
 
 
 @app.get(

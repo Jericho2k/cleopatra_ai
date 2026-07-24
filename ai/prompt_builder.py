@@ -4,6 +4,7 @@ Pure string assembly only — no I/O, DB, or API calls.
 
 from datetime import datetime
 
+from ai.voice_calibration import render_voice_calibration
 from models.schemas import ConversationContext, StageType
 
 
@@ -388,6 +389,7 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     character = getattr(persona, "character", "") or "Confident, playful Eastern European creator."
     comm_style = getattr(persona, "communication_style", "") or "Short casual texts, mirrors energy."
     example_phrases = getattr(persona, "example_phrases", "") or ""
+    voice_calibration = render_voice_calibration(persona)
     upsell_style = getattr(persona, "upsell_style", "") or ""
     emoji_style = getattr(persona, "emoji_style", "") or ""
 
@@ -613,6 +615,7 @@ WHO YOU ARE:
 
 HOW YOU TEXT:
 {comm_style}
+{voice_calibration}
 
 You text like a real person, not a chatbot. Short bursts, natural reactions. You lead as often as you follow. You set the energy, you don't just respond to it. You never write paragraphs.
 
