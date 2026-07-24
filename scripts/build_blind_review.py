@@ -164,8 +164,9 @@ def format_scenario_context(
         [
             "### What to judge",
             "",
-            "Naturalness, relevance, creator voice, non-repetition, commercial usefulness, "
-            "and whether the three options are genuinely distinct.",
+            "Read these as messages from a real creator, not as polished copy. Judge whether the "
+            "reply feels ordinary and context-aware, whether it avoids obvious AI habits, whether "
+            "it matches the creator voice, and whether it still moves the conversation usefully.",
             "",
         ]
     )
@@ -208,13 +209,18 @@ def render_candidate(row: dict[str, Any], label: str) -> list[str]:
     lines.extend(
         [
             "",
-            "**Naturalness (1–5):** ",
+            "**Human believability (1–5):** ",
             "",
             "**Relevance/context (1–5):** ",
             "",
             "**Creator voice (1–5):** ",
             "",
             "**Commercial usefulness (1–5):** ",
+            "",
+            "**Would you suspect AI? (yes / maybe / no):** ",
+            "",
+            "**AI tells, if any:** polished conclusion / forced wit / repeats every point / "
+            "unearned expertise / constant question / therapy voice / other",
             "",
             "**Notes:** ",
             "",
@@ -260,9 +266,10 @@ def main() -> int:
     rng = random.Random(seed)
 
     markdown: list[str] = [
-        "# Cleopatra Model Lab — Blind Review",
+        "# Cleopatra Model Lab — Blind Realism Review",
         "",
         "Do not open the answer key until all rankings are complete.",
+        "This is an offline review sheet. It does not score, block, or reroute production replies.",
         "",
         f"Scenarios: {len(grouped)}",
         "",

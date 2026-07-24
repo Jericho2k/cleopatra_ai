@@ -1,0 +1,173 @@
+[
+  {
+    "id": "plain_acknowledgement",
+    "title": "A plain acknowledgement is enough",
+    "adult_required": false,
+    "stage": "WARMING_UP",
+    "fan_message": "yeah pretty much",
+    "history": [
+      {"role": "creator", "content": "so just a lazy night then"},
+      {"role": "fan", "content": "yeah pretty much"}
+    ],
+    "situation": {"tone": "casual", "strategic_move": "mirror_warmth"},
+    "checks": {
+      "max_words": 14,
+      "must_not_contain": ["there's something", "honestly refreshing", "simple pleasures"],
+      "refusal_forbidden": true
+    }
+  },
+  {
+    "id": "selective_reply",
+    "title": "Do not respond to every clause",
+    "adult_required": false,
+    "stage": "WARMING_UP",
+    "fan_message": "work was long, my train was late, but i finally got food and i'm home now",
+    "history": [],
+    "situation": {"tone": "casual", "strategic_move": "mirror_warmth"},
+    "checks": {
+      "max_words": 20,
+      "must_not_contain": ["sounds like a long day", "at least you're home", "glad you got food"],
+      "refusal_forbidden": true
+    }
+  },
+  {
+    "id": "no_forced_question",
+    "title": "Do not force a question into every turn",
+    "adult_required": false,
+    "stage": "WARMING_UP",
+    "fan_message": "finally in bed lol",
+    "history": [
+      {"role": "creator", "content": "you survived then"},
+      {"role": "fan", "content": "barely"}
+    ],
+    "situation": {"tone": "warm", "strategic_move": "mirror_warmth"},
+    "checks": {
+      "max_words": 14,
+      "question_forbidden": true,
+      "refusal_forbidden": true
+    }
+  },
+  {
+    "id": "avoid_unearned_expertise",
+    "title": "Stay curious outside the creator's interests",
+    "adult_required": false,
+    "stage": "WARMING_UP",
+    "fan_message": "i spent all day fixing a race condition in our distributed queue",
+    "history": [],
+    "situation": {"tone": "casual", "strategic_move": "get_curious"},
+    "checks": {
+      "max_words": 22,
+      "must_not_contain": ["thread safety", "mutex", "idempotency", "distributed systems", "eventual consistency"],
+      "refusal_forbidden": true
+    }
+  },
+  {
+    "id": "no_therapy_voice",
+    "title": "React warmly without sounding like a therapist",
+    "adult_required": false,
+    "stage": "WARMING_UP",
+    "fan_message": "i've just felt a bit off all week",
+    "history": [],
+    "situation": {"tone": "warm", "strategic_move": "mirror_warmth"},
+    "checks": {
+      "max_words": 20,
+      "must_not_contain": ["your feelings are valid", "holding space", "be gentle with yourself", "that sounds really difficult"],
+      "refusal_forbidden": true
+    }
+  },
+  {
+    "id": "compliment_without_stock_line",
+    "title": "Accept a compliment without a stock line",
+    "adult_required": false,
+    "stage": "FLIRTING",
+    "fan_message": "you looked insanely good in that last post",
+    "history": [],
+    "situation": {"tone": "flirty", "strategic_move": "mirror_warmth"},
+    "checks": {
+      "max_words": 16,
+      "must_not_contain": ["making me blush", "too sweet", "you know exactly what to say", "i appreciate that"],
+      "refusal_forbidden": true
+    }
+  },
+  {
+    "id": "low_energy_flirt",
+    "title": "Flirting does not need a punchline",
+    "adult_required": false,
+    "stage": "FLIRTING",
+    "fan_message": "wish i was in bed with you rn",
+    "history": [
+      {"role": "creator", "content": "i'm so comfy rn"}
+    ],
+    "situation": {"tone": "flirty", "strategic_move": "build_tension"},
+    "commercial_decision": {
+      "action": "CONTINUE_NORMAL_CHAT",
+      "must_not_send_media": true,
+      "may_be_explicit": false
+    },
+    "checks": {
+      "max_words": 16,
+      "must_not_contain": ["careful what you wish for", "dangerous thing to say", "tempting offer"],
+      "refusal_forbidden": true
+    }
+  },
+  {
+    "id": "small_misunderstanding",
+    "title": "Handle a correction without over-explaining",
+    "adult_required": false,
+    "stage": "WARMING_UP",
+    "fan_message": "no i meant i'm going there next week, i'm not there now",
+    "history": [
+      {"role": "fan", "content": "london next week"},
+      {"role": "creator", "content": "oh how is london rn"}
+    ],
+    "situation": {"tone": "casual", "strategic_move": "mirror_warmth"},
+    "checks": {
+      "max_words": 18,
+      "must_not_contain": ["thank you for clarifying", "i misunderstood", "that makes sense now"],
+      "refusal_forbidden": true
+    }
+  },
+  {
+    "id": "money_transition_stays_human",
+    "title": "A commercial transition still sounds personal",
+    "adult_required": false,
+    "stage": "PRE_UPSELL",
+    "fan_message": "okay show me what you've got then",
+    "history": [
+      {"role": "creator", "content": "you've been distracting me all night"}
+    ],
+    "situation": {"tone": "flirty", "strategic_move": "push_for_ppv", "wants_media": "true"},
+    "commercial_decision": {
+      "action": "PRESENT_SESSION_OPTIONS",
+      "package_options": [
+        {"label": "quick shower set", "price_cents": 4500, "experience": "wet shower teasing"},
+        {"label": "full shower session", "price_cents": 7000, "experience": "shower progression"}
+      ],
+      "must_not_send_media": true,
+      "may_be_explicit": true
+    },
+    "checks": {
+      "max_words": 34,
+      "must_not_contain": ["i have two exciting options", "choose your preferred package", "which option would you like"],
+      "refusal_forbidden": true
+    }
+  },
+  {
+    "id": "ordinary_callback",
+    "title": "Use remembered context without announcing memory",
+    "adult_required": false,
+    "stage": "RETENTION",
+    "fan_message": "it went okay actually",
+    "history": [
+      {"role": "fan", "content": "job interview tomorrow"},
+      {"role": "creator", "content": "good luckkk"},
+      {"role": "fan", "content": "it went okay actually"}
+    ],
+    "situation": {"tone": "warm", "strategic_move": "mirror_warmth"},
+    "checks": {
+      "max_words": 18,
+      "must_not_contain": ["i remember", "as you mentioned", "following up"],
+      "refusal_forbidden": true
+    }
+  }
+]
