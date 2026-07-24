@@ -10,7 +10,7 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
@@ -21,6 +21,15 @@ from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from core.supabase import get_supabase
+from core.tenancy import (
+    require_account_path_access,
+    require_creator_access,
+    require_creator_fan_access,
+    require_creator_path_access,
+    require_fan_path_access,
+    require_ppv_approval_path_access,
+    require_vault_item_path_access,
+)
 from db.fan_intelligence_queries import get_fan_intelligence_context
 from db.queries import (
     create_fan,
@@ -43,8 +52,14 @@ from services.fan_intelligence import learn_from_fan_message
 from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
+    current_account as apifansly_current_account,
     headers as apifansly_headers,
+    list_chat_messages as apifansly_list_chat_messages,
+    list_chats as apifansly_list_chats,
+    list_vault_album_media as apifansly_list_vault_album_media,
+    list_vault_albums as apifansly_list_vault_albums,
     raise_for_response as raise_for_apifansly_response,
+    send_message as send_apifansly_message,
     response_message as apifansly_response_message,
     url as apifansly_url,
 )
@@ -86,26 +101,11 @@ async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id:
         async with httpx.AsyncClient() as client:
             cursor = None
             for _ in range(5):  # check up to 5 pages
-                params = {}
-                if cursor:
-                    params["cursor"] = cursor
-                resp = await client.get(
-                    apifansly_url(f"{apifansly_id}/chats"),
-                    headers=apifansly_headers(),
-                    params=params,
-                    timeout=15,
+                chats, accounts, cursor = await apifansly_list_chats(
+                    apifansly_id,
+                    cursor=cursor,
+                    client=client,
                 )
-                raise_for_apifansly_response(
-                    resp,
-                    operation="chat lookup",
-                    account_id=apifansly_id,
-                )
-                data = resp.json()
-                data_inner = data.get("data", {}).get("data", {})
-                response_data = data_inner.get("response", {})
-                cursor = data_inner.get("nextCursor")
-                chats = response_data.get("data", [])
-                accounts = response_data.get("aggregationData", {}).get("accounts", [])
                 account_lookup = {str(a.get("id", "")): a for a in accounts}
 
                 for chat in chats:
@@ -138,23 +138,14 @@ async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id:
 
 
 async def send_fansly_message(account_id: str, group_id: str, text: str) -> bool:
-    import httpx
-
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                apifansly_url(f"{account_id}/chats/{group_id}/messages"),
-                headers=apifansly_headers(json_content=True),
-                json={"content": text},
-                timeout=10,
-            )
-            print(f"[SEND] status={response.status_code} body={response.text[:200]}")
-            raise_for_apifansly_response(
-                response,
-                operation="message send",
-                account_id=account_id,
-            )
-            return response.status_code == 201
+        await send_apifansly_message(
+            account_id,
+            group_id,
+            content=text,
+        )
+        print(f"[SEND] account={account_id} group={group_id} accepted=true")
+        return True
     except Exception as e:
         print(f"[SEND ERROR] {e}")
         return False
@@ -586,7 +577,12 @@ _cors_origins = [
 #   • everything else (operator/CRUD/admin)     -> require DASHBOARD_API_SECRET
 # Unconfigured secrets fail open in dev, closed in prod (see core/auth.py).
 from starlette.responses import JSONResponse
-from core.auth import _is_dev, _consteq
+from core.auth import (
+    _is_dev,
+    _consteq,
+    authenticated_dashboard_user,
+    dashboard_user_id,
+)
 
 _PUBLIC_PATHS = {"/health", "/"}
 _WEBHOOK_PATHS = {"/webhook/fansly", "/generate-suggestions"}
@@ -613,6 +609,14 @@ async def api_auth_middleware(request, call_next):
     if not supplied or not _consteq(supplied, expected):
         return JSONResponse({"detail": "Missing or invalid credentials"}, status_code=401)
 
+    if path not in _WEBHOOK_PATHS:
+        try:
+            request.state.dashboard_user_id = await authenticated_dashboard_user(
+                request.headers.get("authorization")
+            )
+        except HTTPException as exc:
+            return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+
     return await call_next(request)
 
 
@@ -631,7 +635,8 @@ app.add_middleware(
 
 
 @app.post("/suggestions", response_model=SuggestionResponse)
-async def suggestions(req: SuggestionRequest) -> SuggestionResponse:
+async def suggestions(req: SuggestionRequest, request: Request) -> SuggestionResponse:
+    await require_creator_fan_access(request, req.creator_id, req.fan_id)
     return await get_suggestions(
         fan_id=req.fan_id,
         creator_id=req.creator_id,
@@ -641,7 +646,11 @@ async def suggestions(req: SuggestionRequest) -> SuggestionResponse:
 
 
 @app.post("/regenerate-suggestions", response_model=SuggestionResponse)
-async def regenerate_suggestions(req: SuggestionRequest) -> SuggestionResponse:
+async def regenerate_suggestions(
+    req: SuggestionRequest,
+    request: Request,
+) -> SuggestionResponse:
+    await require_creator_fan_access(request, req.creator_id, req.fan_id)
     result = await get_suggestions(
         fan_id=req.fan_id,
         creator_id=req.creator_id,
@@ -665,7 +674,8 @@ async def regenerate_suggestions(req: SuggestionRequest) -> SuggestionResponse:
 
 
 @app.post("/reply")
-async def save_reply(req: ReplyRequest) -> dict:
+async def save_reply(req: ReplyRequest, request: Request) -> dict:
+    await require_creator_fan_access(request, req.creator_id, req.fan_id)
     await save_message(
         req.fan_id,
         req.creator_id,
@@ -696,7 +706,12 @@ async def save_reply(req: ReplyRequest) -> dict:
 
 
 @app.post("/connect-creator")
-async def connect_creator(req: ConnectCreatorRequest) -> dict:
+async def connect_creator(req: ConnectCreatorRequest, request: Request) -> dict:
+    if req.creator_id:
+        await require_creator_access(request, req.creator_id)
+    operator_id = dashboard_user_id(request) or req.user_id
+    if not operator_id:
+        raise HTTPException(status_code=401, detail="Missing dashboard user session")
     print(
         f"[CONNECT] creator_id={req.creator_id or 'new'} "
         f"name={req.name} country={req.countryCode}"
@@ -769,7 +784,7 @@ async def connect_creator(req: ConnectCreatorRequest) -> dict:
         if not req.creator_id:
             await asyncio.to_thread(
                 lambda: db.table("chatter_creators").insert({
-                    "chatter_id": req.user_id,
+                    "chatter_id": operator_id,
                     "creator_id": creator["id"],
                 }).execute()
             )
@@ -784,7 +799,12 @@ async def connect_creator(req: ConnectCreatorRequest) -> dict:
 
 
 @app.post("/connect-creator-2fa")
-async def connect_creator_2fa(req: Connect2FARequest) -> dict:
+async def connect_creator_2fa(req: Connect2FARequest, request: Request) -> dict:
+    if req.creator_id:
+        await require_creator_access(request, req.creator_id)
+    operator_id = dashboard_user_id(request) or req.user_id
+    if not operator_id:
+        raise HTTPException(status_code=401, detail="Missing dashboard user session")
     import httpx
 
     async with httpx.AsyncClient() as client:
@@ -844,7 +864,7 @@ async def connect_creator_2fa(req: Connect2FARequest) -> dict:
         if not req.creator_id:
             await asyncio.to_thread(
                 lambda: db.table("chatter_creators").insert({
-                    "chatter_id": req.user_id,
+                    "chatter_id": operator_id,
                     "creator_id": creator["id"],
                 }).execute()
             )
@@ -866,7 +886,10 @@ async def sync_chats_background(creator_id: str) -> None:
         print(f"[SYNC ERROR] {e}")
 
 
-@app.post("/sync-chats/{creator_id}")
+@app.post(
+    "/sync-chats/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def sync_chats(
     creator_id: str,
     incremental: bool = False,
@@ -917,21 +940,11 @@ async def sync_chats(
         cursor = None
 
         while True:
-            params = {}
-            if cursor is not None:
-                params["cursor"] = cursor
-
-            response = await client.get(
-                apifansly_url(f"{apifansly_id}/chats"),
-                headers=apifansly_headers(),
-                params=params,
-                timeout=30,
-            )
             try:
-                raise_for_apifansly_response(
-                    response,
-                    operation="chat synchronization",
-                    account_id=apifansly_id,
+                chats, accounts, cursor = await apifansly_list_chats(
+                    str(apifansly_id),
+                    cursor=cursor,
+                    client=client,
                 )
             except ApiFanslyAccountAccessError as exc:
                 print(f"[SYNC AUTH ERROR] creator={creator_id}: {exc}")
@@ -939,19 +952,16 @@ async def sync_chats(
             except ApiFanslyConfigurationError as exc:
                 print(f"[SYNC CONFIG ERROR] creator={creator_id}: {exc}")
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
-            data = response.json()
-            data_inner = data.get("data", {}).get("data", {})
-            response_data = data_inner.get("response", {})
-            cursor = data_inner.get("nextCursor")
-            chats = response_data.get("data", [])
-            accounts = response_data.get("aggregationData", {}).get("accounts", [])
             for a in accounts:
                 aid = str(a.get("id", ""))
                 if aid:
                     account_lookup[aid] = a
 
             if not all_chats:
-                print(f"[SYNC RAW] {str(response_data)[:500]}")
+                print(
+                    f"[SYNC FIRST PAGE] chats={len(chats)} "
+                    f"accounts={len(accounts)}"
+                )
 
             print(f"[SYNC CHATS] batch={len(chats)} total={len(all_chats)+len(chats)} nextCursor={cursor}")
 
@@ -1012,6 +1022,22 @@ async def sync_chats(
             synced += 1
 
         await _stamp_vault_op(creator_id, "last_chat_reconcile_at")
+        audience_sync = None
+        if force or not incremental:
+            try:
+                from services.fansly_audience import sync_fansly_audience
+
+                audience_sync = await sync_fansly_audience(
+                    creator_id,
+                    str(apifansly_id),
+                )
+            except Exception as exc:
+                # Chat sync remains useful even when a newer audience endpoint is
+                # temporarily unavailable. The failure is explicit in the result.
+                audience_sync = {"status": "error", "detail": str(exc)}
+                print(
+                    f"[FANSLY AUDIENCE ERROR] creator={creator_id}: {exc}"
+                )
         print(
             f"[SYNC CHATS] incremental={incremental} total_chats={len(all_chats)} "
             f"synced={synced} new={new_chats}"
@@ -1021,10 +1047,14 @@ async def sync_chats(
             "mode": "incremental" if incremental else "full",
             "synced": synced,
             "new_chats": new_chats,
+            "audience": audience_sync,
         }
 
 
-@app.post("/load-history/{creator_id}/{fan_id}")
+@app.post(
+    "/load-history/{creator_id}/{fan_id}",
+    dependencies=[Depends(require_creator_fan_access)],
+)
 async def load_fan_history(creator_id: str, fan_id: str) -> dict:
     import httpx
 
@@ -1068,30 +1098,15 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
 
     async with httpx.AsyncClient() as client:
         while True:
-            params = {"limit": 10}
-            if cursor:
-                params["cursor"] = cursor
-
-            response = await client.get(
-                apifansly_url(f"{apifansly_id}/chats/{group_id}/messages"),
-                headers=apifansly_headers(),
-                params=params,
-                timeout=30,
+            messages, account_media_batch, cursor = (
+                await apifansly_list_chat_messages(
+                    str(apifansly_id),
+                    str(group_id),
+                    cursor=cursor,
+                    limit=10,
+                    client=client,
+                )
             )
-            raise_for_apifansly_response(
-                response,
-                operation="chat history load",
-                account_id=apifansly_id,
-            )
-            data = response.json()
-            data_inner = data.get("data", {}).get("data", {})
-            response_data = data_inner.get("response", {})
-            cursor = data_inner.get("nextCursor")
-            messages = response_data.get("messages", [])
-            account_media_batch = response_data.get("accountMedia", [])
-            print(f"[CURSOR CHECK] keys={list(response_data.keys())} cursor={cursor}")
-            if not all_messages:
-                print(f"[HISTORY END] {str(response_data)[-500:]}")
 
             print(f"[LOAD HISTORY] batch={len(messages)} total={len(all_messages)+len(messages)} nextCursor={cursor}")
 
@@ -1206,7 +1221,10 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
     return {"status": "ok", "imported": imported}
 
 
-@app.post("/mark-all-read/{creator_id}")
+@app.post(
+    "/mark-all-read/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def mark_all_read(creator_id: str) -> dict:
     import httpx
 
@@ -1231,7 +1249,10 @@ async def mark_all_read(creator_id: str) -> dict:
     return {"status": "ok"}
 
 
-@app.post("/sync-vault/{creator_id}")
+@app.post(
+    "/sync-vault/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def sync_vault(creator_id: str) -> dict:
     import httpx
 
@@ -1247,18 +1268,10 @@ async def sync_vault(creator_id: str) -> dict:
     apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
     async with httpx.AsyncClient() as client:
         # Step 1: Get all albums
-        resp = await client.get(
-            apifansly_url(f"{apifansly_id}/vault/albums"),
-            headers=apifansly_headers(),
-            timeout=30,
+        albums = await apifansly_list_vault_albums(
+            str(apifansly_id),
+            client=client,
         )
-        raise_for_apifansly_response(
-            resp,
-            operation="vault album synchronization",
-            account_id=apifansly_id,
-        )
-        albums_data = resp.json()
-        albums = albums_data.get("data", {}).get("data", {}).get("response", {}).get("albums", [])
         print(f"[VAULT] found {len(albums)} albums")
 
         total_synced = 0
@@ -1272,36 +1285,17 @@ async def sync_vault(creator_id: str) -> dict:
 
             cursor = None
             while True:
-                params = {"limit": 50}
-                if cursor:
-                    params["cursor"] = cursor
-
-                media_resp = await client.get(
-                    apifansly_url(f"{apifansly_id}/vault/albums/{album_id}/media"),
-                    headers=apifansly_headers(),
-                    params=params,
-                    timeout=30,
-                )
-                raise_for_apifansly_response(
-                    media_resp,
-                    operation="vault media synchronization",
-                    account_id=apifansly_id,
-                )
-                media_data = media_resp.json()
-                print(f"[VAULT ALBUM RAW] {str(media_data)[:500]}")
-                data_l1 = media_data.get("data", {})
-                cursor = data_l1.get("nextCursor")
-                outer = data_l1.get("data", {})
-                response_data = outer.get("response", {})
-                items = response_data if isinstance(response_data, list) else (
-                    response_data.get("data") or response_data.get("media") or []
+                items, cursor = await apifansly_list_vault_album_media(
+                    str(apifansly_id),
+                    str(album_id),
+                    cursor=cursor,
+                    limit=50,
+                    client=client,
                 )
 
                 print(f"[VAULT] album={album_title} batch={len(items)} cursor={cursor}")
 
                 if not items:
-                    # Log raw to debug structure
-                    print(f"[VAULT RAW] {str(media_data)[:300]}")
                     break
 
                 for item in items:
@@ -1342,7 +1336,10 @@ async def sync_vault(creator_id: str) -> dict:
         return {"status": "ok", "synced": total_synced}
 
 
-@app.post("/sync-vault-start/{creator_id}")
+@app.post(
+    "/sync-vault-start/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
     if creator_id in _vault_sync_state and _vault_sync_state[creator_id].get("status") == "running":
         return {"status": "already_running"}
@@ -1357,7 +1354,10 @@ async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
     return {"status": "started"}
 
 
-@app.get("/sync-vault-status/{creator_id}")
+@app.get(
+    "/sync-vault-status/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def sync_vault_status(creator_id: str) -> dict:
     state = _vault_sync_state.get(creator_id, {"status": "idle", "synced": 0, "total": 0, "album": ""})
     return state
@@ -1388,18 +1388,10 @@ async def _run_vault_sync(creator_id: str) -> None:
         existing_ids = {r["media_id"] for r in (existing_rows.data or [])}
 
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                apifansly_url(f"{apifansly_id}/vault/albums"),
-                headers=apifansly_headers(),
-                timeout=30,
+            albums = await apifansly_list_vault_albums(
+                str(apifansly_id),
+                client=client,
             )
-            raise_for_apifansly_response(
-                resp,
-                operation="incremental vault album synchronization",
-                account_id=apifansly_id,
-            )
-            albums_data = resp.json()
-            albums = albums_data.get("data", {}).get("data", {}).get("response", {}).get("albums", [])
 
             total = sum(a.get("itemCount", 0) for a in albums)
             already = len(existing_ids)
@@ -1416,27 +1408,13 @@ async def _run_vault_sync(creator_id: str) -> None:
                 consecutive_dupe_batches = 0
 
                 while True:
-                    params = {"limit": 50}
-                    if cursor:
-                        params["cursor"] = cursor
-
-                    media_resp = await client.get(
-                        apifansly_url(f"{apifansly_id}/vault/albums/{album_id}/media"),
-                        headers=apifansly_headers(),
-                        params=params,
-                        timeout=30,
+                    items, cursor = await apifansly_list_vault_album_media(
+                        str(apifansly_id),
+                        str(album_id),
+                        cursor=cursor,
+                        limit=50,
+                        client=client,
                     )
-                    raise_for_apifansly_response(
-                        media_resp,
-                        operation="incremental vault media synchronization",
-                        account_id=apifansly_id,
-                    )
-                    media_data = media_resp.json()
-                    data_l1 = media_data.get("data", {})
-                    cursor = data_l1.get("nextCursor")
-                    outer = data_l1.get("data", {})
-                    response_data = outer.get("response", {})
-                    items = response_data if isinstance(response_data, list) else []
 
                     if not items:
                         break
@@ -1559,7 +1537,10 @@ async def _run_vault_sync(creator_id: str) -> None:
         _vault_sync_state[creator_id] = {"status": "error", "synced": 0, "total": 0, "album": str(e)}
 
 
-@app.post("/upload-vault-media/{creator_id}")
+@app.post(
+    "/upload-vault-media/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def upload_vault_media(creator_id: str, request: Request) -> dict:
     import httpx
 
@@ -2021,7 +2002,10 @@ async def _stale_approved_set_media_ids(creator_id: str) -> list[str]:
 _categorize_state: dict = {}
 
 
-@app.post("/categorize-vault/{creator_id}")
+@app.post(
+    "/categorize-vault/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def categorize_vault(
     creator_id: str,
     mode: str = "auto",
@@ -2124,7 +2108,10 @@ async def categorize_vault(
     }
 
 
-@app.get("/categorize-vault-status/{creator_id}")
+@app.get(
+    "/categorize-vault-status/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def categorize_vault_status(creator_id: str) -> dict:
     return _categorize_state.get(creator_id, {"status": "idle", "done": 0, "total": 0})
 
@@ -2133,7 +2120,10 @@ class VaultCategorizationSettingsRequest(BaseModel):
     auto_categorize_new_media: bool
 
 
-@app.put("/creator/{creator_id}/vault-categorization-settings")
+@app.put(
+    "/creator/{creator_id}/vault-categorization-settings",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def update_vault_categorization_settings(
     creator_id: str,
     settings: VaultCategorizationSettingsRequest,
@@ -2171,7 +2161,10 @@ async def _manual_recategorization_usage(creator_id: str) -> dict:
     )
 
 
-@app.get("/creator/{creator_id}/vault-categorization-overview")
+@app.get(
+    "/creator/{creator_id}/vault-categorization-overview",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def vault_categorization_overview(creator_id: str) -> dict:
     db = get_supabase()
     creator = await asyncio.to_thread(
@@ -2201,7 +2194,10 @@ async def vault_categorization_overview(creator_id: str) -> dict:
     }
 
 
-@app.get("/vault-media-url/{creator_id}/{media_id}")
+@app.get(
+    "/vault-media-url/{creator_id}/{media_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def get_vault_media_url(creator_id: str, media_id: str) -> dict:
     """Look up a vault media item's URL and thumbnail by fansly_media_id."""
     db = get_supabase()
@@ -2414,7 +2410,10 @@ async def _categorize_single_item_with_retry(item: dict, max_retries: int = 3) -
     return await _categorize_single_item(item)
 
 
-@app.post("/recategorize-item/{item_id}")
+@app.post(
+    "/recategorize-item/{item_id}",
+    dependencies=[Depends(require_vault_item_path_access)],
+)
 async def recategorize_item(item_id: str) -> dict:
     db = get_supabase()
     row = await asyncio.to_thread(
@@ -2474,7 +2473,10 @@ async def recategorize_item(item_id: str) -> dict:
     return {"status": "ok", "item": updated.data, "manual_reanalysis": usage}
 
 
-@app.get("/media/{account_id}/{content_id}")
+@app.get(
+    "/media/{account_id}/{content_id}",
+    dependencies=[Depends(require_account_path_access)],
+)
 async def get_media_url(account_id: str, content_id: str) -> dict:
     import httpx
 
@@ -2552,71 +2554,121 @@ async def _enrich_fan_profile(fan_id: str, creator_id: str, platform_fan_id: str
 
 @app.post("/webhook/fansly")
 async def fansly_webhook(payload: dict) -> dict:
-    print(f"[FANSLY WEBHOOK RAW] {payload}")
+    print(
+        f"[FANSLY WEBHOOK] event={payload.get('event')} "
+        f"account={payload.get('accountId')}"
+    )
 
     event = payload.get("event")
     data = payload.get("data") or {}
+    api_account_id = str(payload.get("accountId") or "")
+    db = get_supabase()
+
+    creator: dict = {}
+    if api_account_id:
+        creator_result = await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("id, auto_mode, auto_mode_new_fans, fansly_account_id")
+            .eq("apifansly_account_id", api_account_id)
+            .limit(1)
+            .execute()
+        )
+        creator = (creator_result.data or [{}])[0]
+    if api_account_id and not creator:
+        print(
+            f"[FANSLY WEBHOOK] ignored unknown API account={api_account_id} "
+            f"event={event}"
+        )
+        return {"status": "creator_not_found"}
+
+    if event == "ppv.purchased":
+        creator_id = str(creator.get("id") or "")
+        platform_fan_id = str(data.get("accountId") or "")
+        account_media_id = str(data.get("accountMediaId") or "")
+        price_cents = int(
+            ((data.get("orderMetadata") or {}).get("accountMediaPrice"))
+            or 0
+        )
+        if not creator_id or not platform_fan_id:
+            return {"status": "invalid_ppv_purchase_event"}
+
+        fan_result = await asyncio.to_thread(
+            lambda: db.table("fans")
+            .select("id, pending_ppv_check")
+            .eq("creator_id", creator_id)
+            .eq("platform_fan_id", platform_fan_id)
+            .limit(1)
+            .execute()
+        )
+        fans = fan_result.data or []
+        if not fans:
+            print(
+                f"[PPV WEBHOOK] fan not found creator={creator_id} "
+                f"platform_fan={platform_fan_id}"
+            )
+            return {"status": "fan_not_found"}
+
+        fan_row = fans[0]
+        pending = fan_row.get("pending_ppv_check") or {}
+        expected_cents = int(
+            pending.get("price_cents")
+            or round(float(pending.get("price") or 0) * 100)
+        )
+        if expected_cents and price_cents:
+            delta = abs(expected_cents - price_cents)
+            if delta > max(100, int(expected_cents * 0.1)):
+                from db.queries import freeze_fan_for_review
+
+                await freeze_fan_for_review(
+                    str(fan_row["id"]),
+                    "ppv_webhook_price_mismatch",
+                )
+                print(
+                    f"[PPV WEBHOOK] price mismatch fan={fan_row['id']} "
+                    f"expected={expected_cents} actual={price_cents}"
+                )
+                return {"status": "review_required"}
+
+        purchase_media_id = str(
+            pending.get("media_id")
+            or account_media_id
+        )
+        if not purchase_media_id:
+            return {"status": "invalid_ppv_purchase_event"}
+
+        from services.suggestions import record_ppv_purchase
+
+        await record_ppv_purchase(
+            str(fan_row["id"]),
+            purchase_media_id,
+            (price_cents / 100.0) if price_cents else None,
+        )
+        print(
+            f"[PPV WEBHOOK] confirmed fan={fan_row['id']} "
+            f"media={purchase_media_id} cents={price_cents}"
+        )
+        return {"status": "ok"}
 
     if event == "tips.received":
-        sender_id = str(data.get("fromUser", {}).get("id", ""))
-        amount = data.get("netAmount", 0) or data.get("grossAmount", 0)
+        # The current documented tip payload identifies the connected creator
+        # but not the sending fan. Never guess by searching platform_fan_id
+        # globally; a later transaction sync can attribute it safely.
+        print(
+            f"[TIP WEBHOOK] reconciliation required creator={creator.get('id')} "
+            f"correlation={data.get('correlationId')} cents={data.get('amount')}"
+        )
+        return {"status": "queued_for_reconciliation"}
 
-        print(f"[TIP] sender={sender_id} amount={amount}")
+    if event == "subscriptions.new":
+        if not creator or not api_account_id:
+            return {"status": "creator_not_found"}
+        from services.fansly_audience import sync_fansly_audience
 
-        if sender_id and amount:
-            try:
-                amt = float(amount)
-            except (TypeError, ValueError):
-                amt = 0.0
-            if amt:
-                from datetime import datetime, timezone
-                db = get_supabase()
-                fan_row = await asyncio.to_thread(
-                    lambda: db.table("fans")
-                    .select("id, total_spent, creator_id, auto_mode")
-                    .eq("platform_fan_id", sender_id)
-                    .limit(1)
-                    .execute()
-                )
-                rows = fan_row.data or []
-                if rows:
-                    r = rows[0]
-                    new_total = int((r.get("total_spent") or 0) + round(amt))
-                    fid = str(r["id"])
-                    creator_id = str(r.get("creator_id", ""))
-
-                    # Update total_spent and store pending_tip for AI acknowledgement
-                    await asyncio.to_thread(
-                        lambda: db.table("fans")
-                        .update({
-                            "total_spent": new_total,
-                            "pending_tip": {
-                                "amount": amt,
-                                "received_at": datetime.now(timezone.utc).isoformat(),
-                            },
-                        })
-                        .eq("id", fid)
-                        .execute()
-                    )
-                    print(f"[TIP] Updated total_spent={new_total} for fan={fid}, pending_tip queued")
-
-                    # If creator has auto_mode on, schedule an AI reply to acknowledge the tip
-                    if creator_id:
-                        creator_row = await asyncio.to_thread(
-                            lambda: db.table("creators")
-                            .select("auto_mode")
-                            .eq("id", creator_id)
-                            .single()
-                            .execute()
-                        )
-                        creator_auto = (creator_row.data or {}).get("auto_mode", False)
-                        fan_auto = r.get("auto_mode")
-                        effective_auto = fan_auto if fan_auto is not None else creator_auto
-                        if effective_auto:
-                            from services.suggestions import schedule_auto_reply
-                            schedule_auto_reply(fid, creator_id)
-                            print(f"[TIP] Scheduled auto-reply for tip acknowledgement fan={fid}")
-        return {"status": "ok"}
+        spawn(
+            sync_fansly_audience(str(creator["id"]), api_account_id),
+            name="sync_fansly_audience",
+        )
+        return {"status": "audience_sync_scheduled"}
 
     if event != "messages.received":
         return {"status": "skipped"}
@@ -2656,21 +2708,23 @@ async def fansly_webhook(payload: dict) -> dict:
         f"creator_platform={creator_platform_id} content={message_content[:50]}"
     )
 
-    db = get_supabase()
-    print(f"[DEBUG] looking up creator with fansly_account_id='{creator_platform_id}' len={len(creator_platform_id)}")
-    creator_row = await asyncio.to_thread(
-        lambda: db.table("creators")
-        .select("id, auto_mode, auto_mode_new_fans")
-        .eq("fansly_account_id", creator_platform_id)
-        .limit(1)
-        .execute()
-    )
-    if not creator_row.data:
+    if not creator:
+        # Backward-compatible fallback for older webhook deliveries that did not
+        # include the top-level API account identifier.
+        creator_result = await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("id, auto_mode, auto_mode_new_fans, fansly_account_id")
+            .eq("fansly_account_id", creator_platform_id)
+            .limit(1)
+            .execute()
+        )
+        creator = (creator_result.data or [{}])[0]
+    if not creator:
         print(f"[WEBHOOK] creator not found for platform_id={creator_platform_id}")
         return {"status": "creator_not_found"}
 
-    creator_id = creator_row.data[0]["id"]
-    auto_mode = creator_row.data[0].get("auto_mode", False)
+    creator_id = creator["id"]
+    auto_mode = creator.get("auto_mode", False)
 
     fan = await get_fan(creator_id, platform_fan_id)
     if not fan:
@@ -2734,7 +2788,10 @@ async def fansly_webhook(payload: dict) -> dict:
     return {"status": "ok"}
 
 
-@app.delete("/creators/{creator_id}")
+@app.delete(
+    "/creators/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def delete_creator(creator_id: str) -> dict:
     db = get_supabase()
 
@@ -2790,12 +2847,15 @@ async def delete_creator(creator_id: str) -> dict:
 
 
 @app.get("/my-creators")
-async def get_my_creators(user_id: str) -> dict:
+async def get_my_creators(request: Request, user_id: str | None = None) -> dict:
+    operator_id = dashboard_user_id(request) or user_id
+    if not operator_id:
+        raise HTTPException(status_code=401, detail="Missing dashboard user session")
     db = get_supabase()
     links = await asyncio.to_thread(
         lambda: db.table("chatter_creators")
         .select("creator_id")
-        .eq("chatter_id", user_id)
+        .eq("chatter_id", operator_id)
         .execute()
     )
     creator_ids = [r["creator_id"] for r in (links.data or [])]
@@ -2811,7 +2871,10 @@ async def get_my_creators(user_id: str) -> dict:
     return {"creators": creators.data or []}
 
 
-@app.get("/creator/{creator_id}/auto-availability")
+@app.get(
+    "/creator/{creator_id}/auto-availability",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def auto_availability(creator_id: str) -> dict:
     """Auto-mode is only available when at least one approved set exists.
     Single source of truth for the dashboard's auto gate + a backend guard."""
@@ -2828,7 +2891,10 @@ async def auto_availability(creator_id: str) -> dict:
     return {"auto_available": count > 0, "approved_sets": count}
 
 
-@app.get("/creator/{creator_id}/commercial-policy")
+@app.get(
+    "/creator/{creator_id}/commercial-policy",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def read_commercial_policy(creator_id: str) -> dict:
     from db.commercial_queries import get_creator_policy
 
@@ -2836,7 +2902,10 @@ async def read_commercial_policy(creator_id: str) -> dict:
     return {"creator_id": creator_id, "policy": policy.model_dump(mode="json")}
 
 
-@app.put("/creator/{creator_id}/commercial-policy")
+@app.put(
+    "/creator/{creator_id}/commercial-policy",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def update_commercial_policy(creator_id: str, policy: CreatorPolicy) -> dict:
     from db.commercial_queries import save_creator_policy
 
@@ -2844,7 +2913,10 @@ async def update_commercial_policy(creator_id: str, policy: CreatorPolicy) -> di
     return {"status": "ok", "creator_id": creator_id, "policy": saved.model_dump(mode="json")}
 
 
-@app.get("/creator/{creator_id}/auto-audience-policy")
+@app.get(
+    "/creator/{creator_id}/auto-audience-policy",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def read_auto_audience_policy(creator_id: str) -> dict:
     db = get_supabase()
     result = await asyncio.to_thread(
@@ -2863,7 +2935,10 @@ async def read_auto_audience_policy(creator_id: str) -> dict:
     return {"creator_id": creator_id, "policy": policy.model_dump(mode="json")}
 
 
-@app.put("/creator/{creator_id}/auto-audience-policy")
+@app.put(
+    "/creator/{creator_id}/auto-audience-policy",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def update_auto_audience_policy(
     creator_id: str,
     policy: AutoAudiencePolicy,
@@ -2880,7 +2955,10 @@ async def update_auto_audience_policy(
     return {"status": "ok", "creator_id": creator_id, "policy": policy.model_dump(mode="json")}
 
 
-@app.get("/creator/{creator_id}/auto-audience-preview")
+@app.get(
+    "/creator/{creator_id}/auto-audience-preview",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def preview_auto_audience(creator_id: str) -> dict:
     from collections import Counter
     from services.auto_audience import AutoAudiencePolicy, evaluate_auto_eligibility
@@ -2981,7 +3059,10 @@ async def preview_auto_audience(creator_id: str) -> dict:
     }
 
 
-@app.get("/fan/{fan_id}/commercial-state")
+@app.get(
+    "/fan/{fan_id}/commercial-state",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def read_commercial_state(fan_id: str) -> dict:
     from db.commercial_queries import get_fan_state
 
@@ -3009,7 +3090,10 @@ class ResolveFanReviewRequest(BaseModel):
     amount: float | None = None
 
 
-@app.get("/fan/{fan_id}/full-auto-status")
+@app.get(
+    "/fan/{fan_id}/full-auto-status",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def read_full_auto_status(fan_id: str) -> dict:
     from services.full_auto_operations import (
         FullAutoStatusUnavailable,
@@ -3026,7 +3110,10 @@ async def read_full_auto_status(fan_id: str) -> dict:
         ) from exc
 
 
-@app.post("/fan/{fan_id}/resolve-review")
+@app.post(
+    "/fan/{fan_id}/resolve-review",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def resolve_review(fan_id: str, request: ResolveFanReviewRequest) -> dict:
     """Resolve a frozen conversation through a deterministic backend action."""
     from services.ppv_recovery import PPVRecoveryError, resolve_fan_review
@@ -3041,7 +3128,10 @@ async def resolve_review(fan_id: str, request: ResolveFanReviewRequest) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.get("/creator/{creator_id}/full-auto-health")
+@app.get(
+    "/creator/{creator_id}/full-auto-health",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def read_full_auto_health(creator_id: str) -> dict:
     from services.full_auto_operations import (
         FullAutoStatusUnavailable,
@@ -3058,7 +3148,10 @@ async def read_full_auto_health(creator_id: str) -> dict:
         ) from exc
 
 
-@app.get("/creator/{creator_id}/fansly-integration-health")
+@app.get(
+    "/creator/{creator_id}/fansly-integration-health",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def read_fansly_integration_health(creator_id: str) -> dict:
     """Verify that the current API key can access this creator connection."""
     import httpx
@@ -3090,8 +3183,7 @@ async def read_fansly_integration_health(creator_id: str) -> dict:
         }
 
     try:
-        endpoint = apifansly_url(f"{account_id}/me")
-        request_headers = apifansly_headers()
+        await apifansly_current_account(str(account_id))
     except ApiFanslyConfigurationError as exc:
         return {
             **common,
@@ -3102,18 +3194,6 @@ async def read_fansly_integration_health(creator_id: str) -> dict:
             "detail": str(exc),
         }
 
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                endpoint,
-                headers=request_headers,
-                timeout=20,
-            )
-        raise_for_apifansly_response(
-            response,
-            operation="integration health check",
-            account_id=account_id,
-        )
     except ApiFanslyAccountAccessError as exc:
         return {
             **common,
@@ -3143,7 +3223,10 @@ async def read_fansly_integration_health(creator_id: str) -> dict:
     }
 
 
-@app.get("/creator/{creator_id}/ppv-approvals")
+@app.get(
+    "/creator/{creator_id}/ppv-approvals",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def read_ppv_approvals(creator_id: str, status: str = "pending") -> dict:
     from services.ppv_delivery import list_ppv_approval_requests
 
@@ -3156,7 +3239,10 @@ async def read_ppv_approvals(creator_id: str, status: str = "pending") -> dict:
     }
 
 
-@app.post("/ppv-approvals/{request_id}/approve")
+@app.post(
+    "/ppv-approvals/{request_id}/approve",
+    dependencies=[Depends(require_ppv_approval_path_access)],
+)
 async def approve_ppv_approval(
     request_id: str,
     request: ResolvePPVApprovalRequest,
@@ -3169,7 +3255,10 @@ async def approve_ppv_approval(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.post("/ppv-approvals/{request_id}/reject")
+@app.post(
+    "/ppv-approvals/{request_id}/reject",
+    dependencies=[Depends(require_ppv_approval_path_access)],
+)
 async def reject_ppv_approval(
     request_id: str,
     request: ResolvePPVApprovalRequest,
@@ -3182,7 +3271,10 @@ async def reject_ppv_approval(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.get("/fan/{fan_id}/operator-ppv-options")
+@app.get(
+    "/fan/{fan_id}/operator-ppv-options",
+    dependencies=[Depends(require_creator_fan_access)],
+)
 async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
     """Return approved sets and vault media with authoritative sale/send state."""
     db = get_supabase()
@@ -3273,7 +3365,10 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
     }
 
 
-@app.post("/fan/{fan_id}/operator-ppv")
+@app.post(
+    "/fan/{fan_id}/operator-ppv",
+    dependencies=[Depends(require_creator_fan_access)],
+)
 async def send_operator_ppv(
     fan_id: str,
     creator_id: str,
@@ -3346,7 +3441,10 @@ async def send_operator_ppv(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@app.post("/fan/{fan_id}/cancel-followup")
+@app.post(
+    "/fan/{fan_id}/cancel-followup",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def cancel_followup(
     fan_id: str,
     request: CancelFollowupRequest,
@@ -3356,7 +3454,10 @@ async def cancel_followup(
     return await cancel_fan_followup(fan_id, request.action_type)
 
 
-@app.post("/plan-session/{creator_id}/{fan_id}")
+@app.post(
+    "/plan-session/{creator_id}/{fan_id}",
+    dependencies=[Depends(require_creator_fan_access)],
+)
 async def plan_session(
     creator_id: str,
     fan_id: str,
@@ -3384,7 +3485,10 @@ async def plan_session(
     )
 
 
-@app.get("/session/{fan_id}")
+@app.get(
+    "/session/{fan_id}",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def get_session(fan_id: str) -> dict:
     from db.queries import get_fan_session
 
@@ -3392,7 +3496,10 @@ async def get_session(fan_id: str) -> dict:
     return {"session": session}
 
 
-@app.post("/session/{fan_id}/advance")
+@app.post(
+    "/session/{fan_id}/advance",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def advance_session(fan_id: str) -> dict:
     """Mark current step sent. Purchase confirmation advances the index."""
     from db.queries import get_fan_session, save_fan_session
@@ -3414,7 +3521,10 @@ async def advance_session(fan_id: str) -> dict:
     }
 
 
-@app.post("/session/{fan_id}/purchased/{media_id}")
+@app.post(
+    "/session/{fan_id}/purchased/{media_id}",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def mark_session_purchased(
     fan_id: str,
     media_id: str,
@@ -3426,14 +3536,20 @@ async def mark_session_purchased(
     return {"status": "ok", "fan_id": fan_id, "media_id": media_id}
 
 
-@app.post("/fan/{fan_id}/record-purchase/{media_id}")
+@app.post(
+    "/fan/{fan_id}/record-purchase/{media_id}",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def record_purchase_endpoint(fan_id: str, media_id: str, amount: float | None = None):
     from services.suggestions import record_ppv_purchase
     await record_ppv_purchase(fan_id, media_id, amount)
     return {"status": "ok", "fan_id": fan_id, "media_id": media_id}
 
 
-@app.delete("/session/{fan_id}")
+@app.delete(
+    "/session/{fan_id}",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def clear_session(fan_id: str) -> dict:
     """End and clear the active session."""
     from db.queries import save_fan_session
@@ -3442,7 +3558,10 @@ async def clear_session(fan_id: str) -> dict:
     return {"status": "ok"}
 
 
-@app.post("/enrich-fan/{fan_id}")
+@app.post(
+    "/enrich-fan/{fan_id}",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def enrich_fan_endpoint(fan_id: str) -> dict:
     db = get_supabase()
     fan_row = await asyncio.to_thread(
@@ -3461,7 +3580,10 @@ async def enrich_fan_endpoint(fan_id: str) -> dict:
     return {"status": "ok"}
 
 
-@app.post("/test/simulate-ppv-purchase")
+@app.post(
+    "/test/simulate-ppv-purchase",
+    dependencies=[Depends(require_fan_path_access)],
+)
 async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
     """Dev only — simulate a fan purchasing a pending PPV."""
     from db.queries import get_fan_session, save_fan_session
@@ -3536,7 +3658,10 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
     }
 
 
-@app.post("/test/inject-message")
+@app.post(
+    "/test/inject-message",
+    dependencies=[Depends(require_creator_fan_access)],
+)
 async def test_inject_message(fan_id: str, creator_id: str, content: str) -> dict:
     """Dev testing only — simulate a fan message without Fansly webhook."""
     from db.queries import save_message
@@ -3545,7 +3670,10 @@ async def test_inject_message(fan_id: str, creator_id: str, content: str) -> dic
     return {"status": "ok", "fan_id": fan_id, "content": content}
 
 
-@app.post("/generate-sets/{creator_id}")
+@app.post(
+    "/generate-sets/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def generate_sets(creator_id: str) -> dict:
     from db.queries import propose_sets
     db = get_supabase()
@@ -3596,7 +3724,10 @@ async def generate_sets(creator_id: str) -> dict:
     return {"status": "ok", "drafts_created": inserted, "from_items": len(items)}
 
 
-@app.get("/debug-scenes/{creator_id}")
+@app.get(
+    "/debug-scenes/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
 async def debug_scenes(creator_id: str) -> dict:
     from db.queries import get_vault_for_session, build_scenes
     vault = await get_vault_for_session(creator_id, min_explicitness=2)

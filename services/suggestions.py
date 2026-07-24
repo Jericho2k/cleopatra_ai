@@ -35,6 +35,8 @@ from services.ppv_delivery import create_ppv_approval_request
 from services.db_reliability import retry_transient_db_operation
 from services.apifansly import (
     headers as apifansly_headers,
+    send_message as send_apifansly_message,
+    sent_message_id,
     url as apifansly_url,
 )
 from services.ppv_persistence import (
@@ -824,25 +826,22 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
 
             if pending and group_id_resend and apifansly_id_resend:
                 media_id_resend = pending.get("media_id")
+                media_ids_resend = (
+                    pending.get("media_ids")
+                    or ([media_id_resend] if media_id_resend else [])
+                )
                 price_resend = pending.get("price")
                 if media_id_resend and price_resend:
                     print(f"[PPV RESEND] Resending media={media_id_resend} price={price_resend} for fan={fan_id}")
                     try:
-                        async with httpx.AsyncClient() as hc:
-                            ppv_resp = await hc.post(
-                                apifansly_url(
-                                    f"{apifansly_id_resend}/chats/{group_id_resend}/messages"
-                                ),
-                                headers=apifansly_headers(json_content=True),
-                                json={
-                                    "content": "sorry about that, here it is again 😏",
-                                    "mediaId": media_id_resend,
-                                    "access_type": "ppv",
-                                    "price": price_resend,
-                                },
-                                timeout=10,
-                            )
-                        print(f"[PPV RESEND] status={ppv_resp.status_code} body={ppv_resp.text[:200]}")
+                        await send_apifansly_message(
+                            str(apifansly_id_resend),
+                            str(group_id_resend),
+                            content="sorry about that, here it is again 😏",
+                            media_ids=media_ids_resend,
+                            price_dollars=float(price_resend),
+                        )
+                        print("[PPV RESEND] accepted=true")
                         await save_message(fan_id, creator_id, "creator", "sorry about that, here it is again 😏", was_ai_suggested=True)
                         return  # Skip normal generation
                     except Exception as e:
@@ -1198,33 +1197,20 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         "this is what I've been saving 😈",
                         "don't say I never spoil you 💋",
                     ])
-                    async with httpx.AsyncClient() as hc:
-                        ppv_resp = await hc.post(
-                            apifansly_url(
-                                f"{apifansly_account_id}/chats/{str(group_id)}/messages"
-                            ),
-                            headers=apifansly_headers(json_content=True),
-                            json={
-                                "content": ppv_content,
-                                "mediaIds": media_ids,
-                                "mediaId": media_id,
-                                "access_type": "ppv",
-                                "price": price,
-                            },
-                            timeout=10,
+                    response_body = await send_apifansly_message(
+                        str(apifansly_account_id),
+                        str(group_id),
+                        content=ppv_content,
+                        media_ids=media_ids,
+                        price_dollars=float(price),
+                    )
+                    platform_message_id = sent_message_id(response_body)
+                    if not platform_message_id:
+                        raise RuntimeError(
+                            "platform accepted PPV but did not return a message ID"
                         )
-                    ppv_resp.raise_for_status()
-                    try:
-                        response_body = ppv_resp.json()
-                        platform_message_id = str(
-                            response_body.get("id")
-                            or response_body.get("data", {}).get("id")
-                            or ""
-                        ) or None
-                    except Exception:
-                        platform_message_id = None
                     print(
-                        f"[PPV SEND] status={ppv_resp.status_code} media={media_id} "
+                        f"[PPV SEND] accepted=true media={media_id} "
                         f"price={price} reference={delivery_reference}"
                     )
                 else:

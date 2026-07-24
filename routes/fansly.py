@@ -1,6 +1,10 @@
-from fastapi import APIRouter, HTTPException
+import asyncio
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
+from core.supabase import get_supabase
+from core.tenancy import require_account_path_access, require_creator_access
 from main import fansly_poller, session_store
 
 fansly_router = APIRouter(prefix="/fansly", tags=["fansly"])
@@ -18,7 +22,7 @@ class ConnectAccountRequest(BaseModel):
 
 
 @fansly_router.post("/connect")
-async def connect_fansly_account(req: ConnectAccountRequest):
+async def connect_fansly_account(req: ConnectAccountRequest, request: Request):
     """
     Onboard a model's Fansly account into Cleopatra.
 
@@ -36,6 +40,8 @@ async def connect_fansly_account(req: ConnectAccountRequest):
        - fansly-client-check header value
        - From the Cookie header, find f-s-c=XXXXX and copy just XXXXX
     """
+    await require_creator_access(request, req.creator_id)
+
     from services.fansly_client import FanslyClient, SessionExpiredError
 
     client = FanslyClient(
@@ -78,7 +84,10 @@ class SendMessageRequest(BaseModel):
     content: str
 
 
-@fansly_router.post("/accounts/{account_id}/groups/{group_id}/messages")
+@fansly_router.post(
+    "/accounts/{account_id}/groups/{group_id}/messages",
+    dependencies=[Depends(require_account_path_access)],
+)
 async def send_message(account_id: str, group_id: str, req: SendMessageRequest):
     """Send a message from a model account to a fan conversation."""
     try:
@@ -89,7 +98,10 @@ async def send_message(account_id: str, group_id: str, req: SendMessageRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@fansly_router.get("/accounts/{account_id}/groups/{group_id}/messages")
+@fansly_router.get(
+    "/accounts/{account_id}/groups/{group_id}/messages",
+    dependencies=[Depends(require_account_path_access)],
+)
 async def get_messages(
     account_id: str,
     group_id: str,
@@ -102,7 +114,10 @@ async def get_messages(
     return data
 
 
-@fansly_router.get("/accounts/{account_id}/groups")
+@fansly_router.get(
+    "/accounts/{account_id}/groups",
+    dependencies=[Depends(require_account_path_access)],
+)
 async def get_chat_groups(account_id: str):
     """Get all conversations for a model account."""
     async with session_store.get_client(account_id) as client:
@@ -111,9 +126,26 @@ async def get_chat_groups(account_id: str):
 
 
 @fansly_router.get("/health")
-async def polling_health():
-    """See health status of all connected Fansly accounts."""
+async def polling_health(creator_id: str, request: Request):
+    """Return legacy poller health for one authorized creator only."""
+    await require_creator_access(request, creator_id)
+    result = await asyncio.to_thread(
+        lambda: get_supabase()
+        .table("creators")
+        .select("fansly_account_id")
+        .eq("id", creator_id)
+        .single()
+        .execute()
+    )
+    account_id = str((result.data or {}).get("fansly_account_id") or "")
+    health = session_store.get_health() if session_store else {}
     return {
-        "polling": fansly_poller.get_status() if fansly_poller else {},
-        "sessions": session_store.get_health() if session_store else {},
+        "creator_id": creator_id,
+        "connected": bool(account_id),
+        "polling": bool(
+            account_id
+            and fansly_poller
+            and account_id in getattr(fansly_poller, "_tasks", {})
+        ),
+        "session": health.get(account_id) if account_id else None,
     }

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -26,7 +25,7 @@ from services.followup_lifecycle import (
     payment_expires_at,
     pending_reference,
 )
-from services.apifansly import headers as apifansly_headers, url as apifansly_url
+from services.apifansly import request as apifansly_request, response_data
 from services.session_lifecycle import mark_step_declined
 
 
@@ -46,12 +45,19 @@ class PPVReconcileResult:
 
 
 def _matching_purchase(transactions: list[dict], expected_price: float) -> float | None:
+    """Return a matching media purchase in dollars.
+
+    API Fansly reports ``totalGross`` in cents while Cleopatra persists PPV
+    prices in dollars. Keeping the conversion here prevents a real $30 unlock
+    (3000 cents) from being treated as an unpurchased $30 offer.
+    """
+    expected_cents = int(round(float(expected_price) * 100))
     for transaction in transactions:
         if transaction.get("type") != 2110:
             continue
-        gross = float(transaction.get("totalGross") or 0)
-        if abs(gross - expected_price) / max(expected_price, 1.0) < 0.1:
-            return gross
+        gross_cents = int(round(float(transaction.get("totalGross") or 0)))
+        if abs(gross_cents - expected_cents) / max(expected_cents, 100) < 0.1:
+            return gross_cents / 100.0
     return None
 
 
@@ -107,8 +113,7 @@ async def _fetch_purchase_amount(
     platform_fan_id: str,
     pending: dict[str, Any],
 ) -> float | None:
-    api_key = os.environ.get("APIFANSLY_API_KEY")
-    if not apifansly_id or not platform_fan_id or not api_key:
+    if not apifansly_id or not platform_fan_id:
         raise RuntimeError("Fansly purchase verification is not configured")
 
     sent_at = pending.get("sent_at")
@@ -118,18 +123,17 @@ async def _fetch_purchase_amount(
     except (TypeError, ValueError):
         raise RuntimeError("Pending PPV has no valid sent_at") from None
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            apifansly_url(
-                f"{apifansly_id}/earnings/fans/{platform_fan_id}/stats"
-            ),
-            headers=apifansly_headers(),
-            params={"after": after_ms},
-            timeout=15,
-        )
-        response.raise_for_status()
-        data = response.json()
-    transactions = data.get("data", {}).get("data", {}).get("response", [])
+    payload = await apifansly_request(
+        "GET",
+        f"{apifansly_id}/earnings/fans/{platform_fan_id}/stats",
+        operation="PPV purchase verification",
+        account_id=apifansly_id,
+        params={"after": after_ms},
+        timeout=15,
+    )
+    transactions = response_data(payload)
+    if not isinstance(transactions, list):
+        raise RuntimeError("Fansly purchase verification returned an invalid response")
     return _matching_purchase(transactions, float(pending.get("price") or 0))
 
 

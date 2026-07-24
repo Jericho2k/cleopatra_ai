@@ -32,9 +32,9 @@ def run(coro):
 
 def test_matching_purchase_filters_transaction_type_and_price():
     transactions = [
-        {"type": 999, "totalGross": 45},
-        {"type": 2110, "totalGross": 80},
-        {"type": 2110, "totalGross": 44},
+        {"type": 999, "totalGross": 4500},
+        {"type": 2110, "totalGross": 8000},
+        {"type": 2110, "totalGross": 4400},
     ]
     assert reconciliation._matching_purchase(transactions, 45) == 44
     assert reconciliation._matching_purchase(transactions, 20) is None

@@ -5,8 +5,6 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import uuid
 
-import httpx
-
 from core.supabase import get_supabase
 from db.commercial_queries import get_creator_policy
 from db.queries import (
@@ -15,9 +13,8 @@ from db.queries import (
 )
 from services.db_reliability import retry_transient_db_operation
 from services.apifansly import (
-    headers as apifansly_headers,
-    raise_for_response as raise_for_apifansly_response,
-    url as apifansly_url,
+    send_message as send_apifansly_message,
+    sent_message_id,
 )
 from services.ppv_persistence import (
     persist_ppv_reconciliation,
@@ -116,31 +113,18 @@ async def send_locked_ppv(
     content = message_content.strip() or "just for you..."
     platform_message_id: str | None = None
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                apifansly_url(f"{account_id}/chats/{group_id}/messages"),
-                headers=apifansly_headers(json_content=True),
-                json={
-                    "content": content,
-                    "mediaIds": exact_media_ids,
-                    "mediaId": exact_media_ids[0],
-                    "access_type": "ppv",
-                    "price": price_dollars,
-                },
-                timeout=10,
-            )
-        raise_for_apifansly_response(
-            response,
-            operation="locked PPV delivery",
-            account_id=account_id,
+        response_body = await send_apifansly_message(
+            str(account_id),
+            str(group_id),
+            content=content,
+            media_ids=exact_media_ids,
+            price_dollars=price_dollars,
         )
-        try:
-            body = response.json()
-            platform_message_id = str(
-                body.get("id") or body.get("data", {}).get("id") or ""
-            ) or None
-        except Exception:
-            platform_message_id = None
+        platform_message_id = sent_message_id(response_body)
+        if not platform_message_id:
+            raise PPVDeliveryError(
+                "platform accepted PPV but did not return a message ID"
+            )
     except Exception as exc:
         await freeze_fan_for_review(fan_id, "ppv_send_failed")
         raise PPVDeliveryError(f"platform rejected PPV delivery: {exc}") from exc

@@ -196,7 +196,8 @@ def test_reaction_prompt_is_purchase_gated_in_send_orchestration():
     assert "persist_ppv_reconciliation(" in source
     assert "state.status = FanStatus.PAYMENT_PENDING" in persistence
     assert 'action_type="PPV_RECONCILE"' in persistence
-    assert "ppv_resp.raise_for_status()" in source
-    assert source.index("ppv_resp.raise_for_status()") < source.index(
+    assert "response_body = await send_apifansly_message(" in source
+    assert "platform accepted PPV but did not return a message ID" in source
+    assert source.index("response_body = await send_apifansly_message(") < source.index(
         "persist_ppv_reconciliation("
     )
