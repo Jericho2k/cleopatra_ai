@@ -38,6 +38,29 @@ def test_rich_media_description_preserves_searchable_visual_facts():
     assert "shower, wet look" in description
 
 
+def test_complete_provider_description_is_not_expanded_twice():
+    description = media_description(
+        {
+            "description": (
+                "Full-nudity photo in a bedroom setting using portrait framing. "
+                "Visible anatomy: breasts, vulva."
+            ),
+            "description_complete": True,
+            "scene_location": "bedroom",
+            "scene_outfit": "partially clothed nude",
+            "visible_anatomy": ["breasts", "vulva"],
+            "tags": ["bedroom", "full nudity"],
+            "explicitness": 4,
+        },
+        source="image",
+    )
+
+    assert description.count("bedroom") == 1
+    assert description.count("Visible anatomy") == 1
+    assert "Semantic tags:" not in description
+    assert description.endswith("Classification evidence: image; explicitness 4/5.")
+
+
 def test_explicit_visual_evidence_cannot_be_silently_downgraded():
     nude = {
         "category": "other",

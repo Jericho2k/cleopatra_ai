@@ -58,8 +58,11 @@ def test_explicit_nudity_becomes_searchable_nude_metadata():
     assert result["scene_outfit"] == "nude"
     assert result["pose"] == "lying"
     assert result["framing"] == "close-up"
-    assert "exposed female genitalia" in result["tags"]
+    assert "full nudity" in result["tags"]
+    assert "vulva" in result["tags"]
+    assert "explicit" not in result["tags"]
     assert "bedroom" in result["description"]
+    assert "classified with" not in result["description"].lower()
 
 
 def test_explicit_activity_with_multiple_people_becomes_bg_content():
@@ -145,12 +148,61 @@ def test_implied_and_partial_nudity_are_not_promoted_to_full_nudity():
     assert implied["scene_outfit"] == "partially nude"
 
 
-def test_rekognition_is_the_v3_default_and_batch_has_cost_circuit_breaker():
+def test_live_explicit_sample_is_sanitized_for_package_matching():
+    result = build_rekognition_metadata(
+        moderation(
+            ("Explicit", "", 99.6, 1),
+            ("Explicit Nudity", "Explicit", 99.4, 2),
+            ("Exposed Female Nipple", "Explicit Nudity", 99.1, 3),
+            ("Exposed Female Genitalia", "Explicit Nudity", 98.8, 3),
+        ),
+        general(
+            ("Skin", 99.9, 0),
+            ("Tattoo", 99.0, 0),
+            ("Blouse", 96.0, 1),
+            ("Clothing", 95.0, 1),
+            ("Body Part", 94.0, 0),
+            ("Finger", 93.0, 0),
+            ("Hand", 92.0, 0),
+            ("Baby", 91.0, 0),
+            ("Face", 90.0, 0),
+            ("Head", 89.0, 0),
+            ("Bedroom", 88.0, 0),
+            ("Bed", 87.0, 1),
+            ("Portrait", 86.0, 0),
+        ),
+        is_video=False,
+        album_title="Bedroom",
+    )
+
+    assert result["category"] == "nude_photo"
+    assert result["scene_outfit"] == "partially clothed nude"
+    assert set(result["visible_anatomy"]) == {"breasts", "vulva"}
+    assert result["description_complete"] is True
+    assert result["description"].count("bedroom") == 1
+    assert "classification evidence" not in result["description"].lower()
+    assert "baby" not in result["description"].lower()
+    assert "baby" not in result["tags"]
+    assert "skin" not in result["tags"]
+    assert "body part" not in result["tags"]
+    assert "finger" not in result["tags"]
+    assert "hand" not in result["tags"]
+    assert "face" not in result["tags"]
+    assert "head" not in result["tags"]
+    assert "explicit" not in result["tags"]
+    assert "full nudity" in result["tags"]
+    assert result["_provider_metadata"]["age_review_required"] is True
+    assert result["_provider_metadata"]["age_review_signals"] == [
+        {"label": "baby", "confidence": 91.0}
+    ]
+
+
+def test_rekognition_is_the_v4_default_and_batch_has_cost_circuit_breaker():
     root = Path(__file__).resolve().parents[1]
     env_example = (root / ".env.example").read_text()
     main_source = (root / "main.py").read_text()
 
-    assert VAULT_CLASSIFIER_VERSION == 3
+    assert VAULT_CLASSIFIER_VERSION == 4
     assert "VAULT_CLASSIFIER_PROVIDER=rekognition" in env_example
     assert 'or "rekognition"' in main_source
     assert "[CATEGORIZE ABORTED]" in main_source

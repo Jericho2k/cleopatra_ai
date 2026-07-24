@@ -2098,11 +2098,15 @@ Return ONLY one JSON object with exactly these keys:
         metadata = {
             key: data.get(key)
             for key in (
-                "description", "mood", "sexual_activity", "body_focus", "action",
+                "description", "description_complete", "mood",
+                "sexual_activity", "body_focus", "action",
                 "pose", "framing", "props", "colors", "nudity",
                 "visible_anatomy",
             )
         }
+        metadata["age_review_required"] = bool(
+            provider_metadata.get("age_review_required")
+        )
         metadata.update({
             "category": category,
             "explicitness": explicitness,

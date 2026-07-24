@@ -53,6 +53,56 @@ _UNDERWEAR = {
 }
 _KISSING = {"kissing on the lips"}
 
+_AGE_SENSITIVE_LABELS = {
+    "baby",
+    "babies",
+    "child",
+    "children",
+    "infant",
+    "kid",
+    "kids",
+    "minor",
+    "teen",
+    "teenager",
+    "toddler",
+}
+_GENERAL_NOISE_LABELS = {
+    "adult",
+    "apparel",
+    "arm",
+    "body part",
+    "clothing",
+    "face",
+    "female",
+    "finger",
+    "hand",
+    "head",
+    "human",
+    "people",
+    "person",
+    "photography",
+    "skin",
+    "woman",
+}
+_CLOTHING_LABELS = {
+    "apparel",
+    "bikini",
+    "blouse",
+    "clothing",
+    "dress",
+    "lingerie",
+    "pants",
+    "shirt",
+    "shorts",
+    "skirt",
+    "swimsuit",
+    "swimwear",
+    "t-shirt",
+    "top",
+    "underwear",
+}
+_MIN_SEMANTIC_CONFIDENCE = 70.0
+
 _ANATOMY = {
     "exposed male genitalia": "penis",
     "obstructed male genitalia": "penis",
@@ -85,11 +135,6 @@ _POSE_LABELS = (
 )
 
 _BODY_LABELS = {
-    "face",
-    "hair",
-    "head",
-    "hand",
-    "arm",
     "leg",
     "foot",
     "feet",
@@ -182,6 +227,22 @@ def build_rekognition_metadata(
         if value
     }
     general_names = {row["name"] for row in general}
+    safe_general = [
+        row
+        for row in general
+        if row["confidence"] >= _MIN_SEMANTIC_CONFIDENCE
+        and row["name"] not in _AGE_SENSITIVE_LABELS
+        and row["name"] not in _GENERAL_NOISE_LABELS
+    ]
+    safe_general_names = {row["name"] for row in safe_general}
+    age_review_signals = [
+        {
+            "label": row["name"],
+            "confidence": row["confidence"],
+        }
+        for row in general
+        if row["name"] in _AGE_SENSITIVE_LABELS
+    ]
     has_activity = bool(moderation_names.intersection(_EXPLICIT_ACTIVITY))
     has_toy = bool(moderation_names.intersection(_SEX_TOYS))
     has_exposed = bool(moderation_names.intersection(_EXPOSED))
@@ -220,7 +281,9 @@ def build_rekognition_metadata(
         ),
         default=0,
     )
-    is_closeup = bool(general_names.intersection({"close-up", "close up", "macro"}))
+    is_closeup = bool(
+        safe_general_names.intersection({"close-up", "close up", "macro"})
+    )
     if has_toy:
         category = "solo_toy_video" if is_video else "solo_toy_photo"
     elif has_activity and person_instances >= 2:
@@ -245,7 +308,7 @@ def build_rekognition_metadata(
     ])
     body_focus = _dedupe(
         visible_anatomy
-        + [name for name in general_names if name in _BODY_LABELS]
+        + [name for name in safe_general_names if name in _BODY_LABELS]
     )
     sexual_activity = _dedupe(
         (["explicit sexual activity"] if has_activity else [])
@@ -253,16 +316,24 @@ def build_rekognition_metadata(
         + (["kissing"] if has_kissing else [])
     )
 
-    location = _first_matching(general_names, _LOCATION_LABELS)
-    pose = _first_matching(general_names, _POSE_LABELS)
+    location = _first_matching(safe_general_names, _LOCATION_LABELS)
+    pose = _first_matching(safe_general_names, _POSE_LABELS)
+    clothing_present = bool(general_names.intersection(_CLOTHING_LABELS))
     if has_exposed or has_activity:
-        outfit = "nude"
+        if has_underwear:
+            outfit = "nude with lingerie or underwear"
+        elif clothing_present:
+            outfit = "partially clothed nude"
+        else:
+            outfit = "nude"
     elif has_partial or has_implied:
         outfit = "partially nude"
     elif has_underwear:
         outfit = (
             "swimwear"
-            if general_names.intersection({"swimwear", "bikini", "swimsuit"})
+            if safe_general_names.intersection(
+                {"swimwear", "bikini", "swimsuit"}
+            )
             else "lingerie or underwear"
         )
     else:
@@ -279,17 +350,19 @@ def build_rekognition_metadata(
                     "skirt",
                     "clothing",
                 )
-                if name in general_names
+                if name in safe_general_names
             ),
             "",
         )
         outfit = clothing or "clothed"
 
-    if "selfie" in general_names:
+    if "selfie" in safe_general_names:
         framing = "selfie"
     elif is_closeup:
         framing = "close-up"
-    elif "portrait" in general_names:
+    elif safe_general_names.intersection({"full body", "full-body"}):
+        framing = "full body"
+    elif "portrait" in safe_general_names:
         framing = "portrait"
     else:
         framing = "other"
@@ -298,56 +371,76 @@ def build_rekognition_metadata(
         sexual_activity[0]
         if sexual_activity
         else "posing"
-        if general_names.intersection({"pose", "photography", "selfie", "portrait"})
+        if safe_general_names.intersection({"pose", "selfie", "portrait"})
         else "none"
     )
     mood = "explicit" if explicitness >= 4 else "teasing" if explicitness >= 2 else "casual"
     good_for = "closer" if explicitness >= 4 else "mid_session" if explicitness >= 2 else "opener"
 
-    moderation_display = [
-        row["name"]
-        for row in moderation
-        if row["taxonomy_level"] >= 2 or not row["parent"]
-    ]
+    content_tags = (
+        [f"{nudity} nudity"] if nudity in {"full", "partial", "implied"} else []
+    )
     scene_display = [
         row["name"]
-        for row in general
-        if row["name"] not in {"person", "people", "human"}
-    ][:10]
+        for row in safe_general
+    ][:8]
     sentences: list[str] = []
-    if moderation_display:
-        sentences.append(
-            "Adult creator media classified with "
-            + ", ".join(_dedupe(moderation_display, limit=6))
-            + "."
-        )
+    media_kind = "Video thumbnail" if is_video else "Photo"
+    if has_activity:
+        content_summary = "Explicit sexual-content"
+    elif has_toy:
+        content_summary = "Adult-toy"
+    elif nudity == "full":
+        content_summary = "Full-nudity"
+    elif nudity == "partial":
+        content_summary = "Partially nude"
+    elif has_underwear:
+        content_summary = "Lingerie or swimwear"
+    elif nudity == "implied":
+        content_summary = "Implied-nudity"
     else:
-        sentences.append("Adult creator media with no explicit moderation labels detected.")
-    if scene_display:
+        content_summary = "Clothed"
+    first_sentence = f"{content_summary} {media_kind.lower()}"
+    if location:
+        first_sentence += f" in a {location} setting"
+    if pose:
+        first_sentence += f" with a {pose} pose"
+    if framing != "other":
+        first_sentence += f" using {framing} framing"
+    sentences.append(first_sentence + ".")
+    if visible_anatomy:
         sentences.append(
-            "Visible objects and scene concepts include "
-            + ", ".join(scene_display)
-            + "."
+            "Visible anatomy: " + ", ".join(visible_anatomy) + "."
         )
-    details = [
-        f"location: {location}" if location else "",
-        f"outfit: {outfit}" if outfit else "",
-        f"pose: {pose}" if pose else "",
-        f"framing: {framing}" if framing != "other" else "",
-    ]
-    details = [value for value in details if value]
-    if details:
-        sentences.append("Visual details — " + "; ".join(details) + ".")
+    if outfit not in {"nude", "clothed"}:
+        sentences.append(f"Clothing state: {outfit}.")
+    used_details = {
+        location,
+        pose,
+        framing,
+        "bedroom" if location == "bedroom" else "",
+        "indoors" if location in {"bedroom", "bathroom", "kitchen", "living room"} else "",
+    }
+    extra_details = _dedupe(
+        [name for name in scene_display if name not in used_details],
+        limit=5,
+    )
+    if extra_details:
+        sentences.append(
+            "Additional visible details: " + ", ".join(extra_details) + "."
+        )
 
     moderation_confidence = max(
         (float(row["confidence"]) for row in moderation),
         default=0,
     )
     general_confidence = max(
-        (float(row["confidence"]) for row in general),
+        (float(row["confidence"]) for row in safe_general),
         default=0,
     )
-    confidence = max(moderation_confidence, general_confidence) / 100
+    confidence = (
+        moderation_confidence if moderation else general_confidence
+    ) / 100
     if not moderation and not general:
         confidence = 0.25
 
@@ -356,7 +449,7 @@ def build_rekognition_metadata(
     )
     label_version = str(labels_response.get("LabelModelVersion") or "unknown")
     tags = _dedupe(
-        moderation_display
+        content_tags
         + sexual_activity
         + visible_anatomy
         + scene_display
@@ -366,6 +459,7 @@ def build_rekognition_metadata(
     return {
         "category": category,
         "description": " ".join(sentences),
+        "description_complete": True,
         "mood": mood,
         "explicitness": explicitness,
         "nudity": nudity,
@@ -400,6 +494,10 @@ def build_rekognition_metadata(
             "label_model_version": label_version,
             "moderation_labels": moderation,
             "general_labels": general[:24],
+            "age_review_signals": age_review_signals,
+            "age_review_required": any(
+                row["confidence"] >= 90 for row in age_review_signals
+            ),
         },
     }
 
@@ -440,7 +538,7 @@ def _analyze_sync(image_bytes: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
             Image=image,
             MaxLabels=int(os.environ.get("VAULT_REKOGNITION_MAX_LABELS", "40")),
             MinConfidence=float(
-                os.environ.get("VAULT_REKOGNITION_LABEL_CONFIDENCE", "50")
+                os.environ.get("VAULT_REKOGNITION_LABEL_CONFIDENCE", "75")
             ),
         )
         return moderation, labels
