@@ -15,6 +15,26 @@ from typing import Any, Iterable
 VAULT_CLASSIFIER_VERSION = 2
 
 _EMPTY_VALUES = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
+_MEDIA_CATEGORIES = {
+    "teaser_clothed",
+    "teaser_bundle",
+    "legs_feet",
+    "lingerie_photo",
+    "lingerie_video",
+    "nude_photo",
+    "nude_video",
+    "striptease_video",
+    "closeup_photo",
+    "closeup_video",
+    "dictate_video",
+    "solo_toy_video",
+    "solo_toy_photo",
+    "explicit_photo",
+    "explicit_video",
+    "bg_content",
+    "task",
+    "other",
+}
 
 
 def clean_text(value: Any) -> str:
@@ -66,6 +86,7 @@ def semantic_tags(data: dict[str, Any]) -> list[str]:
         "tags",
         "sexual_activity",
         "body_focus",
+        "visible_anatomy",
         "props",
         "colors",
     ):
@@ -82,10 +103,93 @@ def semantic_tags(data: dict[str, Any]) -> list[str]:
         "scene_location",
         "scene_outfit",
         "scene_lighting",
+        "nudity",
     ):
         if data.get(key):
             values.append(data[key])
     return normalize_string_list(values, limit=24)
+
+
+def explicitness_from_evidence(data: dict[str, Any]) -> int:
+    """Normalize explicitness from both the score and structured evidence.
+
+    Vision models sometimes choose a conservative numeric score while still
+    returning unambiguous nudity/activity fields.  The deterministic contract
+    must not silently downgrade those internally inconsistent results.
+    """
+    try:
+        level = int(data.get("explicitness", 0))
+    except (TypeError, ValueError):
+        level = 0
+    level = min(max(level, 0), 5)
+
+    nudity = useful_text(data.get("nudity")).lower()
+    anatomy = normalize_string_list(data.get("visible_anatomy"))
+    activities = normalize_string_list(data.get("sexual_activity"))
+    activities = [
+        value
+        for value in activities
+        if value not in {"none", "no activity", "not visible"}
+    ]
+
+    if activities:
+        level = max(level, 5)
+    elif anatomy or nudity in {"partial", "full"}:
+        level = max(level, 4)
+    elif nudity == "implied":
+        level = max(level, 1)
+    return level
+
+
+def normalize_media_category(
+    category: Any,
+    *,
+    explicitness: int,
+    is_video: bool,
+) -> str:
+    """Repair category/type/evidence contradictions deterministically."""
+    result = str(category or "other")
+    if result not in _MEDIA_CATEGORIES:
+        result = "other"
+
+    if is_video:
+        result = {
+            "lingerie_photo": "lingerie_video",
+            "nude_photo": "nude_video",
+            "closeup_photo": "closeup_video",
+            "solo_toy_photo": "solo_toy_video",
+            "explicit_photo": "explicit_video",
+        }.get(result, result)
+    else:
+        result = {
+            "lingerie_video": "lingerie_photo",
+            "nude_video": "nude_photo",
+            "closeup_video": "closeup_photo",
+            "solo_toy_video": "solo_toy_photo",
+            "explicit_video": "explicit_photo",
+            "striptease_video": "lingerie_photo",
+            "dictate_video": "task",
+        }.get(result, result)
+
+    if result in {
+        "other",
+        "teaser_clothed",
+        "teaser_bundle",
+        "lingerie_photo",
+        "lingerie_video",
+        "nude_photo",
+        "nude_video",
+    }:
+        if explicitness >= 5:
+            return "explicit_video" if is_video else "explicit_photo"
+        if explicitness >= 4:
+            return "nude_video" if is_video else "nude_photo"
+        if explicitness == 3 and result in {
+            "teaser_clothed",
+            "teaser_bundle",
+        }:
+            return "lingerie_video" if is_video else "lingerie_photo"
+    return result
 
 
 def media_description(data: dict[str, Any], *, source: str) -> str:
@@ -102,6 +206,8 @@ def media_description(data: dict[str, Any], *, source: str) -> str:
     pose = useful_text(data.get("pose"))
     framing = useful_text(data.get("framing"))
     lighting = useful_text(data.get("scene_lighting"))
+    nudity = useful_text(data.get("nudity"))
+    anatomy = normalize_string_list(data.get("visible_anatomy"))
     if location:
         details.append(f"location: {location}")
     if outfit:
@@ -114,6 +220,10 @@ def media_description(data: dict[str, Any], *, source: str) -> str:
         details.append(f"framing: {framing}")
     if lighting:
         details.append(f"lighting: {lighting}")
+    if nudity:
+        details.append(f"nudity: {nudity}")
+    if anatomy:
+        details.append(f"visible anatomy: {', '.join(anatomy)}")
     if details:
         sentences.append("Visual details — " + "; ".join(details) + ".")
 
@@ -197,4 +307,3 @@ def build_set_description(items: list[dict[str, Any]]) -> str:
     if summaries:
         parts.append("Representative contents: " + " ".join(summaries))
     return " ".join(parts)[:2000]
-

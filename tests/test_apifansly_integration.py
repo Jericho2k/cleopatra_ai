@@ -1,3 +1,5 @@
+import asyncio
+import json
 from pathlib import Path
 
 import httpx
@@ -7,7 +9,9 @@ from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
     DEFAULT_BASE_URL,
+    download_media,
     headers,
+    is_fansly_cdn_url,
     media_references,
     message_payload,
     raise_for_response,
@@ -141,3 +145,46 @@ def test_send_response_id_and_endpoint_cursors_use_documented_nesting():
         response=message_page["data"]["data"]["response"],
     ) == "older-message-cursor"
     assert response_cursor(chat_page) == "next-chat-cursor"
+
+
+def test_protected_media_download_uses_documented_binary_endpoint(monkeypatch):
+    monkeypatch.setenv("APIFANSLY_API_KEY", "test-key")
+    image_bytes = b"\xff\xd8" + (b"x" * 1200)
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["key"] = request.headers.get("x-api-key")
+        captured["json"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            request=request,
+            headers={"content-type": "image/jpeg"},
+            content=image_bytes,
+        )
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await download_media(
+                "https://cdn3.fansly.com/account/media.jpeg?Policy=signed",
+                client=client,
+            )
+
+    assert asyncio.run(run()) == image_bytes
+    assert captured == {
+        "path": "/api/fansly/media/download",
+        "key": "test-key",
+        "json": {
+            "cdnUrl": "https://cdn3.fansly.com/account/media.jpeg?Policy=signed"
+        },
+    }
+
+
+def test_protected_media_download_rejects_non_fansly_urls(monkeypatch):
+    monkeypatch.setenv("APIFANSLY_API_KEY", "test-key")
+    assert is_fansly_cdn_url("https://cdn3.fansly.com/account/media.jpeg")
+    assert not is_fansly_cdn_url("https://fansly.example/media.jpeg")
+
+    with pytest.raises(ValueError, match="Fansly CDN"):
+        asyncio.run(download_media("https://example.com/private.jpeg"))

@@ -6,7 +6,9 @@ from services.vault_metadata import (
     VAULT_CLASSIFIER_VERSION,
     build_set_description,
     classification_confidence,
+    explicitness_from_evidence,
     media_description,
+    normalize_media_category,
 )
 
 
@@ -34,6 +36,54 @@ def test_rich_media_description_preserves_searchable_visual_facts():
     assert "wet white shirt" in description
     assert "showering" in description
     assert "shower, wet look" in description
+
+
+def test_explicit_visual_evidence_cannot_be_silently_downgraded():
+    nude = {
+        "category": "other",
+        "explicitness": 0,
+        "nudity": "full",
+        "visible_anatomy": ["vulva"],
+        "sexual_activity": [],
+    }
+    level = explicitness_from_evidence(nude)
+    assert level == 4
+    assert normalize_media_category(
+        nude["category"],
+        explicitness=level,
+        is_video=False,
+    ) == "nude_photo"
+
+    explicit = {
+        "category": "nude_photo",
+        "explicitness": 4,
+        "nudity": "full",
+        "visible_anatomy": ["vulva"],
+        "sexual_activity": ["toy use"],
+    }
+    level = explicitness_from_evidence(explicit)
+    assert level == 5
+    assert normalize_media_category(
+        explicit["category"],
+        explicitness=level,
+        is_video=False,
+    ) == "explicit_photo"
+
+
+def test_explicit_anatomy_is_preserved_in_searchable_description():
+    description = media_description(
+        {
+            "description": "A close-up nude inventory frame",
+            "nudity": "full",
+            "visible_anatomy": ["vulva"],
+            "framing": "close-up",
+            "explicitness": 4,
+        },
+        source="image",
+    )
+    assert "nudity: full" in description
+    assert "visible anatomy: vulva" in description
+    assert "vulva" in description
 
 
 def test_set_description_is_built_from_exact_media_and_matches_intent():
@@ -94,4 +144,3 @@ def test_migration_and_analyzer_expose_the_v2_contract():
     assert "add column if not exists description" in migration
     assert '"shower set"' in analyzer
     assert "Never collapse a concrete" in analyzer
-

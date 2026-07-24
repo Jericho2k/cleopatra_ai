@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -54,6 +55,24 @@ def headers(*, json_content: bool = False) -> dict[str, str]:
     if json_content:
         result["Content-Type"] = "application/json"
     return result
+
+
+def is_fansly_cdn_url(value: str) -> bool:
+    """Return whether a URL is an HTTPS Fansly CDN asset.
+
+    Vault locations are signed and may be rejected when fetched directly from
+    application infrastructure.  Only known Fansly hosts may be sent to the
+    managed media-download proxy.
+    """
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except ValueError:
+        return False
+    host = str(parsed.hostname or "").lower()
+    return (
+        parsed.scheme == "https"
+        and (host == "fansly.com" or host.endswith(".fansly.com"))
+    )
 
 
 def response_message(response: httpx.Response) -> str:
@@ -220,6 +239,46 @@ async def request(
                 f"API Fansly {operation} returned a non-object response"
             )
         return payload
+    finally:
+        if owns_client:
+            await active_client.aclose()
+
+
+async def download_media(
+    cdn_url: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+    timeout: float = 45,
+) -> bytes:
+    """Download a protected Fansly CDN asset through the documented proxy.
+
+    Unlike the regular API helpers, this endpoint returns binary content rather
+    than the usual JSON envelope.
+    """
+    if not is_fansly_cdn_url(cdn_url):
+        raise ValueError("media download requires an HTTPS Fansly CDN URL")
+
+    owns_client = client is None
+    active_client = client or httpx.AsyncClient(follow_redirects=True)
+    try:
+        response = await active_client.post(
+            url("media/download"),
+            headers=headers(json_content=True),
+            json={"cdnUrl": cdn_url},
+            timeout=timeout,
+        )
+        raise_for_response(response, operation="protected media download")
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "application/json" in content_type:
+            raise ApiFanslyProtocolError(
+                "API Fansly media download returned JSON instead of media: "
+                + response_message(response)
+            )
+        if len(response.content) <= 1000:
+            raise ApiFanslyProtocolError(
+                "API Fansly media download returned an empty or truncated file"
+            )
+        return bytes(response.content)
     finally:
         if owns_client:
             await active_client.aclose()
