@@ -73,6 +73,10 @@ from services.rekognition_classifier import (
     RekognitionConfigurationError,
     classify_with_rekognition,
 )
+from services.nova_inventory_descriptor import (
+    describe_inventory_visual,
+    merge_inventory_descriptor,
+)
 from services.shoot_fingerprint import (
     build_shoot_clusters,
     build_shoot_fingerprint,
@@ -2136,12 +2140,40 @@ Return ONLY one JSON object with exactly these keys:
 
         if not isinstance(data, dict):
             raise ValueError("classifier did not return a JSON object")
+        rich_visual: dict = {"status": "not_requested"}
+        if provider == "rekognition":
+            rich_visual = await describe_inventory_visual(
+                classifier_image,
+                is_video=is_video,
+                album_title=str(item.get("album_title") or ""),
+            )
+            if rich_visual.get("status") == "ready":
+                data = merge_inventory_descriptor(
+                    data,
+                    rich_visual.get("descriptor") or {},
+                )
+                model = (
+                    f"{model}+descriptor-{rich_visual.get('model')}"
+                )
+            print(
+                f"[RICH DESCRIPTION] item={item_id} "
+                f"status={rich_visual.get('status')} "
+                f"model={rich_visual.get('model') or ''} "
+                f"reason={rich_visual.get('reason') or ''}"
+            )
         shoot_fingerprint = await build_shoot_fingerprint(classifier_image)
         local_visual = shoot_fingerprint.get("local") or {}
         if not data.get("colors"):
             data["colors"] = local_visual.get("palette_names") or []
         if useful_text(data.get("scene_lighting")) == "":
             data["scene_lighting"] = local_visual.get("lighting") or ""
+        data["visual_tone"] = local_visual.get("visual_tone") or ""
+        data["orientation"] = local_visual.get("orientation") or ""
+        data["image_dimensions"] = (
+            f"{local_visual.get('width')}x{local_visual.get('height')}"
+            if local_visual.get("width") and local_visual.get("height")
+            else ""
+        )
         explicitness = explicitness_from_evidence(data)
         # Deterministically repair category/media mismatches and conservative
         # labels before they can become sellable set metadata.
@@ -2170,13 +2202,15 @@ Return ONLY one JSON object with exactly these keys:
                 "description", "description_complete", "mood",
                 "sexual_activity", "body_focus", "action",
                 "pose", "framing", "props", "colors", "nudity",
-                "visible_anatomy",
+                "visible_anatomy", "visual_tone", "orientation",
+                "image_dimensions",
             )
         }
         metadata["age_review_required"] = bool(
             provider_metadata.get("age_review_required")
         )
         metadata["shoot_fingerprint"] = shoot_fingerprint
+        metadata["rich_visual_descriptor"] = rich_visual
         metadata.update({
             "category": category,
             "explicitness": explicitness,

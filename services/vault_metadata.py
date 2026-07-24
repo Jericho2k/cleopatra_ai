@@ -12,7 +12,7 @@ from collections import Counter
 from typing import Any, Iterable
 
 
-VAULT_CLASSIFIER_VERSION = 5
+VAULT_CLASSIFIER_VERSION = 6
 
 _EMPTY_VALUES = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
 _MEDIA_CATEGORIES = {
@@ -104,6 +104,8 @@ def semantic_tags(data: dict[str, Any]) -> list[str]:
         "scene_outfit",
         "scene_lighting",
         "nudity",
+        "visual_tone",
+        "orientation",
     ):
         if data.get(key):
             values.append(data[key])
@@ -199,7 +201,14 @@ def media_description(data: dict[str, Any], *, source: str) -> str:
     if summary:
         sentences.append(summary.rstrip(". ") + ".")
 
-    if data.get("description_complete"):
+    rich_result = data.get("rich_visual_descriptor")
+    rich = (
+        rich_result.get("descriptor") or {}
+        if isinstance(rich_result, dict)
+        and rich_result.get("status") == "ready"
+        else {}
+    )
+    if data.get("description_complete") and not rich:
         sentences.append(
             f"Classification evidence: {source.replace('_', ' ')}; "
             f"explicitness {int(data.get('explicitness') or 0)}/5."
@@ -216,6 +225,9 @@ def media_description(data: dict[str, Any], *, source: str) -> str:
     colours = normalize_string_list(data.get("colors"), limit=6)
     nudity = useful_text(data.get("nudity"))
     anatomy = normalize_string_list(data.get("visible_anatomy"))
+    visual_tone = useful_text(data.get("visual_tone"))
+    orientation = useful_text(data.get("orientation"))
+    dimensions = useful_text(data.get("image_dimensions"))
     if location:
         details.append(f"location: {location}")
     if outfit:
@@ -234,8 +246,43 @@ def media_description(data: dict[str, Any], *, source: str) -> str:
         details.append(f"nudity: {nudity}")
     if anatomy:
         details.append(f"visible anatomy: {', '.join(anatomy)}")
+    if visual_tone:
+        details.append(f"visual tone: {visual_tone}")
+    if orientation:
+        details.append(f"orientation: {orientation}")
+    if dimensions:
+        details.append(f"analyzed frame: {dimensions}")
     if details:
         sentences.append("Visual details — " + "; ".join(details) + ".")
+
+    rich_details: list[str] = []
+    for label, key in (
+        ("setting", "setting_details"),
+        ("background", "background_details"),
+        ("wardrobe", "wardrobe_items"),
+        ("wardrobe colours", "wardrobe_colors"),
+        ("props", "props"),
+        ("distinguishing details", "distinguishing_details"),
+    ):
+        values = normalize_string_list(rich.get(key), limit=8)
+        if values:
+            rich_details.append(f"{label}: {', '.join(values)}")
+    for label, key in (
+        ("limb position", "limb_position"),
+        ("gaze", "gaze"),
+        ("expression", "expression"),
+        ("camera angle", "camera_angle"),
+        ("crop", "crop"),
+        ("composition", "composition"),
+        ("visual style", "visual_style"),
+    ):
+        value = useful_text(rich.get(key))
+        if value:
+            rich_details.append(f"{label}: {value}")
+    if rich_details:
+        sentences.append(
+            "Photoshoot details — " + "; ".join(rich_details) + "."
+        )
 
     tags = semantic_tags(data)
     if tags:

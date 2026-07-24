@@ -178,7 +178,7 @@ def test_live_explicit_sample_is_sanitized_for_package_matching():
     assert result["category"] == "nude_photo"
     assert result["scene_outfit"] == "partially clothed nude"
     assert set(result["visible_anatomy"]) == {"breasts", "vulva"}
-    assert result["description_complete"] is True
+    assert result["description_complete"] is False
     assert result["description"].count("bedroom") == 1
     assert "classification evidence" not in result["description"].lower()
     assert "baby" not in result["description"].lower()
@@ -197,12 +197,69 @@ def test_live_explicit_sample_is_sanitized_for_package_matching():
     ]
 
 
-def test_rekognition_is_the_v5_default_and_batch_has_cost_circuit_breaker():
+def test_image_properties_add_clothing_colours_and_lighting():
+    labels = general(
+        ("Person", 99.0, 1),
+        ("Underwear", 91.0, 0),
+        ("Bed", 61.0, 1),
+    )
+    labels["Labels"][1]["Instances"] = [{
+        "Confidence": 91.0,
+        "BoundingBox": {
+            "Width": 0.4,
+            "Height": 0.3,
+            "Left": 0.2,
+            "Top": 0.5,
+        },
+        "DominantColors": [{
+            "SimplifiedColor": "Pink",
+            "CSSColor": "HotPink",
+            "HexCode": "#FF69B4",
+            "PixelPercentage": 72.0,
+        }],
+    }]
+    labels["ImageProperties"] = {
+        "Quality": {
+            "Brightness": 78.0,
+            "Sharpness": 82.0,
+            "Contrast": 44.0,
+        },
+        "DominantColors": [{
+            "SimplifiedColor": "White",
+            "CSSColor": "White",
+            "HexCode": "#FFFFFF",
+            "PixelPercentage": 41.0,
+        }],
+    }
+    result = build_rekognition_metadata(
+        moderation(
+            (
+                "Female Swimwear or Underwear",
+                "Swimwear or Underwear",
+                96.0,
+                2,
+            )
+        ),
+        labels,
+        is_video=False,
+    )
+
+    assert result["scene_location"] == "bedroom"
+    assert result["colors"][0] == "hotpink"
+    assert result["scene_lighting"] == "bright"
+    assert result["_provider_metadata"]["image_properties"]["quality"] == {
+        "brightness": 78.0,
+        "sharpness": 82.0,
+        "contrast": 44.0,
+    }
+
+
+def test_rekognition_is_the_v6_default_and_batch_has_cost_circuit_breaker():
     root = Path(__file__).resolve().parents[1]
     env_example = (root / ".env.example").read_text()
     main_source = (root / "main.py").read_text()
 
-    assert VAULT_CLASSIFIER_VERSION == 5
+    assert VAULT_CLASSIFIER_VERSION == 6
     assert "VAULT_CLASSIFIER_PROVIDER=rekognition" in env_example
     assert 'or "rekognition"' in main_source
     assert "[CATEGORIZE ABORTED]" in main_source

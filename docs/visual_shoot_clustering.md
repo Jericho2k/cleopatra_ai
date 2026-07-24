@@ -7,13 +7,16 @@ anatomy and coarse scene labels. It cannot safely decide that two images came
 from the same photoshoot. A generic album plus `bedroom + nude` can contain many
 unrelated shoots.
 
-Version 5 therefore separates the contracts:
+Version 6 therefore separates the contracts:
 
 1. Rekognition supplies adult-content taxonomy.
-2. Amazon Nova Multimodal Embeddings supplies visual photoshoot similarity.
-3. Deterministic local features preserve palette, lighting, orientation and
+2. Amazon Nova Lite supplies rich factual inventory detail such as setting,
+   wardrobe, pose, camera angle, background and composition. It cannot
+   override Rekognition's adult taxonomy.
+3. Amazon Nova Multimodal Embeddings supplies visual photoshoot similarity.
+4. Deterministic local features preserve palette, lighting, orientation and
    near-duplicate evidence.
-4. Complete-link clustering only merges groups when every cross-group image
+5. Complete-link clustering only merges groups when every cross-group image
    pair clears the configured similarity threshold.
 
 Generic albums and the legacy scene slug are not accepted as photoshoot
@@ -29,7 +32,10 @@ least-privilege statement:
 {
   "Effect": "Allow",
   "Action": "bedrock:InvokeModel",
-  "Resource": "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-2-multimodal-embeddings-v1:0"
+  "Resource": [
+    "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0",
+    "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-2-multimodal-embeddings-v1:0"
+  ]
 }
 ```
 
@@ -49,7 +55,7 @@ does not guess photoshoot identity for those items.
 3. Compare each returned `media_ids` group with the known shoot boundaries.
 4. Raise `VAULT_SHOOT_MIN_SIMILARITY` if unrelated shoots merge. Lower it only
    when a known shoot is consistently split. Prefer splits over false merges.
-5. Re-analyze the remaining stale Version 4 items only after the sample is
+5. Re-analyze the remaining stale Version 5 items only after the sample is
    correct.
 6. Generate draft sets and review them before approval. Approved/manual sets
    are never deleted by generation.

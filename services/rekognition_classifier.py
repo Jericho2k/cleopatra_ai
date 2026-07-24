@@ -102,6 +102,7 @@ _CLOTHING_LABELS = {
     "underwear",
 }
 _MIN_SEMANTIC_CONFIDENCE = 70.0
+_MIN_STRUCTURED_CONFIDENCE = 55.0
 
 _ANATOMY = {
     "exposed male genitalia": "penis",
@@ -187,12 +188,102 @@ def _general_evidence(response: dict[str, Any]) -> list[dict[str, Any]]:
         name = _clean_label(row.get("Name"))
         if not name:
             continue
+        instances: list[dict[str, Any]] = []
+        for instance in (row.get("Instances") or [])[:3]:
+            if not isinstance(instance, dict):
+                continue
+            box = instance.get("BoundingBox") or {}
+            dominant = [
+                {
+                    "simplified": _clean_label(
+                        color.get("SimplifiedColor")
+                    ),
+                    "css": _clean_label(
+                        color.get("CSSColor") or color.get("CssColor")
+                    ),
+                    "hex": str(color.get("HexCode") or "").strip(),
+                    "pixel_percent": round(
+                        float(color.get("PixelPercentage") or 0),
+                        3,
+                    ),
+                }
+                for color in (instance.get("DominantColors") or [])[:5]
+                if isinstance(color, dict)
+            ]
+            instances.append({
+                "confidence": round(
+                    float(instance.get("Confidence") or 0),
+                    3,
+                ),
+                "bounding_box": {
+                    key: round(float(box.get(key.title()) or 0), 5)
+                    for key in ("width", "height", "left", "top")
+                },
+                "dominant_colors": dominant,
+            })
         evidence.append({
             "name": name,
             "confidence": round(float(row.get("Confidence") or 0), 3),
             "instances": len(row.get("Instances") or []),
+            "instance_details": instances,
         })
     return evidence
+
+
+def _dominant_colors(value: Any, *, limit: int = 8) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for row in value[:limit]:
+        if not isinstance(row, dict):
+            continue
+        result.append({
+            "simplified": _clean_label(row.get("SimplifiedColor")),
+            "css": _clean_label(row.get("CSSColor") or row.get("CssColor")),
+            "hex": str(row.get("HexCode") or "").strip(),
+            "pixel_percent": round(
+                float(row.get("PixelPercentage") or 0),
+                3,
+            ),
+        })
+    return result
+
+
+def _image_properties_evidence(response: dict[str, Any]) -> dict[str, Any]:
+    raw = response.get("ImageProperties") or {}
+    if not isinstance(raw, dict):
+        return {}
+
+    def region(value: Any) -> dict[str, Any]:
+        row = value if isinstance(value, dict) else {}
+        quality = row.get("Quality") or {}
+        return {
+            "quality": {
+                key: round(float(quality.get(key.title()) or 0), 3)
+                for key in ("brightness", "sharpness", "contrast")
+                if quality.get(key.title()) is not None
+            },
+            "dominant_colors": _dominant_colors(
+                row.get("DominantColors")
+            ),
+        }
+
+    overall = region(raw)
+    overall["foreground"] = region(raw.get("Foreground"))
+    overall["background"] = region(raw.get("Background"))
+    return overall
+
+
+def _color_names(rows: list[dict[str, Any]], *, limit: int = 8) -> list[str]:
+    values: list[str] = []
+    for row in rows:
+        name = _clean_label(row.get("css") or row.get("simplified"))
+        if not name or name in values:
+            continue
+        values.append(name)
+        if len(values) >= limit:
+            break
+    return values
 
 
 def _first_matching(
@@ -220,6 +311,7 @@ def build_rekognition_metadata(
     """Map AWS responses into Cleopatra's provider-neutral vault contract."""
     moderation = _moderation_evidence(moderation_response)
     general = _general_evidence(labels_response)
+    image_properties = _image_properties_evidence(labels_response)
     moderation_names = {
         value
         for row in moderation
@@ -235,6 +327,12 @@ def build_rekognition_metadata(
         and row["name"] not in _GENERAL_NOISE_LABELS
     ]
     safe_general_names = {row["name"] for row in safe_general}
+    structured_general_names = {
+        row["name"]
+        for row in general
+        if row["confidence"] >= _MIN_STRUCTURED_CONFIDENCE
+        and row["name"] not in _AGE_SENSITIVE_LABELS
+    }
     age_review_signals = [
         {
             "label": row["name"],
@@ -316,8 +414,8 @@ def build_rekognition_metadata(
         + (["kissing"] if has_kissing else [])
     )
 
-    location = _first_matching(safe_general_names, _LOCATION_LABELS)
-    pose = _first_matching(safe_general_names, _POSE_LABELS)
+    location = _first_matching(structured_general_names, _LOCATION_LABELS)
+    pose = _first_matching(structured_general_names, _POSE_LABELS)
     clothing_present = bool(general_names.intersection(_CLOTHING_LABELS))
     if has_exposed or has_activity:
         if has_underwear:
@@ -376,6 +474,30 @@ def build_rekognition_metadata(
     )
     mood = "explicit" if explicitness >= 4 else "teasing" if explicitness >= 2 else "casual"
     good_for = "closer" if explicitness >= 4 else "mid_session" if explicitness >= 2 else "opener"
+
+    clothing_colors = _color_names([
+        color
+        for row in general
+        if row["name"] in _CLOTHING_LABELS
+        for instance in row.get("instance_details") or []
+        for color in instance.get("dominant_colors") or []
+    ])
+    image_colors = _color_names(
+        (image_properties.get("foreground") or {}).get("dominant_colors")
+        or image_properties.get("dominant_colors")
+        or []
+    )
+    colors = _dedupe(clothing_colors + image_colors, limit=8)
+    quality = image_properties.get("quality") or {}
+    brightness = float(quality.get("brightness") or 0)
+    if brightness:
+        lighting = (
+            "dim" if brightness < 32
+            else "bright" if brightness > 72
+            else "balanced"
+        )
+    else:
+        lighting = "unknown"
 
     content_tags = (
         [f"{nudity} nudity"] if nudity in {"full", "partial", "implied"} else []
@@ -459,7 +581,7 @@ def build_rekognition_metadata(
     return {
         "category": category,
         "description": " ".join(sentences),
-        "description_complete": True,
+        "description_complete": False,
         "mood": mood,
         "explicitness": explicitness,
         "nudity": nudity,
@@ -478,10 +600,10 @@ def build_rekognition_metadata(
                 if name in {"bed", "mirror", "phone", "toy", "chair", "couch"}
             ]
         ),
-        "colors": [],
+        "colors": colors,
         "scene_location": location or "unknown",
         "scene_outfit": outfit or "unknown",
-        "scene_lighting": "unknown",
+        "scene_lighting": lighting,
         "scene_id": _slug(album_title, location, outfit) or "unidentified-shoot",
         "confidence": round(min(max(confidence, 0), 1), 3),
         "_classification_model": (
@@ -494,6 +616,7 @@ def build_rekognition_metadata(
             "label_model_version": label_version,
             "moderation_labels": moderation,
             "general_labels": general[:24],
+            "image_properties": image_properties,
             "age_review_signals": age_review_signals,
             "age_review_required": any(
                 row["confidence"] >= 90 for row in age_review_signals
@@ -538,8 +661,19 @@ def _analyze_sync(image_bytes: bytes) -> tuple[dict[str, Any], dict[str, Any]]:
             Image=image,
             MaxLabels=int(os.environ.get("VAULT_REKOGNITION_MAX_LABELS", "40")),
             MinConfidence=float(
-                os.environ.get("VAULT_REKOGNITION_LABEL_CONFIDENCE", "75")
+                os.environ.get("VAULT_REKOGNITION_LABEL_CONFIDENCE", "60")
             ),
+            Features=["GENERAL_LABELS", "IMAGE_PROPERTIES"],
+            Settings={
+                "ImageProperties": {
+                    "MaxDominantColors": int(
+                        os.environ.get(
+                            "VAULT_REKOGNITION_DOMINANT_COLORS",
+                            "8",
+                        )
+                    ),
+                },
+            },
         )
         return moderation, labels
     except (NoCredentialsError, PartialCredentialsError) as exc:
