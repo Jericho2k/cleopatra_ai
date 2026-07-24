@@ -68,6 +68,11 @@ from services.apifansly import (
 from services.auto_audience import AutoAudiencePolicy
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
+from services.rekognition_classifier import (
+    RekognitionClassifierError,
+    RekognitionConfigurationError,
+    classify_with_rekognition,
+)
 from services.suggestions import (
     _should_update_memory,
     _update_fan_ai_summary,
@@ -1399,7 +1404,10 @@ async def _run_vault_sync(creator_id: str) -> None:
     try:
         creator_row = await asyncio.to_thread(
             lambda: db.table("creators")
-            .select("apifansly_account_id, auto_categorize_new_media")
+            .select(
+                "apifansly_account_id, auto_categorize_new_media, "
+                "vault_initial_categorized_at"
+            )
             .eq("id", creator_id)
             .single()
             .execute()
@@ -1407,6 +1415,9 @@ async def _run_vault_sync(creator_id: str) -> None:
         apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
         auto_categorize_new = bool(
             (creator_row.data or {}).get("auto_categorize_new_media", True)
+        )
+        initial_completed_at = (creator_row.data or {}).get(
+            "vault_initial_categorized_at"
         )
         existing_rows = await asyncio.to_thread(
             lambda: db.table("creator_vault_media")
@@ -1422,7 +1433,14 @@ async def _run_vault_sync(creator_id: str) -> None:
                 client=client,
             )
 
-            total = sum(a.get("itemCount", 0) for a in albums)
+            # Albums overlap heavily (especially Fansly's standard "All"
+            # album). Summing itemCount produced misleading progress such as
+            # 57/114 for 57 unique assets. The largest album is the best
+            # available unique-vault estimate before all pages are scanned.
+            total = max(
+                (int(a.get("itemCount") or 0) for a in albums),
+                default=0,
+            )
             already = len(existing_ids)
             new_total = max(total - already, 0)
             synced = 0
@@ -1517,7 +1535,12 @@ async def _run_vault_sync(creator_id: str) -> None:
         new_item_ids = normalize_media_ids(new_item_ids)
         categorized_new = 0
         category_errors = 0
-        if categorize_new_batch_enabled(auto_categorize_new, new_item_ids):
+        # Initial vault analysis is an explicit paid action. Auto-categorize
+        # applies only after that one-time setup has completed.
+        if (
+            initial_completed_at
+            and categorize_new_batch_enabled(auto_categorize_new, new_item_ids)
+        ):
             _vault_sync_state[creator_id] = {
                 "status": "categorizing_new",
                 "synced": synced,
@@ -1747,6 +1770,10 @@ class VaultVisualAccessError(RuntimeError):
     """The classifier could not obtain a usable visual for a vault item."""
 
 
+class VaultClassifierRefusalError(RuntimeError):
+    """A generative compatibility provider refused the supplied media."""
+
+
 async def _download_visual_candidate(
     visual_url: str,
     *,
@@ -1914,13 +1941,9 @@ async def _categorize_single_item(item: dict) -> dict:
     provider/fetch/parse failure is raised so the retry loop can leave the item
     stale instead of permanently saving an empty ``other`` classification.
     """
-    from anthropic import AsyncAnthropic
-    import base64
     import io
     from PIL import Image
 
-    client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    model = os.environ.get("VAULT_CLASSIFIER_MODEL", "claude-sonnet-4-6")
     mimetype = str(item.get("mimetype") or "")
     item_id = item.get("id", "")
     is_video = mimetype.startswith("video") if mimetype else False
@@ -1940,10 +1963,44 @@ async def _categorize_single_item(item: dict) -> dict:
         image.thumbnail((896, 896), Image.Resampling.LANCZOS)
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=84, optimize=True)
-        image_b64 = base64.b64encode(buffer.getvalue()).decode("ascii")
+        classifier_image = buffer.getvalue()
+        provider = str(
+            os.environ.get("VAULT_CLASSIFIER_PROVIDER") or "rekognition"
+        ).strip().lower()
+        provider_metadata: dict = {}
 
-        asset_kind = "video thumbnail" if is_video else "image"
-        prompt = f"""Classify this adult creator {asset_kind} for private vault search and package matching.
+        if provider == "rekognition":
+            data = await classify_with_rekognition(
+                classifier_image,
+                is_video=is_video,
+                album_title=str(item.get("album_title") or ""),
+            )
+            model = str(
+                data.pop("_classification_model", "aws-rekognition")
+            )
+            provider_metadata = dict(data.pop("_provider_metadata", {}) or {})
+            print(
+                f"[CATEGORIZE RAW] item={item_id} provider=rekognition "
+                f"category={data.get('category')} "
+                f"explicitness={data.get('explicitness')} "
+                f"moderation={len(provider_metadata.get('moderation_labels') or [])} "
+                f"labels={len(provider_metadata.get('general_labels') or [])}"
+            )
+        elif provider == "anthropic":
+            # Retained only as a controlled compatibility/benchmark provider.
+            # It is not the production default because it can refuse adult
+            # inventory images instead of returning the required JSON.
+            import base64
+            from anthropic import AsyncAnthropic
+
+            client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+            model = os.environ.get(
+                "VAULT_CLASSIFIER_MODEL",
+                "claude-sonnet-4-6",
+            )
+            image_b64 = base64.b64encode(classifier_image).decode("ascii")
+            asset_kind = "video thumbnail" if is_video else "image"
+            prompt = f"""Classify this adult creator {asset_kind} for private vault search and package matching.
 The creator and all depicted participants must be adults. Describe only what is visibly supported; never invent an act, location, outfit, or prop. A video thumbnail is partial evidence, so describe the visible frame and lower confidence when the complete video cannot be inferred.
 
 Filename: {item.get('filename') or 'unknown'}
@@ -1966,39 +2023,54 @@ the controlled fields below, while never guessing details that are not visible.
 Return ONLY one JSON object with exactly these keys:
 {{"category":"category_key","description":"2-4 factual, non-erotic sentences covering the visible subject, clothing/nudity, pose/action, environment and distinguishing details","mood":"playful|intimate|teasing|explicit|casual","explicitness":0,"nudity":"none|implied|partial|full","visible_anatomy":["only visibly exposed: breasts|buttocks|vulva|penis|anus"],"good_for":"opener|mid_session|closer|standalone","tags":["specific searchable themes"],"sexual_activity":["only visibly supported activities"],"body_focus":["visible focal areas"],"action":"specific visible action or none","pose":"specific pose","framing":"selfie|portrait|full body|close-up|wide|other","props":["visible props"],"colors":["dominant outfit/scene colors"],"scene_location":"specific location or unknown","scene_outfit":"specific outfit/nudity state or unknown","scene_lighting":"natural|bright|dim|flash|colored|unknown","scene_id":"short stable shoot slug derived from album/location/outfit","confidence":0.0}}
 """
-        response = await client.messages.create(
-            model=model,
-            max_tokens=850,
-            temperature=0,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": image_b64,
+            response = await client.messages.create(
+                model=model,
+                max_tokens=850,
+                temperature=0,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": image_b64,
+                            },
                         },
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-        )
-
-        content = "\n".join(
-            str(block.text)
-            for block in response.content
-            if getattr(block, "type", "") == "text"
-            and getattr(block, "text", None)
-        ).strip()
-        if not content:
-            raise ValueError(
-                f"classifier returned no text (stop_reason={response.stop_reason})"
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
             )
-        content = content.replace("```json", "").replace("```", "").strip()
-        print(f"[CATEGORIZE RAW] item={item_id} response={content[:300]}")
-        data = json.loads(content)
+            content = "\n".join(
+                str(block.text)
+                for block in response.content
+                if getattr(block, "type", "") == "text"
+                and getattr(block, "text", None)
+            ).strip()
+            if not content:
+                raise VaultClassifierRefusalError(
+                    f"classifier returned no text (stop_reason={response.stop_reason})"
+                )
+            content = content.replace("```json", "").replace("```", "").strip()
+            refusal_prefixes = (
+                "i'm not able",
+                "i am not able",
+                "i can't",
+                "i cannot",
+                "sorry, but",
+            )
+            if content.lower().startswith(refusal_prefixes):
+                raise VaultClassifierRefusalError(
+                    "The compatibility vision provider refused the media."
+                )
+            print(f"[CATEGORIZE RAW] item={item_id} response={content[:300]}")
+            data = json.loads(content)
+        else:
+            raise RekognitionConfigurationError(
+                "VAULT_CLASSIFIER_PROVIDER must be 'rekognition' or 'anthropic'"
+            )
+
         if not isinstance(data, dict):
             raise ValueError("classifier did not return a JSON object")
         explicitness = explicitness_from_evidence(data)
@@ -2042,6 +2114,8 @@ Return ONLY one JSON object with exactly these keys:
             "scene_id": scene_id,
             "evidence_source": source,
             "fetch_method": fetch_method,
+            "classifier_provider": provider,
+            "provider_details": provider_metadata,
         })
 
         return {
@@ -2460,7 +2534,9 @@ async def _run_vault_categorization(
 
         done = 0
         errors = 0
-        # 2 concurrent max to respect 30k token/min rate limit
+        provider_failures = 0
+        # Keep concurrency deliberately low: Rekognition is fast, but vault
+        # setup must remain predictable and should never create a retry storm.
         batch_size = 2
         for i in range(0, total, batch_size):
             batch = all_items[i:i + batch_size]
@@ -2468,9 +2544,22 @@ async def _run_vault_categorization(
                 *[_categorize_single_item_with_retry(item) for item in batch],
                 return_exceptions=True,
             )
+            fatal_error = ""
             for result in results:
                 if isinstance(result, Exception):
                     errors += 1
+                    if isinstance(result, RekognitionConfigurationError):
+                        fatal_error = str(result)
+                    elif isinstance(
+                        result,
+                        (RekognitionClassifierError, VaultClassifierRefusalError),
+                    ):
+                        provider_failures += 1
+                        if provider_failures >= 3:
+                            fatal_error = (
+                                "Vault categorization stopped after three provider "
+                                f"failures: {result}"
+                            )
                     continue
                 await asyncio.to_thread(
                     lambda r=result: db.table("creator_vault_media")
@@ -2479,6 +2568,19 @@ async def _run_vault_categorization(
                     .execute()
                 )
                 done += 1
+            if fatal_error:
+                _categorize_state[creator_id].update({
+                    "status": "error",
+                    "done": done,
+                    "errors": errors,
+                    "error": fatal_error,
+                    "aborted_remaining": max(total - done - errors, 0),
+                })
+                print(
+                    f"[CATEGORIZE ABORTED] creator={creator_id} "
+                    f"done={done}/{total} errors={errors} reason={fatal_error}"
+                )
+                return
             _categorize_state[creator_id].update({"done": done, "errors": errors})
             print(f"[CATEGORIZE] done={done}/{total} errors={errors}")
             await asyncio.sleep(1.5)  # respect rate limit between batches
@@ -2570,7 +2672,10 @@ async def _categorize_single_item_with_retry(item: dict, max_retries: int = 3) -
         try:
             return await _categorize_single_item(item)
         except Exception as e:
-            if "429" in str(e) and attempt < max_retries - 1:
+            message = str(e).lower()
+            if (
+                "429" in message or "throttl" in message
+            ) and attempt < max_retries - 1:
                 wait = 10 * (attempt + 1)
                 print(f"[CATEGORIZE] rate limited, waiting {wait}s before retry")
                 await asyncio.sleep(wait)
@@ -2632,6 +2737,16 @@ async def recategorize_item(item_id: str) -> dict:
         result = await _categorize_single_item(item)
     except VaultVisualAccessError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RekognitionConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (RekognitionClassifierError, VaultClassifierRefusalError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"{exc} The existing media details were preserved; "
+                "please retry later."
+            ),
+        ) from exc
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(
             status_code=502,
