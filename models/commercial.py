@@ -114,6 +114,9 @@ class CreatorPolicy(BaseModel):
     inactivity_reengagement_delay_hours: int = Field(default=48, ge=6, le=720)
     inactivity_reengagement_cooldown_hours: int = Field(default=168, ge=24, le=2_160)
     inactivity_reengagement_max_per_30_days: int = Field(default=2, ge=1, le=10)
+    personal_event_callbacks_enabled: bool = False
+    personal_event_callback_send_hour_local: int = Field(default=18, ge=0, le=23)
+    personal_event_callback_max_per_30_days: int = Field(default=3, ge=1, le=10)
 
     @model_validator(mode="after")
     def enforce_purchase_gating_invariants(self) -> "CreatorPolicy":

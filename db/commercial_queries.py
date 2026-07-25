@@ -31,13 +31,44 @@ async def save_creator_policy(creator_id: str, policy: CreatorPolicy) -> Creator
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     def _upsert():
-        response = get_supabase().table("creator_commercial_policies").upsert(
-            payload, on_conflict="creator_id"
-        ).execute()
+        db = get_supabase()
+        try:
+            response = db.table("creator_commercial_policies").upsert(
+                payload, on_conflict="creator_id"
+            ).execute()
+        except Exception as exc:
+            # Keep older deployments able to save their existing policy while the
+            # additive callback migration is being applied. The new feature remains
+            # disabled and the returned policy says so; it never pretends an
+            # unavailable column was persisted.
+            message = str(exc).lower()
+            callback_fields = {
+                "personal_event_callbacks_enabled",
+                "personal_event_callback_send_hour_local",
+                "personal_event_callback_max_per_30_days",
+            }
+            if not any(field in message for field in callback_fields):
+                raise
+            compatible = {
+                key: value for key, value in payload.items() if key not in callback_fields
+            }
+            response = db.table("creator_commercial_policies").upsert(
+                compatible, on_conflict="creator_id"
+            ).execute()
+            print(
+                f"[POLICY MIGRATION NEEDED] creator={creator_id} "
+                "apply db/personal_event_callbacks_v1.sql"
+            )
+            return CreatorPolicy(
+                **{
+                    **policy.model_dump(mode="json"),
+                    "personal_event_callbacks_enabled": False,
+                }
+            )
         return (response.data or [payload])[0]
 
-    await asyncio.to_thread(_upsert)
-    return policy
+    result = await asyncio.to_thread(_upsert)
+    return result if isinstance(result, CreatorPolicy) else policy
 
 
 async def get_fan_state(fan_id: str) -> FanCommercialState:

@@ -417,6 +417,20 @@ async def get_suggestions(
             ),
             name=f"fan_intelligence:{fan_id}",
         )
+        try:
+            from services.personal_callbacks import schedule_personal_event_callback
+
+            spawn(
+                schedule_personal_event_callback(
+                    creator_id=creator_id,
+                    fan_id=fan_id,
+                    fan_message=fan_message,
+                    source_message_id=evidence_message_id,
+                ),
+                name=f"personal_callback:{fan_id}",
+            )
+        except Exception as exc:
+            print(f"[PERSONAL CALLBACK ERROR] fan={fan_id} setup_failed={exc}")
 
     if _should_update_memory(conversation_history):
         spawn(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent), name="update_fan_memory")
