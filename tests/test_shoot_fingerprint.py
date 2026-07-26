@@ -1,13 +1,13 @@
+import asyncio
 import io
-import json
 import math
 
 from PIL import Image
 
 from db.queries import propose_sets
 from services.shoot_fingerprint import (
-    _nova_embedding_sync,
     build_local_visual_fingerprint,
+    build_shoot_fingerprint,
     build_shoot_clusters,
     shoot_similarity,
 )
@@ -29,14 +29,14 @@ def item(
     level: int = 4,
 ) -> dict:
     fingerprint = {
-        "status": "ready" if vector else "local_only",
-        "embedding": vector or [],
-        "local": {
-            "hsv_histogram": [1.0, 0.0],
+        "status": "local_only",
+        "provider": "pillow_local",
+        "local": ({
+            "hsv_histogram": vector,
             "dhash": "0000000000000000",
             "palette_names": [colour, "white"],
             "visual_tone": "warm",
-        },
+        } if vector else {}),
     }
     return {
         "fansly_media_id": media_id,
@@ -83,36 +83,15 @@ def test_local_fingerprint_captures_palette_lighting_and_geometry():
     assert len(result["dhash"]) == 16
 
 
-def test_nova_request_uses_clustering_purpose_and_inline_image():
-    class Runtime:
-        request = None
-
-        def invoke_model(self, **kwargs):
-            self.request = kwargs
-            return {
-                "body": io.BytesIO(
-                    json.dumps({
-                        "embeddings": [{
-                            "embeddingType": "IMAGE",
-                            "embedding": [1.0] + ([0.0] * 383),
-                        }],
-                    }).encode("utf-8")
-                )
-            }
-
-    runtime = Runtime()
-    vector, model = _nova_embedding_sync(jpeg_bytes(), client=runtime)
-    body = json.loads(runtime.request["body"])
-    params = body["singleEmbeddingParams"]
-    assert params["embeddingPurpose"] == "CLUSTERING"
-    assert params["embeddingDimension"] == 384
-    assert params["image"]["format"] == "jpeg"
-    assert params["image"]["source"]["bytes"]
-    assert len(vector) == 384
-    assert model == "amazon.nova-2-multimodal-embeddings-v1:0"
+def test_shoot_fingerprint_is_fully_local():
+    result = asyncio.run(build_shoot_fingerprint(jpeg_bytes()))
+    assert result["status"] == "local_only"
+    assert result["provider"] == "pillow_local"
+    assert "embedding" not in result
+    assert result["local"]["hsv_histogram"]
 
 
-def test_visual_embedding_overrides_same_generic_album_and_scene_slug():
+def test_local_visual_evidence_overrides_same_generic_album_and_scene_slug():
     first = [
         item(f"pink-{index}", unit(index), colour="pink")
         for index in (0, 2, 4)
