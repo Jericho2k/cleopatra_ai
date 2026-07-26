@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from ai.generator import generate_replies
+from ai.model_providers import assert_adult_eligible, complete, get_runtime_target
 from ai.prompt_builder import build_prompt
 from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
@@ -32,6 +33,7 @@ from db.queries import (
     save_message,
 )
 from models.commercial import CreatorPolicy
+from models.model_runtime import ModelTelemetryContext, VisionImage
 from models.schemas import (
     ConversationContext,
     Fan,
@@ -39,10 +41,12 @@ from models.schemas import (
     SuggestionRequest,
     SuggestionResponse,
 )
+from services.adult_classifier import ClassifierSettings, classify_image
 from services.fan_intelligence import learn_from_fan_message
 from services.auto_audience import AutoAudiencePolicy
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
+from services.model_telemetry import record_model_failure, record_model_result
 from services.suggestions import (
     _should_update_memory,
     _update_fan_ai_summary,
@@ -50,12 +54,22 @@ from services.suggestions import (
     get_suggestions,
     schedule_auto_reply,
 )
+from services.vault_classification import (
+    CATEGORY_LIST,
+    CLASSIFIER_VERSION,
+    ClassifierVerdict,
+    explicitness_scale_text,
+    merge_frame_verdicts,
+    price_bounds,
+    reconcile,
+)
 from services.vault_operations import (
     MANUAL_RECATEGORIZATION_DAILY_LIMIT,
     categorize_new_batch_enabled,
     manual_recategorization_usage,
     normalize_media_ids,
 )
+from services.video_frames import extract_frames
 
 
 _processed_messages: set = set()
@@ -1575,206 +1589,313 @@ async def _categorize_single_item_and_save(item: dict) -> None:
         result = await _categorize_single_item(item)
         db = get_supabase()
         await asyncio.to_thread(
-            lambda: db.table("creator_vault_media").update({
-                "content_category": result["content_category"],
-                "ai_description": result["ai_description"],
-                "price_min": result["price_min"],
-                "price_max": result["price_max"],
-                "explicitness_level": result.get("explicitness", 3),
-                "good_for": result.get("good_for", "standalone"),
-                "tags": result.get("tags", []),
-                "scene_id": result.get("scene_id", ""),
-                "scene_location": result.get("scene_location", ""),
-                "scene_outfit": result.get("scene_outfit", ""),
-                "scene_lighting": result.get("scene_lighting", ""),
-            }).eq("id", item["id"]).execute()
+            lambda: db.table("creator_vault_media")
+            .update(_vault_classification_row(result))
+            .eq("id", item["id"])
+            .execute()
         )
         print(f"[UPLOAD CATEGORIZE] item={item['id']} category={result['content_category']}")
     except Exception as e:
         print(f"[UPLOAD CATEGORIZE ERROR] {e}")
 
 
-VAULT_CATEGORIES = {
-    "teaser_clothed":   {"min": 0,   "max": 0,   "label": "Clothed teaser (free)"},
-    "teaser_bundle":    {"min": 0,   "max": 0,   "label": "Teaser bundle no nudity (free)"},
-    "legs_feet":        {"min": 15,  "max": 70,  "label": "Legs / feet / armpits"},
-    "lingerie_photo":   {"min": 10,  "max": 80,  "label": "Lingerie photo"},
-    "lingerie_video":   {"min": 15,  "max": 90,  "label": "Lingerie video"},
-    "nude_photo":       {"min": 15,  "max": 80,  "label": "Nude photo"},
-    "striptease_video": {"min": 15,  "max": 100, "label": "Striptease video"},
-    "closeup_photo":    {"min": 25,  "max": 130, "label": "Closeup photo"},
-    "closeup_video":    {"min": 25,  "max": 130, "label": "Closeup video"},
-    "dictate_video":    {"min": 15,  "max": 50,  "label": "Dictate / dirty talk video"},
-    "solo_toy_video":   {"min": 30,  "max": 150, "label": "Solo / toy / orgasm video"},
-    "solo_toy_photo":   {"min": 20,  "max": 80,  "label": "Solo / toy photo"},
-    "bg_content":       {"min": 50,  "max": 300, "label": "BG (boy-girl) content"},
-    "task":             {"min": 10,  "max": 50,  "label": "Task / custom request"},
-    "other":            {"min": 0,   "max": 0,   "label": "Other / unclear"},
-}
+_MAX_IMAGE_BYTES = 4 * 1024 * 1024
+_MAX_IMAGE_DIMENSION = 1024
+_GOOD_FOR_VALUES = {"opener", "mid_session", "closer", "standalone"}
 
-CATEGORY_LIST = "\n".join([
-    f"- {k}: {v['label']} (price range ${v['min']}-${v['max']})"
-    for k, v in VAULT_CATEGORIES.items()
-])
+_VISION_SYSTEM = (
+    "You catalogue an adult creator's own media vault so it can be priced and "
+    "merchandised. Describe only what is visible, factually and without "
+    "euphemism. Return the requested JSON object and nothing else."
+)
+
+
+async def _fetch_media_bytes(url: str, *, timeout: float = 15.0) -> bytes:
+    import httpx
+
+    if not url:
+        return b""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, timeout=timeout)
+    if response.status_code != 200 or len(response.content) <= 1000:
+        return b""
+    return response.content
+
+
+def _prepare_image(data: bytes, mimetype: str) -> VisionImage | None:
+    """Normalize to something both the classifier and the vision model accept."""
+    if not data:
+        return None
+
+    media_type = (
+        mimetype
+        if mimetype in {"image/jpeg", "image/png", "image/webp"}
+        else "image/jpeg"
+    )
+    if len(data) <= _MAX_IMAGE_BYTES and not str(mimetype).endswith("gif"):
+        return VisionImage(data=data, media_type=media_type)
+
+    try:
+        import io
+
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+        image.thumbnail((_MAX_IMAGE_DIMENSION, _MAX_IMAGE_DIMENSION), Image.LANCZOS)
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=85)
+        return VisionImage(data=buffer.getvalue(), media_type="image/jpeg")
+    except Exception as error:
+        print(f"[CATEGORIZE] image downscale failed: {error}")
+        if len(data) <= _MAX_IMAGE_BYTES:
+            return VisionImage(data=data, media_type=media_type)
+        return None
+
+
+async def _collect_item_images(item: dict, *, is_video: bool) -> list[VisionImage]:
+    """The frames to reason over: sampled keyframes for video, one for a photo."""
+    url = str(item.get("url") or "")
+    item_id = item.get("id", "")
+
+    if is_video:
+        try:
+            frames = await extract_frames(url)
+        except Exception as error:
+            print(f"[CATEGORIZE FRAMES] item={item_id} error={error}")
+            return []
+        if not frames:
+            print(f"[CATEGORIZE FRAMES] item={item_id} no frames extracted")
+        return [VisionImage(data=frame, media_type="image/jpeg") for frame in frames]
+
+    try:
+        data = await _fetch_media_bytes(url)
+    except Exception as error:
+        print(f"[CATEGORIZE] image fetch failed for item={item_id}: {error}")
+        return []
+
+    prepared = _prepare_image(data, str(item.get("mimetype") or ""))
+    return [prepared] if prepared else []
+
+
+async def _classify_explicitness(
+    images: list[VisionImage],
+    *,
+    item_id: str,
+) -> ClassifierVerdict:
+    """Score every frame with the adult classifier and keep the peak."""
+    settings = ClassifierSettings.from_env()
+    if not images or not settings.enabled:
+        return ClassifierVerdict()
+
+    results = await asyncio.gather(
+        *[
+            classify_image(
+                image.data,
+                media_type=image.media_type,
+                settings=settings,
+            )
+            for image in images
+        ],
+        return_exceptions=True,
+    )
+
+    verdicts: list[ClassifierVerdict] = []
+    for result in results:
+        if isinstance(result, BaseException):
+            print(f"[CATEGORIZE CLASSIFIER] item={item_id} error={result}")
+            continue
+        verdicts.append(result)
+
+    return merge_frame_verdicts(verdicts)
+
+
+def _vision_prompt(item: dict, *, is_video: bool, frame_count: int) -> str:
+    filename = item.get("filename", "")
+    album = item.get("album_title", "")
+
+    if frame_count > 1:
+        subject = (
+            f"These are {frame_count} keyframes sampled in order from one video. "
+            "Judge the clip as a whole, using the most revealing frame."
+        )
+    elif frame_count == 1:
+        subject = "This is a video keyframe." if is_video else "This is one image."
+    else:
+        subject = (
+            f"The media could not be fetched. Filename: '{filename}'. "
+            f"Album: '{album}'. Infer only from those, and say so in the description."
+        )
+
+    return (
+        f"{subject}\n\n"
+        f"Pick exactly one category:\n{CATEGORY_LIST}\n\n"
+        "Rate EXPLICITNESS strictly on what is ACTUALLY VISIBLE:\n"
+        f"{explicitness_scale_text()}\n"
+        "Lingerie with nothing exposed is 3, NEVER 5. A clothed selfie is 0.\n\n"
+        "Return ONLY a single line of JSON, no newlines, no formatting:\n"
+        '{"category":"category_key","description":"1-2 sentences","mood":"playful",'
+        '"explicitness":3,"good_for":"opener","tags":["tag1"],'
+        '"scene_location":"bedroom","scene_outfit":"red lingerie",'
+        '"scene_lighting":"dim","scene_id":"bedroom-red-lingerie"}'
+    )
+
+
+async def _describe_with_vision(
+    item: dict,
+    images: list[VisionImage],
+    *,
+    is_video: bool,
+) -> dict | None:
+    """Ask the vision model what is in the media. ``None`` means it could not."""
+    item_id = str(item.get("id") or "")
+    try:
+        target = get_runtime_target("VISION")
+        assert_adult_eligible(target)
+    except Exception as error:
+        print(f"[CATEGORIZE VISION] item={item_id} target error={error}")
+        return None
+
+    context = ModelTelemetryContext(
+        feature="vault_categorization",
+        creator_id=item.get("creator_id"),
+        metadata={"is_video": is_video, "frames": len(images)},
+    )
+
+    try:
+        result = await complete(
+            target,
+            system=_VISION_SYSTEM,
+            messages=[
+                {
+                    "role": "user",
+                    "content": _vision_prompt(
+                        item,
+                        is_video=is_video,
+                        frame_count=len(images),
+                    ),
+                }
+            ],
+            max_tokens=400,
+            temperature=0.0,
+            images=images or None,
+        )
+    except Exception as error:
+        await record_model_failure(target, context, error=str(error))
+        print(f"[CATEGORIZE VISION] item={item_id} error={error}")
+        return None
+
+    content = result.text.replace("```json", "").replace("```", "").strip()
+    print(f"[CATEGORIZE RAW] item={item_id} response={content[:300]}")
+    try:
+        data = json.loads(content)
+    except Exception as error:
+        await record_model_result(
+            result, context, success=False, parse_valid=False,
+            error=f"parse_error: {error}",
+        )
+        print(f"[CATEGORIZE VISION] item={item_id} parse error={error}")
+        return None
+
+    if not isinstance(data, dict):
+        await record_model_result(result, context, success=False, parse_valid=False)
+        return None
+
+    await record_model_result(result, context, success=True, parse_valid=True)
+    return data
 
 
 async def _categorize_single_item(item: dict) -> dict:
-    """Run Claude Vision on one vault item and return category + description."""
-    from anthropic import AsyncAnthropic
-    import httpx
+    """Classify one vault item from a classifier verdict plus vision semantics.
 
-    client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    url = item.get("url", "")
-    mimetype = item.get("mimetype", "")
+    Neither source can fail the item on its own: without the classifier this
+    degrades to vision-only, without the vision model the classifier still
+    places the item in a priced tier, and with neither it returns a storable
+    row flagged for review.
+    """
     item_id = item.get("id", "")
-    is_video = mimetype.startswith("video") if mimetype else False
+    mimetype = str(item.get("mimetype") or "")
+    is_video = mimetype.startswith("video")
 
     try:
-        if is_video:
-            # For videos we can't send frames easily — use filename + album as context
-            filename = item.get("filename", "")
-            album = item.get("album_title", "")
-            prompt = (
-                f"This is a video file. Filename: '{filename}'. Album: '{album}'.\n"
-                f"Based on the filename and album name only, classify this into one of these categories:\n{CATEGORY_LIST}\n\n"
-                "Return ONLY valid JSON:\n"
-                '{"category": "category_key", "description": "one sentence description of likely content", "mood": "playful|intimate|explicit|teasing"}'
-            )
-            response = await client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=150,
-                messages=[{"role": "user", "content": prompt}],
-            )
-        else:
-            # Fetch image and send to Claude Vision
-            img_b64 = None
-            media_type = mimetype if mimetype in ["image/jpeg", "image/png", "image/webp", "image/gif"] else "image/jpeg"
-            try:
-                async with httpx.AsyncClient() as hc:
-                    img_resp = await hc.get(url, timeout=15)
-                    if img_resp.status_code == 200 and len(img_resp.content) > 1000:
-                        img_data = img_resp.content
-                        # Resize if over 4MB to stay under Claude's 5MB limit
-                        if len(img_data) > 4 * 1024 * 1024:
-                            try:
-                                from PIL import Image
-                                import io
-                                img_obj = Image.open(io.BytesIO(img_data))
-                                img_obj.thumbnail((1024, 1024), Image.LANCZOS)
-                                buf = io.BytesIO()
-                                img_obj.save(buf, format="JPEG", quality=85)
-                                img_data = buf.getvalue()
-                                media_type = "image/jpeg"
-                                print(f"[CATEGORIZE] resized large image item={item_id} to {len(img_data)} bytes")
-                            except Exception as resize_err:
-                                print(f"[CATEGORIZE] resize failed item={item_id}: {resize_err}")
-                        img_b64 = __import__("base64").b64encode(img_data).decode()
-            except Exception as fetch_err:
-                print(f"[CATEGORIZE] image fetch failed for item={item_id}: {fetch_err}")
+        images = await _collect_item_images(item, is_video=is_video)
 
-            if img_b64:
-                response = await client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=400,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": img_b64,
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": (
-                                    f"Classify this OnlyFans creator image. Pick one category:\n{CATEGORY_LIST}\n\n"
-                                    "Rate EXPLICITNESS strictly on what is ACTUALLY VISIBLE in THIS image:\n"
-                                    "-1 = junk/noise (screenshot, text, meme, unrelated)\n"
-                                    " 0 = casual/SFW (normal selfie, street clothes, nothing suggestive)\n"
-                                    " 1 = teaser (blurred, pixelated, censored, or fully covered)\n"
-                                    " 2 = suggestive but not provocative (hint of skin, flirty, still clothed)\n"
-                                    " 3 = sexy: lingerie / bikini / see-through, nothing explicit shown\n"
-                                    " 4 = nude: breasts, butt, or genitals exposed\n"
-                                    " 5 = explicit/lewd: spread, penetration, sex-act still — max\n"
-                                    "Lingerie with nothing exposed is 3, NEVER 5. A clothed selfie is 0.\n\n"
-                                    "Return ONLY a single line of JSON, no newlines, no formatting:\n"
-                                    '{"category":"category_key","description":"1-2 sentences","mood":"playful","explicitness":3,"good_for":"opener","tags":["tag1"],"scene_location":"bedroom","scene_outfit":"red lingerie","scene_lighting":"dim","scene_id":"bedroom-red-lingerie"}'
-                                ),
-                            },
-                        ],
-                    }],
-                )
-            else:
-                # CDN URL expired or fetch failed — fall back to filename+album
-                filename = item.get("filename", "")
-                album = item.get("album_title", "")
-                print(f"[CATEGORIZE] falling back to filename analysis for item={item_id}")
-                response = await client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=300,
-                    messages=[{"role": "user", "content": (
-                        f"This is an OnlyFans image. Filename: '{filename}'. Album: '{album}'.\n"
-                        f"Based on filename and album only, classify into one of:\n{CATEGORY_LIST}\n\n"
-                        "Return ONLY valid JSON:\n"
-                        "{\n"
-                        '  "category": "category_key",\n'
-                        '  "description": "best guess description based on filename/album",\n'
-                        '  "mood": "playful|intimate|explicit|teasing",\n'
-                        '  "explicitness": 3,\n'
-                        '  "good_for": "opener|mid_session|closer|standalone",\n'
-                        '  "tags": [],\n'
-                        '  "scene": {"location": "unknown", "outfit": "unknown", "hair": "unknown", "lighting": "unknown", "scene_id": "unknown"}\n'
-                        "}"
-                    )}],
-                )
+        # The classifier and the vision model see the same frames and do not
+        # depend on each other, so they run together.
+        verdict, vision = await asyncio.gather(
+            _classify_explicitness(images, item_id=str(item_id)),
+            _describe_with_vision(item, images, is_video=is_video),
+        )
 
-        content = response.content[0].text.strip()
-        content = content.replace("```json", "").replace("```", "").strip()
-        print(f"[CATEGORIZE RAW] item={item_id} response={content[:300]}")
-        data = json.loads(content)
-        category = data.get("category", "other")
-        if category not in VAULT_CATEGORIES:
-            category = "other"
-        description = data.get("description", "")
-        mood = data.get("mood", "")
-        price_info = VAULT_CATEGORIES[category]
+        vision_data = vision or {}
+        decision = reconcile(
+            vision_category=vision_data.get("category"),
+            vision_explicitness=vision_data.get("explicitness", 0),
+            verdict=verdict,
+            is_video=is_video,
+            vision_available=vision is not None,
+        )
 
-        explicitness = min(max(int(data.get("explicitness", 0)), -1), 5)
-        good_for = data.get("good_for", "standalone")
-        if good_for not in ["opener", "mid_session", "closer", "standalone"]:
+        price_min, price_max = price_bounds(decision.category)
+
+        description = str(vision_data.get("description") or "")
+        mood = str(vision_data.get("mood") or "")
+        good_for = vision_data.get("good_for", "standalone")
+        if good_for not in _GOOD_FOR_VALUES:
             good_for = "standalone"
-        tags = data.get("tags", [])
+
+        tags = vision_data.get("tags", [])
         if not isinstance(tags, list):
             tags = []
-        scene_id = data.get("scene_id", "")
-        location = data.get("scene_location", "")
-        outfit = data.get("scene_outfit", "")
-        lighting = data.get("scene_lighting", "")
 
-        full_description = f"[{mood}|{good_for}|explicit:{explicitness}] {description}"
+        scene_id = str(vision_data.get("scene_id") or "")
+        location = str(vision_data.get("scene_location") or "")
+        # The classifier names the garment that made a frame suggestive, which
+        # is the only outfit signal left when the vision model returns nothing.
+        outfit = str(vision_data.get("scene_outfit") or "") or decision.outfit_hint
+        lighting = str(vision_data.get("scene_lighting") or "")
+
+        full_description = (
+            f"[{mood}|{good_for}|explicit:{decision.explicitness}] {description}"
+        )
         if outfit:
             full_description += f" Outfit: {outfit}."
         if location:
             full_description += f" Location: {location}."
         if tags:
-            full_description += f" Tags: {', '.join(tags)}."
+            full_description += f" Tags: {', '.join(str(tag) for tag in tags)}."
+
+        if decision.needs_review:
+            print(
+                f"[CATEGORIZE REVIEW] item={item_id} reason={decision.disagreement} "
+                f"category={decision.category} classifier={decision.classifier_explicitness} "
+                f"vision={decision.vision_explicitness}"
+            )
 
         return {
             "id": item_id,
-            "content_category": category,
+            "content_category": decision.category,
             "ai_description": full_description,
-            "price_min": price_info["min"],
-            "price_max": price_info["max"],
-            "explicitness": explicitness,
+            "price_min": price_min,
+            "price_max": price_max,
+            "explicitness": decision.explicitness,
             "good_for": good_for,
             "tags": tags,
             "scene_id": scene_id,
             "scene_location": location,
             "scene_outfit": outfit,
             "scene_lighting": lighting,
+            "classification_evidence": decision.evidence,
+            "classification_confidence": decision.confidence_score,
+            "classification_source": decision.source,
+            "classification_model": _classification_model_label(
+                verdict, vision_available=vision is not None
+            ),
+            "classification_needs_review": decision.needs_review,
+            "classification_disagreement": decision.disagreement,
+            "classifier_explicitness": decision.classifier_explicitness,
+            "vision_explicitness": decision.vision_explicitness,
+            "classifier_scores": verdict.scores,
+            "analyzed_frame_count": len(images),
         }
 
     except Exception as e:
@@ -1785,7 +1906,64 @@ async def _categorize_single_item(item: dict) -> dict:
             "ai_description": "",
             "price_min": 0,
             "price_max": 0,
+            "classification_evidence": "unavailable",
+            "classification_confidence": 0.0,
+            "classification_source": "failed",
+            "classification_needs_review": True,
+            "classification_disagreement": "error",
         }
+
+
+def _classification_model_label(
+    verdict: ClassifierVerdict,
+    *,
+    vision_available: bool,
+) -> str:
+    """What actually produced this row, for the dashboard's quality panel."""
+    parts: list[str] = []
+    if vision_available:
+        try:
+            target = get_runtime_target("VISION")
+            parts.append(f"{target.provider}:{target.model}")
+        except Exception:
+            pass
+    if verdict.available:
+        parts.append(ClassifierSettings.from_env().provider)
+    return " + ".join(parts)
+
+
+def _vault_classification_row(result: dict) -> dict:
+    """The single column set every categorization path writes.
+
+    Includes the ``classification_*`` provenance the dashboard's quality panel
+    reads. Stamping ``classification_version`` is what lets the operator find
+    and re-analyze media left behind by an older classifier.
+    """
+    return {
+        "content_category": result["content_category"],
+        "ai_description": result["ai_description"],
+        "price_min": result["price_min"],
+        "price_max": result["price_max"],
+        "explicitness_level": result.get("explicitness", 3),
+        "good_for": result.get("good_for", "standalone"),
+        "tags": result.get("tags", []),
+        "scene_id": result.get("scene_id", ""),
+        "scene_location": result.get("scene_location", ""),
+        "scene_outfit": result.get("scene_outfit", ""),
+        "scene_lighting": result.get("scene_lighting", ""),
+        "classification_version": CLASSIFIER_VERSION,
+        "classification_source": result.get("classification_source", "failed"),
+        "classification_model": result.get("classification_model", ""),
+        "classification_confidence": float(result.get("classification_confidence", 0.0) or 0.0),
+        "classified_at": datetime.now(timezone.utc).isoformat(),
+        "classification_evidence": result.get("classification_evidence", "unavailable"),
+        "classification_needs_review": bool(result.get("classification_needs_review", False)),
+        "classification_disagreement": result.get("classification_disagreement", ""),
+        "classifier_explicitness": result.get("classifier_explicitness"),
+        "vision_explicitness": result.get("vision_explicitness"),
+        "classifier_scores": result.get("classifier_scores", {}),
+        "analyzed_frame_count": int(result.get("analyzed_frame_count", 0) or 0),
+    }
 
 
 _VAULT_COOLDOWN_DAYS = 7
@@ -1841,6 +2019,81 @@ async def _count_uncategorized(creator_id: str) -> int:
     return r.count or 0
 
 
+async def _classification_staleness(creator_id: str) -> dict:
+    """How much media an upgrade run would re-analyze, in total and in approved sets."""
+    db = get_supabase()
+    try:
+        result = await asyncio.to_thread(
+            lambda: db.rpc(
+                "vault_classification_staleness",
+                {
+                    "p_creator_id": creator_id,
+                    "p_current_version": CLASSIFIER_VERSION,
+                },
+            ).execute()
+        )
+    except Exception as error:
+        # The overview is a dashboard read; a missing migration must not 500 it.
+        print(f"[VAULT STALENESS] creator={creator_id} error={error}")
+        return {"stale": 0, "stale_approved": 0}
+
+    row = (result.data or [{}])[0]
+    return {
+        "stale": int(row.get("stale") or 0),
+        "stale_approved": int(row.get("stale_approved") or 0),
+    }
+
+
+async def _stale_classification_ids(creator_id: str, scope: str) -> list[str]:
+    """Row ids an upgrade run should reprocess, newest metadata last."""
+    db = get_supabase()
+    approved_media_ids: set[str] | None = None
+
+    if scope == "approved":
+        sets = await asyncio.to_thread(
+            lambda: db.table("vault_sets")
+            .select("media_ids")
+            .eq("creator_id", creator_id)
+            .eq("status", "approved")
+            .execute()
+        )
+        approved_media_ids = {
+            str(media_id)
+            for row in (sets.data or [])
+            for media_id in (row.get("media_ids") or [])
+            if media_id
+        }
+        if not approved_media_ids:
+            return []
+
+    item_ids: list[str] = []
+    page_size = 1000
+    from_idx = 0
+    while True:
+        rows = await asyncio.to_thread(
+            lambda f=from_idx: db.table("creator_vault_media")
+            .select("id, fansly_media_id")
+            .eq("creator_id", creator_id)
+            .not_.is_("content_category", "null")
+            .neq("content_category", "")
+            .lt("classification_version", CLASSIFIER_VERSION)
+            .range(f, f + page_size - 1)
+            .execute()
+        )
+        batch = rows.data or []
+        for row in batch:
+            if approved_media_ids is not None and str(
+                row.get("fansly_media_id") or ""
+            ) not in approved_media_ids:
+                continue
+            item_ids.append(str(row["id"]))
+        if len(batch) < page_size:
+            break
+        from_idx += page_size
+
+    return item_ids
+
+
 _categorize_state: dict = {}
 
 
@@ -1849,12 +2102,19 @@ async def categorize_vault(
     creator_id: str,
     mode: str = "auto",
     force: bool = False,
+    upgrade_scope: str = "all",
+    confirm_upgrade: bool = False,
 ) -> dict:
-    """Start either the one-time initial job or a new-media-only job.
+    """Start the one-time initial job, a new-media job, or a version upgrade.
 
     ``force`` remains accepted for compatibility with older dashboard builds,
     but it cannot unlock a completed initial-vault run or reprocess categorized
     media. That invariant is enforced by the selected rows, not by the UI.
+
+    ``upgrade`` is the only mode that rewrites existing metadata, so it is the
+    only paid re-analysis and it requires ``confirm_upgrade``. It selects rows
+    below the current classifier version — media whose category was decided by
+    an older classifier and whose price band therefore cannot be trusted.
     """
     del force
     if _categorize_state.get(creator_id, {}).get("status") == "running":
@@ -1872,17 +2132,37 @@ async def categorize_vault(
     resolved_mode = mode.strip().lower()
     if resolved_mode == "auto":
         resolved_mode = "new" if initial_completed_at else "initial"
-    if resolved_mode not in {"initial", "new"}:
-        raise HTTPException(status_code=400, detail="mode must be 'initial' or 'new'")
+    if resolved_mode not in {"initial", "new", "upgrade"}:
+        raise HTTPException(
+            status_code=400,
+            detail="mode must be 'initial', 'new' or 'upgrade'",
+        )
     if resolved_mode == "initial" and initial_completed_at:
         return {
             "status": "initial_already_completed",
             "initial_completed_at": initial_completed_at,
         }
 
-    # Both modes select only uncategorized rows. The initial mode is additionally
-    # locked forever after its first successful pass.
-    pending = await _count_uncategorized(creator_id)
+    upgrade_ids: list[str] = []
+    if resolved_mode == "upgrade":
+        if not confirm_upgrade:
+            raise HTTPException(
+                status_code=400,
+                detail="Re-analyzing existing metadata is a paid run and must be confirmed.",
+            )
+        scope = upgrade_scope.strip().lower()
+        if scope not in {"all", "approved"}:
+            raise HTTPException(
+                status_code=400,
+                detail="upgrade_scope must be 'all' or 'approved'",
+            )
+        upgrade_ids = await _stale_classification_ids(creator_id, scope)
+        pending = len(upgrade_ids)
+    else:
+        # Initial and new select only uncategorized rows. The initial mode is
+        # additionally locked forever after its first successful pass.
+        pending = await _count_uncategorized(creator_id)
+
     if pending == 0:
         return {
             "status": "nothing_to_categorize",
@@ -1901,7 +2181,9 @@ async def categorize_vault(
     spawn(
         _run_vault_categorization(
             creator_id,
+            item_ids=upgrade_ids or None,
             mark_initial=resolved_mode == "initial",
+            reprocess=resolved_mode == "upgrade",
         ),
         name=f"run_vault_categorization:{resolved_mode}",
     )
@@ -1967,12 +2249,16 @@ async def vault_categorization_overview(creator_id: str) -> dict:
     )
     if not creator.data:
         raise HTTPException(status_code=404, detail="creator not found")
+    staleness = await _classification_staleness(creator_id)
     return {
         "initial_completed_at": creator.data.get("vault_initial_categorized_at"),
         "auto_categorize_new_media": bool(
             creator.data.get("auto_categorize_new_media", True)
         ),
         "uncategorized": await _count_uncategorized(creator_id),
+        "classifier_version": CLASSIFIER_VERSION,
+        "stale_classifications": staleness["stale"],
+        "stale_approved_classifications": staleness["stale_approved"],
         "manual_reanalysis": await _manual_recategorization_usage(creator_id),
         "active_run": _categorize_state.get(
             creator_id,
@@ -2008,6 +2294,7 @@ async def _run_vault_categorization(
     *,
     item_ids: list[str] | None = None,
     mark_initial: bool = False,
+    reprocess: bool = False,
 ) -> None:
     db = get_supabase()
     try:
@@ -2017,14 +2304,21 @@ async def _run_vault_categorization(
             # URL-safe chunks also make the exact new-media contract explicit.
             for start in range(0, len(target_ids), 250):
                 chunk = target_ids[start:start + 250]
-                rows = await asyncio.to_thread(
-                    lambda ids=chunk: db.table("creator_vault_media")
-                    .select("id, url, mimetype, filename, album_title")
-                    .eq("creator_id", creator_id)
-                    .in_("id", ids)
-                    .or_("content_category.is.null,content_category.eq.")
-                    .execute()
-                )
+
+                def _select(ids=chunk):
+                    query = (
+                        db.table("creator_vault_media")
+                        .select("id, creator_id, url, mimetype, filename, album_title")
+                        .eq("creator_id", creator_id)
+                        .in_("id", ids)
+                    )
+                    # An upgrade run exists precisely to rewrite categorized
+                    # rows, so it is the one path that skips this filter.
+                    if not reprocess:
+                        query = query.or_("content_category.is.null,content_category.eq.")
+                    return query.execute()
+
+                rows = await asyncio.to_thread(_select)
                 all_items.extend(rows.data or [])
         else:
             # Initial setup only: paginate every still-uncategorized item once.
@@ -2033,7 +2327,7 @@ async def _run_vault_categorization(
             while True:
                 rows = await asyncio.to_thread(
                     lambda f=from_idx: db.table("creator_vault_media")
-                    .select("id, url, mimetype, filename, album_title")
+                    .select("id, creator_id, url, mimetype, filename, album_title")
                     .eq("creator_id", creator_id)
                     .or_("content_category.is.null,content_category.eq.")
                     .range(f, f + page_size - 1)
@@ -2047,7 +2341,7 @@ async def _run_vault_categorization(
 
         total = len(all_items)
         _categorize_state[creator_id]["total"] = total
-        mode = "new" if target_ids else "initial"
+        mode = "upgrade" if reprocess else ("new" if target_ids else "initial")
         print(f"[CATEGORIZE] creator={creator_id} mode={mode} items={total}")
 
         done = 0
@@ -2065,19 +2359,10 @@ async def _run_vault_categorization(
                     errors += 1
                     continue
                 await asyncio.to_thread(
-                    lambda r=result: db.table("creator_vault_media").update({
-                        "content_category": r["content_category"],
-                        "ai_description": r["ai_description"],
-                        "price_min": r["price_min"],
-                        "price_max": r["price_max"],
-                        "explicitness_level": r.get("explicitness", 3),
-                        "good_for": r.get("good_for", "standalone"),
-                        "tags": r.get("tags", []),
-                        "scene_id": r.get("scene_id", ""),
-                        "scene_location": r.get("scene_location", ""),
-                        "scene_outfit": r.get("scene_outfit", ""),
-                        "scene_lighting": r.get("scene_lighting", ""),
-                    }).eq("id", r["id"]).execute()
+                    lambda r=result: db.table("creator_vault_media")
+                    .update(_vault_classification_row(r))
+                    .eq("id", r["id"])
+                    .execute()
                 )
                 done += 1
             _categorize_state[creator_id].update({"done": done, "errors": errors})
@@ -2159,19 +2444,10 @@ async def recategorize_item(item_id: str) -> dict:
 
     result = await _categorize_single_item(item)
     await asyncio.to_thread(
-        lambda: db.table("creator_vault_media").update({
-            "content_category": result["content_category"],
-            "ai_description": result["ai_description"],
-            "price_min": result["price_min"],
-            "price_max": result["price_max"],
-            "explicitness_level": result.get("explicitness", 3),
-            "good_for": result.get("good_for", "standalone"),
-            "tags": result.get("tags", []),
-            "scene_id": result.get("scene_id", ""),
-            "scene_location": result.get("scene_location", ""),
-            "scene_outfit": result.get("scene_outfit", ""),
-            "scene_lighting": result.get("scene_lighting", ""),
-        }).eq("id", item_id).execute()
+        lambda: db.table("creator_vault_media")
+        .update(_vault_classification_row(result))
+        .eq("id", item_id)
+        .execute()
     )
     updated = await asyncio.to_thread(
         lambda: db.table("creator_vault_media")

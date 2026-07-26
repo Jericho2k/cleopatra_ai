@@ -3,7 +3,8 @@
   "notes": [
     "Pricing is a snapshot and must be reviewed before production decisions.",
     "adult_policy describes provider eligibility, not raw model capability.",
-    "Do not run adult scenarios through a provider marked ineligible."
+    "Do not run adult scenarios through a provider marked ineligible.",
+    "Vault imagery is always an adult workload. ai.model_providers.assert_adult_eligible enforces this."
   ],
   "models": [
     {
@@ -117,6 +118,40 @@
       "output_per_million": 1.04,
       "adult_policy": "unverified",
       "enabled": true
+    },
+    {
+      "name": "Self-hosted Qwen2.5-VL 72B (vault vision)",
+      "provider": "self_hosted",
+      "model": "Qwen/Qwen2.5-VL-72B-Instruct",
+      "base_url": "http://localhost:8000/v1",
+      "api_key_env": "SELF_HOSTED_API_KEY",
+      "input_per_million": 0.0,
+      "output_per_million": 0.0,
+      "adult_policy": "operator_responsibility",
+      "enabled": true,
+      "timeout_seconds": 90,
+      "metadata": {
+        "role": "vault image and video-frame description",
+        "supports_vision": true,
+        "note": "Serve with vLLM --limit-mm-per-prompt image=8. Set real amortized GPU cost before comparing economics."
+      }
+    },
+    {
+      "name": "Together Qwen2.5-VL 72B (vault vision)",
+      "provider": "together",
+      "model": "Qwen/Qwen2.5-VL-72B-Instruct",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "input_per_million": 1.20,
+      "output_per_million": 1.20,
+      "adult_policy": "unverified",
+      "enabled": false,
+      "timeout_seconds": 90,
+      "metadata": {
+        "role": "vault vision fallback",
+        "supports_vision": true,
+        "note": "Disabled by default: confirm the provider's terms permit adult imagery before enabling."
+      }
     },
     {
       "name": "Self-hosted candidate",
