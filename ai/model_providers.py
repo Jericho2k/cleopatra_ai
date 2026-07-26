@@ -7,11 +7,37 @@ import os
 import time
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
-from models.model_runtime import ModelResult, ModelTarget, ModelUsage
+from models.model_runtime import ModelResult, ModelTarget, ModelUsage, VisionImage
 
 _DEFAULT_CATALOG = Path(__file__).resolve().parents[1] / "config" / "model_candidates.json"
+
+# Providers whose terms do not permit adult workloads regardless of what a
+# catalog row claims. Anthropic is listed because ``model_candidates.json``
+# already marks it ``adult_policy: ineligible`` and nothing enforced it — the
+# vault categorizer called it directly on explicit imagery.
+ADULT_INELIGIBLE_PROVIDERS = frozenset({"anthropic"})
+
+
+class AdultPolicyError(RuntimeError):
+    """Raised before an adult workload can reach an ineligible provider."""
+
+
+def adult_eligibility(target: ModelTarget) -> str:
+    """Effective adult policy: the provider rule outranks the catalog row."""
+    if target.provider in ADULT_INELIGIBLE_PROVIDERS:
+        return "ineligible"
+    return target.adult_policy
+
+
+def assert_adult_eligible(target: ModelTarget) -> None:
+    if adult_eligibility(target) == "ineligible":
+        raise AdultPolicyError(
+            f"{target.name} is ineligible for adult workloads. "
+            "Point VISION_PROVIDER/VISION_MODEL at a provider whose terms "
+            "permit this content."
+        )
 
 
 @lru_cache(maxsize=4)
@@ -40,6 +66,9 @@ def get_runtime_target(prefix: str) -> ModelTarget:
         "CHAT": ("anthropic", "claude-sonnet-4-6"),
         "ANALYZER": ("anthropic", "claude-haiku-4-5-20251001"),
         "EXTRACTOR": ("together", "openai/gpt-oss-120b"),
+        # Vault imagery is adult content, so the default target is one the
+        # operator hosts. See ADULT_INELIGIBLE_PROVIDERS.
+        "VISION": ("self_hosted", "Qwen/Qwen2.5-VL-72B-Instruct"),
     }
     default_provider, default_model = defaults.get(prefix, ("together", ""))
 
@@ -91,11 +120,16 @@ async def complete(
     target: ModelTarget,
     *,
     system: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     max_tokens: int,
     temperature: float | None = None,
+    images: Sequence[VisionImage] | None = None,
 ) -> ModelResult:
-    """Call a configured model endpoint and normalize text, usage, and latency."""
+    """Call a configured model endpoint and normalize text, usage, and latency.
+
+    ``images`` are attached to the final user message in whichever content
+    shape the provider expects, so callers stay provider-neutral.
+    """
 
     started = time.perf_counter()
     if target.provider == "anthropic":
@@ -105,6 +139,7 @@ async def complete(
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            images=images,
         )
     elif target.provider in {"together", "self_hosted", "openai_compatible"}:
         result = await _complete_openai_compatible(
@@ -113,6 +148,7 @@ async def complete(
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            images=images,
         )
     else:
         raise ValueError(f"Unsupported model provider: {target.provider}")
@@ -127,13 +163,71 @@ async def complete(
     )
 
 
+def _attach_images(
+    messages: list[dict[str, Any]],
+    images: Sequence[VisionImage] | None,
+    block_builder,
+) -> list[dict[str, Any]]:
+    """Return ``messages`` with image blocks prepended to the last user turn.
+
+    Images lead the content list because both providers read a prompt that
+    follows its images more reliably than one that precedes them.
+    """
+    if not images:
+        return list(messages)
+
+    prepared = [dict(message) for message in messages]
+    index = next(
+        (
+            position
+            for position in range(len(prepared) - 1, -1, -1)
+            if prepared[position].get("role") == "user"
+        ),
+        None,
+    )
+    if index is None:
+        prepared.append({"role": "user", "content": ""})
+        index = len(prepared) - 1
+
+    content = prepared[index].get("content")
+    text_blocks: list[dict[str, Any]]
+    if isinstance(content, str):
+        text_blocks = [{"type": "text", "text": content}] if content else []
+    elif isinstance(content, list):
+        text_blocks = list(content)
+    else:
+        text_blocks = []
+
+    prepared[index]["content"] = [
+        *(block_builder(image) for image in images),
+        *text_blocks,
+    ]
+    return prepared
+
+
+def _anthropic_image_block(image: VisionImage) -> dict[str, Any]:
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": image.media_type,
+            "data": image.as_base64(),
+        },
+    }
+
+
+def _openai_image_block(image: VisionImage) -> dict[str, Any]:
+    return {"type": "image_url", "image_url": {"url": image.as_data_uri()}}
+
+
 async def _complete_anthropic(
     target: ModelTarget,
     *,
     system: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     max_tokens: int,
     temperature: float | None,
+    images: Sequence[VisionImage] | None = None,
 ) -> ModelResult:
     from anthropic import AsyncAnthropic
 
@@ -142,7 +236,7 @@ async def _complete_anthropic(
         "model": target.model,
         "max_tokens": max_tokens,
         "system": system,
-        "messages": messages,
+        "messages": _attach_images(messages, images, _anthropic_image_block),
     }
     if temperature is not None:
         kwargs["temperature"] = temperature
@@ -172,9 +266,10 @@ async def _complete_openai_compatible(
     target: ModelTarget,
     *,
     system: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     max_tokens: int,
     temperature: float | None,
+    images: Sequence[VisionImage] | None = None,
 ) -> ModelResult:
     from openai import AsyncOpenAI
 
@@ -189,7 +284,7 @@ async def _complete_openai_compatible(
 
     payload_messages = [
         {"role": "system", "content": system},
-        *messages,
+        *_attach_images(messages, images, _openai_image_block),
     ]
 
     kwargs: dict[str, Any] = {

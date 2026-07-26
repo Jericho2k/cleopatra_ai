@@ -3,7 +3,8 @@
   "notes": [
     "Pricing is a snapshot and must be reviewed before production decisions.",
     "adult_policy describes provider eligibility, not raw model capability.",
-    "Do not run adult scenarios through a provider marked ineligible."
+    "Do not run adult scenarios through a provider marked ineligible.",
+    "Vault imagery is always an adult workload. ai.model_providers.assert_adult_eligible enforces this."
   ],
   "models": [
     {
@@ -13,11 +14,13 @@
       "api_key_env": "ANTHROPIC_API_KEY",
       "input_per_million": 3.0,
       "output_per_million": 15.0,
-      "cache_read_per_million": 0.30,
+      "cache_read_per_million": 0.3,
       "cache_write_per_million": 3.75,
       "adult_policy": "ineligible",
       "enabled": true,
-      "metadata": {"role": "quality baseline for non-adult scenarios only"}
+      "metadata": {
+        "role": "quality baseline for non-adult scenarios only"
+      }
     },
     {
       "name": "Together MiniMax M3",
@@ -25,8 +28,8 @@
       "model": "MiniMaxAI/MiniMax-M3",
       "base_url": "https://api.together.xyz/v1",
       "api_key_env": "TOGETHER_API_KEY",
-      "input_per_million": 0.30,
-      "output_per_million": 1.20,
+      "input_per_million": 0.3,
+      "output_per_million": 1.2,
       "cache_read_per_million": 0.06,
       "timeout_seconds": 90,
       "adult_policy": "unverified",
@@ -51,9 +54,9 @@
       "model": "moonshotai/Kimi-K2.6",
       "base_url": "https://api.together.xyz/v1",
       "api_key_env": "TOGETHER_API_KEY",
-      "input_per_million": 1.20,
-      "output_per_million": 4.50,
-      "cache_read_per_million": 0.20,
+      "input_per_million": 1.2,
+      "output_per_million": 4.5,
+      "cache_read_per_million": 0.2,
       "adult_policy": "unverified",
       "enabled": true,
       "stream": true,
@@ -70,7 +73,7 @@
       "api_key_env": "TOGETHER_API_KEY",
       "input_per_million": 1.74,
       "output_per_million": 3.48,
-      "cache_read_per_million": 0.20,
+      "cache_read_per_million": 0.2,
       "adult_policy": "unverified",
       "enabled": true,
       "stream": true,
@@ -103,7 +106,7 @@
       "base_url": "https://api.together.xyz/v1",
       "api_key_env": "TOGETHER_API_KEY",
       "input_per_million": 0.15,
-      "output_per_million": 0.60,
+      "output_per_million": 0.6,
       "adult_policy": "unverified",
       "enabled": true
     },
@@ -119,6 +122,40 @@
       "enabled": true
     },
     {
+      "name": "Self-hosted Qwen2.5-VL 72B (vault vision)",
+      "provider": "self_hosted",
+      "model": "Qwen/Qwen2.5-VL-72B-Instruct",
+      "base_url": "http://localhost:8000/v1",
+      "api_key_env": "SELF_HOSTED_API_KEY",
+      "input_per_million": 0.0,
+      "output_per_million": 0.0,
+      "adult_policy": "operator_responsibility",
+      "enabled": true,
+      "timeout_seconds": 90,
+      "metadata": {
+        "role": "vault adult taxonomy and inventory description",
+        "supports_vision": true,
+        "note": "Vault classifier. Serve with vLLM; set real amortized GPU cost before comparing economics."
+      }
+    },
+    {
+      "name": "Together Qwen2.5-VL 72B (vault vision)",
+      "provider": "together",
+      "model": "Qwen/Qwen2.5-VL-72B-Instruct",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "input_per_million": 1.2,
+      "output_per_million": 1.2,
+      "adult_policy": "unverified",
+      "enabled": false,
+      "timeout_seconds": 90,
+      "metadata": {
+        "role": "vault vision fallback",
+        "supports_vision": true,
+        "note": "Disabled by default: confirm the provider's terms permit adult imagery before enabling."
+      }
+    },
+    {
       "name": "Self-hosted candidate",
       "provider": "self_hosted",
       "model": "replace-with-local-model-id",
@@ -128,7 +165,9 @@
       "output_per_million": 0.0,
       "adult_policy": "operator_responsibility",
       "enabled": false,
-      "metadata": {"note": "Set real amortized GPU cost before comparing economics."}
+      "metadata": {
+        "note": "Set real amortized GPU cost before comparing economics."
+      }
     }
   ]
 }

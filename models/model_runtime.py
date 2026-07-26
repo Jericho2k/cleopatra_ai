@@ -2,8 +2,23 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 from typing import Any
+
+
+@dataclass(frozen=True)
+class VisionImage:
+    """One image to attach to a request, in whatever shape a provider wants."""
+
+    data: bytes
+    media_type: str = "image/jpeg"
+
+    def as_base64(self) -> str:
+        return base64.b64encode(self.data).decode("ascii")
+
+    def as_data_uri(self) -> str:
+        return f"data:{self.media_type};base64,{self.as_base64()}"
 
 
 @dataclass(frozen=True)

@@ -1,12 +1,16 @@
+import asyncio
 import io
 import json
 import math
+from types import SimpleNamespace
 
+import pytest
 from PIL import Image
 
 from db.queries import propose_sets
 from services.shoot_fingerprint import (
-    _nova_embedding_sync,
+    ShootEmbeddingConfigurationError,
+    _request_embedding,
     build_local_visual_fingerprint,
     build_shoot_clusters,
     shoot_similarity,
@@ -83,33 +87,36 @@ def test_local_fingerprint_captures_palette_lighting_and_geometry():
     assert len(result["dhash"]) == 16
 
 
-def test_nova_request_uses_clustering_purpose_and_inline_image():
-    class Runtime:
+def test_embedding_request_sends_the_image_as_a_data_uri(monkeypatch):
+    monkeypatch.setenv("VAULT_SHOOT_EMBEDDING_BASE_URL", "http://localhost:8000/v1")
+    monkeypatch.setenv("VAULT_SHOOT_EMBEDDING_MODEL", "test-embedder")
+
+    class Embeddings:
         request = None
 
-        def invoke_model(self, **kwargs):
-            self.request = kwargs
-            return {
-                "body": io.BytesIO(
-                    json.dumps({
-                        "embeddings": [{
-                            "embeddingType": "IMAGE",
-                            "embedding": [1.0] + ([0.0] * 383),
-                        }],
-                    }).encode("utf-8")
-                )
-            }
+        async def create(self, **kwargs):
+            Embeddings.request = kwargs
+            return SimpleNamespace(
+                data=[SimpleNamespace(embedding=[1.0] + ([0.0] * 383))]
+            )
 
-    runtime = Runtime()
-    vector, model = _nova_embedding_sync(jpeg_bytes(), client=runtime)
-    body = json.loads(runtime.request["body"])
-    params = body["singleEmbeddingParams"]
-    assert params["embeddingPurpose"] == "CLUSTERING"
-    assert params["embeddingDimension"] == 384
-    assert params["image"]["format"] == "jpeg"
-    assert params["image"]["source"]["bytes"]
+    class Client:
+        embeddings = Embeddings()
+
+    vector, model = asyncio.run(_request_embedding(jpeg_bytes(), client=Client()))
+    assert Embeddings.request["model"] == "test-embedder"
+    assert Embeddings.request["input"][0].startswith("data:image/jpeg;base64,")
     assert len(vector) == 384
-    assert model == "amazon.nova-2-multimodal-embeddings-v1:0"
+    assert model == "test-embedder"
+
+
+def test_a_missing_endpoint_opens_the_circuit_breaker(monkeypatch):
+    # A configuration failure must not be retried once per image for a whole
+    # vault run.
+    monkeypatch.delenv("VAULT_SHOOT_EMBEDDING_BASE_URL", raising=False)
+    monkeypatch.delenv("SELF_HOSTED_BASE_URL", raising=False)
+    with pytest.raises(ShootEmbeddingConfigurationError):
+        asyncio.run(_request_embedding(jpeg_bytes()))
 
 
 def test_visual_embedding_overrides_same_generic_album_and_scene_slug():
