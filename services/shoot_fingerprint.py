@@ -9,16 +9,30 @@ import hashlib
 import io
 import math
 import os
+import re
 from collections import Counter
 from typing import Any, Iterable
 
 from PIL import Image, ImageStat
 
 
-SHOOT_FINGERPRINT_VERSION = 1
+SHOOT_FINGERPRINT_VERSION = 2
 _DEFAULT_MIN_SIMILARITY = 0.94
 _GENERIC_ALBUM_PREFIXES = ("album_", "album-")
 _EMPTY = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
+_TOKEN_STOPWORDS = {
+    "a", "an", "and", "at", "in", "of", "on", "or", "the", "to", "with",
+    "image", "photo", "frame", "subject", "person", "creator", "visible",
+}
+_LOCATION_KINDS = {
+    "bathroom": {"bathroom", "shower", "bathtub"},
+    "bedroom": {"bedroom", "bed", "bedding"},
+    "kitchen": {"kitchen", "countertop", "stove"},
+    "living-room": {"living room", "sofa", "couch"},
+    "outdoors": {"outdoor", "outdoors", "garden", "beach", "street"},
+    "studio": {"studio", "backdrop"},
+    "vehicle": {"car", "vehicle"},
+}
 
 
 def _min_similarity() -> float:
@@ -190,6 +204,40 @@ async def build_shoot_fingerprint(image_bytes: bytes) -> dict[str, Any]:
     }
 
 
+def add_semantic_shoot_evidence(
+    fingerprint: dict[str, Any],
+    classification: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach compact Qwen continuity evidence to the local fingerprint."""
+    result = dict(fingerprint)
+    rich_result = classification.get("rich_visual_descriptor")
+    descriptor = (
+        rich_result.get("descriptor") or {}
+        if isinstance(rich_result, dict)
+        and rich_result.get("status") == "ready"
+        else {}
+    )
+    if not descriptor:
+        return result
+    result.update({
+        "status": "local_plus_vision",
+        "provider": "pillow_local+qwen_vl",
+        "semantic": {
+            "setting_location": descriptor.get("setting_location") or "",
+            "setting_details": descriptor.get("setting_details") or [],
+            "background_details": descriptor.get("background_details") or [],
+            "wardrobe_items": descriptor.get("wardrobe_items") or [],
+            "wardrobe_colors": descriptor.get("wardrobe_colors") or [],
+            "wardrobe_materials": descriptor.get("wardrobe_materials") or [],
+            "subject_styling": descriptor.get("subject_styling") or [],
+            "lighting": descriptor.get("lighting") or "",
+            "visual_style": descriptor.get("visual_style") or "",
+            "continuity_markers": descriptor.get("continuity_markers") or [],
+        },
+    })
+    return result
+
+
 def _metadata(item: dict[str, Any]) -> dict[str, Any]:
     value = item.get("classification_metadata")
     return value if isinstance(value, dict) else {}
@@ -205,6 +253,72 @@ def _local(item: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _semantic(item: dict[str, Any]) -> dict[str, Any]:
+    value = shoot_fingerprint(item).get("semantic")
+    return value if isinstance(value, dict) else {}
+
+
+def _tokens(value: Any) -> set[str]:
+    rows = value if isinstance(value, list) else [value]
+    tokens: set[str] = set()
+    for row in rows:
+        for token in re.findall(r"[a-z0-9]+", str(row or "").lower()):
+            if len(token) >= 3 and token not in _TOKEN_STOPWORDS:
+                tokens.add(token)
+    return tokens
+
+
+def _jaccard(left: set[str], right: set[str]) -> float | None:
+    if not left or not right:
+        return None
+    return len(left & right) / len(left | right)
+
+
+def _location_kind(value: Any) -> str:
+    text = " ".join(str(value or "").lower().split())
+    for kind, terms in _LOCATION_KINDS.items():
+        if any(term in text for term in terms):
+            return kind
+    return ""
+
+
+def _semantic_similarity(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> tuple[float, int]:
+    left_semantic = _semantic(left)
+    right_semantic = _semantic(right)
+    if not left_semantic or not right_semantic:
+        return 0.0, 0
+    fields = (
+        ("setting_location", 2.0),
+        ("setting_details", 2.0),
+        ("background_details", 2.5),
+        ("wardrobe_items", 1.5),
+        ("wardrobe_colors", 1.0),
+        ("wardrobe_materials", 1.0),
+        ("subject_styling", 1.0),
+        ("lighting", 1.5),
+        ("visual_style", 0.5),
+        ("continuity_markers", 3.0),
+    )
+    weighted = 0.0
+    total_weight = 0.0
+    shared_tokens: set[str] = set()
+    for field, weight in fields:
+        left_tokens = _tokens(left_semantic.get(field))
+        right_tokens = _tokens(right_semantic.get(field))
+        score = _jaccard(left_tokens, right_tokens)
+        if score is None:
+            continue
+        weighted += score * weight
+        total_weight += weight
+        shared_tokens.update(left_tokens & right_tokens)
+    if not total_weight:
+        return 0.0, 0
+    return weighted / total_weight, len(shared_tokens)
+
+
 def _hamming_similarity(left: str, right: str) -> float:
     if not left or not right:
         return 0.0
@@ -215,22 +329,9 @@ def _hamming_similarity(left: str, right: str) -> float:
     return 1.0 - (distance / 64)
 
 
-def _specific_text(value: Any) -> str:
-    text = " ".join(str(value or "").lower().split())
-    if text in _EMPTY or text in {
-        "nude",
-        "clothed",
-        "partially nude",
-        "partially clothed nude",
-        "lingerie or underwear",
-    }:
-        return ""
-    return text
-
-
 def _structured_compatible(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    left_location = _specific_text(left.get("scene_location"))
-    right_location = _specific_text(right.get("scene_location"))
+    left_location = _location_kind(left.get("scene_location"))
+    right_location = _location_kind(right.get("scene_location"))
     if left_location and right_location and left_location != right_location:
         return False
     return True
@@ -252,7 +353,20 @@ def shoot_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
         str(left_local.get("dhash") or ""),
         str(right_local.get("dhash") or ""),
     )
-    return round((histogram * 0.8) + (duplicate * 0.2), 6)
+    local_score = (histogram * 0.8) + (duplicate * 0.2)
+    semantic_score, shared_tokens = _semantic_similarity(left, right)
+    # Strong structured continuity can bridge ordinary pose/crop changes, but
+    # only when the pixels still resemble one another and at least four
+    # specific scene/styling tokens agree. Complete-link clustering below then
+    # requires this evidence to hold across every pair in a proposed shoot.
+    if (
+        local_score >= 0.72
+        and semantic_score >= 0.72
+        and shared_tokens >= 4
+    ):
+        supported_score = min(0.98, 0.94 + ((semantic_score - 0.72) * 0.14))
+        local_score = max(local_score, supported_score)
+    return round(local_score, 6)
 
 
 def _media_id(item: dict[str, Any]) -> str:
@@ -375,9 +489,17 @@ def build_shoot_clusters(
             )
         else:
             confidence = 1.0
+        uses_semantic = (
+            len(cluster) > 1
+            and all(_semantic(item) for item in cluster)
+        )
         results.append({
             "shoot_id": _cluster_id(cluster),
-            "method": "local_visual",
+            "method": (
+                "local_visual+vision_metadata"
+                if uses_semantic
+                else "local_visual"
+            ),
             "confidence": round(confidence, 4),
             "items": sorted(cluster, key=_media_id),
         })
@@ -434,6 +556,11 @@ def cluster_debug_summary(cluster: dict[str, Any]) -> dict[str, Any]:
         for item in items
         if str(item.get("scene_outfit") or "").lower() not in _EMPTY
     )
+    continuity_markers = Counter(
+        marker
+        for item in items
+        for marker in (_semantic(item).get("continuity_markers") or [])
+    )
     return {
         "shoot_id": cluster.get("shoot_id"),
         "method": cluster.get("method"),
@@ -442,4 +569,7 @@ def cluster_debug_summary(cluster: dict[str, Any]) -> dict[str, Any]:
         "location": locations.most_common(1)[0][0] if locations else None,
         "outfit": outfits.most_common(1)[0][0] if outfits else None,
         "palette": [name for name, _ in palettes.most_common(5)],
+        "continuity_markers": [
+            name for name, _ in continuity_markers.most_common(8)
+        ],
     }

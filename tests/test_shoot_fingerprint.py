@@ -6,6 +6,7 @@ from PIL import Image
 
 from db.queries import propose_sets
 from services.shoot_fingerprint import (
+    add_semantic_shoot_evidence,
     build_local_visual_fingerprint,
     build_shoot_fingerprint,
     build_shoot_clusters,
@@ -27,6 +28,7 @@ def item(
     outfit: str = "partially clothed nude",
     colour: str = "pink",
     level: int = 4,
+    semantic: dict | None = None,
 ) -> dict:
     fingerprint = {
         "status": "local_only",
@@ -38,6 +40,12 @@ def item(
             "visual_tone": "warm",
         } if vector else {}),
     }
+    if semantic:
+        fingerprint.update({
+            "status": "local_plus_vision",
+            "provider": "pillow_local+qwen_vl",
+            "semantic": semantic,
+        })
     return {
         "fansly_media_id": media_id,
         "content_category": "nude_photo",
@@ -75,7 +83,7 @@ def jpeg_bytes(colour=(230, 80, 160)) -> bytes:
 
 def test_local_fingerprint_captures_palette_lighting_and_geometry():
     result = build_local_visual_fingerprint(jpeg_bytes())
-    assert result["version"] == 1
+    assert result["version"] == 2
     assert result["orientation"] == "portrait"
     assert result["lighting"] in {"balanced", "bright"}
     assert result["palette_names"]
@@ -89,6 +97,61 @@ def test_shoot_fingerprint_is_fully_local():
     assert result["provider"] == "pillow_local"
     assert "embedding" not in result
     assert result["local"]["hsv_histogram"]
+
+
+def test_qwen_scene_evidence_is_attached_without_replacing_local_pixels():
+    fingerprint = asyncio.run(build_shoot_fingerprint(jpeg_bytes()))
+    enriched = add_semantic_shoot_evidence(fingerprint, {
+        "rich_visual_descriptor": {
+            "status": "ready",
+            "descriptor": {
+                "setting_location": "bedroom",
+                "setting_details": ["white quilted bedding"],
+                "background_details": ["dark wood headboard"],
+                "wardrobe_items": ["pink mesh lingerie"],
+                "wardrobe_colors": ["pink"],
+                "wardrobe_materials": ["mesh"],
+                "subject_styling": ["short blonde hair"],
+                "lighting": "warm camera-left light",
+                "visual_style": "warm bedroom selfie",
+                "continuity_markers": [
+                    "white quilted bedding",
+                    "dark wood headboard",
+                ],
+            },
+        },
+    })
+    assert enriched["status"] == "local_plus_vision"
+    assert enriched["local"] == fingerprint["local"]
+    assert enriched["semantic"]["setting_location"] == "bedroom"
+
+
+def test_strong_scene_continuity_bridges_pose_and_crop_changes():
+    semantic = {
+        "setting_location": "bedroom",
+        "setting_details": ["white quilted bedding", "dark wood headboard"],
+        "background_details": ["cream wall", "small bedside table"],
+        "wardrobe_items": ["pink mesh lingerie"],
+        "wardrobe_colors": ["pink"],
+        "wardrobe_materials": ["sheer mesh"],
+        "subject_styling": ["short blonde hair", "pink lipstick"],
+        "lighting": "warm bedside light from camera left",
+        "visual_style": "warm bedroom selfie",
+        "continuity_markers": [
+            "white quilted bedding",
+            "dark wood headboard",
+            "pink mesh lingerie",
+            "warm camera-left light",
+        ],
+    }
+    rows = [
+        item("wide", unit(0), semantic=semantic),
+        item("close-crop", unit(45), semantic=semantic),
+    ]
+    assert shoot_similarity(rows[0], rows[1]) >= 0.94
+    clusters = build_shoot_clusters(rows)
+    assert len(clusters) == 1
+    assert clusters[0]["method"] == "local_visual+vision_metadata"
 
 
 def test_local_visual_evidence_overrides_same_generic_album_and_scene_slug():

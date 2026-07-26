@@ -69,6 +69,7 @@ from services.auto_audience import AutoAudiencePolicy
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
 from services.shoot_fingerprint import (
+    add_semantic_shoot_evidence,
     build_shoot_clusters,
     build_shoot_fingerprint,
     cluster_debug_summary,
@@ -2037,11 +2038,17 @@ async def _categorize_single_item(item: dict) -> dict:
         model = str(data.pop("_classification_model", "nudenet-3.4.2"))
         provider_metadata = dict(data.pop("_provider_metadata", {}) or {})
         provider = str(provider_metadata.get("provider") or "local_nudenet")
+        shoot_fingerprint = add_semantic_shoot_evidence(
+            shoot_fingerprint,
+            data,
+        )
+        vision_error = provider_metadata.get("vision_error_reason")
         print(
             f"[CATEGORIZE RAW] item={item_id} provider={provider} "
             f"model={model} category={data.get('category')} "
             f"explicitness={data.get('explicitness')} "
             f"vision={provider_metadata.get('vision_status')}"
+            + (f" vision_error={vision_error}" if vision_error else "")
         )
         if not data.get("colors"):
             data["colors"] = local_visual.get("palette_names") or []
@@ -2083,7 +2090,7 @@ async def _categorize_single_item(item: dict) -> dict:
                 "sexual_activity", "body_focus", "action",
                 "pose", "framing", "props", "colors", "nudity",
                 "visible_anatomy", "visual_tone", "orientation",
-                "image_dimensions",
+                "image_dimensions", "rich_visual_descriptor",
             )
         }
         metadata["age_review_required"] = bool(
@@ -4089,7 +4096,8 @@ async def debug_shoot_clusters(creator_id: str) -> dict:
         "status": "ok",
         "from_items": len(items),
         "visual_clusters": sum(
-            row["method"] == "visual_embedding" and len(row["media_ids"]) >= 2
+            row["method"].startswith("local_visual")
+            and len(row["media_ids"]) >= 2
             for row in summaries
         ),
         "unresolved_items": sum(

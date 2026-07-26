@@ -132,6 +132,48 @@ def test_set_description_is_built_from_exact_media_and_matches_intent():
     ) > 0
 
 
+def test_set_description_keeps_qwen_environment_and_continuity_evidence():
+    descriptor = {
+        "setting_details": ["white quilted bedding"],
+        "background_details": ["dark wood headboard", "cream wall"],
+        "wardrobe_items": ["pink mesh lingerie"],
+        "wardrobe_colors": ["pink"],
+        "wardrobe_materials": ["sheer mesh"],
+        "subject_styling": ["short blonde hair"],
+        "color_details": ["pink lingerie", "white bedding"],
+        "continuity_markers": [
+            "white quilted bedding",
+            "dark wood headboard",
+            "warm camera-left light",
+        ],
+    }
+    items = [
+        {
+            "content_category": "lingerie_photo",
+            "explicitness_level": level,
+            "scene_location": "bedroom",
+            "scene_outfit": "pink mesh lingerie",
+            "scene_lighting": "warm bedside light",
+            "tags": ["bedroom", "pink lingerie"],
+            "ai_description": f"Bedroom sequence frame {level}.",
+            "mimetype": "image/jpeg",
+            "classification_metadata": {
+                "rich_visual_descriptor": {
+                    "status": "ready",
+                    "descriptor": descriptor,
+                },
+            },
+        }
+        for level in (2, 3, 4)
+    ]
+    description = build_set_description(items)
+    assert "Environment continuity" in description
+    assert "white quilted bedding" in description
+    assert "Styling continuity" in description
+    assert "pink mesh lingerie" in description
+    assert "Same-shoot markers" in description
+
+
 def test_automatic_set_builder_keeps_video_sets_and_writes_description():
     items = [
         {

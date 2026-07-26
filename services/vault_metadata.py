@@ -12,7 +12,7 @@ from collections import Counter
 from typing import Any, Iterable
 
 
-VAULT_CLASSIFIER_VERSION = 7
+VAULT_CLASSIFIER_VERSION = 8
 
 _EMPTY_VALUES = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
 _MEDIA_CATEGORIES = {
@@ -261,8 +261,12 @@ def media_description(data: dict[str, Any], *, source: str) -> str:
         ("background", "background_details"),
         ("wardrobe", "wardrobe_items"),
         ("wardrobe colours", "wardrobe_colors"),
+        ("wardrobe materials", "wardrobe_materials"),
+        ("subject styling", "subject_styling"),
         ("props", "props"),
+        ("colour associations", "color_details"),
         ("distinguishing details", "distinguishing_details"),
+        ("continuity markers", "continuity_markers"),
     ):
         values = normalize_string_list(rich.get(key), limit=8)
         if values:
@@ -325,6 +329,12 @@ def build_set_description(items: list[dict[str, Any]]) -> str:
         else {}
         for item in items
     ]
+    descriptors = [
+        rich.get("descriptor") or {}
+        for item_metadata in metadata
+        for rich in [item_metadata.get("rich_visual_descriptor")]
+        if isinstance(rich, dict) and rich.get("status") == "ready"
+    ]
     local_fingerprints = [
         ((value.get("shoot_fingerprint") or {}).get("local") or {})
         for value in metadata
@@ -363,6 +373,31 @@ def build_set_description(items: list[dict[str, Any]]) -> str:
             "visible_anatomy",
             "sexual_activity",
             "body_focus",
+        )
+    }
+    rich_structured = {
+        key: normalize_string_list(
+            [
+                value
+                for descriptor in descriptors
+                for value in (
+                    descriptor.get(key)
+                    if isinstance(descriptor.get(key), list)
+                    else [descriptor.get(key)]
+                )
+            ],
+            limit=12,
+        )
+        for key in (
+            "setting_details",
+            "background_details",
+            "wardrobe_items",
+            "wardrobe_colors",
+            "wardrobe_materials",
+            "subject_styling",
+            "color_details",
+            "distinguishing_details",
+            "continuity_markers",
         )
     }
     levels = [
@@ -412,6 +447,41 @@ def build_set_description(items: list[dict[str, Any]]) -> str:
         )
     if setting_details:
         parts.append("Photoshoot look — " + "; ".join(setting_details) + ".")
+    environment_details = []
+    for label, key in (
+        ("setting", "setting_details"),
+        ("background", "background_details"),
+        ("colour associations", "color_details"),
+    ):
+        if rich_structured[key]:
+            environment_details.append(
+                f"{label}: {', '.join(rich_structured[key])}"
+            )
+    if environment_details:
+        parts.append(
+            "Environment continuity — " + "; ".join(environment_details) + "."
+        )
+    styling_details = []
+    for label, key in (
+        ("wardrobe", "wardrobe_items"),
+        ("wardrobe colours", "wardrobe_colors"),
+        ("materials", "wardrobe_materials"),
+        ("hair/makeup styling", "subject_styling"),
+    ):
+        if rich_structured[key]:
+            styling_details.append(
+                f"{label}: {', '.join(rich_structured[key])}"
+            )
+    if styling_details:
+        parts.append(
+            "Styling continuity — " + "; ".join(styling_details) + "."
+        )
+    if rich_structured["continuity_markers"]:
+        parts.append(
+            "Same-shoot markers: "
+            + ", ".join(rich_structured["continuity_markers"])
+            + "."
+        )
     content_details = []
     for label, key in (
         ("actions", "action"),
