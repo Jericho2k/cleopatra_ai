@@ -1,16 +1,20 @@
 # Visual photoshoot clustering
 
-Vault categorization uses the backend's existing Anthropic configuration for
-inventory taxonomy and description. Local Pillow features preserve palette,
-lighting, orientation, color histograms, and near-duplicate hashes.
+Vault categorization always uses a local NudeNet ONNX detector for exposed
+anatomy and nudity evidence. An optional self-hosted Qwen3-VL endpoint enriches
+that result with activity, pose, wardrobe, and scene detail. Endpoint failure
+falls back to the local result instead of leaving an item uncategorized.
+
+Local Pillow features preserve palette, lighting, orientation, color
+histograms, and near-duplicate hashes.
 
 Complete-link clustering merges a group only when every image pair clears the
 configured similarity threshold. Generic album names and legacy scene slugs are
 not accepted as shoot evidence. Creator-named albums remain a conservative
 fallback.
 
-No AWS account, IAM policy, Rekognition permission, Bedrock model access, or
-separate image-embedding endpoint is required.
+No Anthropic call, AWS account, IAM policy, Rekognition permission, or Bedrock
+model access is used by vault categorization.
 
 ## Calibration
 

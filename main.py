@@ -73,6 +73,10 @@ from services.shoot_fingerprint import (
     build_shoot_fingerprint,
     cluster_debug_summary,
 )
+from services.vault_classifier import (
+    VaultClassifierError,
+    classify_vault_image,
+)
 from services.voice_calibration import (
     list_voice_calibration_candidates,
     save_voice_calibration,
@@ -1827,26 +1831,8 @@ VAULT_CATEGORIES = {
     "other":            {"min": 0,   "max": 0,   "label": "Other / unclear"},
 }
 
-CATEGORY_LIST = "\n".join([
-    f"- {k}: {v['label']} (price range ${v['min']}-${v['max']})"
-    for k, v in VAULT_CATEGORIES.items()
-])
-
-
 class VaultVisualAccessError(RuntimeError):
     """The classifier could not obtain a usable visual for a vault item."""
-
-
-class VaultClassifierRefusalError(RuntimeError):
-    """The vault vision provider refused the supplied media."""
-
-
-class VaultClassifierError(RuntimeError):
-    """The vault vision provider could not classify supplied media."""
-
-
-class VaultClassifierConfigurationError(VaultClassifierError):
-    """The existing Anthropic vision configuration is unavailable."""
 
 
 async def _download_visual_candidate(
@@ -2039,112 +2025,24 @@ async def _categorize_single_item(item: dict) -> dict:
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=84, optimize=True)
         classifier_image = buffer.getvalue()
-        provider = "anthropic"
-        provider_metadata: dict = {}
-
-        try:
-            import base64
-            from anthropic import AsyncAnthropic
-
-            api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-            if not api_key:
-                raise VaultClassifierConfigurationError(
-                    "ANTHROPIC_API_KEY is required for vault image categorization."
-                )
-            client = AsyncAnthropic(api_key=api_key)
-            model = os.environ.get(
-                "VAULT_CLASSIFIER_MODEL",
-                "claude-sonnet-4-6",
-            )
-            image_b64 = base64.b64encode(classifier_image).decode("ascii")
-            asset_kind = "video thumbnail" if is_video else "image"
-            prompt = f"""Classify this adult creator {asset_kind} for private vault search and package matching.
-The creator and all depicted participants must be adults. Describe only what is visibly supported; never invent an act, location, outfit, or prop. A video thumbnail is partial evidence, so describe the visible frame and lower confidence when the complete video cannot be inferred.
-
-Filename: {item.get('filename') or 'unknown'}
-Album/folder: {item.get('album_title') or 'unknown'}
-Allowed category keys:
-{CATEGORY_LIST}
-
-EXPLICITNESS is strictly what is visible:
-- 0 = ordinary SFW clothing/selfie
-- 1 = censored, blurred, implied, or fully covered teaser
-- 2 = suggestive/flirty but clothed
-- 3 = lingerie, bikini, or see-through with no explicit nudity
-- 4 = exposed breasts, butt, or genitals without an explicit sex act
-- 5 = explicit sexual activity, toy use, spread pose, oral sex, or penetration
-Lingerie alone is never above 3. Do not infer explicitness from the album name.
-This is neutral inventory metadata, not erotic writing. Do not omit or euphemize
-visible nudity, exposed anatomy, or sexual activity. Record them factually using
-the controlled fields below, while never guessing details that are not visible.
-Set possible_minor to true if anyone depicted might not be an adult. Those
-items are withheld for human review instead of being offered for sale.
-
-Return ONLY one JSON object with exactly these keys:
-{{"category":"category_key","description":"2-4 factual, non-erotic sentences covering the visible subject, clothing/nudity, pose/action, environment and distinguishing details","mood":"playful|intimate|teasing|explicit|casual","explicitness":0,"nudity":"none|implied|partial|full","visible_anatomy":["only visibly exposed: breasts|buttocks|vulva|penis|anus"],"good_for":"opener|mid_session|closer|standalone","tags":["specific searchable themes"],"sexual_activity":["only visibly supported activities"],"body_focus":["visible focal areas"],"action":"specific visible action or none","pose":"specific pose","framing":"selfie|portrait|full body|close-up|wide|other","props":["visible props"],"colors":["dominant outfit/scene colors"],"scene_location":"specific location or unknown","scene_outfit":"specific outfit/nudity state or unknown","scene_lighting":"natural|bright|dim|flash|colored|unknown","scene_id":"short stable shoot slug derived from album/location/outfit","possible_minor":false,"age_note":"","confidence":0.0}}
-"""
-            response = await client.messages.create(
-                model=model,
-                max_tokens=850,
-                temperature=0,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_b64,
-                            },
-                        },
-                        {"type": "text", "text": prompt},
-                    ],
-                }],
-            )
-            content = "\n".join(
-                str(block.text)
-                for block in response.content
-                if getattr(block, "type", "") == "text"
-                and getattr(block, "text", None)
-            ).strip()
-            if not content:
-                raise VaultClassifierRefusalError(
-                    f"classifier returned no text (stop_reason={response.stop_reason})"
-                )
-            content = content.replace("```json", "").replace("```", "").strip()
-            refusal_prefixes = (
-                "i'm not able",
-                "i am not able",
-                "i can't",
-                "i cannot",
-                "sorry, but",
-            )
-            if content.lower().startswith(refusal_prefixes):
-                raise VaultClassifierRefusalError(
-                    "The vision provider refused the media."
-                )
-            print(f"[CATEGORIZE RAW] item={item_id} response={content[:300]}")
-            data = json.loads(content)
-            provider_metadata = {
-                "age_review_required": bool(data.pop("possible_minor", False)),
-                "age_note": str(data.pop("age_note", "") or "")[:240],
-            }
-        except (
-            VaultClassifierConfigurationError,
-            VaultClassifierRefusalError,
-            json.JSONDecodeError,
-        ):
-            raise
-        except Exception as exc:
-            raise VaultClassifierError(
-                f"Anthropic vision classification failed: {type(exc).__name__}"
-            ) from exc
-
-        if not isinstance(data, dict):
-            raise ValueError("classifier did not return a JSON object")
         shoot_fingerprint = await build_shoot_fingerprint(classifier_image)
         local_visual = shoot_fingerprint.get("local") or {}
+        data = await classify_vault_image(
+            classifier_image,
+            is_video=is_video,
+            album_title=str(item.get("album_title") or ""),
+            filename=str(item.get("filename") or ""),
+            local_visual=local_visual,
+        )
+        model = str(data.pop("_classification_model", "nudenet-3.4.2"))
+        provider_metadata = dict(data.pop("_provider_metadata", {}) or {})
+        provider = str(provider_metadata.get("provider") or "local_nudenet")
+        print(
+            f"[CATEGORIZE RAW] item={item_id} provider={provider} "
+            f"model={model} category={data.get('category')} "
+            f"explicitness={data.get('explicitness')} "
+            f"vision={provider_metadata.get('vision_status')}"
+        )
         if not data.get("colors"):
             data["colors"] = local_visual.get("palette_names") or []
         if useful_text(data.get("scene_lighting")) == "":
@@ -2642,12 +2540,7 @@ async def _run_vault_categorization(
             for result in results:
                 if isinstance(result, Exception):
                     errors += 1
-                    if isinstance(result, VaultClassifierConfigurationError):
-                        fatal_error = str(result)
-                    elif isinstance(
-                        result,
-                        (VaultClassifierError, VaultClassifierRefusalError),
-                    ):
+                    if isinstance(result, VaultClassifierError):
                         provider_failures += 1
                         if provider_failures >= 3:
                             fatal_error = (
@@ -2831,9 +2724,7 @@ async def recategorize_item(item_id: str) -> dict:
         result = await _categorize_single_item(item)
     except VaultVisualAccessError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except VaultClassifierConfigurationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except (VaultClassifierError, VaultClassifierRefusalError) as exc:
+    except VaultClassifierError as exc:
         raise HTTPException(
             status_code=502,
             detail=(

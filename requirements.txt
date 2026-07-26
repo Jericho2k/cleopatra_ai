@@ -7,5 +7,6 @@ httpx
 redis
 python-dotenv
 anthropic>=0.40.0
+nudenet>=3.4.2,<4
 sse-starlette
 Pillow
