@@ -42,6 +42,7 @@ class VaultVision:
     def load(self):
         from transformers import AutoModelForMultimodalLM, AutoProcessor
 
+        print(f"[VAULT VISION] loading model={MODEL_ID}")
         self.processor = AutoProcessor.from_pretrained(
             MODEL_ID,
             cache_dir=MODEL_DIR,
@@ -52,7 +53,9 @@ class VaultVision:
             device_map="auto",
             dtype="auto",
         )
+        self.model.eval()
         weights.commit()
+        print(f"[VAULT VISION] ready model={MODEL_ID}")
 
     @modal.fastapi_endpoint(
         method="POST",
@@ -61,7 +64,9 @@ class VaultVision:
     )
     def classify(self, payload: dict) -> dict:
         from PIL import Image
+        import torch
 
+        print("[VAULT VISION] classification started")
         image_bytes = base64.b64decode(payload["image_base64"], validate=True)
         picture = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         messages = [{
@@ -78,15 +83,17 @@ class VaultVision:
             return_dict=True,
             return_tensors="pt",
         ).to(self.model.device)
-        output = self.model.generate(
-            **inputs,
-            max_new_tokens=900,
-            do_sample=False,
-        )
+        with torch.inference_mode():
+            output = self.model.generate(
+                **inputs,
+                max_new_tokens=1400,
+                do_sample=False,
+            )
         generated = output[0][inputs["input_ids"].shape[-1]:]
         text = self.processor.decode(
             generated,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
+        print("[VAULT VISION] classification completed")
         return {"text": text}

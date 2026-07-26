@@ -50,10 +50,16 @@ _REFUSAL_PREFIXES = (
     "sorry, but",
     "unable to",
 )
+_EMPTY_TEXT = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
 
 
 def _clean(value: Any, *, limit: int = 320) -> str:
     return " ".join(str(value or "").strip().split())[:limit]
+
+
+def _specific(value: Any, *, limit: int = 320) -> str:
+    text = _clean(value, limit=limit)
+    return "" if text.lower() in _EMPTY_TEXT else text
 
 
 def _strings(value: Any, *, limit: int = 24) -> list[str]:
@@ -61,7 +67,7 @@ def _strings(value: Any, *, limit: int = 24) -> list[str]:
     result: list[str] = []
     for row in rows:
         text = _clean(row, limit=120).lower().strip(" .,-_/|")
-        if text and text not in result:
+        if text not in _EMPTY_TEXT and text not in result:
             result.append(text)
         if len(result) >= limit:
             break
@@ -79,6 +85,16 @@ def _threshold() -> float:
     except ValueError:
         value = 0.35
     return min(max(value, 0.05), 0.95)
+
+
+def _vision_timeout() -> float:
+    try:
+        value = float(os.environ.get("VAULT_VISION_TIMEOUT_SECONDS", "620"))
+    except ValueError:
+        value = 620
+    # Modal Web Functions may return a result redirect after 150 seconds during
+    # a first model download. Leave enough time for the 600-second function.
+    return min(max(value, 180), 900)
 
 
 @lru_cache(maxsize=1)
@@ -198,9 +214,11 @@ def _base_metadata(
 
 def _prompt(*, is_video: bool, album_title: str, filename: str) -> str:
     kind = "video thumbnail" if is_video else "image"
-    return f"""Catalogue this adult creator {kind} for private vault search and pricing.
-All depicted participants are consenting adults. Describe only visible evidence.
-Do not moralize, censor, euphemize, or write erotically.
+    return f"""Catalogue this adult creator {kind} for private vault search,
+photoshoot matching, and coherent PPV/set construction. All depicted
+participants are consenting adults. Describe only directly visible evidence.
+Do not identify anyone, estimate age, moralize, censor, euphemize, write
+erotically, or invent details outside the frame.
 
 Filename: {filename or 'unknown'}
 Album: {album_title or 'unknown'}
@@ -209,8 +227,58 @@ Explicitness: 0 ordinary clothing; 1 censored/implied; 2 suggestive clothed;
 3 lingerie/see-through; 4 exposed anatomy without a sex act; 5 visible sexual
 activity, toy use, oral sex, or penetration.
 
-Return only JSON:
-{{"description":"factual inventory description","mood":"playful|intimate|teasing|explicit|casual","explicitness":0,"nudity":"none|implied|partial|full","visible_anatomy":[],"participants":1,"good_for":"opener|mid_session|closer|standalone","tags":[],"sexual_activity":[],"body_focus":[],"action":"visible action or unknown","pose":"visible pose or unknown","framing":"selfie|portrait|full body|close-up|wide|other","props":[],"colors":[],"scene_location":"specific place or unknown","scene_outfit":"specific clothing/nudity state or unknown","scene_lighting":"natural|bright|dim|flash|colored|unknown","scene_id":"short stable shoot slug","confidence":0.0}}"""
+The description must be 3-6 concise factual sentences. Cover the subject's
+visible action and pose, exact wardrobe and accessories, room/environment,
+surfaces and background, important objects/props, lighting and color cast,
+dominant colors with what they belong to, and camera framing/angle. Prefer
+specific evidence such as "white quilted bedding" or "pink mesh lingerie" over
+generic words such as "indoors", "clothing", or "nice". Include only details
+useful for search, continuity, grouping, or selling the media; omit filler.
+
+Continuity markers must be stable, distinctive facts that another frame from
+the same shoot could share: exact garments, materials/patterns, furniture,
+surfaces, architecture, props, hair/makeup styling, lighting color, or unusual
+background objects. Do not use nudity, anatomy, pose, crop, or generic room
+names as continuity markers.
+
+Return only one valid JSON object:
+{{
+  "description": "3-6 concise factual inventory sentences",
+  "mood": "playful|intimate|teasing|explicit|casual",
+  "explicitness": 0,
+  "nudity": "none|implied|partial|full",
+  "visible_anatomy": [],
+  "participants": 1,
+  "good_for": "opener|mid_session|closer|standalone",
+  "sexual_activity": [],
+  "body_focus": [],
+  "action": "specific visible action or unknown",
+  "pose": "specific body pose or unknown",
+  "limb_position": "specific arm and leg positioning or unknown",
+  "gaze": "gaze direction or unknown",
+  "expression": "visible expression or unknown",
+  "framing": "selfie|close-up|medium|three-quarter|full body|wide|other",
+  "camera_angle": "high|eye-level|low|overhead|mirror|other",
+  "crop": "what portion of the subject is visible",
+  "composition": "subject placement and composition",
+  "scene_location": "specific room or environment, or unknown",
+  "setting_details": ["surfaces, furniture, architecture, and scene details"],
+  "background_details": ["specific visible background details"],
+  "scene_outfit": "complete clothing and nudity state",
+  "wardrobe_items": ["specific garments, footwear, and accessories"],
+  "wardrobe_colors": ["garment/accessory colors"],
+  "wardrobe_materials": ["visible materials, textures, and patterns"],
+  "subject_styling": ["visible hair, makeup, and styling details"],
+  "props": ["handheld or scene props"],
+  "colors": ["important colors with the object they belong to"],
+  "scene_lighting": "source, intensity, direction, and color cast",
+  "visual_style": "concise non-erotic visual look",
+  "distinguishing_details": ["other specific searchable visual facts"],
+  "continuity_markers": ["stable distinctive same-shoot evidence"],
+  "tags": ["specific factual search terms"],
+  "scene_id": "short stable shoot slug based on location, styling, and lighting",
+  "confidence": 0.0
+}}"""
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -250,7 +318,10 @@ async def _qwen_metadata(
     if modal_key and modal_secret:
         headers["Modal-Key"] = modal_key
         headers["Modal-Secret"] = modal_secret
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(
+        timeout=_vision_timeout(),
+        follow_redirects=True,
+    ) as client:
         response = await client.post(
             base_url,
             headers=headers,
@@ -268,13 +339,72 @@ async def _qwen_metadata(
     return _json_object(payload.get("result", payload.get("text", payload)))
 
 
+def _visual_descriptor(rich: dict[str, Any]) -> dict[str, Any]:
+    try:
+        confidence = float(rich.get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0
+    return {
+        "description": _specific(rich.get("description"), limit=1800),
+        "setting_location": _specific(rich.get("scene_location")),
+        "setting_details": _strings(rich.get("setting_details"), limit=12),
+        "background_details": _strings(
+            rich.get("background_details"),
+            limit=12,
+        ),
+        "wardrobe_items": _strings(rich.get("wardrobe_items"), limit=12),
+        "wardrobe_colors": _strings(rich.get("wardrobe_colors"), limit=8),
+        "wardrobe_materials": _strings(
+            rich.get("wardrobe_materials"),
+            limit=8,
+        ),
+        "subject_styling": _strings(rich.get("subject_styling"), limit=10),
+        "pose": _specific(rich.get("pose")),
+        "limb_position": _specific(rich.get("limb_position")),
+        "gaze": _specific(rich.get("gaze")),
+        "expression": _specific(rich.get("expression")),
+        "action": _specific(rich.get("action")),
+        "framing": _specific(rich.get("framing"), limit=80),
+        "camera_angle": _specific(rich.get("camera_angle"), limit=80),
+        "crop": _specific(rich.get("crop")),
+        "composition": _specific(rich.get("composition")),
+        "props": _strings(rich.get("props"), limit=12),
+        "lighting": _specific(rich.get("scene_lighting")),
+        "visual_style": _specific(rich.get("visual_style")),
+        "distinguishing_details": _strings(
+            rich.get("distinguishing_details"),
+            limit=12,
+        ),
+        "continuity_markers": _strings(
+            rich.get("continuity_markers"),
+            limit=12,
+        ),
+        "search_tags": _strings(rich.get("tags"), limit=20),
+        "color_details": _strings(rich.get("colors"), limit=12),
+        "confidence": round(min(max(confidence, 0), 1), 3),
+    }
+
+
+def _vision_failure_reason(exc: Exception) -> str:
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"http_{exc.response.status_code}"
+    if isinstance(exc, json.JSONDecodeError):
+        return "invalid_json"
+    if isinstance(exc, ValueError):
+        return "invalid_or_refused_response"
+    return type(exc).__name__
+
+
 def _merge_qwen(base: dict[str, Any], rich: dict[str, Any]) -> dict[str, Any]:
     result = dict(base)
+    descriptor = _visual_descriptor(rich)
     local_anatomy = _strings(base.get("visible_anatomy"), limit=8)
     rich_anatomy = _strings(rich.get("visible_anatomy"), limit=8)
     anatomy = list(dict.fromkeys([*local_anatomy, *rich_anatomy]))
     activities = _strings(rich.get("sexual_activity"), limit=8)
-    action = _clean(rich.get("action"), limit=120).lower() or "unknown"
+    action = descriptor["action"].lower() or "unknown"
     try:
         reported = max(min(int(rich.get("explicitness") or 0), 5), 0)
     except (TypeError, ValueError):
@@ -302,27 +432,54 @@ def _merge_qwen(base: dict[str, Any], rich: dict[str, Any]) -> dict[str, Any]:
         (str(base["nudity"]), rich_nudity),
         key=lambda value: nudity_rank.get(value, -1),
     )
+    wardrobe_parts = [
+        *descriptor["wardrobe_colors"],
+        *descriptor["wardrobe_items"],
+        *descriptor["wardrobe_materials"],
+    ]
+    scene_outfit = _specific(rich.get("scene_outfit"))
+    if wardrobe_parts:
+        wardrobe = ", ".join(dict.fromkeys(wardrobe_parts))
+        if scene_outfit and scene_outfit.lower() not in wardrobe.lower():
+            scene_outfit = f"{wardrobe}; {scene_outfit}"
+        else:
+            scene_outfit = wardrobe
+    rich_tags = [
+        *descriptor["search_tags"],
+        *descriptor["setting_details"],
+        *descriptor["background_details"],
+        *descriptor["wardrobe_items"],
+        *descriptor["wardrobe_colors"],
+        *descriptor["wardrobe_materials"],
+        *descriptor["subject_styling"],
+        *descriptor["distinguishing_details"],
+    ]
     result.update({
         "category": normalize_media_category(category, explicitness=explicitness, is_video=is_video),
-        "description": _clean(rich.get("description"), limit=1800) or base["description"],
-        "mood": _clean(rich.get("mood"), limit=40) or base["mood"],
+        "description": descriptor["description"] or base["description"],
+        "description_complete": bool(descriptor["description"]),
+        "mood": _specific(rich.get("mood"), limit=40) or base["mood"],
         "explicitness": explicitness,
         "nudity": nudity,
         "visible_anatomy": anatomy,
-        "good_for": _clean(rich.get("good_for"), limit=30) or base["good_for"],
-        "tags": list(dict.fromkeys([*base["tags"], *_strings(rich.get("tags"))])),
+        "good_for": _specific(rich.get("good_for"), limit=30) or base["good_for"],
+        "tags": list(dict.fromkeys([*base["tags"], *rich_tags]))[:32],
         "sexual_activity": activities,
         "body_focus": _strings(rich.get("body_focus"), limit=8) or anatomy,
         "action": action,
-        "pose": _clean(rich.get("pose"), limit=120) or "unknown",
-        "framing": _clean(rich.get("framing"), limit=40) or "other",
-        "props": _strings(rich.get("props"), limit=12),
-        "colors": _strings(rich.get("colors"), limit=8) or base["colors"],
-        "scene_location": _clean(rich.get("scene_location"), limit=120) or "unknown",
-        "scene_outfit": _clean(rich.get("scene_outfit"), limit=320) or "unknown",
-        "scene_lighting": _clean(rich.get("scene_lighting"), limit=40) or base["scene_lighting"],
+        "pose": descriptor["pose"] or "unknown",
+        "framing": descriptor["framing"] or "other",
+        "props": descriptor["props"],
+        "colors": descriptor["color_details"] or base["colors"],
+        "scene_location": descriptor["setting_location"] or "unknown",
+        "scene_outfit": scene_outfit[:320] if scene_outfit else "unknown",
+        "scene_lighting": descriptor["lighting"] or base["scene_lighting"],
         "scene_id": _slug(_clean(rich.get("scene_id"), limit=96)) or base["scene_id"],
-        "confidence": max(float(base["confidence"]), float(rich.get("confidence") or 0)),
+        "confidence": max(float(base["confidence"]), descriptor["confidence"]),
+        "rich_visual_descriptor": {
+            "status": "ready",
+            "descriptor": descriptor,
+        },
         "_classification_model": (
             "nudenet-3.4.2+"
             + os.environ.get("VAULT_VISION_MODEL", "Qwen/Qwen3-VL-4B-Instruct")
@@ -365,6 +522,9 @@ async def classify_vault_image(
         )
         return _merge_qwen(base, rich)
     except Exception as exc:
+        reason = _vision_failure_reason(exc)
         base["_provider_metadata"]["vision_status"] = "fallback"
         base["_provider_metadata"]["vision_error"] = type(exc).__name__
+        base["_provider_metadata"]["vision_error_reason"] = reason
+        print(f"[VAULT VISION FALLBACK] reason={reason}")
         return base

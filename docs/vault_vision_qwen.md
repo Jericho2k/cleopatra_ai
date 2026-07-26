@@ -31,7 +31,33 @@ adult vault images. The model is Apache-2.0 licensed.
    VAULT_VISION_MODAL_KEY=wk-...
    VAULT_VISION_MODAL_SECRET=ws-...
    VAULT_VISION_MODEL=Qwen/Qwen3-VL-4B-Instruct
+   VAULT_VISION_TIMEOUT_SECONDS=620
    ```
 
-The endpoint scales to zero after 60 seconds. If it is unavailable, malformed,
-or refuses a frame, the backend saves the local NudeNet result instead.
+The endpoint scales to zero after 60 seconds. The first request can take
+several minutes while Modal downloads and loads the model. The backend follows
+Modal's long-running result redirects and allows up to 620 seconds for that
+first request. Warm requests are normally much faster.
+
+Successful enrichment logs:
+
+```text
+[CATEGORIZE RAW] ... provider=local_nudenet+qwen_vl ... vision=ready
+[SHOOT FINGERPRINT] ... status=local_plus_vision ...
+```
+
+If the endpoint is unavailable, malformed, or refuses a frame, the backend
+saves the local NudeNet result and logs a safe reason such as `timeout`,
+`http_401`, or `http_500`:
+
+```text
+[VAULT VISION FALLBACK] reason=http_401
+[CATEGORIZE RAW] ... provider=local_nudenet ... vision=fallback vision_error=http_401
+```
+
+Qwen returns a concise description plus structured setting, background,
+wardrobe, materials, styling, lighting, composition, color associations, and
+same-shoot continuity markers. Those fields are stored with the item and
+included in generated set descriptions. Strong structured continuity can also
+support the local color/hash evidence when grouping different poses or crops
+from the same shoot.
