@@ -68,19 +68,14 @@ from services.apifansly import (
 from services.auto_audience import AutoAudiencePolicy
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
-from services.rekognition_classifier import (
-    RekognitionClassifierError,
-    RekognitionConfigurationError,
-    classify_with_rekognition,
-)
-from services.nova_inventory_descriptor import (
-    describe_inventory_visual,
-    merge_inventory_descriptor,
-)
 from services.shoot_fingerprint import (
     build_shoot_clusters,
     build_shoot_fingerprint,
     cluster_debug_summary,
+)
+from services.vault_classifier import (
+    VaultClassifierError,
+    classify_vault_image,
 )
 from services.voice_calibration import (
     list_voice_calibration_candidates,
@@ -1836,18 +1831,8 @@ VAULT_CATEGORIES = {
     "other":            {"min": 0,   "max": 0,   "label": "Other / unclear"},
 }
 
-CATEGORY_LIST = "\n".join([
-    f"- {k}: {v['label']} (price range ${v['min']}-${v['max']})"
-    for k, v in VAULT_CATEGORIES.items()
-])
-
-
 class VaultVisualAccessError(RuntimeError):
     """The classifier could not obtain a usable visual for a vault item."""
-
-
-class VaultClassifierRefusalError(RuntimeError):
-    """A generative compatibility provider refused the supplied media."""
 
 
 async def _download_visual_candidate(
@@ -2040,138 +2025,24 @@ async def _categorize_single_item(item: dict) -> dict:
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=84, optimize=True)
         classifier_image = buffer.getvalue()
-        provider = str(
-            os.environ.get("VAULT_CLASSIFIER_PROVIDER") or "rekognition"
-        ).strip().lower()
-        provider_metadata: dict = {}
-
-        if provider == "rekognition":
-            data = await classify_with_rekognition(
-                classifier_image,
-                is_video=is_video,
-                album_title=str(item.get("album_title") or ""),
-            )
-            model = str(
-                data.pop("_classification_model", "aws-rekognition")
-            )
-            provider_metadata = dict(data.pop("_provider_metadata", {}) or {})
-            print(
-                f"[CATEGORIZE RAW] item={item_id} provider=rekognition "
-                f"category={data.get('category')} "
-                f"explicitness={data.get('explicitness')} "
-                f"moderation={len(provider_metadata.get('moderation_labels') or [])} "
-                f"labels={len(provider_metadata.get('general_labels') or [])}"
-            )
-        elif provider == "anthropic":
-            # Retained only as a controlled compatibility/benchmark provider.
-            # It is not the production default because it can refuse adult
-            # inventory images instead of returning the required JSON.
-            import base64
-            from anthropic import AsyncAnthropic
-
-            client = AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-            model = os.environ.get(
-                "VAULT_CLASSIFIER_MODEL",
-                "claude-sonnet-4-6",
-            )
-            image_b64 = base64.b64encode(classifier_image).decode("ascii")
-            asset_kind = "video thumbnail" if is_video else "image"
-            prompt = f"""Classify this adult creator {asset_kind} for private vault search and package matching.
-The creator and all depicted participants must be adults. Describe only what is visibly supported; never invent an act, location, outfit, or prop. A video thumbnail is partial evidence, so describe the visible frame and lower confidence when the complete video cannot be inferred.
-
-Filename: {item.get('filename') or 'unknown'}
-Album/folder: {item.get('album_title') or 'unknown'}
-Allowed category keys:
-{CATEGORY_LIST}
-
-EXPLICITNESS is strictly what is visible:
-- 0 = ordinary SFW clothing/selfie
-- 1 = censored, blurred, implied, or fully covered teaser
-- 2 = suggestive/flirty but clothed
-- 3 = lingerie, bikini, or see-through with no explicit nudity
-- 4 = exposed breasts, butt, or genitals without an explicit sex act
-- 5 = explicit sexual activity, toy use, spread pose, oral sex, or penetration
-Lingerie alone is never above 3. Do not infer explicitness from the album name.
-This is neutral inventory metadata, not erotic writing. Do not omit or euphemize
-visible nudity, exposed anatomy, or sexual activity. Record them factually using
-the controlled fields below, while never guessing details that are not visible.
-
-Return ONLY one JSON object with exactly these keys:
-{{"category":"category_key","description":"2-4 factual, non-erotic sentences covering the visible subject, clothing/nudity, pose/action, environment and distinguishing details","mood":"playful|intimate|teasing|explicit|casual","explicitness":0,"nudity":"none|implied|partial|full","visible_anatomy":["only visibly exposed: breasts|buttocks|vulva|penis|anus"],"good_for":"opener|mid_session|closer|standalone","tags":["specific searchable themes"],"sexual_activity":["only visibly supported activities"],"body_focus":["visible focal areas"],"action":"specific visible action or none","pose":"specific pose","framing":"selfie|portrait|full body|close-up|wide|other","props":["visible props"],"colors":["dominant outfit/scene colors"],"scene_location":"specific location or unknown","scene_outfit":"specific outfit/nudity state or unknown","scene_lighting":"natural|bright|dim|flash|colored|unknown","scene_id":"short stable shoot slug derived from album/location/outfit","confidence":0.0}}
-"""
-            response = await client.messages.create(
-                model=model,
-                max_tokens=850,
-                temperature=0,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/jpeg",
-                                "data": image_b64,
-                            },
-                        },
-                        {"type": "text", "text": prompt},
-                    ],
-                }],
-            )
-            content = "\n".join(
-                str(block.text)
-                for block in response.content
-                if getattr(block, "type", "") == "text"
-                and getattr(block, "text", None)
-            ).strip()
-            if not content:
-                raise VaultClassifierRefusalError(
-                    f"classifier returned no text (stop_reason={response.stop_reason})"
-                )
-            content = content.replace("```json", "").replace("```", "").strip()
-            refusal_prefixes = (
-                "i'm not able",
-                "i am not able",
-                "i can't",
-                "i cannot",
-                "sorry, but",
-            )
-            if content.lower().startswith(refusal_prefixes):
-                raise VaultClassifierRefusalError(
-                    "The compatibility vision provider refused the media."
-                )
-            print(f"[CATEGORIZE RAW] item={item_id} response={content[:300]}")
-            data = json.loads(content)
-        else:
-            raise RekognitionConfigurationError(
-                "VAULT_CLASSIFIER_PROVIDER must be 'rekognition' or 'anthropic'"
-            )
-
-        if not isinstance(data, dict):
-            raise ValueError("classifier did not return a JSON object")
-        rich_visual: dict = {"status": "not_requested"}
-        if provider == "rekognition":
-            rich_visual = await describe_inventory_visual(
-                classifier_image,
-                is_video=is_video,
-                album_title=str(item.get("album_title") or ""),
-            )
-            if rich_visual.get("status") == "ready":
-                data = merge_inventory_descriptor(
-                    data,
-                    rich_visual.get("descriptor") or {},
-                )
-                model = (
-                    f"{model}+descriptor-{rich_visual.get('model')}"
-                )
-            print(
-                f"[RICH DESCRIPTION] item={item_id} "
-                f"status={rich_visual.get('status')} "
-                f"model={rich_visual.get('model') or ''} "
-                f"reason={rich_visual.get('reason') or ''}"
-            )
         shoot_fingerprint = await build_shoot_fingerprint(classifier_image)
         local_visual = shoot_fingerprint.get("local") or {}
+        data = await classify_vault_image(
+            classifier_image,
+            is_video=is_video,
+            album_title=str(item.get("album_title") or ""),
+            filename=str(item.get("filename") or ""),
+            local_visual=local_visual,
+        )
+        model = str(data.pop("_classification_model", "nudenet-3.4.2"))
+        provider_metadata = dict(data.pop("_provider_metadata", {}) or {})
+        provider = str(provider_metadata.get("provider") or "local_nudenet")
+        print(
+            f"[CATEGORIZE RAW] item={item_id} provider={provider} "
+            f"model={model} category={data.get('category')} "
+            f"explicitness={data.get('explicitness')} "
+            f"vision={provider_metadata.get('vision_status')}"
+        )
         if not data.get("colors"):
             data["colors"] = local_visual.get("palette_names") or []
         if useful_text(data.get("scene_lighting")) == "":
@@ -2219,7 +2090,6 @@ Return ONLY one JSON object with exactly these keys:
             provider_metadata.get("age_review_required")
         )
         metadata["shoot_fingerprint"] = shoot_fingerprint
-        metadata["rich_visual_descriptor"] = rich_visual
         metadata.update({
             "category": category,
             "explicitness": explicitness,
@@ -2657,8 +2527,8 @@ async def _run_vault_categorization(
         done = 0
         errors = 0
         provider_failures = 0
-        # Keep concurrency deliberately low: Rekognition is fast, but vault
-        # setup must remain predictable and should never create a retry storm.
+        # Keep concurrency deliberately low so a vault run cannot create a
+        # provider retry storm.
         batch_size = 2
         for i in range(0, total, batch_size):
             batch = all_items[i:i + batch_size]
@@ -2670,12 +2540,7 @@ async def _run_vault_categorization(
             for result in results:
                 if isinstance(result, Exception):
                     errors += 1
-                    if isinstance(result, RekognitionConfigurationError):
-                        fatal_error = str(result)
-                    elif isinstance(
-                        result,
-                        (RekognitionClassifierError, VaultClassifierRefusalError),
-                    ):
+                    if isinstance(result, VaultClassifierError):
                         provider_failures += 1
                         if provider_failures >= 3:
                             fatal_error = (
@@ -2859,9 +2724,7 @@ async def recategorize_item(item_id: str) -> dict:
         result = await _categorize_single_item(item)
     except VaultVisualAccessError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except RekognitionConfigurationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except (RekognitionClassifierError, VaultClassifierRefusalError) as exc:
+    except VaultClassifierError as exc:
         raise HTTPException(
             status_code=502,
             detail=(

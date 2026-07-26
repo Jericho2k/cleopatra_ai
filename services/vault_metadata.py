@@ -12,7 +12,7 @@ from collections import Counter
 from typing import Any, Iterable
 
 
-VAULT_CLASSIFIER_VERSION = 6
+VAULT_CLASSIFIER_VERSION = 7
 
 _EMPTY_VALUES = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
 _MEDIA_CATEGORIES = {
@@ -375,7 +375,7 @@ def build_set_description(items: list[dict[str, Any]]) -> str:
         media_label += f", including {videos} video{'s' if videos != 1 else ''}"
     visually_matched = sum(
         bool(
-            (value.get("shoot_fingerprint") or {}).get("embedding")
+            (value.get("shoot_fingerprint") or {}).get("local")
         )
         for value in metadata
     )
