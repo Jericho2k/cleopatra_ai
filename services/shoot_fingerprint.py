@@ -1,12 +1,17 @@
 """Visual fingerprints and conservative same-photoshoot clustering.
 
-Rekognition remains the source of factual adult-content taxonomy.  It is not a
-photoshoot matcher: location, nudity and an album name are far too coarse for
-that job.  This module gives every analyzed frame:
+The vision classifier is the source of factual adult-content taxonomy.  It is
+not a photoshoot matcher: location, nudity and an album name are far too coarse
+for that job.  This module gives every analyzed frame:
 
-* an Amazon Nova multimodal embedding optimized for clustering;
+* an image embedding from an OpenAI-compatible endpoint, optimized for
+  clustering;
 * small deterministic local image features for palette/lighting/debugging;
 * complete-link clustering so one weak bridge cannot merge two shoots.
+
+Without an embedding endpoint items stay unresolved: local features alone
+cannot separate two shoots in the same room, and a wrong merge would put
+unrelated media into one sellable set.
 
 The embedding is stored inside ``classification_metadata``.  This keeps the
 contract restart-safe without adding a second storage system or a SQL
@@ -14,11 +19,9 @@ migration.
 """
 from __future__ import annotations
 
-import asyncio
 import base64
 import hashlib
 import io
-import json
 import math
 import os
 from collections import Counter
@@ -28,7 +31,7 @@ from PIL import Image, ImageStat
 
 
 SHOOT_FINGERPRINT_VERSION = 1
-NOVA_EMBEDDING_MODEL = "amazon.nova-2-multimodal-embeddings-v1:0"
+DEFAULT_EMBEDDING_MODEL = "google/siglip-so400m-patch14-384"
 _DEFAULT_DIMENSION = 384
 _DEFAULT_MIN_SIMILARITY = 0.86
 _GENERIC_ALBUM_PREFIXES = ("album_", "album-")
@@ -36,11 +39,11 @@ _EMPTY = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
 
 
 class ShootEmbeddingError(RuntimeError):
-    """Nova could not produce a visual embedding."""
+    """The embedding endpoint could not produce a visual embedding."""
 
 
 class ShootEmbeddingConfigurationError(ShootEmbeddingError):
-    """Bedrock credentials, permissions or model access are unavailable."""
+    """The embedding endpoint, credentials, or model are unavailable."""
 
 
 _embedding_disabled_reason: str | None = None
@@ -231,114 +234,88 @@ def build_local_visual_fingerprint(image_bytes: bytes) -> dict[str, Any]:
     }
 
 
-def _nova_embedding_sync(
+async def _request_embedding(
     image_bytes: bytes,
     *,
     client: Any | None = None,
 ) -> tuple[list[float], str]:
+    """Embed one image through an OpenAI-compatible embeddings endpoint.
+
+    Servers such as vLLM, Infinity, or TEI expose image embedding models this
+    way, so the operator picks the model and hosting without this module
+    knowing about any particular vendor.
+    """
+    model_id = str(
+        os.environ.get("VAULT_SHOOT_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
+    ).strip()
+    base_url = str(
+        os.environ.get("VAULT_SHOOT_EMBEDDING_BASE_URL")
+        or os.environ.get("SELF_HOSTED_BASE_URL")
+        or ""
+    ).strip()
+    if not base_url:
+        raise ShootEmbeddingConfigurationError(
+            "Set VAULT_SHOOT_EMBEDDING_BASE_URL (or SELF_HOSTED_BASE_URL) to an "
+            "OpenAI-compatible embeddings endpoint, or set "
+            "VAULT_SHOOT_EMBEDDINGS_ENABLED=false."
+        )
+
+    api_key = str(
+        os.environ.get("VAULT_SHOOT_EMBEDDING_API_KEY")
+        or os.environ.get("SELF_HOSTED_API_KEY")
+        or "not-required"
+    )
+    data_uri = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
+
     if client is None:
         try:
-            import boto3
-            from botocore.exceptions import (
-                BotoCoreError,
-                ClientError,
-                NoCredentialsError,
-                PartialCredentialsError,
-            )
-        except ImportError as exc:
+            from openai import AsyncOpenAI
+        except ImportError as exc:  # pragma: no cover - openai is a hard dep
             raise ShootEmbeddingConfigurationError(
-                "boto3 is not installed for visual shoot embeddings"
+                "the openai package is required for visual shoot embeddings"
             ) from exc
-    else:
-        # Tests and offline calibration can inject a protocol-compatible
-        # runtime without importing the AWS SDK.
-        boto3 = None
-
-        class BotoCoreError(Exception):
-            pass
-
-        class ClientError(Exception):
-            response: dict[str, Any] = {}
-
-        class NoCredentialsError(Exception):
-            pass
-
-        class PartialCredentialsError(Exception):
-            pass
-
-    model_id = str(
-        os.environ.get("VAULT_SHOOT_EMBEDDING_MODEL")
-        or NOVA_EMBEDDING_MODEL
-    ).strip()
-    dimension = _embedding_dimension()
-    region = str(
-        os.environ.get("AWS_BEDROCK_REGION") or "us-east-1"
-    ).strip()
-    runtime = client or boto3.client("bedrock-runtime", region_name=region)
-    request = {
-        "schemaVersion": "nova-multimodal-embed-v1",
-        "taskType": "SINGLE_EMBEDDING",
-        "singleEmbeddingParams": {
-            "embeddingPurpose": "CLUSTERING",
-            "embeddingDimension": dimension,
-            "image": {
-                "detailLevel": "STANDARD_IMAGE",
-                "format": "jpeg",
-                "source": {
-                    "bytes": base64.b64encode(image_bytes).decode("ascii"),
-                },
-            },
-        },
-    }
-    try:
-        response = runtime.invoke_model(
-            body=json.dumps(request),
-            modelId=model_id,
-            accept="application/json",
-            contentType="application/json",
+        client = AsyncOpenAI(
+            base_url=base_url.rstrip("/"),
+            api_key=api_key,
+            timeout=float(os.environ.get("VAULT_SHOOT_EMBEDDING_TIMEOUT", "45")),
         )
-        body = response.get("body")
-        raw = body.read() if hasattr(body, "read") else body
-        payload = json.loads(raw or "{}")
-        embeddings = payload.get("embeddings") or []
-        vector = embeddings[0].get("embedding") if embeddings else None
-        normalized = _normalize(vector or [])
-        if len(normalized) != dimension:
-            raise ShootEmbeddingError(
-                "Nova returned an invalid visual embedding dimension"
+
+    try:
+        response = await client.embeddings.create(model=model_id, input=[data_uri])
+    except Exception as exc:
+        message = f"{type(exc).__name__}: {exc}"
+        lowered = message.lower()
+        # Auth, missing model, and bad routes will not fix themselves on the
+        # next item, so they open the circuit breaker instead of retrying
+        # once per image for the length of a vault run.
+        if any(
+            token in lowered
+            for token in (
+                "authenticat", "unauthorized", "forbidden", "api key",
+                "not found", "does not exist", "connect", "name or service",
             )
-        return normalized, model_id
-    except (NoCredentialsError, PartialCredentialsError) as exc:
-        raise ShootEmbeddingConfigurationError(
-            "AWS credentials are missing for visual shoot embeddings"
-        ) from exc
-    except ClientError as exc:
-        error = exc.response.get("Error") or {}
-        code = str(error.get("Code") or "")
-        message = str(error.get("Message") or code)
-        if code in {
-            "AccessDeniedException",
-            "InvalidSignatureException",
-            "UnrecognizedClientException",
-            "ExpiredTokenException",
-            "ValidationException",
-        }:
+        ):
             raise ShootEmbeddingConfigurationError(
-                f"Amazon Bedrock visual embeddings are unavailable: {message}"
+                f"visual embedding endpoint is unavailable: {message}"
             ) from exc
         raise ShootEmbeddingError(
-            f"Amazon Bedrock could not fingerprint the image: {message}"
+            f"visual embedding request failed: {message}"
         ) from exc
-    except BotoCoreError as exc:
-        raise ShootEmbeddingError(
-            f"Amazon Bedrock visual embedding failed: {type(exc).__name__}"
-        ) from exc
+
+    rows = getattr(response, "data", None) or []
+    vector = getattr(rows[0], "embedding", None) if rows else None
+    if isinstance(rows[0], dict) if rows else False:
+        vector = rows[0].get("embedding")
+    normalized = _normalize(vector or [])
+    if not normalized:
+        raise ShootEmbeddingError("embedding endpoint returned an empty vector")
+    return normalized, model_id
 
 
 async def build_shoot_fingerprint(image_bytes: bytes) -> dict[str, Any]:
-    """Build local visual evidence and, when configured, a Nova embedding.
+    """Build local visual evidence and, when configured, an image embedding.
 
-    A Bedrock failure never discards successful Rekognition classification.
+    An embedding failure never discards a successful classification.
     Configuration failures open a process-local circuit breaker so a whole
     vault run does not repeat the same denied request hundreds of times.
     """
@@ -356,10 +333,7 @@ async def build_shoot_fingerprint(image_bytes: bytes) -> dict[str, Any]:
         result["reason"] = _embedding_disabled_reason
         return result
     try:
-        vector, model_id = await asyncio.to_thread(
-            _nova_embedding_sync,
-            image_bytes,
-        )
+        vector, model_id = await _request_embedding(image_bytes)
     except ShootEmbeddingConfigurationError as exc:
         _embedding_disabled_reason = str(exc)[:240]
         result["reason"] = _embedding_disabled_reason
@@ -369,7 +343,7 @@ async def build_shoot_fingerprint(image_bytes: bytes) -> dict[str, Any]:
         return result
     result.update({
         "status": "ready",
-        "provider": "amazon_nova_multimodal_embeddings",
+        "provider": "openai_compatible_embeddings",
         "model": model_id,
         "purpose": "CLUSTERING",
         "dimension": len(vector),
@@ -440,9 +414,13 @@ def shoot_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
         return 0.0
     left_embedding = _embedding(left)
     right_embedding = _embedding(right)
+    # Palette and dHash cannot tell two shoots in the same room apart, so
+    # without an authoritative vector this stays unresolved rather than
+    # guessing.  An unconfigured embedding endpoint must not silently merge
+    # different shoots into one sellable set.
     if not left_embedding or len(left_embedding) != len(right_embedding):
         return 0.0
-    nova = cosine_similarity(left_embedding, right_embedding)
+    semantic = cosine_similarity(left_embedding, right_embedding)
     left_local = _local(left)
     right_local = _local(right)
     histogram = cosine_similarity(
@@ -453,9 +431,10 @@ def shoot_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
         str(left_local.get("dhash") or ""),
         str(right_local.get("dhash") or ""),
     )
-    # Nova is authoritative.  Palette helps distinguish lighting/outfit
-    # variants; dHash is only a small bonus for crops and near-duplicates.
-    return round((nova * 0.86) + (histogram * 0.10) + (duplicate * 0.04), 6)
+    # The embedding is authoritative.  Palette helps distinguish
+    # lighting/outfit variants; dHash is only a small bonus for crops and
+    # near-duplicates.
+    return round((semantic * 0.86) + (histogram * 0.10) + (duplicate * 0.04), 6)
 
 
 def _media_id(item: dict[str, Any]) -> str:

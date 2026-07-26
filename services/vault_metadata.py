@@ -12,7 +12,11 @@ from collections import Counter
 from typing import Any, Iterable
 
 
-VAULT_CLASSIFIER_VERSION = 6
+# v7 = a single vision pass owns both the adult taxonomy and the inventory
+# description, replacing the Rekognition + Nova pair. Version 6 rows were
+# rated by a different classifier, so they are stale and eligible for an
+# explicit upgrade run.
+VAULT_CLASSIFIER_VERSION = 7
 
 _EMPTY_VALUES = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
 _MEDIA_CATEGORIES = {
