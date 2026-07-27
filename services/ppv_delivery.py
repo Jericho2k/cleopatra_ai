@@ -20,6 +20,11 @@ from services.ppv_persistence import (
     persist_ppv_reconciliation,
     save_ppv_message_receipt,
 )
+from services.ppv_delivery_ledger import (
+    PPVDeliveryClaimError,
+    claim_delivery,
+    transition_delivery,
+)
 from services.vault_operations import normalize_media_ids
 
 
@@ -113,6 +118,20 @@ async def send_locked_ppv(
     content = message_content.strip() or "just for you..."
     platform_message_id: str | None = None
     try:
+        await claim_delivery(
+            reference=reference,
+            creator_id=creator_id,
+            fan_id=fan_id,
+            media_ids=exact_media_ids,
+            price_cents=int(price_cents),
+            source=source,
+            set_id=set_id,
+            step_index=step_index,
+        )
+    except PPVDeliveryClaimError as exc:
+        raise PPVDeliveryError(str(exc)) from exc
+
+    try:
         response_body = await send_apifansly_message(
             str(account_id),
             str(group_id),
@@ -120,17 +139,33 @@ async def send_locked_ppv(
             media_ids=exact_media_ids,
             price_dollars=price_dollars,
         )
-        platform_message_id = sent_message_id(response_body)
-        if not platform_message_id:
-            raise PPVDeliveryError(
-                "platform accepted PPV but did not return a message ID"
-            )
     except Exception as exc:
+        await transition_delivery(reference, "failed", error=str(exc))
         await freeze_fan_for_review(fan_id, "ppv_send_failed")
         raise PPVDeliveryError(f"platform rejected PPV delivery: {exc}") from exc
 
+    platform_message_id = sent_message_id(response_body)
+    if not platform_message_id:
+        # The platform returned success, so the content may be live. Preserve
+        # the active claim to block an unsafe retry until an operator resolves
+        # the ambiguous outcome.
+        await transition_delivery(
+            reference,
+            "delivered_pending",
+            error="platform accepted PPV but did not return a message ID",
+        )
+        await freeze_fan_for_review(fan_id, "ppv_sent_missing_message_id")
+        raise PPVDeliveryError(
+            "platform accepted PPV but did not return a message ID"
+        )
+
     sent_at = datetime.now(timezone.utc)
     try:
+        await transition_delivery(
+            reference,
+            "delivered_pending",
+            platform_message_id=platform_message_id,
+        )
         policy = await retry_transient_db_operation(
             lambda: get_creator_policy(creator_id),
             label=f"PPV delivery policy fan={fan_id}",
@@ -164,7 +199,7 @@ async def send_locked_ppv(
                 "source": source,
             }
         }
-        await save_ppv_message_receipt(
+        receipt_id = await save_ppv_message_receipt(
             fan_id=fan_id,
             creator_id=creator_id,
             content=content,
@@ -172,7 +207,7 @@ async def send_locked_ppv(
             platform_message_id=platform_message_id,
             media_context=media_context,
         )
-        session, reconcile_at = await persist_ppv_reconciliation(
+        session, reconcile_at, attached = await persist_ppv_reconciliation(
             creator_id=creator_id,
             fan_id=fan_id,
             pending=pending,
@@ -181,7 +216,8 @@ async def send_locked_ppv(
         )
         print(
             f"[PPV PERSIST] fan={fan_id} reference={reference} "
-            f"state=PAYMENT_PENDING reconcile_at={reconcile_at.isoformat()}"
+            f"state={'PAYMENT_PENDING' if attached else 'ALREADY_RESOLVED'} "
+            f"reconcile_at={reconcile_at.isoformat()}"
         )
     except Exception as exc:
         await freeze_fan_for_review(fan_id, "ppv_sent_but_reconciliation_not_persisted")
@@ -192,6 +228,7 @@ async def send_locked_ppv(
     return {
         "status": "sent",
         "reference": reference,
+        "message_id": receipt_id,
         "platform_message_id": platform_message_id,
         "media_ids": exact_media_ids,
         "price_cents": int(price_cents),
@@ -309,11 +346,12 @@ async def approve_ppv_request(
             step_index=request.get("step_index"),
         )
     except Exception as exc:
+        error = str(exc)
         await asyncio.to_thread(
             lambda: db.table("ppv_approval_requests")
             .update({
                 "status": "failed",
-                "last_error": str(exc),
+                "last_error": error,
                 "resolved_at": datetime.now(timezone.utc).isoformat(),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             })

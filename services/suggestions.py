@@ -73,7 +73,6 @@ from ai.stage_classifier import classify_stage
 from db.queries import (
     get_conversation_history,
     get_creator_persona,
-    get_fan,
     get_fan_by_id,
     get_fan_session,
     get_ppv_offers,
@@ -227,23 +226,35 @@ async def get_suggestions(
     creator_name: str = "a creator",
     save_fan_message: bool = True,
 ) -> SuggestionResponse:
-    conversation_history = await get_conversation_history(fan_id)
-
-    fan_profile = await get_fan(creator_id, fan_id)
+    (
+        conversation_history,
+        fan_profile,
+        fan_intelligence,
+        buyer_lifecycle,
+        affordability,
+        price_learning,
+        creator_persona,
+        creator_legend,
+        ppv_offers,
+        sent_ppv,
+        active_session,
+    ) = await asyncio.gather(
+        get_conversation_history(fan_id),
+        get_fan_by_id(fan_id),
+        get_fan_intelligence_context(fan_id),
+        get_fan_lifecycle_context(fan_id),
+        get_affordability_context(fan_id),
+        get_price_learning_context(fan_id),
+        get_creator_persona(creator_id),
+        get_creator_legend(creator_id),
+        get_ppv_offers(creator_id),
+        get_sent_ppv(fan_id),
+        get_fan_session(fan_id),
+    )
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
-
-    fan_intelligence = await get_fan_intelligence_context(fan_id)
-    buyer_lifecycle = await get_fan_lifecycle_context(fan_id)
-    affordability = await get_affordability_context(fan_id)
-    price_learning = await get_price_learning_context(fan_id)
-    creator_persona = await get_creator_persona(creator_id)
     if creator_persona is None:
         creator_persona = Persona()
-    creator_legend = await get_creator_legend(creator_id)
-    ppv_offers = await get_ppv_offers(creator_id)
-    sent_ppv = await get_sent_ppv(fan_id)
-    active_session = await get_fan_session(fan_id)
 
     conversation_stage = classify_stage(conversation_history, fan_profile)
 
@@ -309,12 +320,7 @@ async def get_suggestions(
             print(f"[CAP] fan={fan_id} plan suppressed: {cap_reason}")
         else:
             try:
-                async with httpx.AsyncClient() as _hc:
-                    plan_resp = await _hc.post(
-                        f"http://localhost:8080/plan-session/{creator_id}/{fan_id}",
-                        timeout=30,
-                    )
-                plan_data = plan_resp.json()
+                plan_data = await plan_session_for_fan(creator_id, fan_id)
                 if plan_data.get("status") == "ok":
                     active_session = plan_data.get("session") or await get_fan_session(fan_id)
                     print(f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
@@ -633,13 +639,21 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         if current_task and current_task is not asyncio.current_task():
             print(f"[AUTO REPLY] Newer task exists — aborting stale generation for fan={fan_id}")
             return
-        fan_profile = await get_fan_by_id(fan_id)
+        (
+            fan_profile,
+            fan_intelligence,
+            buyer_lifecycle,
+            affordability,
+            price_learning,
+        ) = await asyncio.gather(
+            get_fan_by_id(fan_id),
+            get_fan_intelligence_context(fan_id),
+            get_fan_lifecycle_context(fan_id),
+            get_affordability_context(fan_id),
+            get_price_learning_context(fan_id),
+        )
         if not fan_profile:
             return
-        fan_intelligence = await get_fan_intelligence_context(fan_id)
-        buyer_lifecycle = await get_fan_lifecycle_context(fan_id)
-        affordability = await get_affordability_context(fan_id)
-        price_learning = await get_price_learning_context(fan_id)
         # Frozen for human review (e.g. prior crisis under 'freeze' policy): auto-mode
         # stays out until a human clears the flag in the dashboard.
         if getattr(fan_profile, "needs_human_review", False):
@@ -676,14 +690,22 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             return
         latest_message = fan_messages[-1].content
 
-        creator_persona = await get_creator_persona(creator_id)
+        (
+            creator_persona,
+            ppv_offers,
+            sent_ppv,
+            active_session,
+            similar_exchanges,
+        ) = await asyncio.gather(
+            get_creator_persona(creator_id),
+            get_ppv_offers(creator_id),
+            get_sent_ppv(fan_id),
+            get_fan_session(fan_id),
+            find_similar_exchanges(latest_message, creator_id, enabled=False),
+        )
         if creator_persona is None:
             creator_persona = Persona()
 
-        ppv_offers = await get_ppv_offers(creator_id)
-        sent_ppv = await get_sent_ppv(fan_id)
-        active_session = await get_fan_session(fan_id)
-        similar_exchanges = await find_similar_exchanges(latest_message, creator_id, enabled=False)
         conversation_stage = classify_stage(conversation_history, fan_profile)
 
         # A purchased PPV starts a short text-only bridge before the next step.
@@ -1286,13 +1308,19 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                         "verification_attempts": 0,
                         "platform_message_id": platform_message_id,
                     }
-                    active_session, reconcile_at = await persist_ppv_reconciliation(
+                    active_session, reconcile_at, attached = await persist_ppv_reconciliation(
                         creator_id=creator_id,
                         fan_id=fan_id,
                         pending=pending_check,
                         session=active_session,
                         platform_message_id=platform_message_id,
                     )
+                    if not attached:
+                        print(
+                            f"[TEST DELIVERY] fan={fan_id} "
+                            "reconciliation already resolved"
+                        )
+                        return
                     print(
                         f"[PAYMENT] fan={fan_id} state=PAYMENT_PENDING "
                         f"reference={delivery_reference} reconcile_at={reconcile_at.isoformat()} "
@@ -1387,7 +1415,13 @@ async def _send_post_purchase_reaction(fan_id: str, creator_id: str) -> None:
         print(f"[PPV REACTION ERROR] {e}")
 
 
-async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None = None) -> None:
+async def record_ppv_purchase(
+    fan_id: str,
+    media_id: str,
+    amount: float | None = None,
+    *,
+    pending_override: dict | None = None,
+) -> None:
     """Record one confirmed PPV purchase idempotently and advance its session.
 
     The paid-session plan moves forward only here, after confirmation. The final
@@ -1409,7 +1443,8 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
     creator_id = row.get("creator_id")
     sales_log = list(row.get("sales_log") or [])
     not_sold = list(row.get("not_sold_log") or [])
-    pending = row.get("pending_ppv_check") or {}
+    pending = row.get("pending_ppv_check") or pending_override or {}
+    reference = str(pending.get("reference") or "")
     completed_session: dict | None = None
     lifecycle_context: dict = {}
 
@@ -1428,7 +1463,14 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
         )
     amount_dollars = int(round(float(amount or 0)))
 
-    already_recorded = any(str(entry.get("media_id")) == str(media_id) for entry in sales_log)
+    already_recorded = any(
+        (
+            str(entry.get("payment_reference") or "") == reference
+            if reference
+            else str(entry.get("media_id")) == str(media_id)
+        )
+        for entry in sales_log
+    )
     old_spent = int(row.get("total_spent", 0) or 0)
     new_spent = old_spent
     if not already_recorded:
@@ -1438,12 +1480,29 @@ async def record_ppv_purchase(fan_id: str, media_id: str, amount: float | None =
             "item": f"PPV media {media_id}",
             "media_id": str(media_id),
             "media_ids": pending.get("media_ids") or [str(media_id)],
+            "payment_reference": reference or None,
             "amount": amount_dollars,
             "chatter": "Operator" if pending.get("source") == "operator" else "AI",
         })
-        not_sold = [entry for entry in not_sold if str(media_id) not in str(entry.get("item", ""))]
+        not_sold = [
+            entry
+            for entry in not_sold
+            if (
+                str(entry.get("payment_reference") or "") != reference
+                if reference
+                else str(media_id) not in str(entry.get("item", ""))
+            )
+        ]
         new_spent = old_spent + amount_dollars
 
+    if reference:
+        from services.ppv_delivery_ledger import transition_delivery
+
+        await transition_delivery(
+            reference,
+            "purchased",
+            amount_paid_cents=int(round(float(amount or 0) * 100)),
+        )
     await asyncio.to_thread(
         lambda: db.table("fans").update({
             "total_spent": new_spent,

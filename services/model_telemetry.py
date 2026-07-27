@@ -6,6 +6,7 @@ import asyncio
 import os
 from typing import Any
 
+from core.tasks import spawn
 from models.model_runtime import (
     ModelResult,
     ModelTarget,
@@ -13,6 +14,9 @@ from models.model_runtime import (
     ModelUsage,
     estimate_cost_usd,
 )
+
+_MAX_PENDING_WRITES = 500
+_pending_writes = 0
 
 
 def telemetry_enabled() -> bool:
@@ -33,7 +37,7 @@ async def record_model_result(
     parse_valid: bool | None = None,
     error: str | None = None,
 ) -> None:
-    await _record(
+    _enqueue_record(
         target=result.target,
         usage=result.usage,
         latency_ms=result.latency_ms,
@@ -53,7 +57,7 @@ async def record_model_failure(
     error: str,
     retry_count: int = 0,
 ) -> None:
-    await _record(
+    _enqueue_record(
         target=target,
         usage=ModelUsage(),
         latency_ms=None,
@@ -64,6 +68,26 @@ async def record_model_failure(
         error=error,
         raw_response_id=None,
     )
+
+
+def _enqueue_record(**kwargs: Any) -> None:
+    """Queue telemetry off the reply path with a hard memory bound."""
+    global _pending_writes
+    if not telemetry_enabled():
+        return
+    if _pending_writes >= _MAX_PENDING_WRITES:
+        print("[MODEL TELEMETRY] queue full; dropping event")
+        return
+    _pending_writes += 1
+
+    async def _run() -> None:
+        global _pending_writes
+        try:
+            await _record(**kwargs)
+        finally:
+            _pending_writes -= 1
+
+    spawn(_run(), name="model_telemetry")
 
 
 async def _record(

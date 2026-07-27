@@ -27,6 +27,7 @@ from services.followup_lifecycle import (
 )
 from services.apifansly import request as apifansly_request, response_data
 from services.session_lifecycle import mark_step_declined
+from services.vault_operations import normalize_media_ids
 
 
 class PPVReconcileDisposition(str, Enum):
@@ -44,7 +45,22 @@ class PPVReconcileResult:
     retry_at: datetime | None = None
 
 
-def _matching_purchase(transactions: list[dict], expected_price: float) -> float | None:
+def _transaction_media_id(transaction: dict[str, Any]) -> str:
+    media = transaction.get("accountMedia") or transaction.get("media") or {}
+    return str(
+        transaction.get("accountMediaId")
+        or transaction.get("mediaId")
+        or media.get("id")
+        or ""
+    )
+
+
+def _matching_purchase(
+    transactions: list[dict],
+    expected_price: float,
+    *,
+    expected_media_ids: list[str] | None = None,
+) -> float | None:
     """Return a matching media purchase in dollars.
 
     API Fansly reports ``totalGross`` in cents while Cleopatra persists PPV
@@ -52,12 +68,33 @@ def _matching_purchase(transactions: list[dict], expected_price: float) -> float
     (3000 cents) from being treated as an unpurchased $30 offer.
     """
     expected_cents = int(round(float(expected_price) * 100))
+    price_matches: list[tuple[dict[str, Any], int]] = []
     for transaction in transactions:
         if transaction.get("type") != 2110:
             continue
         gross_cents = int(round(float(transaction.get("totalGross") or 0)))
         if abs(gross_cents - expected_cents) / max(expected_cents, 100) < 0.1:
-            return gross_cents / 100.0
+            price_matches.append((transaction, gross_cents))
+
+    expected_ids = set(normalize_media_ids(expected_media_ids or []))
+    if expected_ids:
+        identified = [
+            (transaction, gross_cents)
+            for transaction, gross_cents in price_matches
+            if _transaction_media_id(transaction)
+        ]
+        for transaction, gross_cents in identified:
+            if _transaction_media_id(transaction) in expected_ids:
+                return gross_cents / 100.0
+        # If Fansly supplied media identity, a different same-price purchase
+        # must never satisfy this pending PPV.
+        if identified:
+            return None
+
+    # Older API responses may omit media identity. Only accept an unambiguous
+    # single price match; multiple same-price purchases require human review.
+    if len(price_matches) == 1:
+        return price_matches[0][1] / 100.0
     return None
 
 
@@ -134,7 +171,13 @@ async def _fetch_purchase_amount(
     transactions = response_data(payload)
     if not isinstance(transactions, list):
         raise RuntimeError("Fansly purchase verification returned an invalid response")
-    return _matching_purchase(transactions, float(pending.get("price") or 0))
+    return _matching_purchase(
+        transactions,
+        float(pending.get("price") or 0),
+        expected_media_ids=normalize_media_ids(
+            pending.get("media_ids") or [pending.get("media_id")]
+        ),
+    )
 
 
 async def _persist_pending_check(
@@ -230,6 +273,11 @@ async def _finalize_abandonment(
 
     if not await asyncio.to_thread(_update_fan):
         return False
+
+    if reference:
+        from services.ppv_delivery_ledger import transition_delivery
+
+        await transition_delivery(reference, "abandoned")
 
     session = await get_fan_session(fan_id)
     if session and session.get("awaiting_purchase_index") is not None:

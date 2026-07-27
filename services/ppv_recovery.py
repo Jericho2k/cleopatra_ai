@@ -26,6 +26,7 @@ AMBIGUOUS_PPV_REVIEW_REASONS = {
     "ppv_sent_but_reconciliation_not_persisted",
     "delivery_sent_but_not_persisted",
     "ppv_purchase_verification_unavailable",
+    "ppv_sent_missing_message_id",
 }
 
 
@@ -34,7 +35,11 @@ class PPVRecoveryError(RuntimeError):
 
 
 async def _load_recovery_context(fan_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    def _load() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    def _load() -> tuple[
+        dict[str, Any],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
         db = get_supabase()
         fan = (
             db.table("fans")
@@ -56,9 +61,21 @@ async def _load_recovery_context(fan_id: str) -> tuple[dict[str, Any], dict[str,
             .limit(50)
             .execute()
         ).data or []
-        return fan, messages
+        deliveries = (
+            db.table("ppv_deliveries")
+            .select(
+                "reference, status, media_ids, price_cents, source, set_id, "
+                "step_index, platform_message_id, claimed_at, delivered_at"
+            )
+            .eq("fan_id", fan_id)
+            .in_("status", ["claimed", "delivered_pending"])
+            .order("claimed_at", desc=True)
+            .limit(1)
+            .execute()
+        ).data or []
+        return fan, messages, deliveries
 
-    fan, messages = await retry_transient_db_operation(
+    fan, messages, deliveries = await retry_transient_db_operation(
         lambda: asyncio.to_thread(_load),
         label=f"PPV recovery context fan={fan_id}",
         log_prefix="PPV RECOVERY RETRY",
@@ -69,6 +86,27 @@ async def _load_recovery_context(fan_id: str) -> tuple[dict[str, Any], dict[str,
         ppv = (message.get("media_context") or {}).get("ppv") or {}
         if ppv.get("payment_reference") and ppv.get("delivery_status") != "voided":
             return fan, message
+    if deliveries:
+        delivery = deliveries[0]
+        media_ids = normalize_media_ids(delivery.get("media_ids") or [])
+        sent_at = delivery.get("delivered_at") or delivery.get("claimed_at")
+        return fan, {
+            "id": None,
+            "sent_at": sent_at,
+            "fansly_message_id": delivery.get("platform_message_id"),
+            "media_context": {
+                "ppv": {
+                    "payment_reference": delivery.get("reference"),
+                    "media_id": media_ids[0] if media_ids else None,
+                    "media_ids": media_ids,
+                    "price": float(delivery.get("price_cents") or 0) / 100,
+                    "price_cents": int(delivery.get("price_cents") or 0),
+                    "source": delivery.get("source"),
+                    "set_id": delivery.get("set_id"),
+                    "step_index": delivery.get("step_index"),
+                }
+            },
+        }
     raise PPVRecoveryError("no recoverable PPV receipt was found")
 
 
@@ -115,13 +153,15 @@ async def repair_ppv_reconciliation(
         label=f"PPV recovery session fan={fan_id}",
         log_prefix="PPV RECOVERY RETRY",
     )
-    session, reconcile_at = await persist_ppv_reconciliation(
+    session, reconcile_at, attached = await persist_ppv_reconciliation(
         creator_id=creator_id,
         fan_id=fan_id,
         pending=pending,
         session=session,
         platform_message_id=pending.get("platform_message_id"),
     )
+    if not attached:
+        raise PPVRecoveryError("PPV delivery was already resolved")
     if clear_review:
         await retry_transient_db_operation(
             lambda: clear_fan_review(fan_id),
@@ -157,19 +197,28 @@ async def _mark_receipt_not_sent(fan_id: str) -> dict[str, Any]:
     })
     context["ppv"] = ppv
 
-    async def _void_message() -> None:
-        await asyncio.to_thread(
-            lambda: get_supabase().table("messages")
-            .update({"media_context": context})
-            .eq("id", message["id"])
-            .execute()
-        )
+    if message.get("id"):
+        async def _void_message() -> None:
+            await asyncio.to_thread(
+                lambda: get_supabase().table("messages")
+                .update({"media_context": context})
+                .eq("id", message["id"])
+                .execute()
+            )
 
-    await retry_transient_db_operation(
-        _void_message,
-        label=f"void PPV receipt fan={fan_id}",
-        log_prefix="PPV RECOVERY RETRY",
-    )
+        await retry_transient_db_operation(
+            _void_message,
+            label=f"void PPV receipt fan={fan_id}",
+            log_prefix="PPV RECOVERY RETRY",
+        )
+    if reference:
+        from services.ppv_delivery_ledger import transition_delivery
+
+        await transition_delivery(
+            reference,
+            "voided",
+            error="operator_confirmed_not_sent",
+        )
 
     current_pending = fan.get("pending_ppv_check") or {}
     if not current_pending or str(current_pending.get("reference") or "") == reference:

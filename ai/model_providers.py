@@ -87,6 +87,24 @@ def _api_key(target: ModelTarget) -> str:
     )
 
 
+@lru_cache(maxsize=8)
+def _anthropic_client(api_key: str):
+    from anthropic import AsyncAnthropic
+
+    return AsyncAnthropic(api_key=api_key)
+
+
+@lru_cache(maxsize=16)
+def _openai_compatible_client(base_url: str, api_key: str, timeout_seconds: float):
+    from openai import AsyncOpenAI
+
+    return AsyncOpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout_seconds,
+    )
+
+
 async def complete(
     target: ModelTarget,
     *,
@@ -135,9 +153,7 @@ async def _complete_anthropic(
     max_tokens: int,
     temperature: float | None,
 ) -> ModelResult:
-    from anthropic import AsyncAnthropic
-
-    client = AsyncAnthropic(api_key=_api_key(target))
+    client = _anthropic_client(_api_key(target))
     kwargs: dict[str, Any] = {
         "model": target.model,
         "max_tokens": max_tokens,
@@ -176,15 +192,13 @@ async def _complete_openai_compatible(
     max_tokens: int,
     temperature: float | None,
 ) -> ModelResult:
-    from openai import AsyncOpenAI
-
     if not target.base_url:
         raise RuntimeError(f"No base URL configured for {target.name}")
 
-    client = AsyncOpenAI(
-        base_url=target.base_url,
-        api_key=_api_key(target),
-        timeout=target.timeout_seconds,
+    client = _openai_compatible_client(
+        target.base_url,
+        _api_key(target),
+        float(target.timeout_seconds),
     )
 
     payload_messages = [

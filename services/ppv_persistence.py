@@ -81,7 +81,7 @@ async def persist_ppv_reconciliation(
     pending: dict[str, Any],
     session: dict[str, Any] | None = None,
     platform_message_id: str | None = None,
-) -> tuple[dict[str, Any] | None, datetime]:
+) -> tuple[dict[str, Any] | None, datetime, bool]:
     """Attach a delivered PPV to payment state and a durable reconcile action."""
     reference = str(pending.get("reference") or "").strip()
     if not reference:
@@ -107,19 +107,38 @@ async def persist_ppv_reconciliation(
         "platform_message_id": pending.get("platform_message_id") or platform_message_id,
     }
 
-    async def _save_pending() -> None:
-        await asyncio.to_thread(
-            lambda: get_supabase().table("fans")
-            .update({"pending_ppv_check": pending})
-            .eq("id", fan_id)
-            .execute()
-        )
+    async def _save_pending() -> bool:
+        def _attach() -> bool:
+            db = get_supabase()
+            result = db.rpc(
+                "attach_pending_ppv",
+                {
+                    "p_fan_id": fan_id,
+                    "p_reference": reference,
+                    "p_pending": pending,
+                },
+            ).execute()
+            outcome = str(result.data or "")
+            if outcome == "attached":
+                return True
+            if outcome != "missing":
+                return False
+            # Pre-ledger receipts repaired after migration still use the fan
+            # snapshot as their authoritative compatibility state.
+            db.table("fans").update({"pending_ppv_check": pending}).eq(
+                "id", fan_id
+            ).execute()
+            return True
 
-    await retry_transient_db_operation(
+        return await asyncio.to_thread(_attach)
+
+    attached = await retry_transient_db_operation(
         _save_pending,
         label=f"pending PPV fan={fan_id}",
         log_prefix="PPV PERSIST RETRY",
     )
+    if not attached:
+        return session, expires_at, False
 
     if session is None:
         session = await retry_transient_db_operation(
@@ -172,7 +191,7 @@ async def persist_ppv_reconciliation(
         label=f"PPV reconcile action fan={fan_id}",
         log_prefix="PPV PERSIST RETRY",
     )
-    return session, reconcile_at
+    return session, reconcile_at, True
 
 
 def pending_from_message_receipt(
