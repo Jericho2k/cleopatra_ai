@@ -58,7 +58,7 @@ _REFUSAL_PREFIXES = (
     "unable to",
 )
 _EMPTY_TEXT = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
-_VISION_GATE = asyncio.Semaphore(1)
+_VISION_GATE = asyncio.Semaphore(2)
 
 
 def _clean(value: Any, *, limit: int = 320) -> str:

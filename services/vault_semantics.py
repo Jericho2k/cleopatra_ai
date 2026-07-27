@@ -254,7 +254,7 @@ def qwen_fallback_reasons(
     reasons: list[str] = []
     activity = (axes.get("activity") or {}).get("label")
     activity_score = float((axes.get("activity") or {}).get("score") or 0)
-    if activity in _HIGH_RISK_ACTIVITIES and activity_score >= 0.15:
+    if activity in _HIGH_RISK_ACTIVITIES and activity_score >= 0.25:
         reasons.append("high_risk_activity")
     wardrobe = (axes.get("wardrobe_state") or {}).get("label")
     wardrobe_score = float(

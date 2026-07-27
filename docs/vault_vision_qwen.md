@@ -55,11 +55,11 @@ download. GPU containers use local-only model loading; only the explicit
 CPU-based preload step contacts the Hub. The backend follows Modal's
 long-running result redirects and allows up to 620 seconds for a cold request.
 
-Qwen intentionally uses one scale-to-zero L4 container because it is the
-exception path. SigLIP2 uses smaller T4 containers, scales up to ten, and
-scales down after 30 seconds. A vault run defaults to 12 concurrent requests.
-This keeps bulk imports parallel while ordinary reanalysis still scales to
-zero.
+Qwen uses up to two scale-to-zero L4 containers because it is the exception
+path. SigLIP2 uses smaller T4 containers, scales up to eight, and scales down
+after 30 seconds. Together they stay within Modal Starter's ten-GPU concurrency
+limit. A vault run defaults to 12 concurrent requests. This keeps bulk imports
+parallel while ordinary reanalysis still scales to zero.
 
 Successful enrichment logs:
 
