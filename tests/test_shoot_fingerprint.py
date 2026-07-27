@@ -1,6 +1,8 @@
 import asyncio
+import base64
 import io
 import math
+import struct
 
 from PIL import Image
 
@@ -81,6 +83,17 @@ def jpeg_bytes(colour=(230, 80, 160)) -> bytes:
     return buffer.getvalue()
 
 
+def encoded_embedding(values: list[float]) -> dict:
+    return {
+        "model": "google/siglip2-base-patch16-224",
+        "encoding": "float16_base64",
+        "dimensions": len(values),
+        "data": base64.b64encode(
+            struct.pack(f"<{len(values)}e", *values)
+        ).decode(),
+    }
+
+
 def test_local_fingerprint_captures_palette_lighting_and_geometry():
     result = build_local_visual_fingerprint(jpeg_bytes())
     assert result["version"] == 2
@@ -126,6 +139,31 @@ def test_qwen_scene_evidence_is_attached_without_replacing_local_pixels():
     assert enriched["semantic"]["setting_location"] == "bedroom"
 
 
+def test_siglip_embedding_is_attached_without_expanding_railway_runtime():
+    fingerprint = asyncio.run(build_shoot_fingerprint(jpeg_bytes()))
+    embedding = encoded_embedding([1.0] + ([0.0] * 15))
+    enriched = add_semantic_shoot_evidence(fingerprint, {
+        "_semantic_fingerprint": {
+            "model": "google/siglip2-base-patch16-224",
+            "revision": "75de2d55",
+            "embedding": embedding,
+            "confidence": 0.88,
+        },
+        "rich_visual_descriptor": {
+            "status": "ready",
+            "descriptor": {
+                "setting_location": "bedroom",
+                "background_details": ["bed and bedding"],
+                "wardrobe_items": ["lingerie set"],
+                "lighting": "warm indoor light",
+            },
+        },
+    })
+    assert enriched["provider"] == "pillow_local+siglip2"
+    assert enriched["embedding"]["dimensions"] == 16
+    assert enriched["semantic_confidence"] == 0.88
+
+
 def test_strong_scene_continuity_bridges_pose_and_crop_changes():
     semantic = {
         "setting_location": "bedroom",
@@ -152,6 +190,35 @@ def test_strong_scene_continuity_bridges_pose_and_crop_changes():
     clusters = build_shoot_clusters(rows)
     assert len(clusters) == 1
     assert clusters[0]["method"] == "local_visual+vision_metadata"
+
+
+def test_embedding_and_controlled_tags_bridge_crop_changes_conservatively():
+    semantic = {
+        "setting_location": "bedroom",
+        "setting_details": ["bed and bedding"],
+        "background_details": ["bed and bedding", "plain wall"],
+        "wardrobe_items": ["lingerie set"],
+        "wardrobe_colors": ["pink"],
+        "lighting": "warm indoor light",
+        "continuity_markers": [
+            "bed and bedding",
+            "lingerie set",
+            "warm indoor light",
+        ],
+    }
+    rows = [
+        item("wide", unit(0), semantic=semantic),
+        item("crop", unit(43), semantic=semantic),
+    ]
+    vector = encoded_embedding([1.0] + ([0.0] * 15))
+    for row in rows:
+        row["classification_metadata"]["shoot_fingerprint"][
+            "embedding"
+        ] = vector
+    assert shoot_similarity(rows[0], rows[1]) >= 0.94
+    clusters = build_shoot_clusters(rows)
+    assert len(clusters) == 1
+    assert clusters[0]["method"] == "local_visual+semantic_embedding"
 
 
 def test_local_visual_evidence_overrides_same_generic_album_and_scene_slug():

@@ -220,9 +220,126 @@ def test_modal_image_includes_qwen_processor_runtime_dependencies():
     assert '"transformers==5.14.1"' in source
     assert '"HF_XET_HIGH_PERFORMANCE": "1"' in source
     assert "def download_weights()" in source
-    assert source.count("local_files_only=True") == 2
+    assert source.count("local_files_only=True") == 4
     assert "max_containers=1" in source
+    assert "max_containers=10" in source
     assert "scaledown_window=60" in source
+    assert "def download_semantic_weights()" in source
+    assert (
+        'SEMANTIC_MODEL_REVISION = '
+        '"75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"'
+    ) in source
+
+
+def semantic_result(*, activity="posing", activity_score=0.8):
+    axis_labels = {
+        "scene_location": "bedroom",
+        "wardrobe_state": "lingerie",
+        "pose": "lying down",
+        "activity": activity,
+        "framing": "medium shot",
+        "lighting": "warm indoor light",
+    }
+    return {
+        "model": "google/siglip2-base-patch16-224",
+        "revision": "75de2d55",
+        "request_id": "semantic-1",
+        "confidence": 0.86,
+        "ambiguous_axes": [],
+        "axes": {
+            name: {
+                "label": label,
+                "score": activity_score if name == "activity" else 0.8,
+                "margin": 0.2,
+                "confident": True,
+                "ranked": [{"label": label, "score": 0.8}],
+            }
+            for name, label in axis_labels.items()
+        },
+        "tags": {
+            "background_details": [
+                {"label": "bed and bedding", "score": 0.8},
+            ],
+            "wardrobe_items": [
+                {"label": "lingerie set", "score": 0.82},
+            ],
+        },
+        "embedding": {
+            "model": "google/siglip2-base-patch16-224",
+            "encoding": "float16_base64",
+            "dimensions": 16,
+            "data": "AAA8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_confident_semantics_avoids_qwen(monkeypatch):
+    monkeypatch.setattr(vault_classifier, "_detect", lambda _: [])
+
+    async def semantics(*args, **kwargs):
+        return semantic_result()
+
+    async def qwen(*args, **kwargs):
+        raise AssertionError("Qwen should not be called")
+
+    monkeypatch.setattr(vault_classifier, "semantic_metadata", semantics)
+    monkeypatch.setattr(vault_classifier, "_qwen_metadata", qwen)
+    monkeypatch.setenv("VAULT_SEMANTIC_BASE_URL", "https://semantic.invalid")
+    monkeypatch.setenv("VAULT_VISION_BASE_URL", "https://qwen.invalid")
+
+    result = await vault_classifier.classify_vault_image(
+        jpeg_bytes(),
+        is_video=False,
+        local_visual=local_visual(),
+    )
+
+    assert result["_provider_metadata"]["provider"] == "local_nudenet+siglip2"
+    assert result["_provider_metadata"]["qwen_status"] == "not_needed"
+    assert result["scene_location"] == "bedroom"
+    assert result["scene_outfit"] == "lingerie set"
+    assert result["explicitness"] == 3
+    assert result["_semantic_fingerprint"]["embedding"]["dimensions"] == 16
+
+
+@pytest.mark.asyncio
+async def test_high_risk_semantic_activity_uses_qwen(monkeypatch):
+    monkeypatch.setattr(vault_classifier, "_detect", lambda _: [])
+    calls = []
+
+    async def semantics(*args, **kwargs):
+        return semantic_result(
+            activity="sexual activity",
+            activity_score=0.7,
+        )
+
+    async def qwen(*args, **kwargs):
+        calls.append(True)
+        return {
+            "description": "Two adults are visible.",
+            "explicitness": 5,
+            "sexual_activity": ["sexual activity"],
+            "participants": 2,
+            "confidence": 0.9,
+        }
+
+    monkeypatch.setattr(vault_classifier, "semantic_metadata", semantics)
+    monkeypatch.setattr(vault_classifier, "_qwen_metadata", qwen)
+    monkeypatch.setenv("VAULT_SEMANTIC_BASE_URL", "https://semantic.invalid")
+    monkeypatch.setenv("VAULT_VISION_BASE_URL", "https://qwen.invalid")
+
+    result = await vault_classifier.classify_vault_image(
+        jpeg_bytes(),
+        is_video=False,
+        local_visual=local_visual(),
+    )
+
+    assert calls == [True]
+    assert result["explicitness"] == 5
+    assert result["_provider_metadata"]["qwen_status"] == "ready"
+    assert result["_provider_metadata"]["qwen_fallback_reasons"] == [
+        "high_risk_activity",
+    ]
 
 
 @pytest.mark.asyncio
@@ -314,4 +431,4 @@ async def test_main_uses_local_classifier_without_anthropic(monkeypatch):
 
     assert result["classification_model"] == "nudenet-3.4.2"
     assert result["classification_metadata"]["classifier_provider"] == "local_nudenet"
-    assert result["classification_version"] == 8
+    assert result["classification_version"] == 9

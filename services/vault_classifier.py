@@ -19,6 +19,11 @@ from typing import Any
 import httpx
 
 from services.vault_metadata import normalize_media_category
+from services.vault_semantics import (
+    qwen_fallback_reasons,
+    semantic_endpoint_configured,
+    semantic_metadata,
+)
 
 
 class VaultClassifierError(RuntimeError):
@@ -475,6 +480,165 @@ def _vision_failure_reason(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def _merge_semantics(
+    base: dict[str, Any],
+    semantic: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach deterministic SigLIP2 tags while preserving NudeNet evidence."""
+    result = dict(base)
+    axes = semantic.get("axes") or {}
+    tags = semantic.get("tags") or {}
+
+    def axis(name: str, default: str = "unknown") -> str:
+        row = axes.get(name) if isinstance(axes.get(name), dict) else {}
+        return _specific(row.get("label"), limit=120) or default
+
+    def tag_labels(name: str) -> list[str]:
+        rows = tags.get(name) if isinstance(tags.get(name), list) else []
+        return _strings(
+            [row.get("label") for row in rows if isinstance(row, dict)],
+            limit=8,
+        )
+
+    scene = axis("scene_location")
+    wardrobe_state = axis("wardrobe_state")
+    pose = axis("pose")
+    action = axis("activity")
+    framing = axis("framing", "other")
+    lighting = axis("lighting", base.get("scene_lighting") or "unknown")
+    background = tag_labels("background_details")
+    wardrobe_items = tag_labels("wardrobe_items")
+    palette = _strings(base.get("colors"), limit=6)
+    continuity = list(dict.fromkeys([
+        *background,
+        *wardrobe_items,
+        scene,
+        lighting,
+    ]))[:8]
+    confidence = float(semantic.get("confidence") or 0)
+    wardrobe_score = float(
+        ((axes.get("wardrobe_state") or {}).get("score")) or 0
+    )
+    explicitness = int(base.get("explicitness") or 0)
+    if (
+        explicitness < 3
+        and wardrobe_state in {"partial nudity", "lingerie", "underwear"}
+        and wardrobe_score >= 0.4
+    ):
+        explicitness = 3
+    is_video = bool((base.get("_provider_metadata") or {}).get("is_video"))
+    category = base.get("category")
+    if explicitness == 3:
+        category = "lingerie_video" if is_video else "lingerie_photo"
+    category = normalize_media_category(
+        category,
+        explicitness=explicitness,
+        is_video=is_video,
+    )
+    outfit = ", ".join(wardrobe_items) or wardrobe_state
+    scene_sentence = (
+        f"The frame appears to be in a {scene}, with {lighting}."
+        if scene != "unknown"
+        else f"The frame uses {lighting}."
+    )
+    description = (
+        f"The subject is {action}, {pose}, in a {framing}. "
+        f"Wardrobe state: {outfit}. {scene_sentence}"
+    )
+    if background:
+        description += f" Visible background details: {', '.join(background)}."
+    if palette:
+        description += f" Dominant colors: {', '.join(palette)}."
+    descriptor = {
+        "description": description,
+        "setting_location": scene,
+        "setting_details": background,
+        "background_details": background,
+        "wardrobe_items": wardrobe_items,
+        "wardrobe_colors": palette,
+        "wardrobe_materials": [],
+        "subject_styling": [],
+        "pose": pose,
+        "limb_position": "",
+        "gaze": "",
+        "expression": "",
+        "action": action,
+        "framing": framing,
+        "camera_angle": "",
+        "crop": "",
+        "composition": "",
+        "props": [],
+        "lighting": lighting,
+        "visual_style": lighting,
+        "distinguishing_details": background,
+        "continuity_markers": continuity,
+        "search_tags": list(dict.fromkeys([
+            scene,
+            wardrobe_state,
+            pose,
+            action,
+            framing,
+            *background,
+            *wardrobe_items,
+        ])),
+        "color_details": palette,
+        "confidence": round(confidence, 3),
+    }
+    endpoint = {
+        key: semantic.get(key)
+        for key in (
+            "request_id", "model", "revision", "latency_ms",
+            "queue_ms", "round_trip_ms",
+        )
+    }
+    result.update({
+        "category": category,
+        "description": description,
+        "description_complete": True,
+        "explicitness": explicitness,
+        "good_for": "closer" if explicitness >= 4 else "mid_session",
+        "tags": list(dict.fromkeys([
+            *base.get("tags", []),
+            *descriptor["search_tags"],
+        ]))[:32],
+        "action": action,
+        "pose": pose,
+        "framing": framing,
+        "scene_location": scene,
+        "scene_outfit": outfit,
+        "scene_lighting": lighting,
+        "visual_tone": lighting,
+        "scene_id": _slug(scene, wardrobe_state, lighting)
+        or base.get("scene_id"),
+        "confidence": max(float(base.get("confidence") or 0), confidence),
+        "rich_visual_descriptor": {
+            "status": "ready",
+            "descriptor": descriptor,
+        },
+        "_classification_model": (
+            f"{base.get('_classification_model', 'nudenet-3.4.2')}+"
+            f"{semantic.get('model') or 'google/siglip2-base-patch16-224'}"
+        ),
+        "_semantic_fingerprint": {
+            "model": semantic.get("model"),
+            "revision": semantic.get("revision"),
+            "embedding": semantic.get("embedding") or {},
+            "confidence": round(confidence, 4),
+            "ambiguous_axes": semantic.get("ambiguous_axes") or [],
+        },
+    })
+    result["_provider_metadata"] = {
+        **base["_provider_metadata"],
+        "provider": "local_nudenet+siglip2",
+        "vision_status": "ready",
+        "semantic_status": "ready",
+        "scene_confidence": round(confidence, 3),
+        "semantic_endpoint": endpoint,
+        "semantic_ambiguous_axes": semantic.get("ambiguous_axes") or [],
+    }
+    return result
+
+
 def _merge_qwen(base: dict[str, Any], rich: dict[str, Any]) -> dict[str, Any]:
     result = dict(base)
     descriptor = _visual_descriptor(rich)
@@ -570,13 +734,21 @@ def _merge_qwen(base: dict[str, Any], rich: dict[str, Any]) -> dict[str, Any]:
             "descriptor": descriptor,
         },
         "_classification_model": (
-            "nudenet-3.4.2+"
+            f"{base.get('_classification_model', 'nudenet-3.4.2')}+"
             + os.environ.get("VAULT_VISION_MODEL", "Qwen/Qwen3-VL-4B-Instruct")
         ),
     })
+    current_provider = str(
+        (base.get("_provider_metadata") or {}).get("provider")
+        or "local_nudenet"
+    )
     result["_provider_metadata"] = {
         **base["_provider_metadata"],
-        "provider": "local_nudenet+qwen_vl",
+        "provider": (
+            current_provider
+            if current_provider.endswith("+qwen_vl")
+            else f"{current_provider}+qwen_vl"
+        ),
         "vision_status": "ready",
         "scene_confidence": descriptor["confidence"],
         "endpoint": endpoint_metadata,
@@ -594,7 +766,7 @@ async def classify_vault_image(
     filename: str = "",
     local_visual: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return local classification, enriched by Qwen when configured."""
+    """Return NudeNet + SigLIP2 metadata with confidence-gated Qwen."""
     detections = await asyncio.to_thread(_detect, image_bytes)
     base = _base_metadata(
         detections,
@@ -602,8 +774,43 @@ async def classify_vault_image(
         album_title=album_title,
         local_visual=local_visual or {},
     )
-    if not os.environ.get("VAULT_VISION_BASE_URL", "").strip():
-        return base
+    enriched = base
+    fallback_reasons: list[str] = []
+    semantic_failed = False
+    if semantic_endpoint_configured():
+        try:
+            semantic = await semantic_metadata(image_bytes)
+            enriched = _merge_semantics(base, semantic)
+            fallback_reasons = qwen_fallback_reasons(
+                semantic,
+                exposed_anatomy=_strings(
+                    base.get("visible_anatomy"),
+                    limit=8,
+                ),
+            )
+        except Exception as exc:
+            semantic_failed = True
+            enriched["_provider_metadata"]["semantic_status"] = "fallback"
+            enriched["_provider_metadata"]["semantic_error"] = type(exc).__name__
+            fallback_reasons = ["semantic_endpoint_failure"]
+            print(
+                f"[VAULT SEMANTIC FALLBACK] reason={type(exc).__name__}"
+            )
+
+    qwen_configured = bool(
+        os.environ.get("VAULT_VISION_BASE_URL", "").strip()
+    )
+    should_call_qwen = qwen_configured and (
+        not semantic_endpoint_configured()
+        or semantic_failed
+        or bool(fallback_reasons)
+    )
+    enriched["_provider_metadata"]["qwen_fallback_reasons"] = fallback_reasons
+    if not should_call_qwen:
+        enriched["_provider_metadata"]["qwen_status"] = (
+            "not_configured" if not qwen_configured else "not_needed"
+        )
+        return enriched
     try:
         rich = await _qwen_metadata(
             image_bytes,
@@ -611,11 +818,17 @@ async def classify_vault_image(
             album_title=album_title,
             filename=filename,
         )
-        return _merge_qwen(base, rich)
+        result = _merge_qwen(enriched, rich)
+        result["_provider_metadata"]["qwen_status"] = "ready"
+        result["_provider_metadata"]["qwen_fallback_reasons"] = (
+            fallback_reasons or ["semantic_not_configured"]
+        )
+        return result
     except Exception as exc:
         reason = _vision_failure_reason(exc)
-        base["_provider_metadata"]["vision_status"] = "fallback"
-        base["_provider_metadata"]["vision_error"] = type(exc).__name__
-        base["_provider_metadata"]["vision_error_reason"] = reason
+        enriched["_provider_metadata"]["vision_status"] = "fallback"
+        enriched["_provider_metadata"]["qwen_status"] = "fallback"
+        enriched["_provider_metadata"]["vision_error"] = type(exc).__name__
+        enriched["_provider_metadata"]["vision_error_reason"] = reason
         print(f"[VAULT VISION FALLBACK] reason={reason}")
-        return base
+        return enriched

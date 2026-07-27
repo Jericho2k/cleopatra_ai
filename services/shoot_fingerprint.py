@@ -5,11 +5,13 @@ keeps a weak visual bridge from merging two otherwise distinct shoots.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import io
 import math
 import os
 import re
+import struct
 from collections import Counter
 from typing import Any, Iterable
 
@@ -208,8 +210,14 @@ def add_semantic_shoot_evidence(
     fingerprint: dict[str, Any],
     classification: dict[str, Any],
 ) -> dict[str, Any]:
-    """Attach compact Qwen continuity evidence to the local fingerprint."""
+    """Attach compact semantic labels and an optional image embedding."""
     result = dict(fingerprint)
+    semantic_fingerprint = classification.get("_semantic_fingerprint")
+    semantic_fingerprint = (
+        semantic_fingerprint
+        if isinstance(semantic_fingerprint, dict)
+        else {}
+    )
     rich_result = classification.get("rich_visual_descriptor")
     descriptor = (
         rich_result.get("descriptor") or {}
@@ -217,11 +225,15 @@ def add_semantic_shoot_evidence(
         and rich_result.get("status") == "ready"
         else {}
     )
-    if not descriptor:
+    if not descriptor and not semantic_fingerprint:
         return result
     result.update({
         "status": "local_plus_vision",
-        "provider": "pillow_local+qwen_vl",
+        "provider": (
+            "pillow_local+siglip2"
+            if semantic_fingerprint.get("embedding")
+            else "pillow_local+qwen_vl"
+        ),
         "semantic": {
             "setting_location": descriptor.get("setting_location") or "",
             "setting_details": descriptor.get("setting_details") or [],
@@ -235,6 +247,25 @@ def add_semantic_shoot_evidence(
             "continuity_markers": descriptor.get("continuity_markers") or [],
         },
     })
+    if semantic_fingerprint:
+        result["embedding"] = {
+            "model": semantic_fingerprint.get("model") or "",
+            "revision": semantic_fingerprint.get("revision") or "",
+            **(
+                semantic_fingerprint.get("embedding")
+                if isinstance(
+                    semantic_fingerprint.get("embedding"),
+                    dict,
+                )
+                else {}
+            ),
+        }
+        result["semantic_confidence"] = float(
+            semantic_fingerprint.get("confidence") or 0
+        )
+        result["ambiguous_axes"] = (
+            semantic_fingerprint.get("ambiguous_axes") or []
+        )
     return result
 
 
@@ -256,6 +287,25 @@ def _local(item: dict[str, Any]) -> dict[str, Any]:
 def _semantic(item: dict[str, Any]) -> dict[str, Any]:
     value = shoot_fingerprint(item).get("semantic")
     return value if isinstance(value, dict) else {}
+
+
+def _embedding(item: dict[str, Any]) -> list[float]:
+    value = shoot_fingerprint(item).get("embedding")
+    if not isinstance(value, dict):
+        return []
+    if value.get("encoding") != "float16_base64":
+        return []
+    try:
+        dimensions = int(value.get("dimensions") or 0)
+        raw = base64.b64decode(str(value.get("data") or ""), validate=True)
+    except (TypeError, ValueError):
+        return []
+    if not 16 <= dimensions <= 2048 or len(raw) != dimensions * 2:
+        return []
+    try:
+        return list(struct.unpack(f"<{dimensions}e", raw))
+    except struct.error:
+        return []
 
 
 def _tokens(value: Any) -> set[str]:
@@ -355,6 +405,13 @@ def shoot_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
     )
     local_score = (histogram * 0.8) + (duplicate * 0.2)
     semantic_score, shared_tokens = _semantic_similarity(left, right)
+    left_embedding = _embedding(left)
+    right_embedding = _embedding(right)
+    embedding_score = (
+        cosine_similarity(left_embedding, right_embedding)
+        if left_embedding and right_embedding
+        else 0.0
+    )
     # Strong structured continuity can bridge ordinary pose/crop changes, but
     # only when the pixels still resemble one another and at least four
     # specific scene/styling tokens agree. Complete-link clustering below then
@@ -365,6 +422,20 @@ def shoot_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
         and shared_tokens >= 4
     ):
         supported_score = min(0.98, 0.94 + ((semantic_score - 0.72) * 0.14))
+        local_score = max(local_score, supported_score)
+    # SigLIP2 bridges crop and pose changes only when its visual match agrees
+    # with both local pixels and controlled scene/wardrobe labels. This avoids
+    # grouping merely because the same creator or generic room is visible.
+    if (
+        embedding_score >= 0.92
+        and local_score >= 0.68
+        and semantic_score >= 0.45
+        and shared_tokens >= 2
+    ):
+        supported_score = min(
+            0.99,
+            0.94 + ((embedding_score - 0.92) * 0.5),
+        )
         local_score = max(local_score, supported_score)
     return round(local_score, 6)
 
@@ -493,10 +564,16 @@ def build_shoot_clusters(
             len(cluster) > 1
             and all(_semantic(item) for item in cluster)
         )
+        uses_embedding = (
+            len(cluster) > 1
+            and all(_embedding(item) for item in cluster)
+        )
         results.append({
             "shoot_id": _cluster_id(cluster),
             "method": (
-                "local_visual+vision_metadata"
+                "local_visual+semantic_embedding"
+                if uses_embedding
+                else "local_visual+vision_metadata"
                 if uses_semantic
                 else "local_visual"
             ),

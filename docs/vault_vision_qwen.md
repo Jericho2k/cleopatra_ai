@@ -1,8 +1,10 @@
-# Optional Qwen3-VL vault enrichment
+# Hybrid NudeNet, SigLIP2, and Qwen vault analysis
 
-The backend works without this endpoint: NudeNet still classifies nudity and
-exposed anatomy locally. Qwen adds richer activity, pose, wardrobe, setting,
-and searchable descriptions.
+Every image first gets local NudeNet evidence. A small SigLIP2 endpoint then
+adds controlled scene, wardrobe, pose, activity, framing, and lighting labels
+plus a compact image embedding. Qwen is called only when those signals report
+sexual activity, disagree with NudeNet about full nudity, or leave all core
+semantics ambiguous.
 
 Qwen3-VL-4B-Instruct is self-hosted so a third-party assistant API cannot block
 adult vault images. The model is Apache-2.0 licensed.
@@ -17,11 +19,12 @@ adult vault images. The model is Apache-2.0 licensed.
    modal setup
    ```
 
-3. Populate the persistent model-weight volume. Run this once for each pinned
-   model revision, before directing production traffic at a new deployment:
+3. Populate both persistent model-weight volumes. Run these once for each
+   pinned revision, before directing production traffic at a new deployment:
 
    ```bash
    modal run deploy/modal_qwen_vl.py::download_weights
+   modal run deploy/modal_qwen_vl.py::download_semantic_weights
    ```
 
 4. Deploy:
@@ -34,14 +37,17 @@ adult vault images. The model is Apache-2.0 licensed.
 6. Add the endpoint URL and token to Railway:
 
    ```text
+   VAULT_SEMANTIC_BASE_URL=https://YOUR-SEMANTIC-ENDPOINT.modal.run
    VAULT_VISION_BASE_URL=https://YOUR-ENDPOINT.modal.run
    VAULT_VISION_MODAL_KEY=wk-...
    VAULT_VISION_MODAL_SECRET=ws-...
    VAULT_VISION_MODEL=Qwen/Qwen3-VL-4B-Instruct
    VAULT_VISION_TIMEOUT_SECONDS=620
+   VAULT_SEMANTIC_TIMEOUT_SECONDS=180
+   VAULT_CATEGORIZATION_CONCURRENCY=12
    ```
 
-The endpoint scales to zero after 60 seconds. The first request can take
+The Qwen endpoint scales to zero after 60 seconds. The first request can take
 longer while Modal loads the model into GPU memory. Weights are pinned to an
 immutable Hugging Face revision and pre-populated in a persistent Volume, so
 production requests do not depend on a mutable model branch or a full Hub
@@ -49,16 +55,18 @@ download. GPU containers use local-only model loading; only the explicit
 CPU-based preload step contacts the Hub. The backend follows Modal's
 long-running result redirects and allows up to 620 seconds for a cold request.
 
-The deployment intentionally uses one scale-to-zero L4 container. Requests
-queue instead of starting duplicate GPUs, which keeps low-volume and manual
-reanalyzes predictable. Change `max_containers` only after production metrics
-show sustained queueing that justifies parallel GPU spend.
+Qwen intentionally uses one scale-to-zero L4 container because it is the
+exception path. SigLIP2 uses smaller T4 containers, scales up to ten, and
+scales down after 30 seconds. A vault run defaults to 12 concurrent requests.
+This keeps bulk imports parallel while ordinary reanalysis still scales to
+zero.
 
 Successful enrichment logs:
 
 ```text
-[CATEGORIZE RAW] ... provider=local_nudenet+qwen_vl ... vision=ready
+[CATEGORIZE RAW] ... provider=local_nudenet+siglip2 ... vision=ready
 [SHOOT FINGERPRINT] ... status=local_plus_vision ...
+[VAULT SEMANTICS] ... status=ready confidence=... ambiguous=...
 [VAULT VISION REQUEST] ... status=ready queue_ms=... round_trip_ms=... inference_ms=...
 ```
 
@@ -71,12 +79,17 @@ saves the local NudeNet result and logs a safe reason such as `timeout`,
 [CATEGORIZE RAW] ... provider=local_nudenet ... vision=fallback vision_error=http_401
 ```
 
-Qwen returns a concise description plus structured setting, background,
-wardrobe, materials, styling, lighting, composition, color associations, and
-same-shoot continuity markers. Those fields are stored with the item and
-included in generated set descriptions. Strong structured continuity can also
-support the local color/hash evidence when grouping different poses or crops
-from the same shoot.
+SigLIP2 produces deterministic controlled labels and an embedding for every
+successfully analyzed image. The backend converts those labels into concise
+searchable text without paying a text-model token cost. Grouping remains
+complete-link and only bridges a pose/crop change when local pixels, controlled
+labels, and embeddings agree. Qwen's richer prose is saved only for fallback
+items.
+
+Production logs expose `qwen_status`, fallback reasons, semantic confidence,
+ambiguous axes, queue time, and inference time. Validate those rates on a
+representative vault before changing thresholds; model confidence is not a
+substitute for real same-shoot precision and recall.
 
 The web endpoint rejects oversized images, malformed base64, extreme
 dimensions, empty/oversized prompts, and unauthenticated requests before GPU

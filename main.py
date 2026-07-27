@@ -2042,12 +2042,21 @@ async def _categorize_single_item(item: dict) -> dict:
             shoot_fingerprint,
             data,
         )
+        data.pop("_semantic_fingerprint", None)
         vision_error = provider_metadata.get("vision_error_reason")
+        qwen_status = provider_metadata.get("qwen_status")
+        fallback_reasons = provider_metadata.get("qwen_fallback_reasons") or []
         print(
             f"[CATEGORIZE RAW] item={item_id} provider={provider} "
             f"model={model} category={data.get('category')} "
             f"explicitness={data.get('explicitness')} "
             f"vision={provider_metadata.get('vision_status')}"
+            + (f" qwen={qwen_status}" if qwen_status else "")
+            + (
+                f" fallback={','.join(fallback_reasons)}"
+                if fallback_reasons
+                else ""
+            )
             + (f" vision_error={vision_error}" if vision_error else "")
         )
         if not data.get("colors"):
@@ -2535,9 +2544,26 @@ async def _run_vault_categorization(
         done = 0
         errors = 0
         provider_failures = 0
-        # Keep concurrency deliberately low so a vault run cannot create a
-        # provider retry storm.
-        batch_size = 2
+        qwen_fallbacks = 0
+        semantic_failures = 0
+        semantic_enabled = bool(
+            os.environ.get("VAULT_SEMANTIC_BASE_URL", "").strip()
+        )
+        try:
+            configured_concurrency = int(
+                os.environ.get(
+                    "VAULT_CATEGORIZATION_CONCURRENCY",
+                    "12" if semantic_enabled else "2",
+                )
+            )
+        except ValueError:
+            configured_concurrency = 12 if semantic_enabled else 2
+        batch_size = min(max(configured_concurrency, 1), 32)
+        _categorize_state[creator_id]["concurrency"] = batch_size
+        print(
+            f"[CATEGORIZE] creator={creator_id} "
+            f"concurrency={batch_size} semantic={semantic_enabled}"
+        )
         for i in range(0, total, batch_size):
             batch = all_items[i:i + batch_size]
             results = await asyncio.gather(
@@ -2556,6 +2582,14 @@ async def _run_vault_categorization(
                                 f"failures: {result}"
                             )
                     continue
+                provider_details = (
+                    (result.get("classification_metadata") or {})
+                    .get("provider_details") or {}
+                )
+                if provider_details.get("qwen_status") == "ready":
+                    qwen_fallbacks += 1
+                if provider_details.get("semantic_status") == "fallback":
+                    semantic_failures += 1
                 await asyncio.to_thread(
                     lambda r=result: db.table("creator_vault_media")
                     .update(_classification_update_payload(r))
@@ -2576,9 +2610,21 @@ async def _run_vault_categorization(
                     f"done={done}/{total} errors={errors} reason={fatal_error}"
                 )
                 return
-            _categorize_state[creator_id].update({"done": done, "errors": errors})
-            print(f"[CATEGORIZE] done={done}/{total} errors={errors}")
-            await asyncio.sleep(1.5)  # respect rate limit between batches
+            _categorize_state[creator_id].update({
+                "done": done,
+                "errors": errors,
+                "qwen_fallbacks": qwen_fallbacks,
+                "semantic_failures": semantic_failures,
+            })
+            print(
+                f"[CATEGORIZE] done={done}/{total} errors={errors} "
+                f"qwen_fallbacks={qwen_fallbacks} "
+                f"semantic_failures={semantic_failures}"
+            )
+            # The self-hosted semantic service scales independently. Preserve
+            # the old provider throttle only for legacy configurations.
+            if not semantic_enabled:
+                await asyncio.sleep(1.5)
 
         if mark_initial and errors == 0:
             await _stamp_vault_op(creator_id, "vault_initial_categorized_at")

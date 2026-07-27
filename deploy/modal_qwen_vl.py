@@ -19,9 +19,53 @@ import modal
 MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
 MODEL_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
 MODEL_DIR = "/models"
+SEMANTIC_MODEL_ID = "google/siglip2-base-patch16-224"
+SEMANTIC_MODEL_REVISION = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"
+SEMANTIC_MODEL_DIR = "/semantic-models"
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 MAX_IMAGE_DIMENSION = 2048
 MAX_PROMPT_CHARS = 16_000
+
+SEMANTIC_AXES = {
+    "scene_location": [
+        "bedroom", "bathroom", "kitchen", "living room", "studio",
+        "shower", "bathtub", "outdoors", "vehicle", "hallway",
+        "other indoor room",
+    ],
+    "wardrobe_state": [
+        "full nudity", "partial nudity", "lingerie", "underwear",
+        "casual clothing", "dress", "swimwear", "costume", "sleepwear",
+    ],
+    "pose": [
+        "standing", "sitting", "lying down", "kneeling", "crouching",
+        "close-up body detail",
+    ],
+    "activity": [
+        "posing", "selfie", "mirror selfie", "showering", "dancing",
+        "undressing", "sexual activity", "using an adult toy",
+    ],
+    "framing": [
+        "close-up", "medium shot", "three-quarter shot", "full-body shot",
+        "wide shot",
+    ],
+    "lighting": [
+        "warm indoor light", "cool blue light",
+        "pink or purple colored light", "natural daylight",
+        "bright studio light", "dim low light",
+    ],
+}
+SEMANTIC_TAGS = {
+    "background_details": [
+        "bed and bedding", "kitchen counter and cabinets", "mirror",
+        "shower or bathtub", "sofa", "curtains", "tiled wall", "plain wall",
+        "studio backdrop",
+    ],
+    "wardrobe_items": [
+        "bra", "panties", "lingerie set", "bodysuit", "stockings",
+        "fishnet clothing", "sheer clothing", "lace clothing", "dress",
+        "crop top", "shorts", "skirt", "high heels", "jewelry",
+    ],
+}
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -41,6 +85,10 @@ image = (
 )
 weights = modal.Volume.from_name(
     "cleopatra-qwen3-vl-weights",
+    create_if_missing=True,
+)
+semantic_weights = modal.Volume.from_name(
+    "cleopatra-siglip2-weights",
     create_if_missing=True,
 )
 app = modal.App("cleopatra-vault-vision", image=image)
@@ -75,6 +123,233 @@ def download_weights() -> dict:
         "path": path,
         "seconds": elapsed,
     }
+
+
+@app.function(
+    cpu=2,
+    memory=4096,
+    timeout=1800,
+    volumes={SEMANTIC_MODEL_DIR: semantic_weights},
+)
+def download_semantic_weights() -> dict:
+    """Populate the pinned SigLIP2 volume before it receives live traffic."""
+    from huggingface_hub import snapshot_download
+
+    started = time.monotonic()
+    path = snapshot_download(
+        repo_id=SEMANTIC_MODEL_ID,
+        revision=SEMANTIC_MODEL_REVISION,
+        cache_dir=SEMANTIC_MODEL_DIR,
+    )
+    semantic_weights.commit()
+    elapsed = round(time.monotonic() - started, 2)
+    print(
+        f"[VAULT SEMANTICS] weights ready model={SEMANTIC_MODEL_ID} "
+        f"revision={SEMANTIC_MODEL_REVISION[:12]} seconds={elapsed}"
+    )
+    return {
+        "status": "ready",
+        "model": SEMANTIC_MODEL_ID,
+        "revision": SEMANTIC_MODEL_REVISION,
+        "path": path,
+        "seconds": elapsed,
+    }
+
+
+def _validated_picture(payload: dict):
+    from fastapi import HTTPException
+    from PIL import Image
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="JSON object required")
+    encoded = payload.get("image_base64")
+    if not isinstance(encoded, str) or not encoded:
+        raise HTTPException(status_code=422, detail="image_base64 required")
+    if len(encoded) > ((MAX_IMAGE_BYTES * 4 // 3) + 16):
+        raise HTTPException(status_code=413, detail="image payload too large")
+    try:
+        image_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="invalid base64 image",
+        ) from exc
+    if not image_bytes or len(image_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="image payload too large")
+    try:
+        picture = Image.open(io.BytesIO(image_bytes))
+        if min(picture.size) < 32 or max(picture.size) > MAX_IMAGE_DIMENSION:
+            raise HTTPException(
+                status_code=422,
+                detail="unsupported image dimensions",
+            )
+        picture.load()
+        picture = picture.convert("RGB")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="invalid image") from exc
+    request_id = re.sub(
+        r"[^a-zA-Z0-9_-]",
+        "",
+        str(payload.get("request_id") or ""),
+    )[:64] or hashlib.sha256(image_bytes).hexdigest()[:12]
+    return picture, image_bytes, request_id
+
+
+@app.cls(
+    gpu="T4",
+    timeout=180,
+    startup_timeout=300,
+    min_containers=0,
+    max_containers=10,
+    buffer_containers=0,
+    scaledown_window=30,
+    volumes={SEMANTIC_MODEL_DIR: semantic_weights},
+)
+class VaultSemantics:
+    @modal.enter()
+    def load(self):
+        import torch
+        from transformers import AutoModel, AutoProcessor
+
+        started = time.monotonic()
+        self.processor = AutoProcessor.from_pretrained(
+            SEMANTIC_MODEL_ID,
+            revision=SEMANTIC_MODEL_REVISION,
+            cache_dir=SEMANTIC_MODEL_DIR,
+            local_files_only=True,
+        )
+        self.model = AutoModel.from_pretrained(
+            SEMANTIC_MODEL_ID,
+            revision=SEMANTIC_MODEL_REVISION,
+            cache_dir=SEMANTIC_MODEL_DIR,
+            local_files_only=True,
+            dtype="auto",
+        ).to("cuda")
+        self.model.eval()
+        self.text_features = {}
+        for group, labels in {**SEMANTIC_AXES, **SEMANTIC_TAGS}.items():
+            prompts = [
+                f"This adult creator image clearly shows {label}."
+                for label in labels
+            ]
+            inputs = self.processor(
+                text=prompts,
+                padding="max_length",
+                max_length=64,
+                truncation=True,
+                return_tensors="pt",
+            ).to("cuda")
+            with torch.inference_mode():
+                features = self.model.get_text_features(**inputs)
+                features = features / features.norm(dim=-1, keepdim=True)
+            self.text_features[group] = features
+        print(
+            f"[VAULT SEMANTICS] ready model={SEMANTIC_MODEL_ID} "
+            f"revision={SEMANTIC_MODEL_REVISION[:12]} "
+            f"seconds={time.monotonic() - started:.2f}"
+        )
+
+    def _scores(self, image_features, group):
+        import torch
+
+        logits = image_features @ self.text_features[group].T
+        scale = self.model.logit_scale.exp()
+        bias = self.model.logit_bias
+        return torch.sigmoid((logits * scale) + bias)[0].float().cpu().tolist()
+
+    @modal.fastapi_endpoint(
+        method="POST",
+        docs=False,
+        requires_proxy_auth=True,
+    )
+    def classify(self, payload: dict) -> dict:
+        import numpy as np
+        import torch
+
+        started = time.monotonic()
+        picture, image_bytes, request_id = _validated_picture(payload)
+        inputs = self.processor(
+            images=[picture],
+            return_tensors="pt",
+        ).to("cuda")
+        with torch.inference_mode():
+            image_features = self.model.get_image_features(**inputs)
+            image_features = image_features / image_features.norm(
+                dim=-1,
+                keepdim=True,
+            )
+
+        axes = {}
+        ambiguous_axes = []
+        confidence_rows = []
+        for group, labels in SEMANTIC_AXES.items():
+            scores = self._scores(image_features, group)
+            ranked = sorted(
+                zip(labels, scores),
+                key=lambda row: row[1],
+                reverse=True,
+            )[:3]
+            margin = ranked[0][1] - ranked[1][1]
+            confident = ranked[0][1] >= 0.34 and margin >= 0.025
+            if not confident:
+                ambiguous_axes.append(group)
+            confidence_rows.append(
+                min(1.0, max(0.0, (ranked[0][1] + (margin * 3)) / 1.2))
+            )
+            axes[group] = {
+                "ranked": [
+                    {"label": label, "score": round(score, 4)}
+                    for label, score in ranked
+                ],
+                "margin": round(margin, 4),
+                "confident": confident,
+            }
+
+        tags = {}
+        for group, labels in SEMANTIC_TAGS.items():
+            ranked = sorted(
+                zip(labels, self._scores(image_features, group)),
+                key=lambda row: row[1],
+                reverse=True,
+            )
+            tags[group] = [
+                {"label": label, "score": round(score, 4)}
+                for label, score in ranked[:4]
+                if score >= 0.28
+            ]
+
+        vector = (
+            image_features[0]
+            .float()
+            .cpu()
+            .numpy()
+            .astype(np.dtype("<f2"))
+        )
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        print(
+            f"[VAULT SEMANTICS] completed request={request_id} "
+            f"latency_ms={elapsed_ms} ambiguous={','.join(ambiguous_axes) or 'none'}"
+        )
+        return {
+            "model": SEMANTIC_MODEL_ID,
+            "revision": SEMANTIC_MODEL_REVISION,
+            "request_id": request_id,
+            "latency_ms": elapsed_ms,
+            "confidence": round(
+                sum(confidence_rows) / max(len(confidence_rows), 1),
+                4,
+            ),
+            "ambiguous_axes": ambiguous_axes,
+            "axes": axes,
+            "tags": tags,
+            "embedding": {
+                "encoding": "float16_base64",
+                "dimensions": int(vector.shape[0]),
+                "data": base64.b64encode(vector.tobytes()).decode("ascii"),
+            },
+        }
 
 
 @app.cls(
