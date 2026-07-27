@@ -1995,7 +1995,11 @@ async def _load_vault_visual(item: dict, *, is_video: bool) -> tuple[bytes, str,
     raise VaultVisualAccessError(reason) from cause
 
 
-async def _categorize_single_item(item: dict) -> dict:
+async def _categorize_single_item(
+    item: dict,
+    *,
+    allow_core_qwen_fallback: bool = True,
+) -> dict:
     """Classify one vault item into the versioned provider-neutral contract.
 
     Images are resized before upload to control vision-token cost.  Videos use
@@ -2034,6 +2038,7 @@ async def _categorize_single_item(item: dict) -> dict:
             album_title=str(item.get("album_title") or ""),
             filename=str(item.get("filename") or ""),
             local_visual=local_visual,
+            allow_core_qwen_fallback=allow_core_qwen_fallback,
         )
         model = str(data.pop("_classification_model", "nudenet-3.4.2"))
         provider_metadata = dict(data.pop("_provider_metadata", {}) or {})
@@ -2046,6 +2051,7 @@ async def _categorize_single_item(item: dict) -> dict:
         vision_error = provider_metadata.get("vision_error_reason")
         qwen_status = provider_metadata.get("qwen_status")
         fallback_reasons = provider_metadata.get("qwen_fallback_reasons") or []
+        deferred_reasons = provider_metadata.get("qwen_deferred_reasons") or []
         print(
             f"[CATEGORIZE RAW] item={item_id} provider={provider} "
             f"model={model} category={data.get('category')} "
@@ -2055,6 +2061,11 @@ async def _categorize_single_item(item: dict) -> dict:
             + (
                 f" fallback={','.join(fallback_reasons)}"
                 if fallback_reasons
+                else ""
+            )
+            + (
+                f" deferred={','.join(deferred_reasons)}"
+                if deferred_reasons
                 else ""
             )
             + (f" vision_error={vision_error}" if vision_error else "")
@@ -2559,15 +2570,26 @@ async def _run_vault_categorization(
         except ValueError:
             configured_concurrency = 12 if semantic_enabled else 2
         batch_size = min(max(configured_concurrency, 1), 32)
+        allow_core_qwen_fallback = total <= 100
         _categorize_state[creator_id]["concurrency"] = batch_size
+        _categorize_state[creator_id]["core_qwen_fallback"] = (
+            allow_core_qwen_fallback
+        )
         print(
             f"[CATEGORIZE] creator={creator_id} "
-            f"concurrency={batch_size} semantic={semantic_enabled}"
+            f"concurrency={batch_size} semantic={semantic_enabled} "
+            f"core_qwen_fallback={allow_core_qwen_fallback}"
         )
         for i in range(0, total, batch_size):
             batch = all_items[i:i + batch_size]
             results = await asyncio.gather(
-                *[_categorize_single_item_with_retry(item) for item in batch],
+                *[
+                    _categorize_single_item_with_retry(
+                        item,
+                        allow_core_qwen_fallback=allow_core_qwen_fallback,
+                    )
+                    for item in batch
+                ],
                 return_exceptions=True,
             )
             fatal_error = ""
@@ -2707,11 +2729,19 @@ async def _refresh_vault_set_descriptions(creator_id: str) -> int:
     return refreshed
 
 
-async def _categorize_single_item_with_retry(item: dict, max_retries: int = 3) -> dict:
+async def _categorize_single_item_with_retry(
+    item: dict,
+    max_retries: int = 3,
+    *,
+    allow_core_qwen_fallback: bool = True,
+) -> dict:
     """Wrap _categorize_single_item with exponential backoff on 429."""
     for attempt in range(max_retries):
         try:
-            return await _categorize_single_item(item)
+            return await _categorize_single_item(
+                item,
+                allow_core_qwen_fallback=allow_core_qwen_fallback,
+            )
         except Exception as e:
             message = str(e).lower()
             if (
@@ -2722,7 +2752,10 @@ async def _categorize_single_item_with_retry(item: dict, max_retries: int = 3) -
                 await asyncio.sleep(wait)
             else:
                 raise
-    return await _categorize_single_item(item)
+    return await _categorize_single_item(
+        item,
+        allow_core_qwen_fallback=allow_core_qwen_fallback,
+    )
 
 
 @app.post(

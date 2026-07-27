@@ -361,6 +361,41 @@ async def test_high_risk_semantic_activity_uses_qwen(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_large_bulk_run_defers_core_ambiguity_qwen(monkeypatch):
+    monkeypatch.setattr(vault_classifier, "_detect", lambda _: [])
+
+    async def semantics(*args, **kwargs):
+        result = semantic_result()
+        result["ambiguous_axes"] = [
+            "scene_location",
+            "wardrobe_state",
+            "activity",
+        ]
+        return result
+
+    async def qwen(*args, **kwargs):
+        raise AssertionError("bulk ambiguity must not block on Qwen")
+
+    monkeypatch.setattr(vault_classifier, "semantic_metadata", semantics)
+    monkeypatch.setattr(vault_classifier, "_qwen_metadata", qwen)
+    monkeypatch.setenv("VAULT_SEMANTIC_BASE_URL", "https://semantic.invalid")
+    monkeypatch.setenv("VAULT_VISION_BASE_URL", "https://qwen.invalid")
+
+    result = await vault_classifier.classify_vault_image(
+        jpeg_bytes(),
+        is_video=False,
+        local_visual=local_visual(),
+        allow_core_qwen_fallback=False,
+    )
+
+    assert result["_provider_metadata"]["qwen_status"] == "deferred_bulk"
+    assert result["_provider_metadata"]["qwen_deferred_reasons"] == [
+        "core_semantics_ambiguous",
+    ]
+    assert result["_provider_metadata"]["qwen_fallback_reasons"] == []
+
+
+@pytest.mark.asyncio
 async def test_qwen_client_follows_modal_result_redirects(monkeypatch):
     observed = {}
 

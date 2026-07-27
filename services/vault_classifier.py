@@ -765,6 +765,7 @@ async def classify_vault_image(
     album_title: str = "",
     filename: str = "",
     local_visual: dict[str, Any] | None = None,
+    allow_core_qwen_fallback: bool = True,
 ) -> dict[str, Any]:
     """Return NudeNet + SigLIP2 metadata with confidence-gated Qwen."""
     detections = await asyncio.to_thread(_detect, image_bytes)
@@ -797,19 +798,46 @@ async def classify_vault_image(
                 f"[VAULT SEMANTIC FALLBACK] reason={type(exc).__name__}"
             )
 
+    deferred_reasons: list[str] = []
+    if not allow_core_qwen_fallback:
+        if not semantic_endpoint_configured():
+            deferred_reasons.append("semantic_not_configured")
+        deferrable = {
+            "core_semantics_ambiguous",
+            "semantic_endpoint_failure",
+        }
+        deferred_reasons = [
+            reason for reason in fallback_reasons if reason in deferrable
+        ]
+        fallback_reasons = [
+            reason for reason in fallback_reasons if reason not in deferrable
+        ]
+        enriched["_provider_metadata"]["qwen_deferred_reasons"] = (
+            deferred_reasons
+        )
+
     qwen_configured = bool(
         os.environ.get("VAULT_VISION_BASE_URL", "").strip()
     )
     should_call_qwen = qwen_configured and (
-        not semantic_endpoint_configured()
-        or semantic_failed
-        or bool(fallback_reasons)
+        bool(fallback_reasons)
+        or (
+            (
+                not semantic_endpoint_configured()
+                or semantic_failed
+            )
+            and allow_core_qwen_fallback
+        )
     )
     enriched["_provider_metadata"]["qwen_fallback_reasons"] = fallback_reasons
     if not should_call_qwen:
-        enriched["_provider_metadata"]["qwen_status"] = (
-            "not_configured" if not qwen_configured else "not_needed"
-        )
+        if deferred_reasons and qwen_configured:
+            qwen_status = "deferred_bulk"
+        else:
+            qwen_status = (
+                "not_configured" if not qwen_configured else "not_needed"
+            )
+        enriched["_provider_metadata"]["qwen_status"] = qwen_status
         return enriched
     try:
         rich = await _qwen_metadata(

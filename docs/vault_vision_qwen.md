@@ -61,6 +61,11 @@ after 30 seconds. Together they stay within Modal Starter's ten-GPU concurrency
 limit. A vault run defaults to 12 concurrent requests. This keeps bulk imports
 parallel while ordinary reanalysis still scales to zero.
 
+Runs over 100 items do not block on Qwen merely because all core semantic axes
+are weak; they store the controlled best labels and embedding and report
+`qwen_status=deferred_bulk`. Strong activity or NudeNet/full-nudity conflicts
+still use Qwen. Manual and smaller runs keep the complete fallback path.
+
 Successful enrichment logs:
 
 ```text
