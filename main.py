@@ -4176,7 +4176,13 @@ async def debug_scenes(creator_id: str) -> dict:
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "vault_classifier_version": VAULT_CLASSIFIER_VERSION,
+        "vault_semantics_configured": bool(
+            os.environ.get("VAULT_SEMANTIC_BASE_URL", "").strip()
+        ),
+    }
 
 
 from routes.fansly import fansly_router
