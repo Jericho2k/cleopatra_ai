@@ -298,7 +298,14 @@ def test_modal_image_includes_qwen_processor_runtime_dependencies():
         / "deploy"
         / "modal_qwen_vl.py"
     ).read_text()
-    assert 'MODEL_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"' in source
+    assert (
+        'MODEL_ID = '
+        '"huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated"'
+    ) in source
+    assert (
+        'MODEL_REVISION = '
+        '"ce72a7c22aacb493fb94478de3bfbe834c61844a"'
+    ) in source
     assert '"torch==2.13.0"' in source
     assert '"torchvision==0.28.0"' in source
     assert '"transformers==5.14.1"' in source

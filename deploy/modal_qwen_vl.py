@@ -16,8 +16,8 @@ import time
 import modal
 
 
-MODEL_ID = "Qwen/Qwen3-VL-4B-Instruct"
-MODEL_REVISION = "ebb281ec70b05090aa6165b016eac8ec08e71b17"
+MODEL_ID = "huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated"
+MODEL_REVISION = "ce72a7c22aacb493fb94478de3bfbe834c61844a"
 MODEL_DIR = "/models"
 SEMANTIC_MODEL_ID = "google/siglip2-base-patch16-224"
 SEMANTIC_MODEL_REVISION = "75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"

@@ -41,7 +41,7 @@ adult vault images. The model is Apache-2.0 licensed.
    VAULT_VISION_BASE_URL=https://YOUR-ENDPOINT.modal.run
    VAULT_VISION_MODAL_KEY=wk-...
    VAULT_VISION_MODAL_SECRET=ws-...
-   VAULT_VISION_MODEL=Qwen/Qwen3-VL-4B-Instruct
+   VAULT_VISION_MODEL=huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated
    VAULT_VISION_TIMEOUT_SECONDS=620
    VAULT_SEMANTIC_TIMEOUT_SECONDS=180
    VAULT_CATEGORIZATION_CONCURRENCY=12
