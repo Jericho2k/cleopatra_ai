@@ -417,12 +417,7 @@ class VaultVision:
             f"seconds={time.monotonic() - started:.2f}"
         )
 
-    @modal.fastapi_endpoint(
-        method="POST",
-        docs=False,
-        requires_proxy_auth=True,
-    )
-    def classify(self, payload: dict) -> dict:
+    def _classify_payload(self, payload: dict) -> dict:
         from fastapi import HTTPException
         from PIL import Image
         import torch
@@ -512,3 +507,16 @@ class VaultVision:
             "revision": MODEL_REVISION,
             "latency_ms": elapsed_ms,
         }
+
+    @modal.fastapi_endpoint(
+        method="POST",
+        docs=False,
+        requires_proxy_auth=True,
+    )
+    def classify(self, payload: dict) -> dict:
+        return self._classify_payload(payload)
+
+    @modal.method()
+    def classify_internal(self, payload: dict) -> dict:
+        """Authenticated workspace-only path for end-to-end verification."""
+        return self._classify_payload(payload)
