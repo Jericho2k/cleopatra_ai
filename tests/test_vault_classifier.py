@@ -229,6 +229,21 @@ def test_modal_image_includes_qwen_processor_runtime_dependencies():
         'SEMANTIC_MODEL_REVISION = '
         '"75de2d55ec2d0b4efc50b3e9ad70dba96a7b2fa2"'
     ) in source
+    assert "def _feature_tensor(output):" in source
+
+
+def test_modal_feature_adapter_handles_transformers_pooled_outputs():
+    from deploy.modal_qwen_vl import _feature_tensor
+
+    class Pooled:
+        pooler_output = "pooled"
+
+    class Hidden:
+        pooler_output = None
+        last_hidden_state = [[["first"], ["second"]]]
+
+    assert _feature_tensor(Pooled()) == "pooled"
+    assert _feature_tensor("tensor") == "tensor"
 
 
 def semantic_result(*, activity="posing", activity_score=0.8):

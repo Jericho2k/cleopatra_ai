@@ -197,6 +197,16 @@ def _validated_picture(payload: dict):
     return picture, image_bytes, request_id
 
 
+def _feature_tensor(output):
+    """Handle tensor and Transformers 5 pooled-output return shapes."""
+    pooled = getattr(output, "pooler_output", None)
+    if pooled is not None:
+        return pooled
+    if hasattr(output, "last_hidden_state"):
+        return output.last_hidden_state[:, 0]
+    return output
+
+
 @app.cls(
     gpu="T4",
     timeout=180,
@@ -242,7 +252,9 @@ class VaultSemantics:
                 return_tensors="pt",
             ).to("cuda")
             with torch.inference_mode():
-                features = self.model.get_text_features(**inputs)
+                features = _feature_tensor(
+                    self.model.get_text_features(**inputs)
+                )
                 features = features / features.norm(dim=-1, keepdim=True)
             self.text_features[group] = features
         print(
@@ -275,7 +287,9 @@ class VaultSemantics:
             return_tensors="pt",
         ).to("cuda")
         with torch.inference_mode():
-            image_features = self.model.get_image_features(**inputs)
+            image_features = _feature_tensor(
+                self.model.get_image_features(**inputs)
+            )
             image_features = image_features / image_features.norm(
                 dim=-1,
                 keepdim=True,
