@@ -240,6 +240,27 @@ def test_sparse_continuity_markers_are_supplemented_with_scene_evidence():
     ]
 
 
+def test_pose_and_anatomy_are_not_continuity_markers():
+    descriptor = vault_classifier._visual_descriptor({
+        "description": "A subject poses in a kitchen.",
+        "continuity_markers": [
+            "black and white maid apron",
+            "blue under-cabinet lighting",
+            "person holding the apron edge",
+            "same body position and hand placement",
+            "visible breasts",
+            "black microwave with digital display",
+        ],
+        "confidence": 0.9,
+    })
+
+    assert descriptor["continuity_markers"] == [
+        "black and white maid apron",
+        "blue under-cabinet lighting",
+        "black microwave with digital display",
+    ]
+
+
 def test_prompt_bounds_untrusted_context_and_requires_consistency():
     prompt = vault_classifier._prompt(
         is_video=False,

@@ -47,6 +47,13 @@ _ACTIVITY_PATTERN = re.compile(
     r"sex act|sexual activity|cumshot|ejaculat|toy use",
     re.I,
 )
+_UNSTABLE_CONTINUITY_PATTERN = re.compile(
+    r"\b(?:pose|posing|standing|sitting|lying|kneeling|crouching|"
+    r"holding|touching|looking|gaze|body position|hand placement|"
+    r"leg position|arm position|framing|crop|nudity|breasts|vulva|"
+    r"penis|buttocks|anus)\b",
+    re.I,
+)
 _REFUSAL_PREFIXES = (
     "i'm not able",
     "i am not able",
@@ -478,10 +485,14 @@ def _visual_descriptor(rich: dict[str, Any]) -> dict[str, Any]:
             rich.get("distinguishing_details"),
             limit=12,
         ),
-        "continuity_markers": _strings(
-            rich.get("continuity_markers"),
-            limit=12,
-        ),
+        "continuity_markers": [
+            marker
+            for marker in _strings(
+                rich.get("continuity_markers"),
+                limit=12,
+            )
+            if not _UNSTABLE_CONTINUITY_PATTERN.search(marker)
+        ],
         "search_tags": _strings(rich.get("tags"), limit=20),
         "color_details": _strings(rich.get("colors"), limit=12),
         "confidence": round(min(max(confidence, 0), 1), 3),
