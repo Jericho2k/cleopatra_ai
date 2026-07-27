@@ -1,4 +1,5 @@
 import io
+from pathlib import Path
 
 import httpx
 import pytest
@@ -164,6 +165,15 @@ def test_modal_failures_are_reduced_to_safe_actionable_reasons():
     assert vault_classifier._vision_failure_reason(
         httpx.ReadTimeout("slow", request=request)
     ) == "timeout"
+
+
+def test_modal_image_includes_qwen_processor_runtime_dependencies():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "modal_qwen_vl.py"
+    ).read_text()
+    assert '"torchvision>=0.21"' in source
 
 
 @pytest.mark.asyncio
