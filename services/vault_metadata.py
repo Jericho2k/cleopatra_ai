@@ -12,7 +12,7 @@ from collections import Counter
 from typing import Any, Iterable
 
 
-VAULT_CLASSIFIER_VERSION = 10
+VAULT_CLASSIFIER_VERSION = 11
 
 _EMPTY_VALUES = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
 _MEDIA_CATEGORIES = {
@@ -194,6 +194,41 @@ def normalize_media_category(
     return result
 
 
+def _missing_content_findings(data: dict[str, Any], summary: str) -> str:
+    """Return detector-backed adult-content facts omitted by provider prose."""
+    normalized_summary = clean_text(summary).lower().replace("-", " ")
+    findings: list[str] = []
+
+    nudity = useful_text(data.get("nudity")).lower()
+    if (
+        nudity in {"implied", "partial", "full"}
+        and f"{nudity} nudity" not in normalized_summary
+    ):
+        findings.append(f"{nudity} nudity is visible")
+
+    anatomy = normalize_string_list(data.get("visible_anatomy"))
+    missing_anatomy = [
+        value for value in anatomy if value not in normalized_summary
+    ]
+    if missing_anatomy:
+        findings.append(
+            f"exposed anatomy: {', '.join(missing_anatomy)}"
+        )
+
+    activities = [
+        value
+        for value in normalize_string_list(data.get("sexual_activity"))
+        if value not in {"none", "no activity", "not visible"}
+        and value not in normalized_summary
+    ]
+    if activities:
+        findings.append(f"detected activity: {', '.join(activities)}")
+
+    if not findings:
+        return ""
+    return "Classifier findings — " + "; ".join(findings) + "."
+
+
 def media_description(data: dict[str, Any], *, source: str) -> str:
     """Build a detailed factual description without exposing provider syntax."""
     sentences: list[str] = []
@@ -209,11 +244,22 @@ def media_description(data: dict[str, Any], *, source: str) -> str:
         else {}
     )
     if data.get("description_complete"):
-        sentences.append(
+        findings = _missing_content_findings(data, summary)
+        if findings:
+            sentences.append(findings)
+        evidence = (
             f"Classification evidence: {source.replace('_', ' ')}; "
             f"explicitness {int(data.get('explicitness') or 0)}/5."
         )
-        return " ".join(sentences)[:1600]
+        # Reserve space for the classifier findings and evidence so an
+        # unusually long provider description cannot truncate the facts that
+        # determine categorization.
+        suffix = " ".join([*sentences[1:], evidence])
+        summary_budget = max(0, 1600 - len(suffix) - 1)
+        compact_summary = sentences[0][:summary_budget].rstrip(" ,;:-")
+        return " ".join(
+            part for part in (compact_summary, suffix) if part
+        )
 
     details: list[str] = []
     location = useful_text(data.get("scene_location"))

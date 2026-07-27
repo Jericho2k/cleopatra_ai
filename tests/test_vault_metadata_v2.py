@@ -88,9 +88,53 @@ def test_complete_rich_description_is_not_expanded_twice():
     assert description.count("kitchen counter") == 1
     assert "Visual details" not in description
     assert "Photoshoot details" not in description
+    assert "exposed anatomy: breasts, vulva" in description
     assert description.endswith(
         "Classification evidence: image; explicitness 4/5."
     )
+
+
+def test_complete_provider_description_cannot_omit_adult_content_findings():
+    description = media_description(
+        {
+            "description": (
+                "A person with short blonde hair stands in a modern kitchen, "
+                "wearing a black and white maid-style apron with lace trim."
+            ),
+            "description_complete": True,
+            "nudity": "partial",
+            "visible_anatomy": ["breasts", "buttocks"],
+            "sexual_activity": [],
+            "explicitness": 4,
+        },
+        source="image",
+    )
+
+    assert "partial nudity is visible" in description
+    assert "exposed anatomy: breasts, buttocks" in description
+    assert description.endswith(
+        "Classification evidence: image; explicitness 4/5."
+    )
+
+
+def test_complete_provider_description_does_not_repeat_content_findings():
+    description = media_description(
+        {
+            "description": (
+                "Full nudity is visible, including breasts and vulva."
+            ),
+            "description_complete": True,
+            "nudity": "full",
+            "visible_anatomy": ["breasts", "vulva"],
+            "explicitness": 4,
+        },
+        source="image",
+    )
+
+    assert "Classifier findings" not in description
+    assert description.count("Full nudity") == 1
+    assert description.count("breasts") == 1
+    assert description.count("vulva") == 1
 
 
 def test_explicit_visual_evidence_cannot_be_silently_downgraded():
