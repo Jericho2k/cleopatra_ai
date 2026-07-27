@@ -45,8 +45,9 @@ The endpoint scales to zero after 60 seconds. The first request can take
 longer while Modal loads the model into GPU memory. Weights are pinned to an
 immutable Hugging Face revision and pre-populated in a persistent Volume, so
 production requests do not depend on a mutable model branch or a full Hub
-download. The backend follows Modal's long-running result redirects and allows
-up to 620 seconds for a cold request.
+download. GPU containers use local-only model loading; only the explicit
+CPU-based preload step contacts the Hub. The backend follows Modal's
+long-running result redirects and allows up to 620 seconds for a cold request.
 
 The deployment intentionally uses one scale-to-zero L4 container. Requests
 queue instead of starting duplicate GPUs, which keeps low-volume and manual

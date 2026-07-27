@@ -220,6 +220,7 @@ def test_modal_image_includes_qwen_processor_runtime_dependencies():
     assert '"transformers==5.14.1"' in source
     assert '"HF_XET_HIGH_PERFORMANCE": "1"' in source
     assert "def download_weights()" in source
+    assert source.count("local_files_only=True") == 2
     assert "max_containers=1" in source
     assert "scaledown_window=60" in source
 

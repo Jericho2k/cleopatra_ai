@@ -101,16 +101,17 @@ class VaultVision:
             MODEL_ID,
             revision=MODEL_REVISION,
             cache_dir=MODEL_DIR,
+            local_files_only=True,
         )
         self.model = AutoModelForMultimodalLM.from_pretrained(
             MODEL_ID,
             revision=MODEL_REVISION,
             cache_dir=MODEL_DIR,
+            local_files_only=True,
             device_map="auto",
             dtype="auto",
         )
         self.model.eval()
-        weights.commit()
         print(
             f"[VAULT VISION] ready model={MODEL_ID} "
             f"revision={MODEL_REVISION[:12]} "
