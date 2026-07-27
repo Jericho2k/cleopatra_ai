@@ -207,6 +207,14 @@ def _feature_tensor(output):
     return output
 
 
+def _axis_confident(top_score: float, margin: float) -> bool:
+    """Calibrate SigLIP's low absolute sigmoid scores with rank separation."""
+    if top_score < 0.06:
+        return False
+    relative_margin = margin / max(top_score, 0.001)
+    return margin >= 0.012 or relative_margin >= 0.18
+
+
 @app.cls(
     gpu="T4",
     timeout=180,
@@ -306,11 +314,13 @@ class VaultSemantics:
                 reverse=True,
             )[:3]
             margin = ranked[0][1] - ranked[1][1]
-            confident = ranked[0][1] >= 0.34 and margin >= 0.025
+            confident = _axis_confident(ranked[0][1], margin)
             if not confident:
                 ambiguous_axes.append(group)
+            relative_margin = margin / max(ranked[0][1], 0.001)
             confidence_rows.append(
-                min(1.0, max(0.0, (ranked[0][1] + (margin * 3)) / 1.2))
+                min(1.0, (ranked[0][1] / 0.35)) * 0.65
+                + min(1.0, relative_margin / 0.3) * 0.35
             )
             axes[group] = {
                 "ranked": [
@@ -331,7 +341,7 @@ class VaultSemantics:
             tags[group] = [
                 {"label": label, "score": round(score, 4)}
                 for label, score in ranked[:4]
-                if score >= 0.28
+                if score >= 0.16
             ]
 
         vector = (

@@ -233,7 +233,7 @@ def test_modal_image_includes_qwen_processor_runtime_dependencies():
 
 
 def test_modal_feature_adapter_handles_transformers_pooled_outputs():
-    from deploy.modal_qwen_vl import _feature_tensor
+    from deploy.modal_qwen_vl import _axis_confident, _feature_tensor
 
     class Pooled:
         pooler_output = "pooled"
@@ -244,6 +244,9 @@ def test_modal_feature_adapter_handles_transformers_pooled_outputs():
 
     assert _feature_tensor(Pooled()) == "pooled"
     assert _feature_tensor("tensor") == "tensor"
+    assert _axis_confident(0.08, 0.015) is True
+    assert _axis_confident(0.08, 0.005) is False
+    assert _axis_confident(0.04, 0.03) is False
 
 
 def semantic_result(*, activity="posing", activity_score=0.8):

@@ -254,7 +254,7 @@ def qwen_fallback_reasons(
     reasons: list[str] = []
     activity = (axes.get("activity") or {}).get("label")
     activity_score = float((axes.get("activity") or {}).get("score") or 0)
-    if activity in _HIGH_RISK_ACTIVITIES and activity_score >= 0.25:
+    if activity in _HIGH_RISK_ACTIVITIES and activity_score >= 0.15:
         reasons.append("high_risk_activity")
     wardrobe = (axes.get("wardrobe_state") or {}).get("label")
     wardrobe_score = float(
@@ -262,7 +262,8 @@ def qwen_fallback_reasons(
     )
     if (
         wardrobe == "full nudity"
-        and wardrobe_score >= 0.4
+        and wardrobe_score >= 0.12
+        and bool((axes.get("wardrobe_state") or {}).get("confident"))
         and not exposed_anatomy
     ):
         reasons.append("nudity_detector_conflict")
