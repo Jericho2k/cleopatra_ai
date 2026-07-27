@@ -21,6 +21,7 @@ image = (
         "fastapi[standard]>=0.115",
         "pillow>=11",
         "torch>=2.6",
+        "torchvision>=0.21",
         "transformers>=4.57.0",
     )
 )
