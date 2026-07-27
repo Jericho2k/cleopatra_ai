@@ -2004,7 +2004,7 @@ async def _categorize_single_item(item: dict) -> dict:
     stale instead of permanently saving an empty ``other`` classification.
     """
     import io
-    from PIL import Image
+    from PIL import Image, ImageOps
 
     mimetype = str(item.get("mimetype") or "")
     item_id = item.get("id", "")
@@ -2021,7 +2021,7 @@ async def _categorize_single_item(item: dict) -> dict:
         # thumbnails whose declared MIME type is missing or inaccurate.
         image = Image.open(io.BytesIO(visual_bytes))
         image.seek(0)
-        image = image.convert("RGB")
+        image = ImageOps.exif_transpose(image).convert("RGB")
         image.thumbnail((896, 896), Image.Resampling.LANCZOS)
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=84, optimize=True)
@@ -2054,7 +2054,8 @@ async def _categorize_single_item(item: dict) -> dict:
             data["colors"] = local_visual.get("palette_names") or []
         if useful_text(data.get("scene_lighting")) == "":
             data["scene_lighting"] = local_visual.get("lighting") or ""
-        data["visual_tone"] = local_visual.get("visual_tone") or ""
+        if useful_text(data.get("visual_tone")) == "":
+            data["visual_tone"] = local_visual.get("visual_tone") or ""
         data["orientation"] = local_visual.get("orientation") or ""
         data["image_dimensions"] = (
             f"{local_visual.get('width')}x{local_visual.get('height')}"
