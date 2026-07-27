@@ -40,6 +40,34 @@ def test_matching_purchase_filters_transaction_type_and_price():
     assert reconciliation._matching_purchase(transactions, 20) is None
 
 
+def test_matching_purchase_rejects_wrong_same_price_media():
+    transactions = [
+        {"type": 2110, "totalGross": 4500, "accountMediaId": "other-media"},
+    ]
+    assert reconciliation._matching_purchase(
+        transactions,
+        45,
+        expected_media_ids=["expected-media"],
+    ) is None
+    assert reconciliation._matching_purchase(
+        transactions,
+        45,
+        expected_media_ids=["other-media"],
+    ) == 45
+
+
+def test_matching_purchase_rejects_ambiguous_anonymous_transactions():
+    transactions = [
+        {"type": 2110, "totalGross": 4500},
+        {"type": 2110, "totalGross": 4500},
+    ]
+    assert reconciliation._matching_purchase(
+        transactions,
+        45,
+        expected_media_ids=["expected-media"],
+    ) is None
+
+
 def test_abandoned_log_preserves_complete_ppv_bundle():
     entry = reconciliation._abandoned_log_entry(
         pending(media_ids=["media-1", "media-2"], source="operator"),

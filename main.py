@@ -64,6 +64,7 @@ from services.apifansly import (
     send_message as send_apifansly_message,
     response_message as apifansly_response_message,
     url as apifansly_url,
+    sent_message_id,
 )
 from services.auto_audience import AutoAudiencePolicy
 from services.fansly_poller import FanslyPoller
@@ -355,6 +356,10 @@ class ReplyRequest(BaseModel):
     was_ai_suggested: bool = False
 
 
+class VaultMediaUrlsRequest(BaseModel):
+    media_ids: list[str] = Field(default_factory=list, max_length=1000)
+
+
 class VoiceCalibrationUpdateRequest(BaseModel):
     enabled: bool = False
     approved_message_ids: list[str] = Field(default_factory=list, max_length=30)
@@ -454,6 +459,26 @@ async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
             .eq("id", fan.id)
             .execute()
         )
+
+    media_context = (
+        {
+            "attachments": [
+                {"contentId": attachment.get("contentId")}
+                for attachment in attachments
+                if attachment.get("contentId")
+            ]
+        }
+        if has_attachments
+        else None
+    )
+    await save_message(
+        str(fan.id),
+        creator_id,
+        "fan",
+        content,
+        fansly_message_id=message_id or None,
+        media_context=media_context,
+    )
 
     await process_incoming_fan_message(
         str(fan.id), creator_id, content, auto_mode, message_id or None,
@@ -757,33 +782,50 @@ async def regenerate_suggestions(
 @app.post("/reply")
 async def save_reply(req: ReplyRequest, request: Request) -> dict:
     await require_creator_fan_access(request, req.creator_id, req.fan_id)
-    await save_message(
-        req.fan_id,
-        req.creator_id,
-        "creator",
-        req.content,
-        req.was_ai_suggested
-    )
 
     db = get_supabase()
-    fan_row = await asyncio.to_thread(
-        lambda: db.table("fans")
-        .select("fansly_group_id")
-        .eq("id", req.fan_id).single().execute()
-    )
-    creator_row = await asyncio.to_thread(
-        lambda: db.table("creators")
-        .select("apifansly_account_id")
-        .eq("id", req.creator_id).single().execute()
+    fan_row, creator_row = await asyncio.gather(
+        asyncio.to_thread(
+            lambda: db.table("fans")
+            .select("fansly_group_id")
+            .eq("id", req.fan_id).single().execute()
+        ),
+        asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("apifansly_account_id")
+            .eq("id", req.creator_id).single().execute()
+        ),
     )
 
     group_id = (fan_row.data or {}).get("fansly_group_id")
     apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
 
-    if group_id and apifansly_id:
-        await send_fansly_message(apifansly_id, group_id, req.content)
+    if not group_id or not apifansly_id:
+        raise HTTPException(status_code=409, detail="No live delivery route for this fan")
+    try:
+        response_body = await send_apifansly_message(
+            str(apifansly_id),
+            str(group_id),
+            content=req.content,
+        )
+    except Exception as exc:
+        print(f"[SEND ERROR] {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="Fansly did not accept the message",
+        ) from exc
+    platform_message_id = sent_message_id(response_body)
 
-    return {"status": "ok"}
+    message_id = await save_message(
+        req.fan_id,
+        req.creator_id,
+        "creator",
+        req.content,
+        req.was_ai_suggested,
+        fansly_message_id=platform_message_id,
+    )
+
+    return {"status": "ok", "message_id": message_id}
 
 
 @app.post("/connect-creator")
@@ -1184,7 +1226,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
                     str(apifansly_id),
                     str(group_id),
                     cursor=cursor,
-                    limit=10,
+                    limit=50,
                     client=client,
                 )
             )
@@ -1224,7 +1266,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
 
     print(f"[MEDIA LOOKUP] keys={list(all_media.keys())[:5]}")
 
-    imported = 0
+    rows_to_insert: list[dict] = []
     for msg in reversed(all_messages):
         msg_id = str(msg.get("id", ""))
         if not msg_id or msg_id in existing_ids:
@@ -1282,11 +1324,16 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
             "media_context": media_context,
         }
 
-        await asyncio.to_thread(
-            lambda r=row: db.table("messages").insert(r).execute()
-        )
+        rows_to_insert.append(row)
         existing_ids.add(msg_id)
-        imported += 1
+
+    for start in range(0, len(rows_to_insert), 250):
+        batch = rows_to_insert[start:start + 250]
+        await asyncio.to_thread(
+            lambda rows=batch: db.table("messages").insert(rows).execute()
+        )
+
+    imported = len(rows_to_insert)
 
     if imported > 0:
         conversation_history = await get_conversation_history(fan_id)
@@ -2481,6 +2528,53 @@ async def get_vault_media_url(creator_id: str, media_id: str) -> dict:
     }
 
 
+@app.post(
+    "/vault-media-urls/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
+async def get_vault_media_urls(
+    creator_id: str,
+    request: VaultMediaUrlsRequest,
+) -> dict:
+    """Resolve a message's PPV thumbnails in one bounded database query."""
+    media_ids = normalize_media_ids(request.media_ids)
+    if not media_ids:
+        return {"media": {}}
+    db = get_supabase()
+    def _load_media() -> list[dict]:
+        rows: list[dict] = []
+        for start in range(0, len(media_ids), 250):
+            result = (
+                db.table("creator_vault_media")
+                .select("fansly_media_id, url, thumbnail_url, mimetype")
+                .eq("creator_id", creator_id)
+                .in_("fansly_media_id", media_ids[start:start + 250])
+                .execute()
+            )
+            rows.extend(result.data or [])
+        return rows
+
+    rows = await asyncio.to_thread(_load_media)
+    resolved = {
+        str(row["fansly_media_id"]): {
+            "url": row.get("url"),
+            "thumbnail_url": row.get("thumbnail_url"),
+            "mimetype": row.get("mimetype"),
+        }
+        for row in rows
+        if row.get("fansly_media_id")
+    }
+    return {
+        "media": {
+            media_id: resolved.get(
+                media_id,
+                {"url": None, "thumbnail_url": None, "mimetype": None},
+            )
+            for media_id in media_ids
+        }
+    }
+
+
 async def _run_vault_categorization(
     creator_id: str,
     *,
@@ -2982,6 +3076,43 @@ async def fansly_webhook(payload: dict) -> dict:
 
         fan_row = fans[0]
         pending = fan_row.get("pending_ppv_check") or {}
+        if not pending:
+            delivery_result = await asyncio.to_thread(
+                lambda: db.table("ppv_deliveries")
+                .select(
+                    "reference, media_ids, price_cents, source, set_id, "
+                    "step_index, platform_message_id, claimed_at, delivered_at"
+                )
+                .eq("creator_id", creator_id)
+                .eq("fan_id", str(fan_row["id"]))
+                .in_("status", ["claimed", "delivered_pending"])
+                .order("claimed_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            delivery_rows = delivery_result.data or []
+            if delivery_rows:
+                delivery = delivery_rows[0]
+                delivery_media_ids = normalize_media_ids(
+                    delivery.get("media_ids") or []
+                )
+                pending = {
+                    "reference": delivery.get("reference"),
+                    "media_id": (
+                        delivery_media_ids[0] if delivery_media_ids else None
+                    ),
+                    "media_ids": delivery_media_ids,
+                    "price": float(delivery.get("price_cents") or 0) / 100,
+                    "price_cents": int(delivery.get("price_cents") or 0),
+                    "source": delivery.get("source"),
+                    "set_id": delivery.get("set_id"),
+                    "step_index": delivery.get("step_index"),
+                    "platform_message_id": delivery.get("platform_message_id"),
+                    "sent_at": (
+                        delivery.get("delivered_at")
+                        or delivery.get("claimed_at")
+                    ),
+                }
         expected_cents = int(
             pending.get("price_cents")
             or round(float(pending.get("price") or 0) * 100)
@@ -3001,9 +3132,29 @@ async def fansly_webhook(payload: dict) -> dict:
                 )
                 return {"status": "review_required"}
 
+        pending_media_ids = normalize_media_ids(
+            pending.get("media_ids") or [pending.get("media_id")]
+        )
+        if (
+            account_media_id
+            and pending_media_ids
+            and account_media_id not in pending_media_ids
+        ):
+            from db.queries import freeze_fan_for_review
+
+            await freeze_fan_for_review(
+                str(fan_row["id"]),
+                "ppv_webhook_media_mismatch",
+            )
+            print(
+                f"[PPV WEBHOOK] media mismatch fan={fan_row['id']} "
+                f"expected={pending_media_ids} actual={account_media_id}"
+            )
+            return {"status": "review_required"}
+
         purchase_media_id = str(
-            pending.get("media_id")
-            or account_media_id
+            account_media_id
+            or pending.get("media_id")
         )
         if not purchase_media_id:
             return {"status": "invalid_ppv_purchase_event"}
@@ -3014,6 +3165,7 @@ async def fansly_webhook(payload: dict) -> dict:
             str(fan_row["id"]),
             purchase_media_id,
             (price_cents / 100.0) if price_cents else None,
+            pending_override=pending,
         )
         print(
             f"[PPV WEBHOOK] confirmed fan={fan_row['id']} "
@@ -3699,7 +3851,7 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
     db = get_supabase()
     fan_row = await asyncio.to_thread(
         lambda: db.table("fans")
-        .select("creator_id, sales_log, pending_ppv_check")
+        .select("creator_id, sales_log, not_sold_log, pending_ppv_check")
         .eq("id", fan_id)
         .single()
         .execute()
@@ -3709,7 +3861,9 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
         raise HTTPException(status_code=404, detail="fan not found for creator")
 
     try:
-        vault_rows, set_rows, message_rows = await asyncio.gather(
+        from services.ppv_delivery_ledger import list_fan_deliveries
+
+        vault_rows, set_rows, message_rows, deliveries = await asyncio.gather(
             asyncio.to_thread(
                 lambda: db.table("creator_vault_media")
                 .select(
@@ -3717,6 +3871,7 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
                     "album_title, content_category, ai_description, price_min, price_max, is_active"
                 )
                 .eq("creator_id", creator_id)
+                .eq("is_active", True)
                 .execute()
             ),
             asyncio.to_thread(
@@ -3736,10 +3891,11 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
                 .eq("creator_id", creator_id)
                 .eq("fan_id", fan_id)
                 .eq("role", "creator")
+                .not_.is_("media_context->ppv", "null")
                 .order("sent_at", desc=True)
-                .limit(1000)
                 .execute()
             ),
+            list_fan_deliveries(creator_id, fan_id),
         )
     except Exception as exc:
         print(f"[OPERATOR PPV OPTIONS] fan={fan_id} creator={creator_id} error={exc}", flush=True)
@@ -3748,31 +3904,20 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
             detail="Could not load the creator vault for this PPV.",
         ) from exc
 
-    sent_ids: set[str] = set()
-    for message in (message_rows.data or []):
-        ppv = (message.get("media_context") or {}).get("ppv") or {}
-        sent_ids.update(normalize_media_ids(ppv.get("media_ids") or [ppv.get("media_id")]))
-    purchased_ids: set[str] = set()
-    for sale in (fan.get("sales_log") or []):
-        purchased_ids.update(
-            normalize_media_ids(sale.get("media_ids") or [sale.get("media_id")])
-        )
-    pending_ids = set(
-        normalize_media_ids(
-            (fan.get("pending_ppv_check") or {}).get("media_ids")
-            or [(fan.get("pending_ppv_check") or {}).get("media_id")]
-        )
+    from services.ppv_status import build_media_status_by_id
+
+    status_by_id = build_media_status_by_id(
+        deliveries=deliveries,
+        message_rows=message_rows.data or [],
+        sales_log=fan.get("sales_log") or [],
+        not_sold_log=fan.get("not_sold_log") or [],
+        pending_ppv=fan.get("pending_ppv_check") or None,
     )
 
     media = []
     for row in (vault_rows.data or []):
         external_id = str(row.get("fansly_media_id") or row.get("media_id") or "")
-        status = (
-            "sold" if external_id in purchased_ids
-            else "payment_pending" if external_id in pending_ids
-            else "sent" if external_id in sent_ids
-            else "unused"
-        )
+        status = status_by_id.get(external_id, "unused")
         media.append({**row, "external_media_id": external_id, "fan_sale_status": status})
 
     return {

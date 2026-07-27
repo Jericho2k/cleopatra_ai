@@ -2,6 +2,7 @@
 .env.local
 .env.example
 venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
