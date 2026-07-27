@@ -136,6 +136,90 @@ def test_qwen_preserves_rich_scene_and_continuity_details():
     assert enriched["visual_tone"] == "warm bedroom selfie"
 
 
+def test_qwen_nested_fields_are_normalized_and_sparse_description_is_rebuilt():
+    semantic = semantic_result()
+    semantic["axes"]["scene_location"]["label"] = "kitchen"
+    semantic["tags"]["background_details"] = [{
+        "label": "kitchen counter and cabinets",
+        "score": 0.8,
+    }]
+    base = vault_classifier._merge_semantics(
+        vault_classifier._base_metadata(
+            [{
+                "class": "FEMALE_BREAST_EXPOSED",
+                "score": 0.91,
+                "box": [10, 20, 30, 40],
+            }],
+            is_video=False,
+            album_title="Album_123",
+            local_visual=local_visual(),
+        ),
+        semantic,
+    )
+    enriched = vault_classifier._merge_qwen(base, {
+        "visual_details": {
+            "location": "kitchen",
+            "outfit": "black and white maid apron with topless styling",
+            "clothing_items": ["maid apron", "lace trim"],
+            "background": ["black countertop", "white cabinets"],
+            "lighting": "cool blue under-cabinet light",
+            "dominant_colors": [
+                "black countertop",
+                "white cabinets",
+                "blue light",
+            ],
+        },
+        "photoshoot_details": {
+            "styling": ["short platinum hair"],
+            "continuity_details": [
+                "black and white maid apron",
+                "blue under-cabinet light",
+            ],
+        },
+        "nudity": "partial",
+        "visible_anatomy": ["breasts"],
+        "explicitness": 4,
+        "scene_id": "kitchen-maid-topless-blue",
+        "confidence": 0.88,
+    })
+
+    descriptor = enriched["rich_visual_descriptor"]["descriptor"]
+    assert enriched["description_complete"] is True
+    assert "maid apron" in enriched["description"]
+    assert "cool blue under-cabinet light" in enriched["description"]
+    assert enriched["scene_location"] == "kitchen"
+    assert "maid apron" in enriched["scene_outfit"]
+    assert "kitchen counter and cabinets" in descriptor["background_details"]
+    assert "black countertop" in descriptor["background_details"]
+    assert enriched["_provider_metadata"]["qwen_description_generated"] is True
+    assert enriched["_provider_metadata"]["qwen_field_count"] >= 7
+
+
+def test_sparse_qwen_does_not_erase_fast_semantic_fields():
+    base = vault_classifier._merge_semantics(
+        vault_classifier._base_metadata(
+            [],
+            is_video=False,
+            album_title="Album_123",
+            local_visual=local_visual(),
+        ),
+        semantic_result(),
+    )
+    enriched = vault_classifier._merge_qwen(base, {
+        "scene_id": "bedroom-lingerie-warm",
+        "confidence": 0.6,
+    })
+
+    descriptor = enriched["rich_visual_descriptor"]["descriptor"]
+    assert enriched["description_complete"] is True
+    assert enriched["scene_location"] == "bedroom"
+    assert enriched["scene_outfit"] == "lingerie set"
+    assert "bed and bedding" in descriptor["background_details"]
+    assert "warm indoor light" in enriched["description"]
+    assert enriched["_provider_metadata"]["qwen_description_generated"] is True
+    assert enriched["_provider_metadata"]["qwen_field_count"] == 1
+
+
 def test_sparse_continuity_markers_are_supplemented_with_scene_evidence():
     descriptor = vault_classifier._visual_descriptor({
         "description": "A creator poses beside a distinctive tiled wall.",

@@ -481,6 +481,203 @@ def _visual_descriptor(rich: dict[str, Any]) -> dict[str, Any]:
     return descriptor
 
 
+def _normalize_qwen_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Flatten common small-model schema variations into the requested keys."""
+    result = dict(payload)
+    aliases = {
+        "description": {"visualdescription", "summary", "caption"},
+        "mood": {"tone"},
+        "explicitness": {"explicitnesslevel", "explicitnessscore"},
+        "nudity": {"nuditystate"},
+        "visible_anatomy": {"visibleanatomy", "anatomy"},
+        "participants": {"participantcount", "peoplecount"},
+        "good_for": {"goodfor", "sellinguse"},
+        "sexual_activity": {"sexualactivity", "activitytype"},
+        "body_focus": {"bodyfocus"},
+        "action": {"activity", "subjectaction"},
+        "pose": {"bodypose"},
+        "limb_position": {"limbposition"},
+        "gaze": {"gazedirection"},
+        "expression": {"facialexpression"},
+        "framing": {"shottype", "cameraframing"},
+        "camera_angle": {"cameraangle", "angle"},
+        "crop": {"imagecrop"},
+        "composition": {"imagecomposition"},
+        "scene_location": {
+            "scenelocation", "settinglocation", "location", "room",
+            "environment",
+        },
+        "setting_details": {
+            "settingdetails", "scenedetails", "environmentdetails",
+        },
+        "background_details": {"backgrounddetails", "background"},
+        "scene_outfit": {
+            "sceneoutfit", "outfit", "wardrobe", "wardrobestate",
+        },
+        "wardrobe_items": {
+            "wardrobeitems", "clothingitems", "garments", "clothing",
+        },
+        "wardrobe_colors": {
+            "wardrobecolors", "wardrobeclours", "clothingcolors",
+        },
+        "wardrobe_materials": {
+            "wardrobematerials", "clothingmaterials", "materials",
+        },
+        "subject_styling": {
+            "subjectstyling", "styling", "hairandmakeup",
+        },
+        "props": {"objects", "sceneprops"},
+        "colors": {
+            "dominantcolors", "dominantcolours", "colordetails",
+            "colourdetails",
+        },
+        "scene_lighting": {"scenelighting", "lighting"},
+        "visual_style": {"visualstyle", "style"},
+        "distinguishing_details": {
+            "distinguishingdetails", "distinctivedetails",
+        },
+        "continuity_markers": {
+            "continuitymarkers", "continuitydetails",
+        },
+        "tags": {"searchtags", "semantictags"},
+        "scene_id": {"sceneid", "shootid"},
+        "confidence": {"confidenceScore", "analysisconfidence"},
+    }
+
+    def key(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+    flattened: list[tuple[str, Any]] = []
+    queue: list[tuple[Any, int]] = [(payload, 0)]
+    seen: set[int] = set()
+    while queue:
+        value, depth = queue.pop(0)
+        if not isinstance(value, dict) or id(value) in seen:
+            continue
+        seen.add(id(value))
+        for field, child in value.items():
+            flattened.append((key(field), child))
+            if depth < 3 and isinstance(child, dict):
+                queue.append((child, depth + 1))
+
+    for canonical, field_aliases in aliases.items():
+        current = result.get(canonical)
+        if current not in (None, "", [], {}):
+            continue
+        accepted = {key(canonical), *(key(alias) for alias in field_aliases)}
+        for normalized_key, value in flattened:
+            if normalized_key in accepted and value not in (None, "", [], {}):
+                result[canonical] = value
+                break
+    return result
+
+
+def _overlay_visual_descriptors(
+    base: dict[str, Any],
+    qwen: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve useful fast metadata when Qwen omits an optional field."""
+    result = dict(qwen)
+    list_fields = {
+        "setting_details",
+        "background_details",
+        "wardrobe_items",
+        "wardrobe_colors",
+        "wardrobe_materials",
+        "subject_styling",
+        "props",
+        "distinguishing_details",
+        "continuity_markers",
+        "search_tags",
+        "color_details",
+    }
+    for field, base_value in base.items():
+        current = result.get(field)
+        if field in list_fields:
+            result[field] = list(dict.fromkeys([
+                *_strings(current, limit=12),
+                *_strings(base_value, limit=12),
+            ]))
+        elif current in (None, ""):
+            result[field] = base_value
+    result["confidence"] = round(max(
+        float(base.get("confidence") or 0),
+        float(qwen.get("confidence") or 0),
+    ), 3)
+    return result
+
+
+def _structured_visual_description(
+    descriptor: dict[str, Any],
+    *,
+    nudity: str,
+    anatomy: list[str],
+    scene_outfit: str,
+) -> str:
+    """Build concise prose when a valid Qwen object omits its description."""
+    sentences: list[str] = []
+    action = _specific(descriptor.get("action"))
+    pose = _specific(descriptor.get("pose"))
+    framing = _specific(descriptor.get("framing"))
+    subject = []
+    if action:
+        subject.append(action)
+    if pose:
+        subject.append(f"while {pose}")
+    if subject:
+        sentence = f"The subject is {' '.join(subject)}"
+        if framing:
+            sentence += f", shown in a {framing}"
+        sentences.append(sentence + ".")
+    elif framing:
+        sentences.append(f"The subject is shown in a {framing}.")
+
+    wardrobe_items = _strings(descriptor.get("wardrobe_items"), limit=8)
+    if scene_outfit and scene_outfit not in {"unknown", nudity, f"{nudity} nudity"}:
+        sentences.append(f"Visible wardrobe and styling: {scene_outfit}.")
+    elif wardrobe_items:
+        sentences.append(
+            f"Visible wardrobe: {', '.join(wardrobe_items)}."
+        )
+    if nudity in {"partial", "full"}:
+        anatomy_text = (
+            f", including {', '.join(anatomy)}"
+            if anatomy
+            else ""
+        )
+        sentences.append(
+            f"{nudity.title()} nudity is visible{anatomy_text}."
+        )
+
+    location = _specific(descriptor.get("setting_location"))
+    surroundings = list(dict.fromkeys([
+        *_strings(descriptor.get("setting_details"), limit=8),
+        *_strings(descriptor.get("background_details"), limit=8),
+    ]))
+    if location and surroundings:
+        sentences.append(
+            f"The setting is a {location}, with "
+            f"{', '.join(surroundings)} visible."
+        )
+    elif location:
+        sentences.append(f"The setting is a {location}.")
+    elif surroundings:
+        sentences.append(
+            f"Visible surroundings include {', '.join(surroundings)}."
+        )
+
+    lighting = _specific(descriptor.get("lighting"))
+    colors = _strings(descriptor.get("color_details"), limit=8)
+    look: list[str] = []
+    if lighting:
+        look.append(f"lighting: {lighting}")
+    if colors:
+        look.append(f"important colors: {', '.join(colors)}")
+    if look:
+        sentences.append("Visual look — " + "; ".join(look) + ".")
+    return " ".join(sentences)[:1800]
+
+
 def _vision_failure_reason(exc: Exception) -> str:
     if isinstance(exc, httpx.TimeoutException):
         return "timeout"
@@ -740,7 +937,19 @@ def _merge_semantics(
 
 def _merge_qwen(base: dict[str, Any], rich: dict[str, Any]) -> dict[str, Any]:
     result = dict(base)
-    descriptor = _visual_descriptor(rich)
+    rich = _normalize_qwen_payload(rich)
+    qwen_descriptor = _visual_descriptor(rich)
+    base_rich = base.get("rich_visual_descriptor")
+    base_descriptor = (
+        base_rich.get("descriptor") or {}
+        if isinstance(base_rich, dict)
+        and base_rich.get("status") == "ready"
+        else {}
+    )
+    descriptor = _overlay_visual_descriptors(
+        base_descriptor,
+        qwen_descriptor,
+    )
     local_anatomy = _strings(base.get("visible_anatomy"), limit=8)
     rich_anatomy = _strings(rich.get("visible_anatomy"), limit=8)
     anatomy = list(dict.fromkeys([*local_anatomy, *rich_anatomy]))
@@ -788,7 +997,14 @@ def _merge_qwen(base: dict[str, Any], rich: dict[str, Any]) -> dict[str, Any]:
     if nudity == "full":
         scene_outfit = "full nudity"
     elif nudity == "partial" and not scene_outfit:
-        scene_outfit = "partial nudity"
+        scene_outfit = _specific(base.get("scene_outfit")) or "partial nudity"
+    if not qwen_descriptor["description"]:
+        descriptor["description"] = _structured_visual_description(
+            descriptor,
+            nudity=nudity,
+            anatomy=anatomy,
+            scene_outfit=scene_outfit,
+        )
     rich_tags = [
         *descriptor["search_tags"],
         *descriptor["setting_details"],
@@ -816,12 +1032,16 @@ def _merge_qwen(base: dict[str, Any], rich: dict[str, Any]) -> dict[str, Any]:
         "tags": list(dict.fromkeys([*base["tags"], *rich_tags]))[:32],
         "sexual_activity": activities,
         "body_focus": _strings(rich.get("body_focus"), limit=8) or anatomy,
-        "action": action,
-        "pose": descriptor["pose"] or "unknown",
-        "framing": descriptor["framing"] or "other",
+        "action": action if action != "unknown" else base.get("action", "unknown"),
+        "pose": descriptor["pose"] or base.get("pose") or "unknown",
+        "framing": descriptor["framing"] or base.get("framing") or "other",
         "props": descriptor["props"],
         "colors": descriptor["color_details"] or base["colors"],
-        "scene_location": descriptor["setting_location"] or "unknown",
+        "scene_location": (
+            descriptor["setting_location"]
+            or base.get("scene_location")
+            or "unknown"
+        ),
         "scene_outfit": scene_outfit[:320] if scene_outfit else "unknown",
         "scene_lighting": descriptor["lighting"] or base["scene_lighting"],
         "visual_tone": (
@@ -857,6 +1077,49 @@ def _merge_qwen(base: dict[str, Any], rich: dict[str, Any]) -> dict[str, Any]:
         "endpoint": endpoint_metadata,
         "reported_explicitness": reported,
         "explicitness_escalated": explicitness > reported,
+        "qwen_description_generated": (
+            not bool(qwen_descriptor["description"])
+            and bool(descriptor["description"])
+        ),
+        "qwen_field_count": sum(
+            bool(rich.get(field))
+            for field in (
+                "description",
+                "mood",
+                "explicitness",
+                "nudity",
+                "visible_anatomy",
+                "participants",
+                "good_for",
+                "sexual_activity",
+                "body_focus",
+                "action",
+                "pose",
+                "limb_position",
+                "gaze",
+                "expression",
+                "framing",
+                "camera_angle",
+                "crop",
+                "composition",
+                "scene_location",
+                "setting_details",
+                "background_details",
+                "scene_outfit",
+                "wardrobe_items",
+                "wardrobe_colors",
+                "wardrobe_materials",
+                "subject_styling",
+                "props",
+                "colors",
+                "scene_lighting",
+                "visual_style",
+                "distinguishing_details",
+                "continuity_markers",
+                "tags",
+                "scene_id",
+            )
+        ),
     }
     return result
 
