@@ -134,6 +134,9 @@ def test_qwen_preserves_rich_scene_and_continuity_details():
     assert enriched["_provider_metadata"]["vision_status"] == "ready"
     assert enriched["_provider_metadata"]["scene_confidence"] == 0.87
     assert enriched["_provider_metadata"]["endpoint"]["request_id"] == "abc123"
+    assert enriched["_classification_model"].endswith(
+        "+Qwen/Qwen3-VL-4B-Instruct"
+    )
     assert enriched["visual_tone"] == "warm bedroom selfie"
 
 

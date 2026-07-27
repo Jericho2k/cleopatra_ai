@@ -1093,9 +1093,12 @@ def _merge_qwen(base: dict[str, Any], rich: dict[str, Any]) -> dict[str, Any]:
         },
         "_classification_model": (
             f"{base.get('_classification_model', 'nudenet-3.4.2')}+"
-            + os.environ.get(
-                "VAULT_VISION_MODEL",
-                "huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated",
+            + (
+                _specific(endpoint_metadata.get("model"), limit=160)
+                or os.environ.get(
+                    "VAULT_VISION_MODEL",
+                    "huihui-ai/Huihui-Qwen3-VL-4B-Instruct-abliterated",
+                )
             )
         ),
     })
