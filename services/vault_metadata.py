@@ -12,7 +12,7 @@ from collections import Counter
 from typing import Any, Iterable
 
 
-VAULT_CLASSIFIER_VERSION = 9
+VAULT_CLASSIFIER_VERSION = 10
 
 _EMPTY_VALUES = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
 _MEDIA_CATEGORIES = {
@@ -208,7 +208,7 @@ def media_description(data: dict[str, Any], *, source: str) -> str:
         and rich_result.get("status") == "ready"
         else {}
     )
-    if data.get("description_complete") and not rich:
+    if data.get("description_complete"):
         sentences.append(
             f"Classification evidence: {source.replace('_', ' ')}; "
             f"explicitness {int(data.get('explicitness') or 0)}/5."

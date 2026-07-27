@@ -61,6 +61,38 @@ def test_complete_provider_description_is_not_expanded_twice():
     assert description.endswith("Classification evidence: image; explicitness 4/5.")
 
 
+def test_complete_rich_description_is_not_expanded_twice():
+    description = media_description(
+        {
+            "description": (
+                "A subject crouches beside a kitchen counter. "
+                "Full nudity is visible."
+            ),
+            "description_complete": True,
+            "scene_location": "kitchen",
+            "scene_outfit": "full nudity",
+            "visible_anatomy": ["breasts", "vulva"],
+            "explicitness": 4,
+            "rich_visual_descriptor": {
+                "status": "ready",
+                "descriptor": {
+                    "background_details": [
+                        "kitchen counter and cabinets",
+                    ],
+                },
+            },
+        },
+        source="image",
+    )
+
+    assert description.count("kitchen counter") == 1
+    assert "Visual details" not in description
+    assert "Photoshoot details" not in description
+    assert description.endswith(
+        "Classification evidence: image; explicitness 4/5."
+    )
+
+
 def test_explicit_visual_evidence_cannot_be_silently_downgraded():
     nude = {
         "category": "other",

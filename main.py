@@ -1999,6 +1999,7 @@ async def _categorize_single_item(
     item: dict,
     *,
     allow_core_qwen_fallback: bool = True,
+    force_qwen: bool = False,
 ) -> dict:
     """Classify one vault item into the versioned provider-neutral contract.
 
@@ -2039,6 +2040,7 @@ async def _categorize_single_item(
             filename=str(item.get("filename") or ""),
             local_visual=local_visual,
             allow_core_qwen_fallback=allow_core_qwen_fallback,
+            force_qwen=force_qwen,
         )
         model = str(data.pop("_classification_model", "nudenet-3.4.2"))
         provider_metadata = dict(data.pop("_provider_metadata", {}) or {})
@@ -2808,7 +2810,7 @@ async def recategorize_item(item_id: str) -> dict:
     )
 
     try:
-        result = await _categorize_single_item(item)
+        result = await _categorize_single_item(item, force_qwen=True)
     except VaultVisualAccessError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except VaultClassifierError as exc:

@@ -58,6 +58,19 @@ _REFUSAL_PREFIXES = (
     "unable to",
 )
 _EMPTY_TEXT = {"", "unknown", "unclear", "none", "n/a", "na", "null"}
+_GENERIC_SCENE_LABELS = {"other indoor room"}
+_GENERIC_CONTINUITY_LABELS = {
+    "bed and bedding",
+    "mirror",
+    "sofa",
+    "curtains",
+    "plain wall",
+    "bra",
+    "panties",
+    "lingerie set",
+    "dress",
+    "jewelry",
+}
 _VISION_GATE = asyncio.Semaphore(2)
 
 
@@ -488,10 +501,16 @@ def _merge_semantics(
     result = dict(base)
     axes = semantic.get("axes") or {}
     tags = semantic.get("tags") or {}
+    ambiguous_axes = set(semantic.get("ambiguous_axes") or [])
 
     def axis(name: str, default: str = "unknown") -> str:
         row = axes.get(name) if isinstance(axes.get(name), dict) else {}
-        return _specific(row.get("label"), limit=120) or default
+        if name in ambiguous_axes or not bool(row.get("confident")):
+            return default
+        value = _specific(row.get("label"), limit=120)
+        if name == "scene_location" and value in _GENERIC_SCENE_LABELS:
+            return default
+        return value or default
 
     def tag_labels(name: str) -> list[str]:
         rows = tags.get(name) if isinstance(tags.get(name), list) else []
@@ -509,12 +528,11 @@ def _merge_semantics(
     background = tag_labels("background_details")
     wardrobe_items = tag_labels("wardrobe_items")
     palette = _strings(base.get("colors"), limit=6)
-    continuity = list(dict.fromkeys([
-        *background,
-        *wardrobe_items,
-        scene,
-        lighting,
-    ]))[:8]
+    continuity = [
+        value
+        for value in dict.fromkeys([*background, *wardrobe_items])
+        if value not in _GENERIC_CONTINUITY_LABELS
+    ][:6]
     confidence = float(semantic.get("confidence") or 0)
     wardrobe_score = float(
         ((axes.get("wardrobe_state") or {}).get("score")) or 0
@@ -535,44 +553,75 @@ def _merge_semantics(
         explicitness=explicitness,
         is_video=is_video,
     )
-    outfit = ", ".join(wardrobe_items) or wardrobe_state
-    scene_sentence = (
-        f"The frame appears to be in a {scene}, with {lighting}."
-        if scene != "unknown"
-        else f"The frame uses {lighting}."
-    )
-    description = (
-        f"The subject is {action}, {pose}, in a {framing}. "
-        f"Wardrobe state: {outfit}. {scene_sentence}"
-    )
-    if background:
-        description += f" Visible background details: {', '.join(background)}."
+    detector_nudity = _specific(base.get("nudity"), limit=20).lower()
+    if detector_nudity == "full":
+        wardrobe_state = "full nudity"
+        outfit = "full nudity"
+    elif detector_nudity == "partial":
+        wardrobe_state = "partial nudity"
+        outfit = "partial nudity"
+    elif wardrobe_state == "full nudity":
+        # A zero-shot wardrobe label cannot overrule the absence of exposed
+        # anatomy. Qwen will arbitrate this conflict when configured.
+        wardrobe_state = "unknown"
+        outfit = "unknown"
+    elif wardrobe_state == "unknown":
+        outfit = "unknown"
+    else:
+        outfit = ", ".join(wardrobe_items) or wardrobe_state
+
+    activity_phrases = {
+        "selfie": "taking a selfie",
+        "mirror selfie": "taking a mirror selfie",
+        "sexual activity": "engaged in sexual activity",
+        "using an adult toy": "using an adult toy",
+    }
+    subject_bits: list[str] = []
+    if action != "unknown":
+        subject_bits.append(activity_phrases.get(action, action))
+    if pose != "unknown":
+        subject_bits.append(f"while {pose}")
+    description_parts: list[str] = []
+    if subject_bits:
+        subject = " ".join(subject_bits)
+        if framing != "other":
+            description_parts.append(
+                f"The subject is {subject}, shown in a {framing}."
+            )
+        else:
+            description_parts.append(f"The subject is {subject}.")
+    elif framing != "other":
+        description_parts.append(f"The subject is shown in a {framing}.")
+
+    if detector_nudity == "full":
+        description_parts.append("Full nudity is visible.")
+    elif detector_nudity == "partial":
+        description_parts.append("Partial nudity is visible.")
+    elif outfit != "unknown":
+        description_parts.append(f"Visible wardrobe: {outfit}.")
+
+    if scene != "unknown" and background:
+        description_parts.append(
+            f"The setting appears to be a {scene}, with "
+            f"{', '.join(background)} visible."
+        )
+    elif scene != "unknown":
+        description_parts.append(f"The setting appears to be a {scene}.")
+    elif background:
+        description_parts.append(
+            f"Visible background elements include {', '.join(background)}."
+        )
+    if lighting != "unknown":
+        description_parts.append(f"Lighting: {lighting}.")
     if palette:
-        description += f" Dominant colors: {', '.join(palette)}."
-    descriptor = {
-        "description": description,
-        "setting_location": scene,
-        "setting_details": background,
-        "background_details": background,
-        "wardrobe_items": wardrobe_items,
-        "wardrobe_colors": palette,
-        "wardrobe_materials": [],
-        "subject_styling": [],
-        "pose": pose,
-        "limb_position": "",
-        "gaze": "",
-        "expression": "",
-        "action": action,
-        "framing": framing,
-        "camera_angle": "",
-        "crop": "",
-        "composition": "",
-        "props": [],
-        "lighting": lighting,
-        "visual_style": lighting,
-        "distinguishing_details": background,
-        "continuity_markers": continuity,
-        "search_tags": list(dict.fromkeys([
+        description_parts.append(
+            f"Dominant frame colors: {', '.join(palette)}."
+        )
+    description = " ".join(description_parts) or base["description"]
+
+    search_tags = [
+        value
+        for value in dict.fromkeys([
             scene,
             wardrobe_state,
             pose,
@@ -580,7 +629,43 @@ def _merge_semantics(
             framing,
             *background,
             *wardrobe_items,
-        ])),
+        ])
+        if value not in _EMPTY_TEXT
+        and value not in _GENERIC_SCENE_LABELS
+    ]
+    semantic_scene_id = (
+        _slug(scene, *continuity[:2])
+        if scene != "unknown" and continuity
+        else ""
+    )
+    fallback_scene_id = _specific(base.get("scene_id"), limit=96)
+    if fallback_scene_id.startswith("album-"):
+        fallback_scene_id = ""
+    descriptor = {
+        "description": description,
+        "setting_location": "" if scene == "unknown" else scene,
+        "setting_details": background,
+        "background_details": background,
+        "wardrobe_items": wardrobe_items,
+        # Local palette describes the whole frame, not necessarily clothing.
+        "wardrobe_colors": [],
+        "wardrobe_materials": [],
+        "subject_styling": [],
+        "pose": "" if pose == "unknown" else pose,
+        "limb_position": "",
+        "gaze": "",
+        "expression": "",
+        "action": "" if action == "unknown" else action,
+        "framing": "" if framing == "other" else framing,
+        "camera_angle": "",
+        "crop": "",
+        "composition": "",
+        "props": [],
+        "lighting": "" if lighting == "unknown" else lighting,
+        "visual_style": "" if lighting == "unknown" else lighting,
+        "distinguishing_details": background,
+        "continuity_markers": continuity,
+        "search_tags": search_tags,
         "color_details": palette,
         "confidence": round(confidence, 3),
     }
@@ -608,8 +693,9 @@ def _merge_semantics(
         "scene_outfit": outfit,
         "scene_lighting": lighting,
         "visual_tone": lighting,
-        "scene_id": _slug(scene, wardrobe_state, lighting)
-        or base.get("scene_id"),
+        "scene_id": semantic_scene_id
+        or fallback_scene_id
+        or "unidentified-shoot",
         "confidence": max(float(base.get("confidence") or 0), confidence),
         "rich_visual_descriptor": {
             "status": "ready",
@@ -633,8 +719,21 @@ def _merge_semantics(
         "vision_status": "ready",
         "semantic_status": "ready",
         "scene_confidence": round(confidence, 3),
+        "explicitness_confidence": round(
+            float(base.get("confidence") or 0),
+            3,
+        ),
         "semantic_endpoint": endpoint,
-        "semantic_ambiguous_axes": semantic.get("ambiguous_axes") or [],
+        "semantic_ambiguous_axes": sorted(ambiguous_axes),
+        "semantic_axes": {
+            name: {
+                "score": round(float((row or {}).get("score") or 0), 3),
+                "confident": bool((row or {}).get("confident"))
+                and name not in ambiguous_axes,
+            }
+            for name, row in axes.items()
+            if isinstance(row, dict)
+        },
     }
     return result
 
@@ -686,6 +785,10 @@ def _merge_qwen(base: dict[str, Any], rich: dict[str, Any]) -> dict[str, Any]:
             scene_outfit = f"{wardrobe}; {scene_outfit}"
         else:
             scene_outfit = wardrobe
+    if nudity == "full":
+        scene_outfit = "full nudity"
+    elif nudity == "partial" and not scene_outfit:
+        scene_outfit = "partial nudity"
     rich_tags = [
         *descriptor["search_tags"],
         *descriptor["setting_details"],
@@ -766,6 +869,7 @@ async def classify_vault_image(
     filename: str = "",
     local_visual: dict[str, Any] | None = None,
     allow_core_qwen_fallback: bool = True,
+    force_qwen: bool = False,
 ) -> dict[str, Any]:
     """Return NudeNet + SigLIP2 metadata with confidence-gated Qwen."""
     detections = await asyncio.to_thread(_detect, image_bytes)
@@ -819,8 +923,11 @@ async def classify_vault_image(
     qwen_configured = bool(
         os.environ.get("VAULT_VISION_BASE_URL", "").strip()
     )
+    if force_qwen and qwen_configured and not fallback_reasons:
+        fallback_reasons = ["manual_detailed_analysis"]
     should_call_qwen = qwen_configured and (
-        bool(fallback_reasons)
+        force_qwen
+        or bool(fallback_reasons)
         or (
             (
                 not semantic_endpoint_configured()

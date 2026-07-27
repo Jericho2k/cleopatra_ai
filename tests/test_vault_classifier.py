@@ -320,6 +320,78 @@ async def test_confident_semantics_avoids_qwen(monkeypatch):
     assert result["_semantic_fingerprint"]["embedding"]["dimensions"] == 16
 
 
+def test_semantics_cannot_contradict_detector_nudity():
+    base = vault_classifier._base_metadata(
+        [
+            {
+                "class": "FEMALE_BREAST_EXPOSED",
+                "score": 0.91,
+                "box": [10, 20, 30, 40],
+            },
+            {
+                "class": "FEMALE_GENITALIA_EXPOSED",
+                "score": 0.87,
+                "box": [20, 80, 25, 30],
+            },
+        ],
+        is_video=False,
+        album_title="Album_123",
+        local_visual=local_visual(),
+    )
+    semantic = semantic_result()
+    semantic["axes"]["scene_location"]["label"] = "kitchen"
+    semantic["axes"]["wardrobe_state"]["label"] = "partial nudity"
+    semantic["axes"]["pose"]["label"] = "crouching"
+    semantic["axes"]["framing"]["label"] = "wide shot"
+    semantic["axes"]["lighting"]["label"] = "dim low light"
+    semantic["tags"]["background_details"] = [{
+        "label": "kitchen counter and cabinets",
+        "score": 0.8,
+    }]
+
+    result = vault_classifier._merge_semantics(base, semantic)
+    descriptor = result["rich_visual_descriptor"]["descriptor"]
+
+    assert result["nudity"] == "full"
+    assert result["scene_outfit"] == "full nudity"
+    assert "Partial nudity" not in result["description"]
+    assert "Full nudity is visible." in result["description"]
+    assert descriptor["wardrobe_colors"] == []
+    assert descriptor["continuity_markers"] == [
+        "kitchen counter and cabinets",
+    ]
+    assert result["scene_id"] == (
+        "kitchen-kitchen-counter-and-cabinets"
+    )
+
+
+def test_ambiguous_or_generic_semantics_are_not_stated_as_facts():
+    base = vault_classifier._base_metadata(
+        [],
+        is_video=False,
+        album_title="Album_123",
+        local_visual=local_visual(),
+    )
+    semantic = semantic_result()
+    semantic["ambiguous_axes"] = ["wardrobe_state", "pose"]
+    semantic["axes"]["scene_location"]["label"] = "other indoor room"
+    semantic["tags"]["background_details"] = [{
+        "label": "plain wall",
+        "score": 0.8,
+    }]
+
+    result = vault_classifier._merge_semantics(base, semantic)
+    descriptor = result["rich_visual_descriptor"]["descriptor"]
+
+    assert result["scene_location"] == "unknown"
+    assert result["scene_outfit"] == "unknown"
+    assert result["pose"] == "unknown"
+    assert result["scene_id"] == "unidentified-shoot"
+    assert descriptor["continuity_markers"] == []
+    assert "other indoor room" not in result["description"]
+    assert "lingerie" not in result["description"]
+
+
 @pytest.mark.asyncio
 async def test_high_risk_semantic_activity_uses_qwen(monkeypatch):
     monkeypatch.setattr(vault_classifier, "_detect", lambda _: [])
@@ -357,6 +429,46 @@ async def test_high_risk_semantic_activity_uses_qwen(monkeypatch):
     assert result["_provider_metadata"]["qwen_status"] == "ready"
     assert result["_provider_metadata"]["qwen_fallback_reasons"] == [
         "high_risk_activity",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_manual_analysis_forces_qwen(monkeypatch):
+    monkeypatch.setattr(vault_classifier, "_detect", lambda _: [])
+    calls = []
+
+    async def semantics(*args, **kwargs):
+        return semantic_result()
+
+    async def qwen(*args, **kwargs):
+        calls.append(True)
+        return {
+            "description": (
+                "A subject poses beside a kitchen counter under blue light."
+            ),
+            "explicitness": 0,
+            "nudity": "none",
+            "participants": 1,
+            "sexual_activity": [],
+            "confidence": 0.9,
+        }
+
+    monkeypatch.setattr(vault_classifier, "semantic_metadata", semantics)
+    monkeypatch.setattr(vault_classifier, "_qwen_metadata", qwen)
+    monkeypatch.setenv("VAULT_SEMANTIC_BASE_URL", "https://semantic.invalid")
+    monkeypatch.setenv("VAULT_VISION_BASE_URL", "https://qwen.invalid")
+
+    result = await vault_classifier.classify_vault_image(
+        jpeg_bytes(),
+        is_video=False,
+        local_visual=local_visual(),
+        force_qwen=True,
+    )
+
+    assert calls == [True]
+    assert result["_provider_metadata"]["qwen_status"] == "ready"
+    assert result["_provider_metadata"]["qwen_fallback_reasons"] == [
+        "manual_detailed_analysis",
     ]
 
 
@@ -484,7 +596,7 @@ async def test_main_uses_local_classifier_without_anthropic(monkeypatch):
 
     assert result["classification_model"] == "nudenet-3.4.2"
     assert result["classification_metadata"]["classifier_provider"] == "local_nudenet"
-    assert result["classification_version"] == 9
+    assert result["classification_version"] == 10
 
 
 @pytest.mark.asyncio
@@ -495,6 +607,6 @@ async def test_health_exposes_safe_vault_rollout_state(monkeypatch):
     )
     assert await main.health() == {
         "status": "ok",
-        "vault_classifier_version": 9,
+        "vault_classifier_version": 10,
         "vault_semantics_configured": True,
     }
