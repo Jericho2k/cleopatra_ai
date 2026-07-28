@@ -214,7 +214,7 @@ async def process_incoming_fan_message(
         ),
         name=f"fan_intelligence:{fan_id}",
     )
-    audience_row, memberships = await asyncio.gather(
+    audience_row, memberships, auto_availability = await asyncio.gather(
         asyncio.to_thread(
             lambda: get_supabase()
             .from_("creators")
@@ -230,6 +230,7 @@ async def process_incoming_fan_message(
         .eq("fan_id", fan_id)
         .execute()
         ),
+        _creator_auto_availability(creator_id),
     )
     from services.auto_audience import AutoAudiencePolicy, evaluate_auto_eligibility
 
@@ -264,12 +265,20 @@ async def process_incoming_fan_message(
         spend_tier=str(getattr(fan_profile, "spend_tier", "cold") or "cold"),
         is_new_fan=is_new_fan,
     )
-    effective_auto = eligibility.eligible
+    effective_auto = (
+        eligibility.eligible
+        and bool(auto_availability.get("auto_available"))
+    )
+    effective_reason = (
+        eligibility.reason
+        if auto_availability.get("auto_available")
+        else "no_approved_sets"
+    )
 
     print(
         f"[AUTO MODE] creator={creator_id} creator_auto={auto_mode} "
         f"fan_auto={fan_profile.auto_mode} effective_auto={effective_auto} "
-        f"reason={eligibility.reason} fan={fan_id}"
+        f"reason={effective_reason} fan={fan_id}"
     )
 
     if effective_auto:
@@ -1009,6 +1018,259 @@ async def sync_chats_background(creator_id: str) -> None:
         print(f"[SYNC ERROR] {e}")
 
 
+def _apifansly_account_media_lookup(account_media: list[dict]) -> dict[str, dict]:
+    lookup: dict[str, dict] = {}
+    for item in account_media:
+        if not isinstance(item, dict):
+            continue
+        media = item.get("media") or {}
+        locations = media.get("locations") or []
+        variants = media.get("variants") or []
+        media_url = (
+            locations[0].get("location")
+            if locations and isinstance(locations[0], dict)
+            else None
+        )
+        if (
+            not media_url
+            and variants
+            and isinstance(variants[0], dict)
+            and variants[0].get("locations")
+        ):
+            media_url = variants[0]["locations"][0].get("location")
+        try:
+            raw_price = float(item.get("price") or 0)
+        except (TypeError, ValueError):
+            raw_price = 0
+        info = {
+            "url": media_url,
+            "price": raw_price,
+            "is_ppv": raw_price > 0,
+            "purchased": bool(
+                item.get("purchased", item.get("isPurchased", False))
+            ),
+            "access": item.get("access"),
+        }
+        for key in (item.get("id"), item.get("mediaId")):
+            if key:
+                lookup[str(key)] = info
+    return lookup
+
+
+def _apifansly_message_row(
+    message: dict,
+    *,
+    fan_id: str,
+    creator_id: str,
+    creator_platform_id: str,
+    media_lookup: dict[str, dict],
+) -> dict | None:
+    message_id = str(message.get("id") or "")
+    if not message_id:
+        return None
+    content = str(message.get("content") or "")
+    attachments = message.get("attachments") or []
+    if not content and not attachments:
+        return None
+
+    created_at = message.get("createdAt")
+    try:
+        timestamp = float(created_at or 0)
+    except (TypeError, ValueError):
+        timestamp = 0
+    if timestamp > 0:
+        if timestamp > 1e12:
+            timestamp /= 1000
+        sent_at = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    else:
+        sent_at = datetime.now(timezone.utc).isoformat()
+
+    resolved_attachments = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        content_id = str(attachment.get("contentId") or "")
+        info = media_lookup.get(content_id) or {}
+        resolved_attachments.append({
+            "contentId": content_id,
+            "url": info.get("url"),
+            "type": attachment.get("contentType", 1),
+            "price": info.get("price"),
+            "is_ppv": info.get("is_ppv"),
+            "purchased": info.get("purchased"),
+            "access": info.get("access"),
+        })
+
+    sender_id = str(message.get("senderId") or "")
+    return {
+        "fan_id": fan_id,
+        "creator_id": creator_id,
+        "role": "creator" if sender_id == creator_platform_id else "fan",
+        "content": content,
+        "fansly_message_id": message_id,
+        "sent_at": sent_at,
+        "media_context": (
+            {"attachments": resolved_attachments}
+            if resolved_attachments
+            else None
+        ),
+    }
+
+
+async def _sync_recent_fan_messages(
+    *,
+    creator_id: str,
+    fan_id: str,
+    account_id: str,
+    creator_platform_id: str,
+    group_id: str,
+    creator_auto_mode: bool,
+    client=None,
+) -> dict:
+    """Import the latest API Fansly page and process only newly seen fan text."""
+    db = get_supabase()
+    messages, account_media, _ = await apifansly_list_chat_messages(
+        account_id,
+        group_id,
+        limit=10,
+        client=client,
+    )
+    message_ids = [
+        str(message.get("id"))
+        for message in messages
+        if message.get("id")
+    ]
+    if not message_ids:
+        return {"imported": 0, "inbound": 0, "media_updated": 0}
+
+    existing = await asyncio.to_thread(
+        lambda: db.table("messages")
+        .select("id, fansly_message_id, role, media_context")
+        .eq("fan_id", fan_id)
+        .in_("fansly_message_id", message_ids)
+        .execute()
+    )
+    existing_by_platform_id = {
+        str(row.get("fansly_message_id")): row
+        for row in (existing.data or [])
+        if row.get("fansly_message_id")
+    }
+    media_lookup = _apifansly_account_media_lookup(account_media)
+    rows = []
+    media_updates = []
+    for message in reversed(messages):
+        row = _apifansly_message_row(
+            message,
+            fan_id=fan_id,
+            creator_id=creator_id,
+            creator_platform_id=creator_platform_id,
+            media_lookup=media_lookup,
+        )
+        if not row:
+            continue
+        platform_message_id = str(message.get("id") or "")
+        current = existing_by_platform_id.get(platform_message_id)
+        if not current:
+            rows.append(row)
+            continue
+        attachments = (row.get("media_context") or {}).get("attachments") or []
+        current_attachments = (
+            (current.get("media_context") or {}).get("attachments") or []
+        )
+        has_resolved_media = any(item.get("url") for item in attachments)
+        already_resolved = any(item.get("url") for item in current_attachments)
+        if (
+            current.get("role") == "fan"
+            and has_resolved_media
+            and not already_resolved
+        ):
+            media_updates.append({
+                "id": str(current["id"]),
+                "media_context": row["media_context"],
+            })
+
+    if rows:
+        await asyncio.to_thread(
+            lambda: db.table("messages").insert(rows).execute()
+        )
+    for update in media_updates:
+        await asyncio.to_thread(
+            lambda item=update: db.table("messages")
+            .update({"media_context": item["media_context"]})
+            .eq("id", item["id"])
+            .eq("fan_id", fan_id)
+            .execute()
+        )
+    inbound = [row for row in rows if row["role"] == "fan"]
+    newest_text = next(
+        (row for row in reversed(inbound) if str(row.get("content") or "").strip()),
+        None,
+    )
+    if newest_text:
+        await process_incoming_fan_message(
+            fan_id,
+            creator_id,
+            str(newest_text["content"]),
+            creator_auto_mode,
+            str(newest_text["fansly_message_id"]),
+        )
+    return {
+        "imported": len(rows),
+        "inbound": len(inbound),
+        "media_updated": len(media_updates),
+    }
+
+
+@app.post(
+    "/sync-fan-messages/{creator_id}/{fan_id}",
+    dependencies=[Depends(require_creator_fan_access)],
+)
+async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
+    """Low-cost active-chat reconciliation for managed API Fansly accounts."""
+    import httpx
+
+    db = get_supabase()
+    fan_result, creator_result = await asyncio.gather(
+        asyncio.to_thread(
+            lambda: db.table("fans")
+            .select("fansly_group_id")
+            .eq("id", fan_id)
+            .eq("creator_id", creator_id)
+            .single()
+            .execute()
+        ),
+        asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("apifansly_account_id, fansly_account_id, auto_mode")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        ),
+    )
+    fan = fan_result.data or {}
+    creator = creator_result.data or {}
+    account_id = str(creator.get("apifansly_account_id") or "")
+    platform_id = str(creator.get("fansly_account_id") or "")
+    group_id = str(fan.get("fansly_group_id") or "")
+    if not account_id or not platform_id or not group_id:
+        raise HTTPException(
+            status_code=409,
+            detail="The active chat is missing its API Fansly delivery binding.",
+        )
+
+    async with httpx.AsyncClient() as client:
+        result = await _sync_recent_fan_messages(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            account_id=account_id,
+            creator_platform_id=platform_id,
+            group_id=group_id,
+            creator_auto_mode=bool(creator.get("auto_mode")),
+            client=client,
+        )
+    return {"status": "ok", **result}
+
+
 @app.post(
     "/sync-chats/{creator_id}",
     dependencies=[Depends(require_creator_path_access)],
@@ -1023,13 +1285,16 @@ async def sync_chats(
     db = get_supabase()
     creator_row = await asyncio.to_thread(
         lambda cid=creator_id: db.table("creators")
-        .select("apifansly_account_id, fansly_account_id")
+        .select("apifansly_account_id, fansly_account_id, auto_mode")
         .eq("id", cid)
         .single()
         .execute()
     )
 
-    apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
+    creator = creator_row.data or {}
+    apifansly_id = creator.get("apifansly_account_id")
+    creator_platform_id = str(creator.get("fansly_account_id") or "")
+    creator_auto_mode = bool(creator.get("auto_mode"))
     if not apifansly_id:
         return {"status": "error", "message": "no apifansly account"}
 
@@ -1110,6 +1375,7 @@ async def sync_chats(
 
         synced = 0
         new_chats = 0
+        new_messages = 0
         for chat in all_chats:
             platform_fan_id = str(chat.get("partnerAccountId", ""))
             account_data = account_lookup.get(platform_fan_id, {})
@@ -1143,6 +1409,25 @@ async def sync_chats(
                 lambda fid=fan.id, p=update_payload: db.table("fans").update(p).eq("id", fid).execute()
             )
             synced += 1
+            if incremental and creator_platform_id:
+                try:
+                    recent = await _sync_recent_fan_messages(
+                        creator_id=creator_id,
+                        fan_id=str(fan.id),
+                        account_id=str(apifansly_id),
+                        creator_platform_id=creator_platform_id,
+                        group_id=group_id,
+                        creator_auto_mode=creator_auto_mode,
+                        client=client,
+                    )
+                    new_messages += int(recent.get("imported") or 0)
+                except ApiFanslyAccountAccessError:
+                    raise
+                except Exception as exc:
+                    print(
+                        f"[SYNC MESSAGES ERROR] creator={creator_id} "
+                        f"fan={fan.id} group={group_id}: {exc}"
+                    )
 
         await _stamp_vault_op(creator_id, "last_chat_reconcile_at")
         audience_sync = None
@@ -1170,6 +1455,7 @@ async def sync_chats(
             "mode": "incremental" if incremental else "full",
             "synced": synced,
             "new_chats": new_chats,
+            "new_messages": new_messages,
             "audience": audience_sync,
         }
 
@@ -3215,8 +3501,8 @@ async def fansly_webhook(payload: dict) -> dict:
         return {"status": "skipped"}
 
     interactions = data.get("interactions") or []
-    creator_platform_id = None
-    if interactions:
+    creator_platform_id = str(creator.get("fansly_account_id") or "")
+    if not creator_platform_id and interactions:
         creator_platform_id = str(interactions[0].get("userId", "") or "")
 
     if not creator_platform_id:
@@ -3395,6 +3681,27 @@ async def get_my_creators(request: Request, user_id: str | None = None) -> dict:
     return {"creators": creators.data or []}
 
 
+class CreatorAutoModeRequest(BaseModel):
+    enabled: bool
+
+
+class FanAutoModeRequest(BaseModel):
+    auto_mode: bool | None
+
+
+async def _creator_auto_availability(creator_id: str) -> dict:
+    result = await asyncio.to_thread(
+        lambda: get_supabase().table("vault_sets")
+        .select("id", count="exact")
+        .eq("creator_id", creator_id)
+        .eq("status", "approved")
+        .limit(1)
+        .execute()
+    )
+    count = int(result.count or 0)
+    return {"auto_available": count > 0, "approved_sets": count}
+
+
 @app.get(
     "/creator/{creator_id}/auto-availability",
     dependencies=[Depends(require_creator_path_access)],
@@ -3402,17 +3709,72 @@ async def get_my_creators(request: Request, user_id: str | None = None) -> dict:
 async def auto_availability(creator_id: str) -> dict:
     """Auto-mode is only available when at least one approved set exists.
     Single source of truth for the dashboard's auto gate + a backend guard."""
-    db = get_supabase()
-    r = await asyncio.to_thread(
-        lambda: db.table("vault_sets")
-        .select("id", count="exact")
-        .eq("creator_id", creator_id)
-        .eq("status", "approved")
-        .limit(1)
+    return await _creator_auto_availability(creator_id)
+
+
+@app.put(
+    "/creator/{creator_id}/auto-mode",
+    dependencies=[Depends(require_creator_path_access)],
+)
+async def update_creator_auto_mode(
+    creator_id: str,
+    request: CreatorAutoModeRequest,
+) -> dict:
+    availability = await _creator_auto_availability(creator_id)
+    if request.enabled and not availability["auto_available"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Auto mode is locked until at least one vault set is approved.",
+        )
+    await asyncio.to_thread(
+        lambda: get_supabase().table("creators")
+        .update({"auto_mode": request.enabled})
+        .eq("id", creator_id)
         .execute()
     )
-    count = r.count or 0
-    return {"auto_available": count > 0, "approved_sets": count}
+    return {
+        "status": "ok",
+        "auto_mode": request.enabled,
+        **availability,
+    }
+
+
+@app.put(
+    "/fan/{fan_id}/auto-mode",
+    dependencies=[Depends(require_fan_path_access)],
+)
+async def update_fan_auto_mode(
+    fan_id: str,
+    request: FanAutoModeRequest,
+) -> dict:
+    db = get_supabase()
+    fan_result = await asyncio.to_thread(
+        lambda: db.table("fans")
+        .select("creator_id")
+        .eq("id", fan_id)
+        .single()
+        .execute()
+    )
+    creator_id = str((fan_result.data or {}).get("creator_id") or "")
+    if not creator_id:
+        raise HTTPException(status_code=404, detail="Fan not found.")
+    availability = await _creator_auto_availability(creator_id)
+    if request.auto_mode is True and not availability["auto_available"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Auto mode is locked until at least one vault set is approved.",
+        )
+    await asyncio.to_thread(
+        lambda: db.table("fans")
+        .update({"auto_mode": request.auto_mode})
+        .eq("id", fan_id)
+        .execute()
+    )
+    return {
+        "status": "ok",
+        "auto_mode": request.auto_mode,
+        **availability,
+    }
 
 
 @app.get(
