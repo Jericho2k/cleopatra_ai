@@ -35,6 +35,11 @@ class PPVDeliveryError(RuntimeError):
     pass
 
 
+_PROVISIONAL_LOCK_REASONS = {
+    "account_media_not_visible",
+}
+
+
 async def verify_locked_ppv(
     *,
     account_id: str,
@@ -42,6 +47,7 @@ async def verify_locked_ppv(
     platform_message_id: str,
     media_ids: list[str],
     price_cents: int,
+    allow_provisional: bool = False,
 ) -> dict:
     """Confirm the accepted message became paid ``accountMedia`` upstream."""
     evidence: dict = {"verified": False, "reason": "not_checked"}
@@ -64,11 +70,22 @@ async def verify_locked_ppv(
             f"[PPV LOCK CHECK] message={platform_message_id} attempt={attempt} "
             f"verified={bool(evidence.get('verified'))} "
             f"reason={evidence.get('reason')} "
+            f"attachments={evidence.get('attachment_count')} "
             f"media={evidence.get('actual_media_ids')} "
             f"prices={evidence.get('raw_prices')}"
         )
         if evidence.get("verified"):
             return evidence
+    if (
+        allow_provisional
+        and evidence.get("reason") in _PROVISIONAL_LOCK_REASONS
+        and int(evidence.get("attachment_count") or 0) >= len(media_ids)
+    ):
+        return {
+            **evidence,
+            "provisional": True,
+            "reason": str(evidence.get("reason")),
+        }
     raise PPVDeliveryError(
         "Fansly accepted the media but did not confirm its payment lock "
         f"({evidence.get('reason', 'unknown')})"
@@ -222,12 +239,20 @@ async def send_locked_ppv(
             platform_message_id=platform_message_id,
             media_ids=exact_media_ids,
             price_cents=int(price_cents),
+            allow_provisional=source == "operator",
         )
-        print(
-            f"[PPV LOCK VERIFIED] fan={fan_id} message={platform_message_id} "
-            f"media={lock_evidence.get('actual_media_ids')} "
-            f"price={lock_evidence.get('raw_prices')}"
-        )
+        if lock_evidence.get("provisional"):
+            print(
+                f"[PPV LOCK PROVISIONAL] fan={fan_id} "
+                f"message={platform_message_id} "
+                f"reason={lock_evidence.get('reason')} source={source}"
+            )
+        else:
+            print(
+                f"[PPV LOCK VERIFIED] fan={fan_id} message={platform_message_id} "
+                f"media={lock_evidence.get('actual_media_ids')} "
+                f"price={lock_evidence.get('raw_prices')}"
+            )
     except Exception as exc:
         deleted = False
         delete_error = None
@@ -267,6 +292,19 @@ async def send_locked_ppv(
             reference,
             "delivered_pending",
             platform_message_id=platform_message_id,
+            error=(
+                f"operator_provisional_lock:{lock_evidence.get('reason')}"
+                if lock_evidence.get("provisional")
+                else None
+            ),
+            metadata={
+                "lock_verification": (
+                    "provisional"
+                    if lock_evidence.get("provisional")
+                    else "verified"
+                ),
+                "lock_verification_reason": lock_evidence.get("reason"),
+            },
         )
         policy = await retry_transient_db_operation(
             lambda: get_creator_policy(creator_id),
@@ -287,6 +325,11 @@ async def send_locked_ppv(
             "expires_at": expires_at.isoformat(),
             "verification_attempts": 0,
             "platform_message_id": platform_message_id,
+            "lock_verification": (
+                "provisional"
+                if lock_evidence.get("provisional")
+                else "verified"
+            ),
         }
         media_context = {
             "ppv": {
@@ -299,6 +342,11 @@ async def send_locked_ppv(
                 "step_index": step_index,
                 "payment_reference": reference,
                 "source": source,
+                "lock_verification": (
+                    "provisional"
+                    if lock_evidence.get("provisional")
+                    else "verified"
+                ),
             }
         }
         receipt_id = await save_ppv_message_receipt(
@@ -342,6 +390,11 @@ async def send_locked_ppv(
         "sent_at": sent_at.isoformat(),
         "expires_at": expires_at.isoformat(),
         "source": source,
+        "lock_verification": (
+            "provisional"
+            if lock_evidence.get("provisional")
+            else "verified"
+        ),
     }
 
 

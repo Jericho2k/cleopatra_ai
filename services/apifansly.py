@@ -289,7 +289,12 @@ def ppv_delivery_evidence(
         )
     ]
     if not matched:
-        return {"verified": False, "reason": "account_media_not_visible"}
+        return {
+            "verified": False,
+            "reason": "account_media_not_visible",
+            "attachment_ids": sorted(attachment_ids),
+            "attachment_count": len(attachment_ids),
+        }
 
     expected_ids = {
         str(value).strip()
