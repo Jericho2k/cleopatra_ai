@@ -199,6 +199,21 @@ def sent_message_id(payload: Any) -> str | None:
     return str(value) if value is not None and value != "" else None
 
 
+def sent_attachment_ids(payload: Any) -> list[str]:
+    """Extract the account-media bundle IDs returned by a successful send."""
+    response = response_data(payload)
+    if not isinstance(response, dict):
+        return []
+    result: list[str] = []
+    for attachment in response.get("attachments") or []:
+        if not isinstance(attachment, dict):
+            continue
+        content_id = str(attachment.get("contentId") or "").strip()
+        if content_id and content_id not in result:
+            result.append(content_id)
+    return result
+
+
 def account_media_prices(row: dict[str, Any]) -> list[float]:
     """Return every price Fansly exposes for an account-media item.
 

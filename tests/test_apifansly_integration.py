@@ -18,6 +18,7 @@ from services.apifansly import (
     ppv_delivery_evidence,
     raise_for_response,
     response_cursor,
+    sent_attachment_ids,
     sent_message_id,
     url,
 )
@@ -248,6 +249,24 @@ def test_send_response_id_and_endpoint_cursors_use_documented_nesting():
         response=message_page["data"]["data"]["response"],
     ) == "older-message-cursor"
     assert response_cursor(chat_page) == "next-chat-cursor"
+
+
+def test_send_response_preserves_fansly_attachment_bundle_identity():
+    payload = {
+        "data": {
+            "data": {
+                "response": {
+                    "id": "message-123",
+                    "attachments": [{
+                        "contentType": 1,
+                        "contentId": "account-media-bundle-1",
+                    }],
+                }
+            }
+        }
+    }
+
+    assert sent_attachment_ids(payload) == ["account-media-bundle-1"]
 
 
 def test_delete_message_uses_documented_compensation_endpoint(monkeypatch):
