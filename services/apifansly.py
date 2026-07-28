@@ -6,6 +6,7 @@ across chat sync, vault sync, PPV delivery, and purchase reconciliation.
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable
 from urllib.parse import urlparse
@@ -198,6 +199,51 @@ def sent_message_id(payload: Any) -> str | None:
     return str(value) if value is not None and value != "" else None
 
 
+def account_media_prices(row: dict[str, Any]) -> list[float]:
+    """Return every price Fansly exposes for an account-media item.
+
+    API Fansly responses are not consistent about where the PPV price lives:
+    some put it on ``accountMedia.price`` while others put it in the nested
+    permission flags (occasionally inside JSON-encoded metadata).
+    """
+    prices: list[float] = []
+
+    def collect(value: Any, *, price_key: bool = False) -> None:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and stripped[0:1] in {"{", "["}:
+                try:
+                    collect(json.loads(stripped))
+                    return
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            if price_key:
+                try:
+                    prices.append(float(stripped))
+                except (TypeError, ValueError):
+                    pass
+            return
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if price_key:
+                prices.append(float(value))
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                collect(nested, price_key=str(key).lower() == "price")
+            return
+        if isinstance(value, list):
+            for nested in value:
+                collect(nested)
+
+    collect({"price": row.get("price")})
+    collect(row.get("permissions") or {})
+    unique: list[float] = []
+    for price in prices:
+        if price not in unique:
+            unique.append(price)
+    return unique
+
+
 def ppv_delivery_evidence(
     messages: Iterable[dict[str, Any]],
     account_media: Iterable[dict[str, Any]],
@@ -263,13 +309,25 @@ def ppv_delivery_evidence(
         }
 
     expected_cents = int(expected_price_cents)
-    raw_prices: list[float] = []
-    for row in matched:
-        try:
-            raw_prices.append(float(row.get("price") or 0))
-        except (TypeError, ValueError):
-            raw_prices.append(0)
-    if not raw_prices or any(price <= 0 for price in raw_prices):
+    required_rows = [
+        row
+        for row in matched
+        if str(row.get("mediaId") or row.get("id") or "").strip() in expected_ids
+    ] if expected_ids else matched
+    raw_prices = [
+        price
+        for row in required_rows
+        for price in account_media_prices(row)
+    ]
+    positive_prices_by_media = [
+        [price for price in account_media_prices(row) if price > 0]
+        for row in required_rows
+    ]
+    if (
+        not required_rows
+        or not positive_prices_by_media
+        or any(not prices for prices in positive_prices_by_media)
+    ):
         return {
             "verified": False,
             "reason": "media_is_not_payment_gated",
@@ -282,7 +340,10 @@ def ppv_delivery_evidence(
             or abs((raw_price * 100) - expected_cents) < 0.01
         )
 
-    if any(not _matches_expected(price) for price in raw_prices):
+    if any(
+        not any(_matches_expected(price) for price in prices)
+        for prices in positive_prices_by_media
+    ):
         return {
             "verified": False,
             "reason": "price_mismatch",

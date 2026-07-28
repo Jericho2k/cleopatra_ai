@@ -4,6 +4,7 @@ import inspect
 from pathlib import Path
 
 from main import (
+    _apifansly_account_media_lookup,
     _apifansly_message_row,
     handle_new_fan_message,
     process_incoming_fan_message,
@@ -120,6 +121,27 @@ def test_recent_chat_import_preserves_inbound_media_and_role():
     assert row is not None
     assert row["role"] == "fan"
     assert row["media_context"]["attachments"][0]["url"].endswith("media.jpg")
+
+
+def test_inbound_media_lookup_uses_variants_and_preserves_type_metadata():
+    lookup = _apifansly_account_media_lookup([{
+        "id": "account-media-1",
+        "mediaId": "media-1",
+        "price": 0,
+        "media": {
+            "mimetype": "video/mp4",
+            "filename": "fan-video.mp4",
+            "variants": [{
+                "locations": [{
+                    "location": "https://cdn3.fansly.com/fan/video.mp4"
+                }]
+            }],
+        },
+    }])
+
+    assert lookup["account-media-1"]["url"].endswith("video.mp4")
+    assert lookup["account-media-1"]["mimetype"] == "video/mp4"
+    assert lookup["account-media-1"]["filename"] == "fan-video.mp4"
 
 
 def test_auto_mode_writes_are_backend_gated_by_approved_sets():
