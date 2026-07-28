@@ -17,6 +17,7 @@ from services.apifansly import (
     list_chat_messages,
     ppv_delivery_evidence,
     send_message as send_apifansly_message,
+    sent_attachment_ids,
     sent_message_id,
 )
 from services.ppv_persistence import (
@@ -48,6 +49,7 @@ async def verify_locked_ppv(
     media_ids: list[str],
     price_cents: int,
     allow_provisional: bool = False,
+    expected_attachment_ids: list[str] | None = None,
 ) -> dict:
     """Confirm the accepted message became paid ``accountMedia`` upstream."""
     evidence: dict = {"verified": False, "reason": "not_checked"}
@@ -76,10 +78,21 @@ async def verify_locked_ppv(
         )
         if evidence.get("verified"):
             return evidence
+    expected_attachments = {
+        str(value).strip()
+        for value in (expected_attachment_ids or [])
+        if str(value).strip()
+    }
+    visible_attachments = {
+        str(value).strip()
+        for value in (evidence.get("attachment_ids") or [])
+        if str(value).strip()
+    }
     if (
         allow_provisional
         and evidence.get("reason") in _PROVISIONAL_LOCK_REASONS
-        and int(evidence.get("attachment_count") or 0) >= len(media_ids)
+        and expected_attachments
+        and expected_attachments.issubset(visible_attachments)
     ):
         return {
             **evidence,
@@ -218,6 +231,12 @@ async def send_locked_ppv(
         raise PPVDeliveryError(f"platform rejected PPV delivery: {exc}") from exc
 
     platform_message_id = sent_message_id(response_body)
+    platform_attachment_ids = sent_attachment_ids(response_body)
+    print(
+        f"[PPV PLATFORM ACCEPTED] fan={fan_id} "
+        f"message={platform_message_id} "
+        f"attachment_bundle_ids={platform_attachment_ids}"
+    )
     if not platform_message_id:
         # The platform returned success, so the content may be live. Preserve
         # the active claim to block an unsafe retry until an operator resolves
@@ -240,6 +259,7 @@ async def send_locked_ppv(
             media_ids=exact_media_ids,
             price_cents=int(price_cents),
             allow_provisional=source == "operator",
+            expected_attachment_ids=platform_attachment_ids,
         )
         if lock_evidence.get("provisional"):
             print(

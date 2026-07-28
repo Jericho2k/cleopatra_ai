@@ -87,9 +87,10 @@ def test_operator_can_accept_delayed_account_media_as_provisional(monkeypatch):
         account_id="account",
         group_id="group",
         platform_message_id="message-1",
-        media_ids=["media-1"],
+        media_ids=["media-1", "media-2", "media-3"],
         price_cents=3500,
         allow_provisional=True,
+        expected_attachment_ids=["account-media-delayed"],
     ))
 
     assert result["provisional"] is True
@@ -123,7 +124,7 @@ def test_automated_ppv_still_rejects_delayed_account_media(monkeypatch):
         ))
 
 
-def test_operator_provisional_mode_requires_every_attachment(monkeypatch):
+def test_operator_provisional_mode_requires_returned_bundle_identity(monkeypatch):
     async def page(*_args, **_kwargs):
         return (
             [{
@@ -145,9 +146,10 @@ def test_operator_provisional_mode_requires_every_attachment(monkeypatch):
             account_id="account",
             group_id="group",
             platform_message_id="message-1",
-            media_ids=["media-1", "media-2"],
+            media_ids=["media-1", "media-2", "media-3"],
             price_cents=3500,
             allow_provisional=True,
+            expected_attachment_ids=["different-attachment-bundle"],
         ))
 
 
@@ -180,6 +182,7 @@ def test_operator_provisional_mode_rejects_explicitly_free_media(monkeypatch):
             media_ids=["media-1"],
             price_cents=3500,
             allow_provisional=True,
+            expected_attachment_ids=["account-media-1"],
         ))
 
 
@@ -201,6 +204,7 @@ def test_operator_provisional_mode_requires_the_sent_message(monkeypatch):
             media_ids=["media-1"],
             price_cents=3500,
             allow_provisional=True,
+            expected_attachment_ids=["account-media-1"],
         ))
 
 
