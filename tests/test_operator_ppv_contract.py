@@ -8,7 +8,12 @@ import pytest
 
 from main import read_operator_ppv_options
 from models.commercial import CreatorPolicy
-from services.ppv_delivery import PPVDeliveryError, send_locked_ppv
+from services import ppv_delivery
+from services.ppv_delivery import (
+    PPVDeliveryError,
+    send_locked_ppv,
+    verify_locked_ppv,
+)
 from services.ppv_persistence import persist_ppv_reconciliation
 
 
@@ -59,6 +64,144 @@ def test_delivery_contract_persists_only_after_platform_acceptance():
     assert "FanStatus.PAYMENT_PENDING" in persistence_source
     assert "PPV_RECONCILE" in persistence_source
     assert "ppv_sent_but_reconciliation_not_persisted" in source
+
+
+def test_operator_can_accept_delayed_account_media_as_provisional(monkeypatch):
+    async def page(*_args, **_kwargs):
+        return (
+            [{
+                "id": "message-1",
+                "attachments": [{"contentId": "account-media-delayed"}],
+            }],
+            [],
+            None,
+        )
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(ppv_delivery, "list_chat_messages", page)
+    monkeypatch.setattr(ppv_delivery.asyncio, "sleep", no_sleep)
+
+    result = asyncio.run(verify_locked_ppv(
+        account_id="account",
+        group_id="group",
+        platform_message_id="message-1",
+        media_ids=["media-1"],
+        price_cents=3500,
+        allow_provisional=True,
+    ))
+
+    assert result["provisional"] is True
+    assert result["reason"] == "account_media_not_visible"
+
+
+def test_automated_ppv_still_rejects_delayed_account_media(monkeypatch):
+    async def page(*_args, **_kwargs):
+        return (
+            [{
+                "id": "message-1",
+                "attachments": [{"contentId": "account-media-delayed"}],
+            }],
+            [],
+            None,
+        )
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(ppv_delivery, "list_chat_messages", page)
+    monkeypatch.setattr(ppv_delivery.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(PPVDeliveryError, match="account_media_not_visible"):
+        asyncio.run(verify_locked_ppv(
+            account_id="account",
+            group_id="group",
+            platform_message_id="message-1",
+            media_ids=["media-1"],
+            price_cents=3500,
+        ))
+
+
+def test_operator_provisional_mode_requires_every_attachment(monkeypatch):
+    async def page(*_args, **_kwargs):
+        return (
+            [{
+                "id": "message-1",
+                "attachments": [{"contentId": "only-one-attachment"}],
+            }],
+            [],
+            None,
+        )
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(ppv_delivery, "list_chat_messages", page)
+    monkeypatch.setattr(ppv_delivery.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(PPVDeliveryError, match="account_media_not_visible"):
+        asyncio.run(verify_locked_ppv(
+            account_id="account",
+            group_id="group",
+            platform_message_id="message-1",
+            media_ids=["media-1", "media-2"],
+            price_cents=3500,
+            allow_provisional=True,
+        ))
+
+
+def test_operator_provisional_mode_rejects_explicitly_free_media(monkeypatch):
+    async def page(*_args, **_kwargs):
+        return (
+            [{
+                "id": "message-1",
+                "attachments": [{"contentId": "account-media-1"}],
+            }],
+            [{
+                "id": "account-media-1",
+                "mediaId": "media-1",
+                "price": 0,
+            }],
+            None,
+        )
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(ppv_delivery, "list_chat_messages", page)
+    monkeypatch.setattr(ppv_delivery.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(PPVDeliveryError, match="media_is_not_payment_gated"):
+        asyncio.run(verify_locked_ppv(
+            account_id="account",
+            group_id="group",
+            platform_message_id="message-1",
+            media_ids=["media-1"],
+            price_cents=3500,
+            allow_provisional=True,
+        ))
+
+
+def test_operator_provisional_mode_requires_the_sent_message(monkeypatch):
+    async def page(*_args, **_kwargs):
+        return [], [], None
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(ppv_delivery, "list_chat_messages", page)
+    monkeypatch.setattr(ppv_delivery.asyncio, "sleep", no_sleep)
+
+    with pytest.raises(PPVDeliveryError, match="message_not_visible"):
+        asyncio.run(verify_locked_ppv(
+            account_id="account",
+            group_id="group",
+            platform_message_id="message-1",
+            media_ids=["media-1"],
+            price_cents=3500,
+            allow_provisional=True,
+        ))
 
 
 def test_approval_queue_is_single_pending_request_per_fan():
