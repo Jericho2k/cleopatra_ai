@@ -45,7 +45,7 @@ async def verify_locked_ppv(
 ) -> dict:
     """Confirm the accepted message became paid ``accountMedia`` upstream."""
     evidence: dict = {"verified": False, "reason": "not_checked"}
-    for delay in (0.0, 0.5, 1.5, 3.0):
+    for attempt, delay in enumerate((0.0, 0.5, 1.5, 3.0), start=1):
         if delay:
             await asyncio.sleep(delay)
         messages, account_media, _ = await list_chat_messages(
@@ -59,6 +59,13 @@ async def verify_locked_ppv(
             message_id=platform_message_id,
             expected_media_ids=media_ids,
             expected_price_cents=price_cents,
+        )
+        print(
+            f"[PPV LOCK CHECK] message={platform_message_id} attempt={attempt} "
+            f"verified={bool(evidence.get('verified'))} "
+            f"reason={evidence.get('reason')} "
+            f"media={evidence.get('actual_media_ids')} "
+            f"prices={evidence.get('raw_prices')}"
         )
         if evidence.get("verified"):
             return evidence
@@ -240,11 +247,14 @@ async def send_locked_ppv(
                 + (f"; delete_error={delete_error}" if delete_error else "")
             ),
         )
-        await freeze_fan_for_review(fan_id, "ppv_lock_verification_failed")
+        # A manual/operator send that was conclusively removed is safe to retry
+        # after the verification bug is corrected. It should not disable the
+        # separate AI workflow for the whole conversation.
+        if source != "operator" or not deleted:
+            await freeze_fan_for_review(fan_id, "ppv_lock_verification_failed")
         raise PPVDeliveryError(
             "Fansly accepted the media, but its PPV payment lock could not be "
-            "verified. The unverified message was removed and auto-send was "
-            "frozen for review."
+            "verified. The unverified message was removed."
             if deleted
             else
             "Fansly accepted the media, but its PPV payment lock and cleanup "

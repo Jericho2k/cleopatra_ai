@@ -164,6 +164,61 @@ def test_ppv_delivery_evidence_accepts_documented_dollars_or_cents(
     assert evidence["actual_media_ids"] == ["media-1"]
 
 
+def test_ppv_delivery_evidence_accepts_nested_permission_price():
+    evidence = ppv_delivery_evidence(
+        [{
+            "id": "message-1",
+            "attachments": [{"contentId": "account-media-1"}],
+        }],
+        [{
+            "id": "account-media-1",
+            "mediaId": "media-1",
+            "price": 0,
+            "permissions": {
+                "permissionFlags": [{
+                    "metadata": json.dumps({"1": json.dumps({"price": 3000})})
+                }]
+            },
+        }],
+        message_id="message-1",
+        expected_media_ids=["media-1"],
+        expected_price_cents=3000,
+    )
+
+    assert evidence["verified"] is True
+    assert 3000.0 in evidence["raw_prices"]
+
+
+def test_ppv_delivery_evidence_ignores_free_preview_attachment():
+    evidence = ppv_delivery_evidence(
+        [{
+            "id": "message-1",
+            "attachments": [
+                {"contentId": "preview-account-media"},
+                {"contentId": "paid-account-media"},
+            ],
+        }],
+        [
+            {
+                "id": "preview-account-media",
+                "mediaId": "preview-media",
+                "price": 0,
+            },
+            {
+                "id": "paid-account-media",
+                "mediaId": "media-1",
+                "price": 30,
+            },
+        ],
+        message_id="message-1",
+        expected_media_ids=["media-1"],
+        expected_price_cents=3000,
+    )
+
+    assert evidence["verified"] is True
+    assert evidence["actual_media_ids"] == ["media-1", "preview-media"]
+
+
 def test_media_references_preserve_per_item_preview():
     assert media_references(
         ["media-1"],

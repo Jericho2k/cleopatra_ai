@@ -52,6 +52,7 @@ from services.fan_intelligence import learn_from_fan_message
 from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
+    account_media_prices,
     current_account as apifansly_current_account,
     download_media as apifansly_download_media,
     headers as apifansly_headers,
@@ -1019,37 +1020,51 @@ async def sync_chats_background(creator_id: str) -> None:
 
 
 def _apifansly_account_media_lookup(account_media: list[dict]) -> dict[str, dict]:
+    def first_location(value: object) -> str | None:
+        if isinstance(value, dict):
+            direct = value.get("location")
+            if isinstance(direct, str) and direct.startswith("https://"):
+                return direct
+            for key in ("locations", "variants", "media", "preview"):
+                found = first_location(value.get(key))
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for nested in value:
+                found = first_location(nested)
+                if found:
+                    return found
+        return None
+
     lookup: dict[str, dict] = {}
     for item in account_media:
         if not isinstance(item, dict):
             continue
         media = item.get("media") or {}
-        locations = media.get("locations") or []
-        variants = media.get("variants") or []
-        media_url = (
-            locations[0].get("location")
-            if locations and isinstance(locations[0], dict)
-            else None
-        )
-        if (
-            not media_url
-            and variants
-            and isinstance(variants[0], dict)
-            and variants[0].get("locations")
-        ):
-            media_url = variants[0]["locations"][0].get("location")
-        try:
-            raw_price = float(item.get("price") or 0)
-        except (TypeError, ValueError):
-            raw_price = 0
+        media_url = first_location(media) or first_location(item)
+        prices = account_media_prices(item)
+        positive_prices = [price for price in prices if price > 0]
+        raw_price = positive_prices[0] if positive_prices else (prices[0] if prices else 0)
         info = {
             "url": media_url,
             "price": raw_price,
-            "is_ppv": raw_price > 0,
+            "is_ppv": bool(positive_prices),
             "purchased": bool(
                 item.get("purchased", item.get("isPurchased", False))
             ),
             "access": item.get("access"),
+            "mimetype": (
+                media.get("mimetype")
+                or media.get("mimeType")
+                or item.get("mimetype")
+                or item.get("mimeType")
+            ),
+            "filename": (
+                media.get("filename")
+                or media.get("fileName")
+                or item.get("filename")
+                or item.get("fileName")
+            ),
         }
         for key in (item.get("id"), item.get("mediaId")):
             if key:
@@ -1095,6 +1110,8 @@ def _apifansly_message_row(
             "contentId": content_id,
             "url": info.get("url"),
             "type": attachment.get("contentType", 1),
+            "mimetype": info.get("mimetype"),
+            "filename": info.get("filename"),
             "price": info.get("price"),
             "is_ppv": info.get("is_ppv"),
             "purchased": info.get("purchased"),
@@ -1179,10 +1196,21 @@ async def _sync_recent_fan_messages(
         )
         has_resolved_media = any(item.get("url") for item in attachments)
         already_resolved = any(item.get("url") for item in current_attachments)
+        discovered_attachments = bool(attachments) and not current_attachments
+        discovered_metadata = any(
+            item.get("mimetype") or item.get("filename")
+            for item in attachments
+        ) and not any(
+            item.get("mimetype") or item.get("filename")
+            for item in current_attachments
+        )
         if (
             current.get("role") == "fan"
-            and has_resolved_media
-            and not already_resolved
+            and (
+                discovered_attachments
+                or discovered_metadata
+                or (has_resolved_media and not already_resolved)
+            )
         ):
             media_updates.append({
                 "id": str(current["id"]),
@@ -1214,11 +1242,28 @@ async def _sync_recent_fan_messages(
             creator_auto_mode,
             str(newest_text["fansly_message_id"]),
         )
-    return {
+    result = {
         "imported": len(rows),
         "inbound": len(inbound),
         "media_updated": len(media_updates),
+        "attachments_seen": sum(
+            len((row.get("media_context") or {}).get("attachments") or [])
+            for row in rows
+        ),
+        "attachments_resolved": sum(
+            1
+            for row in rows
+            for item in ((row.get("media_context") or {}).get("attachments") or [])
+            if item.get("url")
+        ),
     }
+    if result["imported"] or result["media_updated"]:
+        print(
+            f"[SYNC FAN MESSAGES] fan={fan_id} imported={result['imported']} "
+            f"inbound={result['inbound']} media_updated={result['media_updated']} "
+            f"attachments={result['attachments_resolved']}/{result['attachments_seen']}"
+        )
+    return result
 
 
 @app.post(
@@ -3576,10 +3621,50 @@ async def fansly_webhook(payload: dict) -> dict:
     mid = str(message_id) if message_id else ""
 
     media_context = (
-        {"attachments": [{"contentId": a.get("contentId")} for a in attachments_raw]}
+        {
+            "attachments": [
+                {
+                    "contentId": a.get("contentId"),
+                    "type": a.get("contentType", 1),
+                }
+                for a in attachments_raw
+                if isinstance(a, dict) and a.get("contentId")
+            ]
+        }
         if attachments_raw
         else None
     )
+    # Webhooks contain attachment IDs but not the signed media locations.
+    # Enrich the new row immediately when possible; active-chat reconciliation
+    # remains the fallback if Fansly has not exposed accountMedia yet.
+    if media_context and api_account_id and group_id:
+        try:
+            recent_messages, account_media, _ = await apifansly_list_chat_messages(
+                api_account_id,
+                str(group_id),
+                limit=10,
+            )
+            source_message = next(
+                (
+                    item for item in recent_messages
+                    if str(item.get("id") or "") == mid
+                ),
+                data,
+            )
+            resolved = _apifansly_message_row(
+                source_message,
+                fan_id=str(fan.id),
+                creator_id=str(creator_id),
+                creator_platform_id=creator_platform_id,
+                media_lookup=_apifansly_account_media_lookup(account_media),
+            )
+            if resolved and resolved.get("media_context"):
+                media_context = resolved["media_context"]
+        except Exception as exc:
+            print(
+                f"[WEBHOOK MEDIA ENRICH] deferred fan={fan.id} "
+                f"message={mid} error={type(exc).__name__}"
+            )
 
     if mid:
         await save_message(
