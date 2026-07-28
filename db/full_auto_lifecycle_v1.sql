@@ -3,7 +3,7 @@
 
 alter table public.creator_commercial_policies
     add column if not exists ppv_recheck_minutes integer not null default 20,
-    add column if not exists ppv_payment_window_hours integer not null default 24,
+    add column if not exists ppv_payment_window_hours integer not null default 2,
     add column if not exists abandoned_ppv_followup_enabled boolean not null default true,
     add column if not exists abandoned_ppv_followup_delay_hours integer not null default 18,
     add column if not exists post_session_followup_enabled boolean not null default true,

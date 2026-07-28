@@ -17,6 +17,23 @@ def test_supervised_auto_is_opt_in():
     assert CreatorPolicy(require_operator_ppv_approval=True).require_operator_ppv_approval is True
 
 
+def test_ppv_payment_hold_defaults_to_two_hours():
+    assert CreatorPolicy().ppv_payment_window_hours == 2
+
+
+def test_manual_ppv_is_not_blocked_by_an_existing_offer():
+    source = inspect.getsource(send_locked_ppv)
+    assert 'if source != "operator" and fan.get("pending_ppv_check")' in source
+    assert 'if source != "operator" and session and step_index is None' in source
+
+    migration = (
+        Path(__file__).resolve().parents[1] / "db" / "operator_ppv_concurrency_v1.sql"
+    ).read_text(encoding="utf-8")
+    assert "drop index if exists public.ppv_deliveries_one_active_per_fan_idx" in migration
+    assert "source <> 'operator'" in migration
+    assert "return 'operator_tracked'" in migration
+
+
 def test_locked_ppv_rejects_empty_media_before_any_delivery():
     with pytest.raises(PPVDeliveryError, match="at least one media"):
         asyncio.run(

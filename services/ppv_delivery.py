@@ -111,7 +111,7 @@ async def send_locked_ppv(
             "this conversation is frozen for review "
             f"({fan.get('review_reason') or 'review_required'})"
         )
-    if fan.get("pending_ppv_check"):
+    if source != "operator" and fan.get("pending_ppv_check"):
         raise PPVDeliveryError("this fan already has a locked PPV awaiting payment")
 
     creator_row = await asyncio.to_thread(
@@ -136,7 +136,7 @@ async def send_locked_ppv(
         raise PPVDeliveryError("no live delivery route for this fan")
 
     session = await get_fan_session(fan_id)
-    if session and step_index is None:
+    if source != "operator" and session and step_index is None:
         raise PPVDeliveryError(
             "this fan already has a planned paid session; resolve that session before sending a manual PPV"
         )
@@ -306,9 +306,14 @@ async def send_locked_ppv(
             session=session,
             platform_message_id=platform_message_id,
         )
+        persisted_state = (
+            "PAYMENT_PENDING"
+            if attached
+            else ("OPERATOR_TRACKED" if source == "operator" else "ALREADY_RESOLVED")
+        )
         print(
             f"[PPV PERSIST] fan={fan_id} reference={reference} "
-            f"state={'PAYMENT_PENDING' if attached else 'ALREADY_RESOLVED'} "
+            f"state={persisted_state} "
             f"reconcile_at={reconcile_at.isoformat()}"
         )
     except Exception as exc:

@@ -3337,6 +3337,7 @@ async def fansly_webhook(payload: dict) -> dict:
         creator_id = str(creator.get("id") or "")
         platform_fan_id = str(data.get("accountId") or "")
         account_media_id = str(data.get("accountMediaId") or "")
+        platform_order_id = str(data.get("orderId") or "")
         price_cents = int(
             ((data.get("orderMetadata") or {}).get("accountMediaPrice"))
             or 0
@@ -3346,7 +3347,7 @@ async def fansly_webhook(payload: dict) -> dict:
 
         fan_result = await asyncio.to_thread(
             lambda: db.table("fans")
-            .select("id, pending_ppv_check")
+            .select("id, pending_ppv_check, sales_log")
             .eq("creator_id", creator_id)
             .eq("platform_fan_id", platform_fan_id)
             .limit(1)
@@ -3361,44 +3362,66 @@ async def fansly_webhook(payload: dict) -> dict:
             return {"status": "fan_not_found"}
 
         fan_row = fans[0]
-        pending = fan_row.get("pending_ppv_check") or {}
-        if not pending:
-            delivery_result = await asyncio.to_thread(
-                lambda: db.table("ppv_deliveries")
-                .select(
-                    "reference, media_ids, price_cents, source, set_id, "
-                    "step_index, platform_message_id, claimed_at, delivered_at"
-                )
-                .eq("creator_id", creator_id)
-                .eq("fan_id", str(fan_row["id"]))
-                .in_("status", ["claimed", "delivered_pending"])
-                .order("claimed_at", desc=True)
-                .limit(1)
-                .execute()
+        if platform_order_id and any(
+            str(entry.get("platform_order_id") or "") == platform_order_id
+            for entry in (fan_row.get("sales_log") or [])
+        ):
+            return {"status": "duplicate"}
+        delivery_result = await asyncio.to_thread(
+            lambda: db.table("ppv_deliveries")
+            .select(
+                "reference, status, media_ids, price_cents, source, set_id, "
+                "step_index, platform_message_id, claimed_at, delivered_at"
             )
-            delivery_rows = delivery_result.data or []
-            if delivery_rows:
-                delivery = delivery_rows[0]
-                delivery_media_ids = normalize_media_ids(
-                    delivery.get("media_ids") or []
+            .eq("creator_id", creator_id)
+            .eq("fan_id", str(fan_row["id"]))
+            .in_("status", ["claimed", "delivered_pending", "abandoned"])
+            .order("claimed_at")
+            .execute()
+        )
+        delivery_rows = delivery_result.data or []
+
+        def _delivery_matches(delivery: dict) -> bool:
+            media_ids = normalize_media_ids(delivery.get("media_ids") or [])
+            if account_media_id and media_ids and account_media_id not in media_ids:
+                return False
+            expected = int(delivery.get("price_cents") or 0)
+            if expected and price_cents:
+                return abs(expected - price_cents) <= max(
+                    100,
+                    int(expected * 0.1),
                 )
-                pending = {
-                    "reference": delivery.get("reference"),
-                    "media_id": (
-                        delivery_media_ids[0] if delivery_media_ids else None
-                    ),
-                    "media_ids": delivery_media_ids,
-                    "price": float(delivery.get("price_cents") or 0) / 100,
-                    "price_cents": int(delivery.get("price_cents") or 0),
-                    "source": delivery.get("source"),
-                    "set_id": delivery.get("set_id"),
-                    "step_index": delivery.get("step_index"),
-                    "platform_message_id": delivery.get("platform_message_id"),
-                    "sent_at": (
-                        delivery.get("delivered_at")
-                        or delivery.get("claimed_at")
-                    ),
-                }
+            return True
+
+        matching_active = [
+            delivery for delivery in delivery_rows if _delivery_matches(delivery)
+            and delivery.get("status") in {"claimed", "delivered_pending"}
+        ]
+        matching_abandoned = [
+            delivery for delivery in delivery_rows if _delivery_matches(delivery)
+            and delivery.get("status") == "abandoned"
+        ]
+        delivery = (
+            matching_active[0]
+            if matching_active
+            else (matching_abandoned[-1] if matching_abandoned else None)
+        )
+        if delivery:
+            delivery_media_ids = normalize_media_ids(delivery.get("media_ids") or [])
+            pending = {
+                "reference": delivery.get("reference"),
+                "media_id": delivery_media_ids[0] if delivery_media_ids else None,
+                "media_ids": delivery_media_ids,
+                "price": float(delivery.get("price_cents") or 0) / 100,
+                "price_cents": int(delivery.get("price_cents") or 0),
+                "source": delivery.get("source"),
+                "set_id": delivery.get("set_id"),
+                "step_index": delivery.get("step_index"),
+                "platform_message_id": delivery.get("platform_message_id"),
+                "sent_at": delivery.get("delivered_at") or delivery.get("claimed_at"),
+            }
+        else:
+            pending = fan_row.get("pending_ppv_check") or {}
         expected_cents = int(
             pending.get("price_cents")
             or round(float(pending.get("price") or 0) * 100)
@@ -3406,17 +3429,11 @@ async def fansly_webhook(payload: dict) -> dict:
         if expected_cents and price_cents:
             delta = abs(expected_cents - price_cents)
             if delta > max(100, int(expected_cents * 0.1)):
-                from db.queries import freeze_fan_for_review
-
-                await freeze_fan_for_review(
-                    str(fan_row["id"]),
-                    "ppv_webhook_price_mismatch",
-                )
                 print(
-                    f"[PPV WEBHOOK] price mismatch fan={fan_row['id']} "
+                    f"[PPV WEBHOOK] unmatched price fan={fan_row['id']} "
                     f"expected={expected_cents} actual={price_cents}"
                 )
-                return {"status": "review_required"}
+                return {"status": "unmatched_ppv_purchase"}
 
         pending_media_ids = normalize_media_ids(
             pending.get("media_ids") or [pending.get("media_id")]
@@ -3426,17 +3443,11 @@ async def fansly_webhook(payload: dict) -> dict:
             and pending_media_ids
             and account_media_id not in pending_media_ids
         ):
-            from db.queries import freeze_fan_for_review
-
-            await freeze_fan_for_review(
-                str(fan_row["id"]),
-                "ppv_webhook_media_mismatch",
-            )
             print(
-                f"[PPV WEBHOOK] media mismatch fan={fan_row['id']} "
+                f"[PPV WEBHOOK] unmatched media fan={fan_row['id']} "
                 f"expected={pending_media_ids} actual={account_media_id}"
             )
-            return {"status": "review_required"}
+            return {"status": "unmatched_ppv_purchase"}
 
         purchase_media_id = str(
             account_media_id
@@ -3452,6 +3463,7 @@ async def fansly_webhook(payload: dict) -> dict:
             purchase_media_id,
             (price_cents / 100.0) if price_cents else None,
             pending_override=pending,
+            platform_order_id=platform_order_id or None,
         )
         print(
             f"[PPV WEBHOOK] confirmed fan={fan_row['id']} "

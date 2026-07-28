@@ -69,8 +69,9 @@ def test_delivery_claim_is_database_atomic():
     migration = (
         Path(__file__).resolve().parents[1] / "db" / "ppv_delivery_ledger_v1.sql"
     ).read_text(encoding="utf-8")
-    assert "ppv_deliveries_one_active_per_fan_idx" in migration
+    assert "ppv_deliveries_one_active_automated_per_fan_idx" in migration
     assert "where status in ('claimed', 'delivered_pending')" in migration
+    assert "source <> 'operator'" in migration
     assert "function public.attach_pending_ppv" in migration
     assert "for update" in migration
     source = inspect.getsource(send_locked_ppv)

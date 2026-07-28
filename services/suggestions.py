@@ -23,6 +23,7 @@ from services.commercial_orchestrator import orchestrate
 from models.commercial import ActionType, FanStatus
 from db.fan_intelligence_queries import get_fan_intelligence_context
 from db.commercial_queries import (
+    cancel_action_by_dedupe_key,
     cancel_actions_for_fan,
     get_creator_policy,
     get_fan_state,
@@ -1421,6 +1422,7 @@ async def record_ppv_purchase(
     amount: float | None = None,
     *,
     pending_override: dict | None = None,
+    platform_order_id: str | None = None,
 ) -> None:
     """Record one confirmed PPV purchase idempotently and advance its session.
 
@@ -1443,8 +1445,17 @@ async def record_ppv_purchase(
     creator_id = row.get("creator_id")
     sales_log = list(row.get("sales_log") or [])
     not_sold = list(row.get("not_sold_log") or [])
-    pending = row.get("pending_ppv_check") or pending_override or {}
+    current_pending = row.get("pending_ppv_check") or {}
+    pending = pending_override or current_pending
     reference = str(pending.get("reference") or "")
+    current_reference = str(current_pending.get("reference") or "")
+    clears_current_pending = bool(
+        current_pending
+        and (
+            (reference and current_reference == reference)
+            or (not reference and not pending_override)
+        )
+    )
     completed_session: dict | None = None
     lifecycle_context: dict = {}
 
@@ -1462,6 +1473,16 @@ async def record_ppv_purchase(
             0,
         )
     amount_dollars = int(round(float(amount or 0)))
+
+    duplicate_platform_order = bool(
+        platform_order_id
+        and any(
+            str(entry.get("platform_order_id") or "") == platform_order_id
+            for entry in sales_log
+        )
+    )
+    if duplicate_platform_order:
+        return
 
     already_recorded = any(
         (
@@ -1481,6 +1502,7 @@ async def record_ppv_purchase(
             "media_id": str(media_id),
             "media_ids": pending.get("media_ids") or [str(media_id)],
             "payment_reference": reference or None,
+            "platform_order_id": platform_order_id or None,
             "amount": amount_dollars,
             "chatter": "Operator" if pending.get("source") == "operator" else "AI",
         })
@@ -1502,19 +1524,29 @@ async def record_ppv_purchase(
             reference,
             "purchased",
             amount_paid_cents=int(round(float(amount or 0) * 100)),
+            metadata=(
+                {"platform_order_id": platform_order_id}
+                if platform_order_id
+                else None
+            ),
         )
-    await asyncio.to_thread(
-        lambda: db.table("fans").update({
+    fan_update = {
             "total_spent": new_spent,
             "spend_tier": _tier(new_spent),
             "sales_log": sales_log,
             "not_sold_log": not_sold,
-            "pending_ppv_check": None,
-        }).eq("id", fan_id).execute()
+    }
+    if clears_current_pending:
+        fan_update["pending_ppv_check"] = None
+    await asyncio.to_thread(
+        lambda: db.table("fans").update(fan_update).eq("id", fan_id).execute()
     )
     await mark_ppv_purchased(fan_id, str(media_id))
-    if creator_id:
-        await cancel_actions_for_fan(fan_id, "PPV_RECONCILE")
+    if creator_id and reference:
+        await cancel_action_by_dedupe_key(
+            f"ppv-reconcile:{fan_id}:{reference}"
+        )
+    if creator_id and clears_current_pending:
         await cancel_actions_for_fan(fan_id, "ABANDONED_PPV_FOLLOWUP")
     if creator_id and not already_recorded:
         try:
@@ -1528,7 +1560,7 @@ async def record_ppv_purchase(
         except Exception as exc:
             print(f"[AFFORDABILITY] purchase record failed fan={fan_id}: {exc}")
 
-    if session and creator_id:
+    if session and creator_id and pending.get("step_index") is not None:
         try:
             policy = await get_creator_policy(creator_id)
             updated, completed = mark_step_purchased(
@@ -1601,7 +1633,7 @@ async def record_ppv_purchase(
             await freeze_fan_for_review(fan_id, "session_purchase_reconcile_failed")
             print(f"[SESSION PURCHASE RECONCILE ERROR] fan={fan_id}: {exc}")
             raise
-    elif creator_id:
+    elif creator_id and clears_current_pending:
         # A one-off operator PPV has no executable paid-session plan. Once the
         # purchase is confirmed, clear the payment hold without inventing a
         # session lifecycle.

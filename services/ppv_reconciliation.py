@@ -192,6 +192,58 @@ async def _persist_pending_check(
     await asyncio.to_thread(_update)
 
 
+async def _load_delivery_pending(
+    creator_id: str,
+    fan_id: str,
+    reference: str,
+    *,
+    payment_window_hours: int,
+) -> dict[str, Any]:
+    """Rebuild one active manual offer without relying on the fan singleton."""
+    def _load() -> dict[str, Any]:
+        rows = (
+            get_supabase().table("ppv_deliveries")
+            .select(
+                "reference, media_ids, price_cents, source, set_id, step_index, "
+                "platform_message_id, claimed_at, delivered_at"
+            )
+            .eq("creator_id", creator_id)
+            .eq("fan_id", fan_id)
+            .eq("reference", reference)
+            .in_("status", ["claimed", "delivered_pending"])
+            .limit(1)
+            .execute()
+        ).data or []
+        return rows[0] if rows else {}
+
+    delivery = await asyncio.to_thread(_load)
+    if not delivery:
+        return {}
+    media_ids = normalize_media_ids(delivery.get("media_ids") or [])
+    sent_at_raw = delivery.get("delivered_at") or delivery.get("claimed_at")
+    if not media_ids or not sent_at_raw:
+        return {}
+    sent_at = datetime.fromisoformat(str(sent_at_raw).replace("Z", "+00:00"))
+    if sent_at.tzinfo is None:
+        sent_at = sent_at.replace(tzinfo=timezone.utc)
+    return {
+        "reference": str(delivery["reference"]),
+        "media_id": media_ids[0],
+        "media_ids": media_ids,
+        "price": float(delivery.get("price_cents") or 0) / 100,
+        "price_cents": int(delivery.get("price_cents") or 0),
+        "source": delivery.get("source") or "operator",
+        "set_id": delivery.get("set_id"),
+        "step_index": delivery.get("step_index"),
+        "platform_message_id": delivery.get("platform_message_id"),
+        "sent_at": sent_at.isoformat(),
+        "expires_at": (
+            sent_at + timedelta(hours=payment_window_hours)
+        ).isoformat(),
+        "verification_attempts": 0,
+    }
+
+
 async def _verification_unavailable(
     *,
     fan_id: str,
@@ -245,10 +297,17 @@ async def _finalize_abandonment(
     pending: dict[str, Any],
     fan_row: dict,
     now: datetime,
+    detached: bool = False,
 ) -> bool:
     reference = pending_reference(pending)
     media_id = str(pending.get("media_id") or "")
     expected_price = float(pending.get("price") or 0)
+
+    if detached and reference:
+        from services.ppv_delivery_ledger import abandon_delivery_if_active
+
+        if not await abandon_delivery_if_active(reference):
+            return False
 
     def _update_fan() -> bool:
         db = get_supabase()
@@ -260,24 +319,29 @@ async def _finalize_abandonment(
             .execute()
         ).data or {}
         current = latest.get("pending_ppv_check") or {}
-        if not current or pending_reference(current) != reference:
+        if not detached and (
+            not current or pending_reference(current) != reference
+        ):
             return False
         not_sold = list(latest.get("not_sold_log") or fan_row.get("not_sold_log") or [])
         if not any(str(entry.get("payment_reference") or "") == reference for entry in not_sold):
             not_sold.append(_abandoned_log_entry(pending, now=now))
-        db.table("fans").update({
-            "not_sold_log": not_sold,
-            "pending_ppv_check": None,
-        }).eq("id", fan_id).execute()
+        update = {"not_sold_log": not_sold}
+        if not detached:
+            update["pending_ppv_check"] = None
+        db.table("fans").update(update).eq("id", fan_id).execute()
         return True
 
     if not await asyncio.to_thread(_update_fan):
         return False
 
-    if reference:
+    if reference and not detached:
         from services.ppv_delivery_ledger import transition_delivery
 
         await transition_delivery(reference, "abandoned")
+
+    if detached:
+        return True
 
     session = await get_fan_session(fan_id)
     if session and session.get("awaiting_purchase_index") is not None:
@@ -374,15 +438,19 @@ async def reconcile_pending_ppv(
     policy = await get_creator_policy(creator_id)
     creator_row, fan_row = await _load_platform_context(creator_id, fan_id)
     pending = fan_row.get("pending_ppv_check") or {}
+    detached = False
+    reference = pending_reference(pending) if pending else ""
+    if expected_reference and reference != expected_reference:
+        pending = await _load_delivery_pending(
+            creator_id,
+            fan_id,
+            expected_reference,
+            payment_window_hours=policy.ppv_payment_window_hours,
+        )
+        detached = bool(pending)
+        reference = pending_reference(pending) if pending else ""
     if not pending:
         return PPVReconcileResult(PPVReconcileDisposition.STALE, "no pending PPV")
-
-    reference = pending_reference(pending)
-    if expected_reference and reference != expected_reference:
-        return PPVReconcileResult(
-            PPVReconcileDisposition.STALE,
-            "pending PPV was superseded",
-        )
 
     expires_at = payment_expires_at(
         pending,
@@ -404,6 +472,21 @@ async def reconcile_pending_ppv(
                 pending=pending,
             )
         except (httpx.HTTPError, RuntimeError) as exc:
+            if detached:
+                if now < expires_at:
+                    return PPVReconcileResult(
+                        PPVReconcileDisposition.PENDING,
+                        f"{type(exc).__name__}; retrying manual PPV reconciliation",
+                        retry_at=next_reconcile_at(
+                            now,
+                            expires_at=expires_at,
+                            recheck_minutes=policy.ppv_recheck_minutes,
+                        ),
+                    )
+                return PPVReconcileResult(
+                    PPVReconcileDisposition.REVIEW_REQUIRED,
+                    "manual PPV verification unavailable at expiry",
+                )
             return await _verification_unavailable(
                 fan_id=fan_id,
                 pending=pending,
@@ -415,7 +498,12 @@ async def reconcile_pending_ppv(
     if amount is not None:
         from services.suggestions import record_ppv_purchase
 
-        await record_ppv_purchase(fan_id, str(pending.get("media_id") or ""), amount)
+        await record_ppv_purchase(
+            fan_id,
+            str(pending.get("media_id") or ""),
+            amount,
+            pending_override=pending,
+        )
         return PPVReconcileResult(PPVReconcileDisposition.PURCHASED, "purchase confirmed")
 
     if now < expires_at:
@@ -428,7 +516,8 @@ async def reconcile_pending_ppv(
             "last_verified_at": now.isoformat(),
             "verification_attempts": int(pending.get("verification_attempts") or 0) + 1,
         })
-        await _persist_pending_check(fan_id, pending)
+        if not detached:
+            await _persist_pending_check(fan_id, pending)
         return PPVReconcileResult(
             PPVReconcileDisposition.PENDING,
             "not purchased yet; payment window remains open",
@@ -445,6 +534,7 @@ async def reconcile_pending_ppv(
         pending=pending,
         fan_row=fan_row,
         now=now,
+        detached=detached,
     )
     if not finalized:
         return PPVReconcileResult(

@@ -137,17 +137,18 @@ async def persist_ppv_reconciliation(
         label=f"pending PPV fan={fan_id}",
         log_prefix="PPV PERSIST RETRY",
     )
-    if not attached:
+    is_operator_delivery = str(pending.get("source") or "") == "operator"
+    if not attached and not is_operator_delivery:
         return session, expires_at, False
 
-    if session is None:
+    if attached and session is None:
         session = await retry_transient_db_operation(
             lambda: get_fan_session(fan_id),
             label=f"PPV session read fan={fan_id}",
             log_prefix="PPV PERSIST RETRY",
         )
     step_index = pending.get("step_index")
-    if session and step_index is not None:
+    if attached and session and step_index is not None:
         session = mark_step_sent(
             session,
             step_index=int(step_index),
@@ -159,17 +160,18 @@ async def persist_ppv_reconciliation(
             log_prefix="PPV PERSIST RETRY",
         )
 
-    state = await retry_transient_db_operation(
-        lambda: get_fan_state(fan_id),
-        label=f"PPV commercial state read fan={fan_id}",
-        log_prefix="PPV PERSIST RETRY",
-    )
-    state.status = FanStatus.PAYMENT_PENDING
-    await retry_transient_db_operation(
-        lambda: save_fan_state(fan_id, creator_id, state),
-        label=f"PPV commercial state write fan={fan_id}",
-        log_prefix="PPV PERSIST RETRY",
-    )
+    if attached:
+        state = await retry_transient_db_operation(
+            lambda: get_fan_state(fan_id),
+            label=f"PPV commercial state read fan={fan_id}",
+            log_prefix="PPV PERSIST RETRY",
+        )
+        state.status = FanStatus.PAYMENT_PENDING
+        await retry_transient_db_operation(
+            lambda: save_fan_state(fan_id, creator_id, state),
+            label=f"PPV commercial state write fan={fan_id}",
+            log_prefix="PPV PERSIST RETRY",
+        )
 
     persisted_expires_at = datetime.fromisoformat(
         str(pending["expires_at"]).replace("Z", "+00:00")
@@ -191,7 +193,7 @@ async def persist_ppv_reconciliation(
         label=f"PPV reconcile action fan={fan_id}",
         log_prefix="PPV PERSIST RETRY",
     )
-    return session, reconcile_at, True
+    return session, reconcile_at, attached
 
 
 def pending_from_message_receipt(
