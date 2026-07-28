@@ -198,6 +198,105 @@ def sent_message_id(payload: Any) -> str | None:
     return str(value) if value is not None and value != "" else None
 
 
+def ppv_delivery_evidence(
+    messages: Iterable[dict[str, Any]],
+    account_media: Iterable[dict[str, Any]],
+    *,
+    message_id: str,
+    expected_media_ids: Iterable[str],
+    expected_price_cents: int,
+) -> dict[str, Any]:
+    """Validate that a sent message is actually locked by Fansly.
+
+    A successful send response only proves that Fansly accepted the message.
+    The documented chat-message read response is the authoritative place where
+    the resulting ``accountMedia`` price and original ``mediaId`` are exposed.
+    Prices have appeared as both dollars and cents across API Fansly responses,
+    so comparison accepts either representation but never accepts zero.
+    """
+    sent = next(
+        (
+            row
+            for row in messages
+            if str(row.get("id") or "") == str(message_id)
+        ),
+        None,
+    )
+    if not sent:
+        return {"verified": False, "reason": "message_not_visible"}
+
+    attachment_ids = {
+        str(attachment.get("contentId") or "")
+        for attachment in (sent.get("attachments") or [])
+        if isinstance(attachment, dict) and attachment.get("contentId")
+    }
+    if not attachment_ids:
+        return {"verified": False, "reason": "message_has_no_media"}
+
+    matched = [
+        row
+        for row in account_media
+        if isinstance(row, dict)
+        and (
+            str(row.get("id") or "") in attachment_ids
+            or str(row.get("mediaId") or "") in attachment_ids
+        )
+    ]
+    if not matched:
+        return {"verified": False, "reason": "account_media_not_visible"}
+
+    expected_ids = {
+        str(value).strip()
+        for value in expected_media_ids
+        if str(value).strip()
+    }
+    actual_ids = {
+        str(row.get("mediaId") or row.get("id") or "").strip()
+        for row in matched
+        if row.get("mediaId") or row.get("id")
+    }
+    if expected_ids and not expected_ids.issubset(actual_ids):
+        return {
+            "verified": False,
+            "reason": "media_mismatch",
+            "actual_media_ids": sorted(actual_ids),
+        }
+
+    expected_cents = int(expected_price_cents)
+    raw_prices: list[float] = []
+    for row in matched:
+        try:
+            raw_prices.append(float(row.get("price") or 0))
+        except (TypeError, ValueError):
+            raw_prices.append(0)
+    if not raw_prices or any(price <= 0 for price in raw_prices):
+        return {
+            "verified": False,
+            "reason": "media_is_not_payment_gated",
+            "raw_prices": raw_prices,
+        }
+
+    def _matches_expected(raw_price: float) -> bool:
+        return (
+            abs(raw_price - expected_cents) < 0.01
+            or abs((raw_price * 100) - expected_cents) < 0.01
+        )
+
+    if any(not _matches_expected(price) for price in raw_prices):
+        return {
+            "verified": False,
+            "reason": "price_mismatch",
+            "raw_prices": raw_prices,
+        }
+
+    return {
+        "verified": True,
+        "reason": "locked_ppv_confirmed",
+        "actual_media_ids": sorted(actual_ids),
+        "raw_prices": raw_prices,
+    }
+
+
 async def request(
     method: str,
     path: str,
@@ -309,6 +408,24 @@ async def send_message(
         timeout=15,
         client=client,
     )
+
+
+async def delete_message(
+    account_id: str,
+    message_id: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> bool:
+    """Delete a sent message through the documented compensation endpoint."""
+    await request(
+        "DELETE",
+        f"{account_id}/messages/{message_id}",
+        operation="message deletion",
+        account_id=account_id,
+        timeout=15,
+        client=client,
+    )
+    return True
 
 
 async def list_chats(

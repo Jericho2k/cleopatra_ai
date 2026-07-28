@@ -165,6 +165,11 @@ def test_superseded_reconciliation_is_a_noop(monkeypatch):
             ({}, {"pending_ppv_check": pending(reference="new-ref")})
         ),
     )
+    monkeypatch.setattr(
+        reconciliation,
+        "_load_delivery_pending",
+        lambda *_args, **_kwargs: async_value({}),
+    )
     result = run(reconciliation.reconcile_pending_ppv(
         creator_id="creator",
         fan_id="fan",
@@ -172,6 +177,58 @@ def test_superseded_reconciliation_is_a_noop(monkeypatch):
         now=NOW,
     ))
     assert result.disposition == PPVReconcileDisposition.STALE
+
+
+def test_reference_specific_manual_offer_reconciles_without_fan_singleton(monkeypatch):
+    manual = pending(
+        reference="manual-ref",
+        source="operator",
+        expires_at="2026-07-18T14:00:00+00:00",
+    )
+    monkeypatch.setattr(
+        reconciliation,
+        "get_creator_policy",
+        lambda _creator_id: async_value(CreatorPolicy(ppv_recheck_minutes=20)),
+    )
+    monkeypatch.setattr(
+        reconciliation,
+        "_load_platform_context",
+        lambda _creator_id, _fan_id: async_value(
+            (
+                {"apifansly_account_id": "account"},
+                {
+                    "platform_fan_id": "fan",
+                    "pending_ppv_check": pending(reference="automated-ref"),
+                },
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        reconciliation,
+        "_load_delivery_pending",
+        lambda *_args, **_kwargs: async_value(manual),
+    )
+    monkeypatch.setattr(
+        reconciliation,
+        "_fetch_purchase_amount",
+        lambda **_kwargs: async_value(None),
+    )
+    monkeypatch.setattr(
+        reconciliation,
+        "_persist_pending_check",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("manual offer must not overwrite the fan singleton")
+        ),
+    )
+
+    result = run(reconciliation.reconcile_pending_ppv(
+        creator_id="creator",
+        fan_id="fan",
+        expected_reference="manual-ref",
+        now=NOW,
+    ))
+    assert result.disposition == PPVReconcileDisposition.PENDING
+    assert result.retry_at == datetime(2026, 7, 18, 12, 20, tzinfo=timezone.utc)
 
 
 def test_local_test_ppv_never_calls_live_earnings_and_expires(monkeypatch):

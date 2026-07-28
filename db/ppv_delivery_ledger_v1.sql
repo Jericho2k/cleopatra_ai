@@ -34,11 +34,12 @@ create table if not exists public.ppv_deliveries (
     check (jsonb_typeof(media_ids) = 'array' and jsonb_array_length(media_ids) > 0)
 );
 
--- This index is the delivery lock. It makes two workers/tabs racing to send a
--- PPV to the same fan mutually exclusive before either reaches the platform.
-create unique index if not exists ppv_deliveries_one_active_per_fan_idx
+-- AI/session delivery remains mutually exclusive. Operators may intentionally
+-- send more than one live offer while an earlier manual offer is unpaid.
+create unique index if not exists ppv_deliveries_one_active_automated_per_fan_idx
     on public.ppv_deliveries (fan_id)
-    where status in ('claimed', 'delivered_pending');
+    where status in ('claimed', 'delivered_pending')
+      and source <> 'operator';
 
 create index if not exists ppv_deliveries_fan_created_idx
     on public.ppv_deliveries (fan_id, claimed_at desc);
@@ -66,9 +67,10 @@ set search_path = public
 as $$
 declare
     v_status text;
+    v_source text;
 begin
-    select status
-      into v_status
+    select status, source
+      into v_status, v_source
       from public.ppv_deliveries
      where fan_id = p_fan_id
        and reference = p_reference
@@ -79,6 +81,9 @@ begin
     end if;
     if v_status <> 'delivered_pending' then
         return v_status;
+    end if;
+    if v_source = 'operator' then
+        return 'operator_tracked';
     end if;
 
     update public.fans

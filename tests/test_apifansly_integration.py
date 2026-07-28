@@ -9,11 +9,13 @@ from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
     DEFAULT_BASE_URL,
+    delete_message,
     download_media,
     headers,
     is_fansly_cdn_url,
     media_references,
     message_payload,
+    ppv_delivery_evidence,
     raise_for_response,
     response_cursor,
     sent_message_id,
@@ -116,6 +118,52 @@ def test_locked_ppv_payload_matches_current_api_contract():
     assert "mediaId" not in payload
 
 
+def test_ppv_delivery_evidence_rejects_silently_free_media():
+    evidence = ppv_delivery_evidence(
+        [{
+            "id": "message-1",
+            "attachments": [{"contentId": "account-media-1"}],
+        }],
+        [{
+            "id": "account-media-1",
+            "mediaId": "media-1",
+            "price": 0,
+        }],
+        message_id="message-1",
+        expected_media_ids=["media-1"],
+        expected_price_cents=2500,
+    )
+
+    assert evidence == {
+        "verified": False,
+        "reason": "media_is_not_payment_gated",
+        "raw_prices": [0.0],
+    }
+
+
+@pytest.mark.parametrize("upstream_price", [25, 2500])
+def test_ppv_delivery_evidence_accepts_documented_dollars_or_cents(
+    upstream_price,
+):
+    evidence = ppv_delivery_evidence(
+        [{
+            "id": "message-1",
+            "attachments": [{"contentId": "account-media-1"}],
+        }],
+        [{
+            "id": "account-media-1",
+            "mediaId": "media-1",
+            "price": upstream_price,
+        }],
+        message_id="message-1",
+        expected_media_ids=["media-1"],
+        expected_price_cents=2500,
+    )
+
+    assert evidence["verified"] is True
+    assert evidence["actual_media_ids"] == ["media-1"]
+
+
 def test_media_references_preserve_per_item_preview():
     assert media_references(
         ["media-1"],
@@ -145,6 +193,35 @@ def test_send_response_id_and_endpoint_cursors_use_documented_nesting():
         response=message_page["data"]["data"]["response"],
     ) == "older-message-cursor"
     assert response_cursor(chat_page) == "next-chat-cursor"
+
+
+def test_delete_message_uses_documented_compensation_endpoint(monkeypatch):
+    monkeypatch.setenv("APIFANSLY_API_KEY", "test-key")
+    captured = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            request=request,
+            json={"data": {"data": {"response": {"success": True}}}},
+        )
+
+    async def run():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await delete_message(
+                "account-1",
+                "message-1",
+                client=client,
+            )
+
+    assert asyncio.run(run()) is True
+    assert captured == {
+        "method": "DELETE",
+        "path": "/api/fansly/account-1/messages/message-1",
+    }
 
 
 def test_protected_media_download_uses_documented_binary_endpoint(monkeypatch):

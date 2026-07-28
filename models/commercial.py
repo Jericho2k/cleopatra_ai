@@ -101,7 +101,7 @@ class CreatorPolicy(BaseModel):
     require_purchase_before_next_step: bool = True
     require_operator_ppv_approval: bool = False
     ppv_recheck_minutes: int = Field(default=20, ge=5, le=1_440)
-    ppv_payment_window_hours: int = Field(default=24, ge=1, le=168)
+    ppv_payment_window_hours: int = Field(default=2, ge=1, le=168)
     abandoned_ppv_followup_enabled: bool = True
     abandoned_ppv_followup_delay_hours: int = Field(default=18, ge=1, le=720)
     pending_offer_expiry_hours: int = Field(default=24, ge=1, le=168)

@@ -138,6 +138,16 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
             .execute()
         ).data or []
 
+    def _approved_set_count() -> int:
+        response = (
+            get_supabase().table("vault_sets")
+            .select("id", count="exact", head=True)
+            .eq("creator_id", creator_id)
+            .eq("status", "approved")
+            .execute()
+        )
+        return int(response.count or 0)
+
     def _creator_message_count() -> int:
         response = (
             get_supabase().table("messages")
@@ -185,6 +195,10 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
     memberships = await _retry_transient_operation(
         lambda: asyncio.to_thread(_memberships), label="fan lists"
     )
+    approved_set_count = await _retry_transient_operation(
+        lambda: asyncio.to_thread(_approved_set_count),
+        label="approved set availability",
+    )
     creator_message_count = await _retry_transient_operation(
         lambda: asyncio.to_thread(_creator_message_count),
         label="creator message count",
@@ -225,7 +239,8 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
         spend_tier=str(fan.get("spend_tier") or "cold"),
         is_new_fan=creator_message_count == 0,
     )
-    effective_auto = eligibility.eligible
+    auto_available = approved_set_count > 0
+    effective_auto = eligibility.eligible and auto_available
     pending = fan.get("pending_ppv_check") or None
 
     return {
@@ -235,7 +250,11 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
         "effective_auto_mode": effective_auto,
         "fan_auto_mode": fan_auto,
         "creator_auto_mode": creator_auto,
-        "auto_mode_reason": eligibility.reason,
+        "auto_mode_reason": (
+            eligibility.reason if auto_available else "no_approved_sets"
+        ),
+        "auto_available": auto_available,
+        "approved_sets": approved_set_count,
         "needs_human_review": bool(fan.get("needs_human_review")),
         "review_reason": fan.get("review_reason"),
         "commercial_state": state.model_dump(mode="json"),

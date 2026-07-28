@@ -3,9 +3,17 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
-from main import handle_new_fan_message, read_operator_ppv_options, save_reply
+from main import (
+    _apifansly_message_row,
+    handle_new_fan_message,
+    process_incoming_fan_message,
+    read_operator_ppv_options,
+    save_reply,
+    update_creator_auto_mode,
+    update_fan_auto_mode,
+)
 from services import suggestions
-from services.ppv_delivery import send_locked_ppv
+from services.ppv_delivery import send_locked_ppv, verify_locked_ppv
 from services.ppv_status import build_media_status_by_id
 
 
@@ -61,8 +69,9 @@ def test_delivery_claim_is_database_atomic():
     migration = (
         Path(__file__).resolve().parents[1] / "db" / "ppv_delivery_ledger_v1.sql"
     ).read_text(encoding="utf-8")
-    assert "ppv_deliveries_one_active_per_fan_idx" in migration
+    assert "ppv_deliveries_one_active_automated_per_fan_idx" in migration
     assert "where status in ('claimed', 'delivered_pending')" in migration
+    assert "source <> 'operator'" in migration
     assert "function public.attach_pending_ppv" in migration
     assert "for update" in migration
     source = inspect.getsource(send_locked_ppv)
@@ -70,6 +79,59 @@ def test_delivery_claim_is_database_atomic():
         "response_body = await send_apifansly_message("
     )
     assert '"delivered_pending"' in source
+
+
+def test_locked_ppv_is_verified_upstream_before_local_payment_state():
+    source = inspect.getsource(send_locked_ppv)
+    assert source.index("lock_evidence = await verify_locked_ppv(") < source.index(
+        "pending = {"
+    )
+    assert "ppv_lock_verification_failed" in source
+    assert "delete_apifansly_message" in source
+    assert '"voided" if deleted else "delivered_pending"' in source
+    assert "ppv_delivery_evidence" in inspect.getsource(verify_locked_ppv)
+
+
+def test_recent_chat_import_preserves_inbound_media_and_role():
+    row = _apifansly_message_row(
+        {
+            "id": "message-1",
+            "senderId": "fan-platform-id",
+            "content": "",
+            "createdAt": 1_700_000_000,
+            "attachments": [
+                {"contentId": "account-media-1", "contentType": 1}
+            ],
+        },
+        fan_id="fan",
+        creator_id="creator",
+        creator_platform_id="creator-platform-id",
+        media_lookup={
+            "account-media-1": {
+                "url": "https://cdn3.fansly.com/fan/media.jpg",
+                "price": 0,
+                "is_ppv": False,
+                "purchased": True,
+                "access": True,
+            }
+        },
+    )
+
+    assert row is not None
+    assert row["role"] == "fan"
+    assert row["media_context"]["attachments"][0]["url"].endswith("media.jpg")
+
+
+def test_auto_mode_writes_are_backend_gated_by_approved_sets():
+    creator_source = inspect.getsource(update_creator_auto_mode)
+    fan_source = inspect.getsource(update_fan_auto_mode)
+    processing_source = inspect.getsource(process_incoming_fan_message)
+    assert "_creator_auto_availability" in creator_source
+    assert "_creator_auto_availability" in fan_source
+    assert "Auto mode is locked until at least one vault set is approved." in (
+        creator_source + fan_source
+    )
+    assert "no_approved_sets" in processing_source
 
 
 def test_poller_persists_before_processing():

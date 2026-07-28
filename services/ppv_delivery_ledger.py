@@ -110,6 +110,27 @@ async def transition_delivery(
     )
 
 
+async def abandon_delivery_if_active(reference: str) -> bool:
+    """Atomically expire an offer unless a purchase won the race."""
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _update() -> bool:
+        result = (
+            get_supabase().table("ppv_deliveries")
+            .update({
+                "status": "abandoned",
+                "abandoned_at": now,
+                "updated_at": now,
+            })
+            .eq("reference", reference)
+            .in_("status", list(ACTIVE_STATUSES))
+            .execute()
+        )
+        return bool(result.data)
+
+    return await asyncio.to_thread(_update)
+
+
 async def list_fan_deliveries(creator_id: str, fan_id: str) -> list[dict[str, Any]]:
     result = await asyncio.to_thread(
         lambda: get_supabase().table("ppv_deliveries")

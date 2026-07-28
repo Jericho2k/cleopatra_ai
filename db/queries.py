@@ -109,6 +109,14 @@ async def create_fan(creator_id: str, platform_fan_id: str, display_name: str) -
             .execute()
         )
         auto_new = bool((creator.data or [{}])[0].get("auto_mode_new_fans", False))
+        approved_sets = (
+            db.table("vault_sets")
+            .select("id", count="exact", head=True)
+            .eq("creator_id", creator_id)
+            .eq("status", "approved")
+            .execute()
+        )
+        auto_available = int(approved_sets.count or 0) > 0
 
         row = {
             "creator_id": creator_id,
@@ -117,7 +125,7 @@ async def create_fan(creator_id: str, platform_fan_id: str, display_name: str) -
         }
         # Only set when the toggle is on, so existing global-fallback behavior
         # is untouched when it's off (auto_mode stays NULL → falls back to creator.auto_mode).
-        if auto_new:
+        if auto_new and auto_available:
             row["auto_mode"] = True
 
         r = db.table("fans").insert(row).execute()

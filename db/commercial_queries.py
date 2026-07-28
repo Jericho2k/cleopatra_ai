@@ -323,6 +323,19 @@ async def cancel_actions_for_fan(
     await asyncio.to_thread(_cancel)
 
 
+async def cancel_action_by_dedupe_key(dedupe_key: str) -> None:
+    def _cancel():
+        (
+            get_supabase().table("scheduled_actions")
+            .update({"status": "CANCELLED"})
+            .eq("dedupe_key", dedupe_key)
+            .in_("status", ["PENDING", "FAILED"])
+            .execute()
+        )
+
+    await asyncio.to_thread(_cancel)
+
+
 async def claim_due_actions(limit: int = 20, stale_minutes: int = 10) -> list[dict]:
     now = datetime.now(timezone.utc)
     stale_before = (now - timedelta(minutes=stale_minutes)).isoformat()

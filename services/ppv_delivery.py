@@ -13,6 +13,9 @@ from db.queries import (
 )
 from services.db_reliability import retry_transient_db_operation
 from services.apifansly import (
+    delete_message as delete_apifansly_message,
+    list_chat_messages,
+    ppv_delivery_evidence,
     send_message as send_apifansly_message,
     sent_message_id,
 )
@@ -30,6 +33,39 @@ from services.vault_operations import normalize_media_ids
 
 class PPVDeliveryError(RuntimeError):
     pass
+
+
+async def verify_locked_ppv(
+    *,
+    account_id: str,
+    group_id: str,
+    platform_message_id: str,
+    media_ids: list[str],
+    price_cents: int,
+) -> dict:
+    """Confirm the accepted message became paid ``accountMedia`` upstream."""
+    evidence: dict = {"verified": False, "reason": "not_checked"}
+    for delay in (0.0, 0.5, 1.5, 3.0):
+        if delay:
+            await asyncio.sleep(delay)
+        messages, account_media, _ = await list_chat_messages(
+            account_id,
+            group_id,
+            limit=10,
+        )
+        evidence = ppv_delivery_evidence(
+            messages,
+            account_media,
+            message_id=platform_message_id,
+            expected_media_ids=media_ids,
+            expected_price_cents=price_cents,
+        )
+        if evidence.get("verified"):
+            return evidence
+    raise PPVDeliveryError(
+        "Fansly accepted the media but did not confirm its payment lock "
+        f"({evidence.get('reason', 'unknown')})"
+    )
 
 
 async def send_locked_ppv(
@@ -59,7 +95,10 @@ async def send_locked_ppv(
     db = get_supabase()
     fan_row = await asyncio.to_thread(
         lambda: db.table("fans")
-        .select("creator_id, fansly_group_id, platform_fan_id, pending_ppv_check")
+        .select(
+            "creator_id, fansly_group_id, platform_fan_id, pending_ppv_check, "
+            "needs_human_review, review_reason"
+        )
         .eq("id", fan_id)
         .single()
         .execute()
@@ -67,7 +106,12 @@ async def send_locked_ppv(
     fan = fan_row.data or {}
     if str(fan.get("creator_id") or "") != str(creator_id):
         raise PPVDeliveryError("fan does not belong to this creator")
-    if fan.get("pending_ppv_check"):
+    if fan.get("needs_human_review"):
+        raise PPVDeliveryError(
+            "this conversation is frozen for review "
+            f"({fan.get('review_reason') or 'review_required'})"
+        )
+    if source != "operator" and fan.get("pending_ppv_check"):
         raise PPVDeliveryError("this fan already has a locked PPV awaiting payment")
 
     creator_row = await asyncio.to_thread(
@@ -92,7 +136,7 @@ async def send_locked_ppv(
         raise PPVDeliveryError("no live delivery route for this fan")
 
     session = await get_fan_session(fan_id)
-    if session and step_index is None:
+    if source != "operator" and session and step_index is None:
         raise PPVDeliveryError(
             "this fan already has a planned paid session; resolve that session before sending a manual PPV"
         )
@@ -132,6 +176,11 @@ async def send_locked_ppv(
         raise PPVDeliveryError(str(exc)) from exc
 
     try:
+        print(
+            f"[PPV PLATFORM SEND] fan={fan_id} group={group_id} "
+            f"media_ids={exact_media_ids} access_type=['ppv'] "
+            f"price_dollars={price_dollars:.2f}"
+        )
         response_body = await send_apifansly_message(
             str(account_id),
             str(group_id),
@@ -158,6 +207,49 @@ async def send_locked_ppv(
         raise PPVDeliveryError(
             "platform accepted PPV but did not return a message ID"
         )
+
+    try:
+        lock_evidence = await verify_locked_ppv(
+            account_id=str(account_id),
+            group_id=str(group_id),
+            platform_message_id=platform_message_id,
+            media_ids=exact_media_ids,
+            price_cents=int(price_cents),
+        )
+        print(
+            f"[PPV LOCK VERIFIED] fan={fan_id} message={platform_message_id} "
+            f"media={lock_evidence.get('actual_media_ids')} "
+            f"price={lock_evidence.get('raw_prices')}"
+        )
+    except Exception as exc:
+        deleted = False
+        delete_error = None
+        try:
+            deleted = await delete_apifansly_message(
+                str(account_id),
+                platform_message_id,
+            )
+        except Exception as compensation_exc:
+            delete_error = str(compensation_exc)
+        await transition_delivery(
+            reference,
+            "voided" if deleted else "delivered_pending",
+            platform_message_id=platform_message_id,
+            error=(
+                f"{exc}; unverified_message_deleted={deleted}"
+                + (f"; delete_error={delete_error}" if delete_error else "")
+            ),
+        )
+        await freeze_fan_for_review(fan_id, "ppv_lock_verification_failed")
+        raise PPVDeliveryError(
+            "Fansly accepted the media, but its PPV payment lock could not be "
+            "verified. The unverified message was removed and auto-send was "
+            "frozen for review."
+            if deleted
+            else
+            "Fansly accepted the media, but its PPV payment lock and cleanup "
+            "could not be verified. Auto-send is frozen for urgent review."
+        ) from exc
 
     sent_at = datetime.now(timezone.utc)
     try:
@@ -214,9 +306,14 @@ async def send_locked_ppv(
             session=session,
             platform_message_id=platform_message_id,
         )
+        persisted_state = (
+            "PAYMENT_PENDING"
+            if attached
+            else ("OPERATOR_TRACKED" if source == "operator" else "ALREADY_RESOLVED")
+        )
         print(
             f"[PPV PERSIST] fan={fan_id} reference={reference} "
-            f"state={'PAYMENT_PENDING' if attached else 'ALREADY_RESOLVED'} "
+            f"state={persisted_state} "
             f"reconcile_at={reconcile_at.isoformat()}"
         )
     except Exception as exc:
