@@ -1237,6 +1237,53 @@ def _apifansly_message_row(
     }
 
 
+def _matching_unbound_creator_message(
+    platform_row: dict,
+    candidates: list[dict],
+    *,
+    used_ids: set[str] | None = None,
+    tolerance_seconds: float = 15.0,
+) -> dict | None:
+    """Match a just-sent local row that is missing its Fansly identity."""
+    if platform_row.get("role") != "creator":
+        return None
+    content = " ".join(str(platform_row.get("content") or "").split())
+    if not content:
+        return None
+    try:
+        platform_time = datetime.fromisoformat(
+            str(platform_row.get("sent_at") or "").replace("Z", "+00:00")
+        )
+    except ValueError:
+        return None
+
+    excluded = used_ids or set()
+    matches: list[tuple[float, dict]] = []
+    for candidate in candidates:
+        candidate_id = str(candidate.get("id") or "")
+        if (
+            not candidate_id
+            or candidate_id in excluded
+            or candidate.get("role") != "creator"
+            or candidate.get("fansly_message_id")
+            or " ".join(str(candidate.get("content") or "").split()) != content
+        ):
+            continue
+        try:
+            candidate_time = datetime.fromisoformat(
+                str(candidate.get("sent_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            continue
+        try:
+            delta = abs((candidate_time - platform_time).total_seconds())
+        except TypeError:
+            continue
+        if delta <= tolerance_seconds:
+            matches.append((delta, candidate))
+    return min(matches, key=lambda match: match[0])[1] if matches else None
+
+
 async def _sync_recent_fan_messages(
     *,
     creator_id: str,
@@ -1273,14 +1320,33 @@ async def _sync_recent_fan_messages(
     if not message_ids:
         return {"imported": 0, "inbound": 0, "media_updated": 0}
 
-    existing = await retry_transient_db_operation(
-        lambda: asyncio.to_thread(
-            lambda: db.table("messages")
-            .select("id, fansly_message_id, role, media_context")
-            .eq("fan_id", fan_id)
-            .in_("fansly_message_id", message_ids)
-            .execute()
-        ),
+    async def _load_existing_message_rows():
+        return await asyncio.gather(
+            asyncio.to_thread(
+                lambda: db.table("messages")
+                .select("id, fansly_message_id, role, media_context")
+                .eq("fan_id", fan_id)
+                .in_("fansly_message_id", message_ids)
+                .execute()
+            ),
+            asyncio.to_thread(
+                lambda: db.table("messages")
+                .select(
+                    "id, fansly_message_id, role, content, sent_at, "
+                    "media_context"
+                )
+                .eq("fan_id", fan_id)
+                .eq("creator_id", creator_id)
+                .eq("role", "creator")
+                .is_("fansly_message_id", "null")
+                .order("sent_at", desc=True)
+                .limit(20)
+                .execute()
+            ),
+        )
+
+    existing, unbound = await retry_transient_db_operation(
+        _load_existing_message_rows,
         label=f"load_recent_messages:{fan_id}",
     )
     existing_by_platform_id = {
@@ -1291,6 +1357,8 @@ async def _sync_recent_fan_messages(
     media_lookup = _apifansly_account_media_lookup(account_media)
     rows = []
     media_updates = []
+    identity_updates = []
+    used_unbound_ids: set[str] = set()
     for message in reversed(messages):
         row = _apifansly_message_row(
             message,
@@ -1304,6 +1372,21 @@ async def _sync_recent_fan_messages(
         platform_message_id = str(message.get("id") or "")
         current = existing_by_platform_id.get(platform_message_id)
         if not current:
+            candidate = _matching_unbound_creator_message(
+                row,
+                unbound.data or [],
+                used_ids=used_unbound_ids,
+            )
+            if candidate:
+                candidate_id = str(candidate["id"])
+                used_unbound_ids.add(candidate_id)
+                identity_updates.append({
+                    "id": candidate_id,
+                    "fansly_message_id": platform_message_id,
+                    "media_context": row.get("media_context"),
+                })
+                existing_by_platform_id[platform_message_id] = candidate
+                continue
             rows.append(row)
             continue
         attachments = (row.get("media_context") or {}).get("attachments") or []
@@ -1337,6 +1420,21 @@ async def _sync_recent_fan_messages(
         await asyncio.to_thread(
             lambda: db.table("messages").insert(rows).execute()
         )
+    for update in identity_updates:
+        payload = {"fansly_message_id": update["fansly_message_id"]}
+        if update.get("media_context"):
+            payload["media_context"] = update["media_context"]
+        await retry_transient_db_operation(
+            lambda item=update, values=payload: asyncio.to_thread(
+                lambda: db.table("messages")
+                .update(values)
+                .eq("id", item["id"])
+                .eq("fan_id", fan_id)
+                .is_("fansly_message_id", "null")
+                .execute()
+            ),
+            label=f"reconcile_message_identity:{update['id']}",
+        )
     for update in media_updates:
         await retry_transient_db_operation(
             lambda item=update: asyncio.to_thread(
@@ -1365,6 +1463,7 @@ async def _sync_recent_fan_messages(
         "imported": len(rows),
         "inbound": len(inbound),
         "media_updated": len(media_updates),
+        "identity_reconciled": len(identity_updates),
         "attachments_seen": sum(
             len((row.get("media_context") or {}).get("attachments") or [])
             for row in rows
@@ -1376,10 +1475,15 @@ async def _sync_recent_fan_messages(
             if item.get("url")
         ),
     }
-    if result["imported"] or result["media_updated"]:
+    if (
+        result["imported"]
+        or result["media_updated"]
+        or result["identity_reconciled"]
+    ):
         print(
             f"[SYNC FAN MESSAGES] fan={fan_id} imported={result['imported']} "
             f"inbound={result['inbound']} media_updated={result['media_updated']} "
+            f"identity_reconciled={result['identity_reconciled']} "
             f"attachments={result['attachments_resolved']}/{result['attachments_seen']}"
         )
     return result
