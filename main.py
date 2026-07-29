@@ -67,6 +67,7 @@ from services.apifansly import (
     response_message as apifansly_response_message,
     url as apifansly_url,
     sent_message_id,
+    usage_snapshot as apifansly_usage_snapshot,
 )
 from services.auto_audience import AutoAudiencePolicy
 from services.fansly_poller import FanslyPoller
@@ -568,6 +569,58 @@ async def vault_autosync_scheduler():
 
 
 _chat_reconcile_denied_bindings: set[tuple[str, str]] = set()
+_chat_reconcile_due_at: dict[str, float] = {}
+_chat_last_message_ids: dict[tuple[str, str], str] = {}
+
+
+def _chat_reconcile_interval_seconds(
+    *,
+    creator_auto_mode: bool,
+    has_auto_fan: bool,
+) -> int:
+    env_name = (
+        "CHAT_RECONCILE_ACTIVE_MINUTES"
+        if creator_auto_mode or has_auto_fan
+        else "CHAT_RECONCILE_IDLE_MINUTES"
+    )
+    default = 10 if env_name.endswith("ACTIVE_MINUTES") else 30
+    try:
+        minutes = int(os.environ.get(env_name, str(default)))
+    except ValueError:
+        minutes = default
+    return min(max(minutes, 5), 120) * 60
+
+
+def _chat_message_sync_needed(
+    creator_id: str,
+    group_id: str,
+    platform_last_message_id: str,
+    *,
+    is_new_chat: bool,
+) -> bool:
+    """Fetch messages only when the chat-list cursor changed.
+
+    The first observation after a process restart intentionally returns true,
+    providing a durable safety reconciliation without a new database column.
+    """
+    if is_new_chat:
+        return True
+    previous = _chat_last_message_ids.get((creator_id, group_id))
+    if previous is None:
+        return True
+    return bool(
+        platform_last_message_id
+        and platform_last_message_id != previous
+    )
+
+
+def _remember_chat_message_id(
+    creator_id: str,
+    group_id: str,
+    message_id: str,
+) -> None:
+    if creator_id and group_id and message_id:
+        _chat_last_message_ids[(creator_id, group_id)] = message_id
 
 
 async def _reconcile_chat_creators_once(
@@ -632,18 +685,60 @@ async def _reconcile_chat_creators_once(
 
 
 async def chat_reconciliation_scheduler():
-    """Incrementally reconcile Fansly chat lists with a durable DB lease."""
+    """Reconcile active creators more often than idle creators."""
     while True:
-        await asyncio.sleep(10 * 60)
         try:
-            db = get_supabase()
-            creators = await asyncio.to_thread(
-                lambda: db.table("creators")
-                .select("id, apifansly_account_id")
-                .not_.is_("apifansly_account_id", "null")
-                .execute()
+            tick_minutes = int(
+                os.environ.get("CHAT_RECONCILE_TICK_MINUTES", "5")
             )
-            await _reconcile_chat_creators_once(creators.data or [])
+        except ValueError:
+            tick_minutes = 5
+        await asyncio.sleep(min(max(tick_minutes, 1), 10) * 60)
+        try:
+            import time
+
+            db = get_supabase()
+            creators_result, auto_fans_result = await asyncio.gather(
+                asyncio.to_thread(
+                    lambda: db.table("creators")
+                    .select("id, apifansly_account_id, auto_mode")
+                    .not_.is_("apifansly_account_id", "null")
+                    .execute()
+                ),
+                asyncio.to_thread(
+                    lambda: db.table("fans")
+                    .select("creator_id")
+                    .eq("auto_mode", True)
+                    .execute()
+                ),
+            )
+            auto_fan_creators = {
+                str(row.get("creator_id") or "")
+                for row in (auto_fans_result.data or [])
+                if row.get("creator_id")
+            }
+            now = time.monotonic()
+            due: list[dict] = []
+            active_creator_ids: set[str] = set()
+            for creator in creators_result.data or []:
+                creator_id = str(creator.get("id") or "")
+                if not creator_id:
+                    continue
+                active_creator_ids.add(creator_id)
+                if now < _chat_reconcile_due_at.get(creator_id, 0):
+                    continue
+                due.append(creator)
+                _chat_reconcile_due_at[creator_id] = now + (
+                    _chat_reconcile_interval_seconds(
+                        creator_auto_mode=bool(creator.get("auto_mode")),
+                        has_auto_fan=creator_id in auto_fan_creators,
+                    )
+                )
+            for creator_id in list(_chat_reconcile_due_at):
+                if creator_id not in active_creator_ids:
+                    _chat_reconcile_due_at.pop(creator_id, None)
+            if due:
+                await _reconcile_chat_creators_once(due)
         except Exception as exc:
             print(f"[CRON CHAT RECONCILE INFRA ERROR] {exc}")
 
@@ -1160,6 +1255,16 @@ async def _sync_recent_fan_messages(
         limit=10,
         client=client,
     )
+    newest = max(
+        messages,
+        key=lambda row: int(row.get("createdAt") or 0),
+        default={},
+    )
+    _remember_chat_message_id(
+        creator_id,
+        group_id,
+        str(newest.get("id") or ""),
+    )
     message_ids = [
         str(message.get("id"))
         for message in messages
@@ -1459,6 +1564,7 @@ async def sync_chats(
                 continue
 
             fan = await get_fan(creator_id, platform_fan_id)
+            is_new_chat = fan is None
             if not fan:
                 fan = await create_fan(creator_id, platform_fan_id, fan_name)
                 new_chats += 1
@@ -1474,7 +1580,16 @@ async def sync_chats(
                 lambda fid=fan.id, p=update_payload: db.table("fans").update(p).eq("id", fid).execute()
             )
             synced += 1
-            if incremental and creator_platform_id:
+            platform_last_message_id = str(
+                chat.get("lastMessageId") or ""
+            )
+            should_sync_messages = _chat_message_sync_needed(
+                creator_id,
+                group_id,
+                platform_last_message_id,
+                is_new_chat=is_new_chat,
+            )
+            if incremental and creator_platform_id and should_sync_messages:
                 try:
                     recent = await _sync_recent_fan_messages(
                         creator_id=creator_id,
@@ -1486,6 +1601,11 @@ async def sync_chats(
                         client=client,
                     )
                     new_messages += int(recent.get("imported") or 0)
+                    _remember_chat_message_id(
+                        creator_id,
+                        group_id,
+                        platform_last_message_id,
+                    )
                 except ApiFanslyAccountAccessError:
                     raise
                 except Exception as exc:
@@ -1523,6 +1643,12 @@ async def sync_chats(
             "new_messages": new_messages,
             "audience": audience_sync,
         }
+
+
+@app.get("/apifansly-usage")
+async def get_apifansly_usage() -> dict:
+    """Expose rolling, secret-free provider usage to dashboard operators."""
+    return apifansly_usage_snapshot()
 
 
 @app.post(

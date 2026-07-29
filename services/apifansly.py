@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import time
+from collections import Counter, deque
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
@@ -15,6 +18,10 @@ import httpx
 
 
 DEFAULT_BASE_URL = "https://v1.apifansly.com/api/fansly"
+_USAGE_WINDOW_SECONDS = 24 * 60 * 60
+_USAGE_EVENTS: deque[dict[str, Any]] = deque(maxlen=50_000)
+_USAGE_LOCK = threading.Lock()
+_USAGE_STARTED_AT = time.time()
 
 
 class ApiFanslyConfigurationError(RuntimeError):
@@ -27,6 +34,73 @@ class ApiFanslyAccountAccessError(RuntimeError):
 
 class ApiFanslyProtocolError(RuntimeError):
     """The upstream response was successful HTTP but not the documented shape."""
+
+
+def _record_usage(
+    response: httpx.Response,
+    *,
+    operation: str,
+    account_id: str | None,
+) -> None:
+    """Record a bounded, secret-free API usage event for diagnostics."""
+    now = time.time()
+    try:
+        request = response.request
+        method = str(request.method or "")
+        path = str(request.url.path or "")
+    except RuntimeError:
+        method = ""
+        path = ""
+    event = {
+        "at": now,
+        "operation": str(operation or "unknown"),
+        "account_id": str(account_id or ""),
+        "method": method,
+        "path": path,
+        "status": int(response.status_code),
+        "response_bytes": len(response.content or b""),
+    }
+    with _USAGE_LOCK:
+        _USAGE_EVENTS.append(event)
+        cutoff = now - _USAGE_WINDOW_SECONDS
+        while _USAGE_EVENTS and _USAGE_EVENTS[0]["at"] < cutoff:
+            _USAGE_EVENTS.popleft()
+        total_24h = len(_USAGE_EVENTS)
+    print(
+        f"[APIFANSLY USAGE] operation={event['operation']} "
+        f"account={event['account_id'] or 'none'} method={event['method']} "
+        f"status={event['status']} bytes={event['response_bytes']} "
+        f"calls_24h={total_24h}"
+    )
+
+
+def usage_snapshot() -> dict[str, Any]:
+    """Return the current process's rolling 24-hour API usage summary."""
+    now = time.time()
+    cutoff = now - _USAGE_WINDOW_SECONDS
+    with _USAGE_LOCK:
+        while _USAGE_EVENTS and _USAGE_EVENTS[0]["at"] < cutoff:
+            _USAGE_EVENTS.popleft()
+        events = list(_USAGE_EVENTS)
+    by_operation = Counter(event["operation"] for event in events)
+    by_account = Counter(
+        event["account_id"] or "unbound"
+        for event in events
+    )
+    by_status = Counter(str(event["status"]) for event in events)
+    return {
+        "window_hours": 24,
+        "process_started_at": _USAGE_STARTED_AT,
+        "calls": len(events),
+        "response_bytes": sum(event["response_bytes"] for event in events),
+        "by_operation": dict(sorted(by_operation.items())),
+        "by_account": dict(sorted(by_account.items())),
+        "by_status": dict(sorted(by_status.items())),
+        "note": (
+            "This counts HTTP calls observed by the current backend process. "
+            "Provider credits may be higher for large payloads."
+        ),
+    }
 
 
 def api_key() -> str:
@@ -95,6 +169,11 @@ def raise_for_response(
     operation: str,
     account_id: str | None = None,
 ) -> None:
+    _record_usage(
+        response,
+        operation=operation,
+        account_id=account_id,
+    )
     if response.is_success:
         return
     message = response_message(response)
