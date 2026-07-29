@@ -244,6 +244,26 @@ async def save_message(
     """
 
     def _save() -> str | None:
+        if fansly_message_id is not None:
+            try:
+                existing = (
+                    get_supabase().table("messages")
+                    .select("id")
+                    .eq("fan_id", fan_id)
+                    .eq("creator_id", creator_id)
+                    .eq("fansly_message_id", fansly_message_id)
+                    .limit(1)
+                    .execute()
+                )
+                if existing.data and existing.data[0].get("id") is not None:
+                    return str(existing.data[0]["id"])
+            except Exception as exc:
+                # Delivery already happened. A failed defensive read must not
+                # turn the response into an apparent send failure.
+                print(
+                    "[MESSAGE DEDUPE READ ERROR] "
+                    f"fan={fan_id} platform_message={fansly_message_id}: {exc}"
+                )
         row = {
             "fan_id": fan_id,
             "creator_id": creator_id,
