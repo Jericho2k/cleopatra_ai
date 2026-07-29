@@ -1,7 +1,9 @@
 import asyncio
 
 import httpx
+import pytest
 
+import main
 from main import _download_visual_candidate, _vault_media_visual_urls
 
 
@@ -68,3 +70,26 @@ def test_classifier_falls_back_to_protected_media_download(monkeypatch):
         ("GET", "/account/media.jpeg"),
         ("POST", "/api/fansly/media/download"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_video_visual_uses_real_keyframe_sheet_before_thumbnail(
+    monkeypatch,
+):
+    async def keyframes(url, *, client):
+        assert url == "https://cdn3.fansly.com/account/video.mp4"
+        return b"\xff\xd8" + (b"x" * 1500), "video_frames_4_direct_cdn"
+
+    monkeypatch.setattr(main, "_video_classifier_image", keyframes)
+    content, source, method = await main._load_vault_visual(
+        {
+            "url": "https://cdn3.fansly.com/account/video.mp4",
+            "thumbnail_url": "https://cdn3.fansly.com/account/poster.jpeg",
+        },
+        is_video=True,
+        client=object(),
+    )
+
+    assert len(content) > 1000
+    assert source == "video_frames"
+    assert method == "video_frames_4_direct_cdn"
