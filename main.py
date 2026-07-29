@@ -49,6 +49,7 @@ from models.schemas import (
     SuggestionResponse,
 )
 from services.fan_intelligence import learn_from_fan_message
+from services.db_reliability import retry_transient_db_operation
 from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
@@ -97,6 +98,12 @@ from services.vault_operations import (
     manual_recategorization_usage,
     normalize_media_ids,
 )
+from services.video_frames import (
+    FrameSettings,
+    build_contact_sheet,
+    extract_frames,
+    ffmpeg_available,
+)
 from services.vault_metadata import (
     VAULT_CLASSIFIER_VERSION,
     build_set_description,
@@ -111,6 +118,7 @@ from services.vault_metadata import (
 
 _processed_messages: set = set()
 _vault_sync_state: dict = {}
+_protected_video_download_gate = asyncio.Semaphore(1)
 
 
 async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id: str) -> str | None:
@@ -1160,12 +1168,15 @@ async def _sync_recent_fan_messages(
     if not message_ids:
         return {"imported": 0, "inbound": 0, "media_updated": 0}
 
-    existing = await asyncio.to_thread(
-        lambda: db.table("messages")
-        .select("id, fansly_message_id, role, media_context")
-        .eq("fan_id", fan_id)
-        .in_("fansly_message_id", message_ids)
-        .execute()
+    existing = await retry_transient_db_operation(
+        lambda: asyncio.to_thread(
+            lambda: db.table("messages")
+            .select("id, fansly_message_id, role, media_context")
+            .eq("fan_id", fan_id)
+            .in_("fansly_message_id", message_ids)
+            .execute()
+        ),
+        label=f"load_recent_messages:{fan_id}",
     )
     existing_by_platform_id = {
         str(row.get("fansly_message_id")): row
@@ -1222,12 +1233,15 @@ async def _sync_recent_fan_messages(
             lambda: db.table("messages").insert(rows).execute()
         )
     for update in media_updates:
-        await asyncio.to_thread(
-            lambda item=update: db.table("messages")
-            .update({"media_context": item["media_context"]})
-            .eq("id", item["id"])
-            .eq("fan_id", fan_id)
-            .execute()
+        await retry_transient_db_operation(
+            lambda item=update: asyncio.to_thread(
+                lambda: db.table("messages")
+                .update({"media_context": item["media_context"]})
+                .eq("id", item["id"])
+                .eq("fan_id", fan_id)
+                .execute()
+            ),
+            label=f"update_message_media:{update['id']}",
         )
     inbound = [row for row in rows if row["role"] == "fan"]
     newest_text = next(
@@ -1275,22 +1289,28 @@ async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
     import httpx
 
     db = get_supabase()
-    fan_result, creator_result = await asyncio.gather(
-        asyncio.to_thread(
-            lambda: db.table("fans")
-            .select("fansly_group_id")
-            .eq("id", fan_id)
-            .eq("creator_id", creator_id)
-            .single()
-            .execute()
-        ),
-        asyncio.to_thread(
-            lambda: db.table("creators")
-            .select("apifansly_account_id, fansly_account_id, auto_mode")
-            .eq("id", creator_id)
-            .single()
-            .execute()
-        ),
+    async def _load_bindings():
+        return await asyncio.gather(
+            asyncio.to_thread(
+                lambda: db.table("fans")
+                .select("fansly_group_id")
+                .eq("id", fan_id)
+                .eq("creator_id", creator_id)
+                .single()
+                .execute()
+            ),
+            asyncio.to_thread(
+                lambda: db.table("creators")
+                .select("apifansly_account_id, fansly_account_id, auto_mode")
+                .eq("id", creator_id)
+                .single()
+                .execute()
+            ),
+        )
+
+    fan_result, creator_result = await retry_transient_db_operation(
+        _load_bindings,
+        label=f"active_chat_bindings:{creator_id}:{fan_id}",
     )
     fan = fan_result.data or {}
     creator = creator_result.data or {}
@@ -2312,7 +2332,94 @@ async def _refresh_vault_item_urls(item: dict) -> dict | None:
     return None
 
 
-async def _load_vault_visual(item: dict, *, is_video: bool) -> tuple[bytes, str, str]:
+def _write_temp_video(content: bytes) -> str:
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(
+        prefix="cleopatra-video-",
+        suffix=".media",
+        delete=False,
+    ) as temporary:
+        temporary.write(content)
+        return temporary.name
+
+
+async def _video_classifier_image(
+    video_url: str,
+    *,
+    client,
+) -> tuple[bytes, str]:
+    """Return a chronological keyframe sheet and a retrieval audit label."""
+    import os
+
+    settings = FrameSettings.from_env()
+    if not settings.enabled:
+        raise VaultVisualAccessError(
+            "Video-frame analysis is disabled in this deployment."
+        )
+    if not ffmpeg_available():
+        raise VaultVisualAccessError(
+            "Video-frame analysis is unavailable because FFmpeg is missing."
+        )
+
+    direct = await extract_frames(video_url, settings=settings)
+    if len(direct.frames) >= 2:
+        sheet, count = await asyncio.to_thread(
+            build_contact_sheet,
+            direct.frames,
+        )
+        if count >= 2 and sheet:
+            return sheet, f"video_frames_{count}_direct_cdn"
+
+    if not is_fansly_cdn_url(video_url):
+        raise VaultVisualAccessError(
+            "The video could not provide at least two readable keyframes."
+        )
+
+    # Protected videos occasionally reject direct ffmpeg range requests. The
+    # documented API Fansly proxy is a bounded fallback, serialized to avoid
+    # loading several large clips into the Railway container at once.
+    async with _protected_video_download_gate:
+        content = await apifansly_download_media(
+            video_url,
+            client=client,
+            timeout=max(settings.timeout_seconds * 2, 60),
+        )
+        temporary_path = await asyncio.to_thread(
+            _write_temp_video,
+            content,
+        )
+        try:
+            protected = await extract_frames(
+                temporary_path,
+                settings=settings,
+            )
+        finally:
+            try:
+                await asyncio.to_thread(os.unlink, temporary_path)
+            except FileNotFoundError:
+                pass
+    if len(protected.frames) < 2:
+        raise VaultVisualAccessError(
+            "The protected video could not provide at least two readable keyframes."
+        )
+    sheet, count = await asyncio.to_thread(
+        build_contact_sheet,
+        protected.frames,
+    )
+    if count < 2 or not sheet:
+        raise VaultVisualAccessError(
+            "The extracted video frames were blank or unreadable."
+        )
+    return sheet, f"video_frames_{count}_apifansly_download"
+
+
+async def _load_vault_visual(
+    item: dict,
+    *,
+    is_video: bool,
+    client=None,
+) -> tuple[bytes, str, str]:
     """Return image bytes, evidence source, and retrieval method."""
     import httpx
 
@@ -2322,8 +2429,48 @@ async def _load_vault_visual(item: dict, *, is_video: bool) -> tuple[bytes, str,
     )
     first_error: Exception | None = None
 
-    if visual_url:
-        async with httpx.AsyncClient(follow_redirects=True) as client:
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(follow_redirects=True)
+    try:
+        if is_video:
+            video_errors: list[Exception] = []
+            video_url = str(item.get("url") or "")
+            if video_url:
+                try:
+                    content, method = await _video_classifier_image(
+                        video_url,
+                        client=client,
+                    )
+                    return content, "video_frames", method
+                except Exception as exc:
+                    video_errors.append(exc)
+
+            try:
+                refreshed_video = await _refresh_vault_item_urls(item)
+            except Exception as exc:
+                refreshed_video = None
+                video_errors.append(exc)
+            refreshed_url = str((refreshed_video or {}).get("url") or "")
+            if refreshed_url and refreshed_url != video_url:
+                try:
+                    content, method = await _video_classifier_image(
+                        refreshed_url,
+                        client=client,
+                    )
+                    return content, "video_frames", method + "_after_refresh"
+                except Exception as exc:
+                    video_errors.append(exc)
+
+            detail = str(video_errors[-1]) if video_errors else (
+                "Fansly did not provide the original video URL."
+            )
+            raise VaultVisualAccessError(
+                "This video was left unclassified because multiple real "
+                f"keyframes could not be extracted. {detail}"
+            ) from (video_errors[-1] if video_errors else None)
+
+        if visual_url:
             try:
                 content, method = await _download_visual_candidate(
                     visual_url,
@@ -2333,44 +2480,60 @@ async def _load_vault_visual(item: dict, *, is_video: bool) -> tuple[bytes, str,
             except Exception as exc:
                 first_error = exc
 
-    try:
-        refreshed = await _refresh_vault_item_urls(item)
-    except Exception as exc:
-        refreshed = None
-        refresh_error = exc
-    else:
-        refresh_error = None
+        try:
+            refreshed = await _refresh_vault_item_urls(item)
+        except Exception as exc:
+            refreshed = None
+            refresh_error = exc
+        else:
+            refresh_error = None
 
-    if refreshed:
-        refreshed_url = str(
-            (
-                refreshed.get("thumbnail_url")
-                if is_video
-                else refreshed.get("url")
+        if refreshed:
+            refreshed_url = str(
+                (
+                    refreshed.get("thumbnail_url")
+                    if is_video
+                    else refreshed.get("url")
+                )
+                or ""
             )
-            or ""
-        )
-        if refreshed_url:
-            async with httpx.AsyncClient(follow_redirects=True) as client:
+            if refreshed_url:
                 content, method = await _download_visual_candidate(
                     refreshed_url,
                     client=client,
                 )
                 return content, source, method + "_after_refresh"
 
-    if is_video and not visual_url:
-        reason = (
-            "Fansly did not provide an image thumbnail for this video. "
-            "The item was left unclassified rather than guessed from its filename."
-        )
-    else:
-        reason = (
-            "The protected media link is unavailable or expired. "
-            "Reconnect the creator's API Fansly account or sync the vault to "
-            "refresh signed media links, then retry."
-        )
-    cause = refresh_error or first_error
-    raise VaultVisualAccessError(reason) from cause
+        if is_video and not visual_url:
+            reason = (
+                "Fansly did not provide an image thumbnail for this video. "
+                "The item was left unclassified rather than guessed from its filename."
+            )
+        else:
+            reason = (
+                "The protected media link is unavailable or expired. "
+                "Reconnect the creator's API Fansly account or sync the vault to "
+                "refresh signed media links, then retry."
+            )
+        cause = refresh_error or first_error
+        raise VaultVisualAccessError(reason) from cause
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
+def _prepare_classifier_image(visual_bytes: bytes) -> bytes:
+    """Normalize a source image without blocking the async classification loop."""
+    import io
+    from PIL import Image, ImageOps
+
+    image = Image.open(io.BytesIO(visual_bytes))
+    image.seek(0)
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    image.thumbnail((896, 896), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=84, optimize=True)
+    return buffer.getvalue()
 
 
 async def _categorize_single_item(
@@ -2378,6 +2541,7 @@ async def _categorize_single_item(
     *,
     allow_core_qwen_fallback: bool = True,
     force_qwen: bool = False,
+    visual_client=None,
 ) -> dict:
     """Classify one vault item into the versioned provider-neutral contract.
 
@@ -2386,29 +2550,30 @@ async def _categorize_single_item(
     provider/fetch/parse failure is raised so the retry loop can leave the item
     stale instead of permanently saving an empty ``other`` classification.
     """
-    import io
-    from PIL import Image, ImageOps
-
-    mimetype = str(item.get("mimetype") or "")
+    mimetype = str(item.get("mimetype") or "").lower()
     item_id = item.get("id", "")
     is_video = mimetype.startswith("video") if mimetype else False
 
     try:
-        visual_bytes, source, fetch_method = await _load_vault_visual(
-            item,
-            is_video=is_video,
-        )
+        if visual_client is None:
+            visual_bytes, source, fetch_method = await _load_vault_visual(
+                item,
+                is_video=is_video,
+            )
+        else:
+            visual_bytes, source, fetch_method = await _load_vault_visual(
+                item,
+                is_video=is_video,
+                client=visual_client,
+            )
 
         # Classification does not need original-resolution media.  Normalizing
         # every asset to a compact JPEG makes cost predictable and also handles
         # thumbnails whose declared MIME type is missing or inaccurate.
-        image = Image.open(io.BytesIO(visual_bytes))
-        image.seek(0)
-        image = ImageOps.exif_transpose(image).convert("RGB")
-        image.thumbnail((896, 896), Image.Resampling.LANCZOS)
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=84, optimize=True)
-        classifier_image = buffer.getvalue()
+        classifier_image = await asyncio.to_thread(
+            _prepare_classifier_image,
+            visual_bytes,
+        )
         shoot_fingerprint = await build_shoot_fingerprint(classifier_image)
         local_visual = shoot_fingerprint.get("local") or {}
         data = await classify_vault_image(
@@ -2639,6 +2804,38 @@ async def _stale_approved_set_media_ids(creator_id: str) -> list[str]:
     return normalize_media_ids(result)
 
 
+async def _video_frame_upgrade_media_ids(creator_id: str) -> list[str]:
+    """Return video rows that have never been classified from real frames."""
+    db = get_supabase()
+    result: list[str] = []
+    page_size = 1000
+    offset = 0
+    while True:
+        rows = await asyncio.to_thread(
+            lambda start=offset: db.table("creator_vault_media")
+            .select("id")
+            .eq("creator_id", creator_id)
+            .ilike("mimetype", "video/%")
+            .or_(
+                f"classification_version.lt.{VAULT_CLASSIFIER_VERSION},"
+                "classification_source.is.null,"
+                "classification_source.neq.video_frames"
+            )
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        batch = rows.data or []
+        result.extend(
+            str(row["id"])
+            for row in batch
+            if row.get("id")
+        )
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return normalize_media_ids(result)
+
+
 _categorize_state: dict = {}
 
 
@@ -2657,8 +2854,8 @@ async def categorize_vault(
 
     ``force`` remains accepted for compatibility with older dashboard builds,
     but it cannot unlock a completed initial-vault run or reprocess categorized
-    media.  A classifier-version upgrade is a separate, confirmed operation and
-    can only select rows older than the current metadata contract.
+    media. A confirmed upgrade can target older metadata, approved-set media,
+    or videos that have not yet been inspected through real keyframes.
     """
     del force
     if _categorize_state.get(creator_id, {}).get("status") == "running":
@@ -2690,13 +2887,16 @@ async def categorize_vault(
     upgrade_item_ids: list[str] | None = None
     if resolved_mode == "upgrade":
         upgrade_scope = upgrade_scope.strip().lower()
-        if upgrade_scope not in {"approved", "all"}:
+        if upgrade_scope not in {"approved", "all", "videos"}:
             raise HTTPException(
                 status_code=400,
-                detail="upgrade_scope must be 'approved' or 'all'",
+                detail="upgrade_scope must be 'approved', 'videos', or 'all'",
             )
         if upgrade_scope == "approved":
             upgrade_item_ids = await _stale_approved_set_media_ids(creator_id)
+            pending = len(upgrade_item_ids)
+        elif upgrade_scope == "videos":
+            upgrade_item_ids = await _video_frame_upgrade_media_ids(creator_id)
             pending = len(upgrade_item_ids)
         else:
             pending = await _count_stale_classifications(creator_id)
@@ -2825,6 +3025,9 @@ async def vault_categorization_overview(creator_id: str) -> dict:
         "uncategorized": await _count_uncategorized(creator_id),
         "stale_classifications": await _count_stale_classifications(creator_id),
         "stale_approved_classifications": len(stale_approved),
+        "video_frame_upgrades": len(
+            await _video_frame_upgrade_media_ids(creator_id)
+        ),
         "classifier_version": VAULT_CLASSIFIER_VERSION,
         "manual_reanalysis": await _manual_recategorization_usage(creator_id),
         "active_run": _categorize_state.get(
@@ -2931,7 +3134,6 @@ async def _run_vault_categorization(
                         .select(select_fields)
                         .eq("creator_id", creator_id)
                         .in_("id", ids)
-                        .lt("classification_version", VAULT_CLASSIFIER_VERSION)
                         .execute()
                     )
                 else:
@@ -2979,6 +3181,12 @@ async def _run_vault_categorization(
         mode = "new" if target_ids else ("upgrade" if upgrade_legacy else "initial")
         print(f"[CATEGORIZE] creator={creator_id} mode={mode} items={total}")
 
+        import time
+        import httpx
+
+        started_monotonic = time.monotonic()
+        started_at = datetime.now(timezone.utc).isoformat()
+        _categorize_state[creator_id]["started_at"] = started_at
         done = 0
         errors = 0
         provider_failures = 0
@@ -3007,73 +3215,93 @@ async def _run_vault_categorization(
             f"concurrency={batch_size} semantic={semantic_enabled} "
             f"core_qwen_fallback={allow_core_qwen_fallback}"
         )
-        for i in range(0, total, batch_size):
-            batch = all_items[i:i + batch_size]
-            results = await asyncio.gather(
-                *[
-                    _categorize_single_item_with_retry(
-                        item,
-                        allow_core_qwen_fallback=allow_core_qwen_fallback,
+        limits = httpx.Limits(
+            max_connections=max(batch_size * 2, 16),
+            max_keepalive_connections=max(batch_size, 8),
+        )
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            limits=limits,
+        ) as visual_client:
+            for i in range(0, total, batch_size):
+                batch = all_items[i:i + batch_size]
+                results = await asyncio.gather(
+                    *[
+                        _categorize_single_item_with_retry(
+                            item,
+                            allow_core_qwen_fallback=allow_core_qwen_fallback,
+                            visual_client=visual_client,
+                        )
+                        for item in batch
+                    ],
+                    return_exceptions=True,
+                )
+                fatal_error = ""
+                for result in results:
+                    if isinstance(result, Exception):
+                        errors += 1
+                        if isinstance(result, VaultClassifierError):
+                            provider_failures += 1
+                            if provider_failures >= 3:
+                                fatal_error = (
+                                    "Vault categorization stopped after three provider "
+                                    f"failures: {result}"
+                                )
+                        continue
+                    provider_details = (
+                        (result.get("classification_metadata") or {})
+                        .get("provider_details") or {}
                     )
-                    for item in batch
-                ],
-                return_exceptions=True,
-            )
-            fatal_error = ""
-            for result in results:
-                if isinstance(result, Exception):
-                    errors += 1
-                    if isinstance(result, VaultClassifierError):
-                        provider_failures += 1
-                        if provider_failures >= 3:
-                            fatal_error = (
-                                "Vault categorization stopped after three provider "
-                                f"failures: {result}"
-                            )
-                    continue
-                provider_details = (
-                    (result.get("classification_metadata") or {})
-                    .get("provider_details") or {}
-                )
-                if provider_details.get("qwen_status") == "ready":
-                    qwen_fallbacks += 1
-                if provider_details.get("semantic_status") == "fallback":
-                    semantic_failures += 1
-                await asyncio.to_thread(
-                    lambda r=result: db.table("creator_vault_media")
-                    .update(_classification_update_payload(r))
-                    .eq("id", r["id"])
-                    .execute()
-                )
-                done += 1
-            if fatal_error:
+                    if provider_details.get("qwen_status") == "ready":
+                        qwen_fallbacks += 1
+                    if provider_details.get("semantic_status") == "fallback":
+                        semantic_failures += 1
+                    await retry_transient_db_operation(
+                        lambda r=result: asyncio.to_thread(
+                            lambda: db.table("creator_vault_media")
+                            .update(_classification_update_payload(r))
+                            .eq("id", r["id"])
+                            .execute()
+                        ),
+                        label=f"save_vault_classification:{result['id']}",
+                    )
+                    done += 1
+                if fatal_error:
+                    _categorize_state[creator_id].update({
+                        "status": "error",
+                        "done": done,
+                        "errors": errors,
+                        "error": fatal_error,
+                        "aborted_remaining": max(total - done - errors, 0),
+                    })
+                    print(
+                        f"[CATEGORIZE ABORTED] creator={creator_id} "
+                        f"done={done}/{total} errors={errors} reason={fatal_error}"
+                    )
+                    return
+                elapsed = max(time.monotonic() - started_monotonic, 0.001)
+                rate = done / elapsed
+                remaining = max(total - done - errors, 0)
+                eta = round(remaining / rate) if rate > 0 else None
                 _categorize_state[creator_id].update({
-                    "status": "error",
                     "done": done,
                     "errors": errors,
-                    "error": fatal_error,
-                    "aborted_remaining": max(total - done - errors, 0),
+                    "qwen_fallbacks": qwen_fallbacks,
+                    "semantic_failures": semantic_failures,
+                    "elapsed_seconds": round(elapsed),
+                    "items_per_minute": round(rate * 60, 1),
+                    "estimated_seconds_remaining": eta,
                 })
                 print(
-                    f"[CATEGORIZE ABORTED] creator={creator_id} "
-                    f"done={done}/{total} errors={errors} reason={fatal_error}"
+                    f"[CATEGORIZE] done={done}/{total} errors={errors} "
+                    f"rate={rate * 60:.1f}/min eta_s={eta} "
+                    f"qwen_fallbacks={qwen_fallbacks} "
+                    f"semantic_failures={semantic_failures}"
                 )
-                return
-            _categorize_state[creator_id].update({
-                "done": done,
-                "errors": errors,
-                "qwen_fallbacks": qwen_fallbacks,
-                "semantic_failures": semantic_failures,
-            })
-            print(
-                f"[CATEGORIZE] done={done}/{total} errors={errors} "
-                f"qwen_fallbacks={qwen_fallbacks} "
-                f"semantic_failures={semantic_failures}"
-            )
-            # The self-hosted semantic service scales independently. Preserve
-            # the old provider throttle only for legacy configurations.
-            if not semantic_enabled:
-                await asyncio.sleep(1.5)
+                # The self-hosted semantic service scales independently. Preserve
+                # the old provider throttle only for legacy configurations.
+                if not semantic_enabled:
+                    await asyncio.sleep(1.5)
 
         if mark_initial and errors == 0:
             await _stamp_vault_op(creator_id, "vault_initial_categorized_at")
@@ -3089,7 +3317,15 @@ async def _run_vault_categorization(
             "initial_locked": bool(mark_initial and errors == 0),
             "sets_refreshed": refreshed_sets,
         })
-        print(f"[CATEGORIZE] complete done={done} errors={errors}")
+        elapsed = max(time.monotonic() - started_monotonic, 0.001)
+        _categorize_state[creator_id].update({
+            "elapsed_seconds": round(elapsed),
+            "estimated_seconds_remaining": 0,
+        })
+        print(
+            f"[CATEGORIZE] complete done={done} errors={errors} "
+            f"elapsed_s={elapsed:.1f} rate={done / elapsed * 60:.1f}/min"
+        )
 
     except Exception as e:
         import traceback
@@ -3116,7 +3352,8 @@ async def _refresh_vault_set_descriptions(creator_id: str) -> int:
     media_by_id: dict[str, dict] = {}
     fields = (
         "fansly_media_id, content_category, ai_description, explicitness_level, "
-        "scene_location, scene_outfit, scene_lighting, mimetype, tags"
+        "scene_location, scene_outfit, scene_lighting, mimetype, tags, "
+        "classification_metadata"
     )
     for start in range(0, len(external_ids), 250):
         chunk = external_ids[start:start + 250]
@@ -3161,6 +3398,7 @@ async def _categorize_single_item_with_retry(
     max_retries: int = 3,
     *,
     allow_core_qwen_fallback: bool = True,
+    visual_client=None,
 ) -> dict:
     """Wrap _categorize_single_item with exponential backoff on 429."""
     for attempt in range(max_retries):
@@ -3168,6 +3406,7 @@ async def _categorize_single_item_with_retry(
             return await _categorize_single_item(
                 item,
                 allow_core_qwen_fallback=allow_core_qwen_fallback,
+                visual_client=visual_client,
             )
         except Exception as e:
             message = str(e).lower()
@@ -3182,6 +3421,7 @@ async def _categorize_single_item_with_retry(
     return await _categorize_single_item(
         item,
         allow_core_qwen_fallback=allow_core_qwen_fallback,
+        visual_client=visual_client,
     )
 
 
@@ -4745,6 +4985,91 @@ async def generate_sets(creator_id: str) -> dict:
         inserted += len(chunk)
 
     return {"status": "ok", "drafts_created": inserted, "from_items": len(items)}
+
+
+@app.post(
+    "/creator/{creator_id}/vault-sets/{set_id}/generate-description",
+    dependencies=[Depends(require_creator_path_access)],
+)
+async def generate_vault_set_description(
+    creator_id: str,
+    set_id: str,
+) -> dict:
+    """Build and save a manual set description from its classified media."""
+    db = get_supabase()
+    set_result = await retry_transient_db_operation(
+        lambda: asyncio.to_thread(
+            lambda: db.table("vault_sets")
+            .select("id, media_ids")
+            .eq("id", set_id)
+            .eq("creator_id", creator_id)
+            .limit(1)
+            .execute()
+        ),
+        label=f"load_vault_set:{set_id}",
+    )
+    set_rows = set_result.data or []
+    if not set_rows:
+        raise HTTPException(status_code=404, detail="Vault set not found.")
+    vault_set = set_rows[0]
+    media_ids = normalize_media_ids(vault_set.get("media_ids") or [])
+    if not media_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="Add media to this set before generating its description.",
+        )
+
+    items: list[dict] = []
+    fields = (
+        "fansly_media_id, content_category, ai_description, explicitness_level, "
+        "scene_location, scene_outfit, scene_lighting, mimetype, tags, "
+        "classification_metadata"
+    )
+    for start in range(0, len(media_ids), 250):
+        chunk = media_ids[start:start + 250]
+        result = await retry_transient_db_operation(
+            lambda ids=chunk: asyncio.to_thread(
+                lambda: db.table("creator_vault_media")
+                .select(fields)
+                .eq("creator_id", creator_id)
+                .in_("fansly_media_id", ids)
+                .execute()
+            ),
+            label=f"load_vault_set_media:{set_id}:{start}",
+        )
+        items.extend(result.data or [])
+    if not items:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected media could not be found in this creator's vault.",
+        )
+
+    description = build_set_description(items)
+    if not description:
+        raise HTTPException(
+            status_code=409,
+            detail="The selected media needs AI categorization first.",
+        )
+    await retry_transient_db_operation(
+        lambda: asyncio.to_thread(
+            lambda: db.table("vault_sets")
+            .update({
+                "description": description,
+                "metadata_version": VAULT_CLASSIFIER_VERSION,
+            })
+            .eq("id", set_id)
+            .eq("creator_id", creator_id)
+            .execute()
+        ),
+        label=f"save_vault_set_description:{set_id}",
+    )
+    return {
+        "status": "ok",
+        "set_id": set_id,
+        "description": description,
+        "metadata_version": VAULT_CLASSIFIER_VERSION,
+        "media_count": len(items),
+    }
 
 
 @app.get(

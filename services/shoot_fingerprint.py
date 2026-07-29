@@ -5,6 +5,7 @@ keeps a weak visual bridge from merging two otherwise distinct shoots.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -202,7 +203,13 @@ async def build_shoot_fingerprint(image_bytes: bytes) -> dict[str, Any]:
         "version": SHOOT_FINGERPRINT_VERSION,
         "status": "local_only",
         "provider": "pillow_local",
-        "local": build_local_visual_fingerprint(image_bytes),
+        # Pillow's resize, quantization, and histogram work is CPU-bound. Keep
+        # it off the event loop so one image cannot stall every other download
+        # and semantic-classifier request in the current batch.
+        "local": await asyncio.to_thread(
+            build_local_visual_fingerprint,
+            image_bytes,
+        ),
     }
 
 

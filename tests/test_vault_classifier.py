@@ -750,7 +750,7 @@ async def test_main_uses_local_classifier_without_anthropic(monkeypatch):
 
     assert result["classification_model"] == "nudenet-3.4.2"
     assert result["classification_metadata"]["classifier_provider"] == "local_nudenet"
-    assert result["classification_version"] == 11
+    assert result["classification_version"] == main.VAULT_CLASSIFIER_VERSION
 
 
 @pytest.mark.asyncio
@@ -761,6 +761,6 @@ async def test_health_exposes_safe_vault_rollout_state(monkeypatch):
     )
     assert await main.health() == {
         "status": "ok",
-        "vault_classifier_version": 11,
+        "vault_classifier_version": main.VAULT_CLASSIFIER_VERSION,
         "vault_semantics_configured": True,
     }
