@@ -100,6 +100,7 @@ async def plan_session_for_fan(
     plan: list[dict[str, Any]] = []
     for index, (row, cents) in enumerate(zip(sequence, allocations, strict=True)):
         media_ids = [str(value) for value in (row.get("media_ids") or []) if value]
+        is_individual_video = "individual_video" in (row.get("tags") or [])
         plan.append({
             "step_number": index + 1,
             "media_ids": media_ids,
@@ -113,9 +114,14 @@ async def plan_session_for_fan(
             "explicit_min": row.get("explicit_min"),
             "explicit_max": row.get("explicit_max"),
             "description": (
-                f"{row.get('title') or row.get('location') or 'private'} "
-                f"bundle ({len(media_ids)} pcs)"
+                f"{row.get('title') or row.get('location') or 'private'} video"
+                if is_individual_video
+                else (
+                    f"{row.get('title') or row.get('location') or 'private'} "
+                    f"bundle ({len(media_ids)} pcs)"
+                )
             ),
+            "asset_type": "video" if is_individual_video else "photo_set",
             "sent": False,
             "purchased": False,
             "declined": False,
@@ -164,8 +170,9 @@ async def _load_approved_sets(creator_id: str) -> list[dict[str, Any]]:
         response = (
             get_supabase().table("vault_sets")
             .select(
-                "id, title, location, outfit, explicit_min, explicit_max, "
-                "media_ids, preview_media_id, suggested_price, tags"
+                "id, title, description, location, outfit, explicit_min, explicit_max, "
+                "media_ids, preview_media_id, suggested_price, tags, base_price_cents, "
+                "min_price_cents, max_price_cents, dynamic_pricing_enabled"
             )
             .eq("creator_id", creator_id)
             .eq("status", "approved")

@@ -497,7 +497,12 @@ def _collect_tags(items, limit=8):
 
 def propose_sets(vault_items, max_per_set=6, min_per_set=3, min_level=2):
     sets = []
-    for shoot in build_shoot_clusters(vault_items):
+    photo_items = [
+        item
+        for item in vault_items
+        if not str(item.get("mimetype") or "").lower().startswith("video")
+    ]
+    for shoot in build_shoot_clusters(photo_items):
         bucket = [
             item
             for item in shoot["items"]
@@ -605,6 +610,79 @@ def propose_sets(vault_items, max_per_set=6, min_per_set=3, min_level=2):
             })
     sets.sort(key=lambda s: (s["explicit_max"], len(s["media_ids"])), reverse=True)
     return sets
+
+
+def propose_video_ppvs(vault_items, min_level=2):
+    """Turn each frame-classified video into its own approvable PPV asset.
+
+    Videos are deliberately never bundled here. An approved row still uses the
+    existing ``vault_sets`` contract, but contains exactly one media id so the
+    commercial planner and delivery ledger can treat every clip as an
+    individual locked message.
+    """
+    proposals = []
+    for item in vault_items:
+        if not str(item.get("mimetype") or "").lower().startswith("video"):
+            continue
+        if str(item.get("classification_source") or "") != "video_frames":
+            continue
+        media_id = str(item.get("fansly_media_id") or "").strip()
+        category = str(item.get("content_category") or "").strip().lower()
+        level = int(item.get("explicitness_level") or 0)
+        if (
+            not media_id
+            or level < min_level
+            or category in _JUNK_META
+            or category in {"other", "teaser_clothed", "teaser_bundle"}
+        ):
+            continue
+
+        minimum = max(1, round(float(item.get("price_min") or 15)))
+        maximum = max(minimum, round(float(item.get("price_max") or minimum)))
+        suggested = int(round(((minimum + maximum) / 2) / 5) * 5)
+        suggested = max(minimum, min(maximum, suggested))
+        location = str(item.get("scene_location") or "").replace("_", " ").strip()
+        outfit = str(item.get("scene_outfit") or "").strip()
+        if location.lower() in _JUNK_META:
+            location = ""
+        if outfit.lower() in _JUNK_META:
+            outfit = ""
+        label = category.replace("_video", "").replace("_", " ").strip()
+        title_parts = [
+            value
+            for value in (
+                location.title() if location else "Private",
+                outfit,
+                label,
+                "video",
+            )
+            if value
+        ]
+        tags = _collect_tags([item], limit=10)
+        for tag in ("video", "individual_video"):
+            if tag not in tags:
+                tags.append(tag)
+        proposals.append({
+            "title": " · ".join(title_parts[:4])[:80],
+            "description": build_set_description([item]),
+            "location": location or None,
+            "outfit": outfit or None,
+            "explicit_min": level,
+            "explicit_max": level,
+            "media_ids": [media_id],
+            "preview_media_id": media_id,
+            "suggested_price": suggested,
+            "base_price_cents": suggested * 100,
+            "min_price_cents": minimum * 100,
+            "max_price_cents": maximum * 100,
+            "tags": tags[:12],
+            "metadata_version": VAULT_CLASSIFIER_VERSION,
+        })
+    proposals.sort(
+        key=lambda row: (row["explicit_max"], row["suggested_price"], row["media_ids"][0]),
+        reverse=True,
+    )
+    return proposals
 
 
 async def get_fan_session(fan_id: str) -> dict | None:

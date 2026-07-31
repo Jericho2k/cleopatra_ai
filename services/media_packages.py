@@ -283,6 +283,61 @@ def build_offer_packages(
     if not rows:
         return []
 
+    individual_videos = [
+        row for row in rows if "individual_video" in (row.get("tags") or [])
+    ]
+    standard_rows = [
+        row for row in rows if "individual_video" not in (row.get("tags") or [])
+    ]
+    wants_video = bool(
+        re.search(
+            r"\b(video|videos|vid|clip|clips)\b",
+            str(desired_experience or ""),
+            re.IGNORECASE,
+        )
+    )
+    if wants_video or (individual_videos and not standard_rows):
+        video_packages: list[PackageOption] = []
+        excluded_video_ids: set[str] = set()
+        for key, label, target, use_ceiling in (
+            ("video-quick", "private video", policy.quick_package_target_cents, False),
+            ("video-premium", "premium private video", policy.full_package_target_cents, True),
+        ):
+            target = approved_target_from_learning(
+                price_learning,
+                fallback_cents=target,
+                use_ceiling=use_ceiling,
+            )
+            if hard_ceiling_cents:
+                target = min(target, int(hard_ceiling_cents))
+            sequence = choose_sequence(
+                individual_videos,
+                target_cents=target,
+                min_steps=1,
+                max_steps=1,
+                preferred_tags=preferred_tags,
+                excluded_set_ids=excluded_video_ids,
+                desired_experience=desired_experience,
+                hard_ceiling_cents=hard_ceiling_cents,
+            )
+            package = package_from_sequence(
+                sequence,
+                label=label,
+                target_cents=target,
+                package_key=key,
+            )
+            if package:
+                video_packages.append(package)
+                excluded_video_ids.update(package.set_ids)
+            if not policy.offer_two_packages:
+                break
+        if video_packages:
+            return sorted(video_packages, key=lambda package: package.price_cents)
+
+    rows = standard_rows
+    if not rows:
+        return []
+
     quick_target_cents = approved_target_from_learning(
         price_learning, fallback_cents=policy.quick_package_target_cents
     )

@@ -5168,7 +5168,7 @@ async def test_inject_message(fan_id: str, creator_id: str, content: str) -> dic
     dependencies=[Depends(require_creator_path_access)],
 )
 async def generate_sets(creator_id: str) -> dict:
-    from db.queries import propose_sets
+    from db.queries import propose_sets, propose_video_ppvs
     db = get_supabase()
 
     items, page = [], 0
@@ -5179,8 +5179,10 @@ async def generate_sets(creator_id: str) -> dict:
                 "fansly_media_id, content_category, ai_description, explicitness_level, "
                 "scene_id, scene_location, scene_outfit, scene_lighting, album_title, "
                 "mimetype, price_min, price_max, tags, good_for, classification_metadata"
+                ", classification_source, is_active"
             )
             .eq("creator_id", creator_id)
+            .eq("is_active", True)
             .range(p * 1000, p * 1000 + 999)
             .execute()
         )
@@ -5190,7 +5192,25 @@ async def generate_sets(creator_id: str) -> dict:
             break
         page += 1
 
-    proposed = propose_sets(items)
+    photo_proposals = propose_sets(items)
+    video_proposals = propose_video_ppvs(items)
+
+    approved_rows = await asyncio.to_thread(
+        lambda: db.table("vault_sets")
+        .select("media_ids")
+        .eq("creator_id", creator_id)
+        .eq("status", "approved")
+        .execute()
+    )
+    approved_exact_sets = {
+        tuple(sorted(normalize_media_ids(row.get("media_ids") or [])))
+        for row in (approved_rows.data or [])
+    }
+    proposed = [
+        proposal
+        for proposal in [*photo_proposals, *video_proposals]
+        if tuple(sorted(proposal["media_ids"])) not in approved_exact_sets
+    ]
 
     # Wipe prior AI drafts; never touch approved or manual sets
     await asyncio.to_thread(
@@ -5198,15 +5218,25 @@ async def generate_sets(creator_id: str) -> dict:
         .eq("creator_id", creator_id).eq("status", "draft").eq("source", "ai").execute()
     )
 
-    to_insert = [{
-        "creator_id": creator_id, "description": s["description"],
-        "title": s["title"], "location": s["location"], "outfit": s["outfit"],
-        "explicit_min": s["explicit_min"], "explicit_max": s["explicit_max"],
-        "media_ids": s["media_ids"], "preview_media_id": s["preview_media_id"],
-        "suggested_price": s["suggested_price"], "tags": s["tags"],
-        "metadata_version": s["metadata_version"],
-        "status": "draft", "source": "ai",
-    } for s in proposed]
+    to_insert = []
+    for proposal in proposed:
+        payload = {
+            "creator_id": creator_id, "description": proposal["description"],
+            "title": proposal["title"], "location": proposal["location"],
+            "outfit": proposal["outfit"],
+            "explicit_min": proposal["explicit_min"],
+            "explicit_max": proposal["explicit_max"],
+            "media_ids": proposal["media_ids"],
+            "preview_media_id": proposal["preview_media_id"],
+            "suggested_price": proposal["suggested_price"],
+            "tags": proposal["tags"],
+            "metadata_version": proposal["metadata_version"],
+            "status": "draft", "source": "ai",
+        }
+        for field in ("base_price_cents", "min_price_cents", "max_price_cents"):
+            if field in proposal:
+                payload[field] = proposal[field]
+        to_insert.append(payload)
 
     inserted = 0
     for i in range(0, len(to_insert), 100):
@@ -5214,7 +5244,15 @@ async def generate_sets(creator_id: str) -> dict:
         await asyncio.to_thread(lambda c=chunk: db.table("vault_sets").insert(c).execute())
         inserted += len(chunk)
 
-    return {"status": "ok", "drafts_created": inserted, "from_items": len(items)}
+    return {
+        "status": "ok",
+        "drafts_created": inserted,
+        "photo_sets_created": sum(len(row["media_ids"]) > 1 for row in proposed),
+        "video_ppvs_created": sum(
+            "individual_video" in (row.get("tags") or []) for row in proposed
+        ),
+        "from_items": len(items),
+    }
 
 
 @app.post(

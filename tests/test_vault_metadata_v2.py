@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from db.queries import propose_sets
+from db.queries import propose_sets, propose_video_ppvs
 from services.media_packages import sequence_intent_score
 from services.vault_metadata import (
     VAULT_CLASSIFIER_VERSION,
@@ -250,7 +250,7 @@ def test_set_description_keeps_qwen_environment_and_continuity_evidence():
     assert "Same-shoot markers" in description
 
 
-def test_automatic_set_builder_keeps_video_sets_and_writes_description():
+def test_automatic_set_builder_proposes_each_frame_classified_video_individually():
     items = [
         {
             "fansly_media_id": f"video-{index}",
@@ -261,6 +261,7 @@ def test_automatic_set_builder_keeps_video_sets_and_writes_description():
             "scene_outfit": "blue lingerie",
             "album_title": "Bathroom shoot",
             "mimetype": "video/mp4",
+            "classification_source": "video_frames",
             "price_min": 15,
             "price_max": 90,
             "tags": ["shower", "blue lingerie"],
@@ -269,11 +270,27 @@ def test_automatic_set_builder_keeps_video_sets_and_writes_description():
         }
         for index in range(3)
     ]
-    proposed = propose_sets(items)
-    assert len(proposed) == 1
-    assert proposed[0]["media_ids"] == ["video-0", "video-1", "video-2"]
-    assert "including 3 videos" in proposed[0]["description"]
-    assert proposed[0]["metadata_version"] == VAULT_CLASSIFIER_VERSION
+    assert propose_sets(items) == []
+    proposed = propose_video_ppvs(items)
+    assert len(proposed) == 3
+    assert all(len(row["media_ids"]) == 1 for row in proposed)
+    assert {row["media_ids"][0] for row in proposed} == {
+        "video-0", "video-1", "video-2",
+    }
+    assert all("individual_video" in row["tags"] for row in proposed)
+    assert all("including 1 video" in row["description"] for row in proposed)
+    assert all(row["metadata_version"] == VAULT_CLASSIFIER_VERSION for row in proposed)
+
+
+def test_video_ppv_builder_requires_real_frame_classification():
+    legacy = {
+        "fansly_media_id": "legacy-video",
+        "content_category": "explicit_video",
+        "explicitness_level": 4,
+        "mimetype": "video/mp4",
+        "classification_source": "video_thumbnail",
+    }
+    assert propose_video_ppvs([legacy]) == []
 
 
 def test_migration_and_analyzer_expose_the_v2_contract():
