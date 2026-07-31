@@ -41,3 +41,50 @@ def test_offers_are_multi_step_and_exactly_priced():
     assert offers[0].price_cents == 2800
     assert len(offers[0].set_ids) >= 2
     assert offers[-1].price_cents == 6000
+
+
+def test_video_request_returns_single_video_ppv_options():
+    video_rows = [
+        {
+            "id": f"video-{index}",
+            "title": f"Private shower video {index}",
+            "description": "A private shower clip.",
+            "location": "shower",
+            "outfit": "",
+            "explicit_min": 4,
+            "explicit_max": 4,
+            "base_price_cents": price,
+            "min_price_cents": price,
+            "max_price_cents": price,
+            "media_ids": [f"media-video-{index}"],
+            "tags": ["shower", "video", "individual_video"],
+        }
+        for index, price in enumerate((3500, 7000))
+    ]
+    offers = build_offer_packages(
+        [*rows(), *video_rows],
+        CreatorPolicy(),
+        desired_experience="send me a shower video",
+    )
+    assert [offer.price_cents for offer in offers] == [3500, 7000]
+    assert all(len(offer.set_ids) == 1 for offer in offers)
+    assert {offer.set_ids[0] for offer in offers} == {"video-0", "video-1"}
+
+
+def test_video_only_vault_is_offerable_without_two_steps():
+    video = {
+        "id": "only-video",
+        "title": "Private video",
+        "description": "A private clip.",
+        "explicit_min": 3,
+        "explicit_max": 3,
+        "base_price_cents": 4500,
+        "min_price_cents": 4000,
+        "max_price_cents": 6000,
+        "media_ids": ["media-video"],
+        "tags": ["video", "individual_video"],
+    }
+    offers = build_offer_packages([video], CreatorPolicy())
+    assert len(offers) == 1
+    assert offers[0].set_ids == ["only-video"]
+    assert offers[0].price_cents == 4000
