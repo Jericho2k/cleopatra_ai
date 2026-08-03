@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import inspect
-from pathlib import Path
 import random
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from ai import prompt_builder
 from models.commercial import (
@@ -20,9 +21,9 @@ from models.conversation_director import (
     advance_conversation_director,
 )
 from models.session_strategy import SessionGoal, derive_session_strategy
-from services.commercial_policy import CommercialContext, decide_next_action
-from services.human_delivery import build_delivery_schedule
 from services import suggestions
+from services.commercial_policy import CommercialContext, decide_next_action
+from services.human_delivery import AvailabilityMode, build_delivery_schedule
 
 
 def selected_event() -> CommercialEvent:
@@ -161,20 +162,118 @@ def test_director_calls_selection_and_pending_unlock_payment_pending():
     assert waiting.action == DirectorAction.WAIT_FOR_PAYMENT
 
 
-def test_delivery_timing_is_jittered_bounded_and_length_aware():
-    short = build_delivery_schedule("hey", ["hey :)"], rng=random.Random(7))
+def _timed_history(creator_gap: timedelta, *, creator_messages: int = 1):
+    now = datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc)
+    history = []
+    for offset in range(creator_messages):
+        history.append(
+            {
+                "role": "creator",
+                "content": "previous",
+                "sent_at": now - creator_gap - timedelta(minutes=offset),
+            }
+        )
+    history.append({"role": "fan", "content": "hey", "sent_at": now})
+    return history
+
+
+def test_live_delivery_timing_is_jittered_bounded_and_length_aware():
+    history = _timed_history(timedelta(minutes=2))
+    short = build_delivery_schedule(
+        "hey", ["hey :)"], conversation_history=history, rng=random.Random(7)
+    )
     long = build_delivery_schedule(
         "I had a really long day and wanted to tell you what happened",
         ["aw okay tell me, what happened? I wanna hear it"],
+        conversation_history=history,
         rng=random.Random(7),
     )
-    assert 2.5 <= short.initial_delay_seconds <= 18.0
-    assert 2.5 <= long.initial_delay_seconds <= 18.0
+    assert short.availability_mode == AvailabilityMode.LIVE
+    assert 0.5 <= short.availability_delay_seconds <= 8.0
+    assert 2.5 <= short.composition_delay_seconds <= 22.0
     assert long.initial_delay_seconds > short.initial_delay_seconds
 
-    split = build_delivery_schedule("hi", ["first bubble", "a much longer second bubble"], rng=random.Random(3))
+    split = build_delivery_schedule(
+        "hi",
+        ["first bubble", "a much longer second bubble"],
+        conversation_history=history,
+        rng=random.Random(3),
+    )
     assert len(split.inter_part_delays_seconds) == 1
     assert 1.5 <= split.inter_part_delays_seconds[0] <= 14.0
+
+
+def test_timing_modes_follow_real_conversation_cadence():
+    assert build_delivery_schedule(
+        "hey",
+        ["hi"],
+        conversation_history=_timed_history(timedelta(minutes=10)),
+        conversation_phase="TENSION",
+        rng=random.Random(1),
+    ).availability_mode == AvailabilityMode.INTIMATE
+    assert build_delivery_schedule(
+        "hey",
+        ["hi"],
+        conversation_history=_timed_history(timedelta(minutes=10)),
+        rng=random.Random(1),
+    ).availability_mode == AvailabilityMode.WARM
+    assert build_delivery_schedule(
+        "hey",
+        ["hi"],
+        conversation_history=_timed_history(timedelta(hours=2)),
+        rng=random.Random(1),
+    ).availability_mode == AvailabilityMode.CASUAL
+    assert build_delivery_schedule(
+        "hey",
+        ["hi"],
+        conversation_history=_timed_history(timedelta(days=1)),
+        rng=random.Random(1),
+    ).availability_mode == AvailabilityMode.RETURNING
+    assert build_delivery_schedule(
+        "hey",
+        ["hi"],
+        conversation_history=[
+            {
+                "role": "fan",
+                "content": "first message",
+                "sent_at": datetime(2026, 8, 4, 12, 0, tzinfo=timezone.utc),
+            }
+        ],
+        rng=random.Random(1),
+    ).availability_mode == AvailabilityMode.NEW
+
+
+def test_ordinary_chat_can_take_minutes_but_live_chat_stays_responsive():
+    live = build_delivery_schedule(
+        "hey",
+        ["hi"],
+        conversation_history=_timed_history(timedelta(minutes=1)),
+        rng=random.Random(2),
+    )
+    casual = build_delivery_schedule(
+        "hey",
+        ["hi"],
+        conversation_history=_timed_history(timedelta(hours=2)),
+        rng=random.Random(2),
+    )
+    returning = build_delivery_schedule(
+        "hey",
+        ["hi"],
+        conversation_history=_timed_history(timedelta(days=1)),
+        rng=random.Random(2),
+    )
+
+    assert live.availability_delay_seconds <= 8.0
+    assert 600.0 <= casual.availability_delay_seconds <= 1200.0
+    assert 1800.0 <= returning.availability_delay_seconds <= 2400.0
+
+
+def test_typing_indicator_starts_after_availability_pause():
+    source = inspect.getsource(suggestions._debounced_auto_reply)
+    availability_wait = source.index('phase="availability"')
+    typing_request = source.index('/typing"')
+    composition_wait = source.index('phase="before_part_1"')
+    assert availability_wait < typing_request < composition_wait
 
 
 def test_stale_auto_reply_cannot_clear_newer_task(monkeypatch):

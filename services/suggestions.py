@@ -1098,12 +1098,28 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
             group_id = await get_or_fetch_group_id(apifansly_account_id, str(platform_fan_id), fan_id)
 
         parts = [p.strip() for p in reply.split("|") if p.strip()]
-        timing = build_delivery_schedule(latest_message, parts)
+        timing = build_delivery_schedule(
+            latest_message,
+            parts,
+            conversation_history=conversation_history,
+            conversation_phase=conversation_director.get("phase"),
+            active_session=active_session,
+        )
         print(
             f"[AUTO TIMING] fan={fan_id} parts={len(parts)} "
-            f"initial={timing.initial_delay_seconds:.2f}s "
+            f"mode={timing.availability_mode.value} "
+            f"away={timing.availability_delay_seconds:.2f}s "
+            f"compose={timing.composition_delay_seconds:.2f}s "
             f"between={list(timing.inter_part_delays_seconds)}"
         )
+
+        # Do not advertise typing while the simulated creator is unavailable.
+        if not await _sleep_while_current(
+            fan_id,
+            timing.availability_delay_seconds,
+            phase="availability",
+        ):
+            return
 
         if group_id and apifansly_account_id:
             try:
@@ -1119,7 +1135,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 pass
 
         if not await _sleep_while_current(
-            fan_id, timing.initial_delay_seconds, phase="before_part_1"
+            fan_id, timing.composition_delay_seconds, phase="before_part_1"
         ):
             return
 
