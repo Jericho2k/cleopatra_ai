@@ -167,18 +167,30 @@ async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id:
     return None
 
 
-async def send_fansly_message(account_id: str, group_id: str, text: str) -> bool:
+async def send_fansly_message(account_id: str, group_id: str, text: str) -> str | None:
+    """Deliver plain text and return its durable platform identity.
+
+    A 2xx response without a message ID is not sufficient evidence for an
+    automated send.  Callers can reconcile an ambiguous acceptance instead of
+    persisting an unbound local row or immediately sending a duplicate.
+    """
     try:
-        await send_apifansly_message(
+        response_body = await send_apifansly_message(
             account_id,
             group_id,
             content=text,
         )
-        print(f"[SEND] account={account_id} group={group_id} accepted=true")
-        return True
+        platform_message_id = sent_message_id(response_body)
+        if not platform_message_id:
+            raise RuntimeError("platform accepted text but did not return a message ID")
+        print(
+            f"[SEND] account={account_id} group={group_id} accepted=true "
+            f"message={platform_message_id}"
+        )
+        return platform_message_id
     except Exception as e:
         print(f"[SEND ERROR] {e}")
-        return False
+        return None
 
 
 async def process_incoming_fan_message(
@@ -4986,6 +4998,16 @@ async def cancel_followup(
     from services.full_auto_operations import cancel_fan_followup
 
     return await cancel_fan_followup(fan_id, request.action_type)
+
+
+@app.post(
+    "/fan/{fan_id}/retry-followup/{action_id}",
+    dependencies=[Depends(require_fan_path_access)],
+)
+async def retry_followup(fan_id: str, action_id: str) -> dict:
+    from services.full_auto_operations import retry_fan_followup
+
+    return await retry_fan_followup(fan_id, action_id)
 
 
 @app.post(

@@ -28,6 +28,24 @@ from db.commercial_queries import (
 from models.commercial import FanStatus
 
 POLL_SECONDS = 60
+LAST_RUN_STARTED_AT: datetime | None = None
+LAST_RUN_COMPLETED_AT: datetime | None = None
+LAST_RUN_ERROR: str | None = None
+LAST_RUN_SENT = 0
+
+
+def worker_health_snapshot() -> dict:
+    return {
+        "last_run_started_at": (
+            LAST_RUN_STARTED_AT.isoformat() if LAST_RUN_STARTED_AT else None
+        ),
+        "last_run_completed_at": (
+            LAST_RUN_COMPLETED_AT.isoformat() if LAST_RUN_COMPLETED_AT else None
+        ),
+        "last_error": LAST_RUN_ERROR,
+        "last_sent": LAST_RUN_SENT,
+        "poll_seconds": POLL_SECONDS,
+    }
 
 
 @dataclass(frozen=True)
@@ -220,6 +238,8 @@ async def _send_goal(action: dict, goal: str) -> HandlerResult:
         creator_id=action["creator_id"],
         fan_id=action["fan_id"],
         goal=goal,
+        action_id=str(action["id"]),
+        action_payload=action.get("payload") or {},
     )
     if not sent:
         raise RuntimeError("proactive delivery was not confirmed")
@@ -421,82 +441,97 @@ async def repair_followup_obligations() -> int:
 
 
 async def process_once() -> int:
-    await repair_followup_obligations()
-    actions = await claim_due_actions()
+    global LAST_RUN_STARTED_AT, LAST_RUN_COMPLETED_AT, LAST_RUN_ERROR, LAST_RUN_SENT
+    LAST_RUN_STARTED_AT = datetime.now(timezone.utc)
+    LAST_RUN_ERROR = None
     sent = 0
-    for action in actions:
-        aid = action["id"]
-        try:
-            handler = HANDLERS.get(action["action_type"])
-            if not handler:
-                await fail_action(aid, f"no handler for {action['action_type']}",
-                                  action.get("attempts", 0))
-                continue
-
-            if action["action_type"] not in {"PPV_RECONCILE", "OFFER_EXPIRY"}:
-                check = await _should_still_send(action)
-                if not check.ok:
-                    if check.retry_at:
-                        await _record_followup_postponed(action, check.retry_at)
-                        await reschedule_action(aid, check.retry_at)
-                        print(
-                            f"[SCHEDULED] postponed {action['action_type']} "
-                            f"fan={action['fan_id']} until={check.retry_at.isoformat()}: {check.reason}"
-                        )
-                    else:
-                        await complete_action(aid)
-                        await _record_message_action_resolution(action, sent=False)
-                        print(
-                            f"[SCHEDULED] skip {action['action_type']} "
-                            f"fan={action['fan_id']}: {check.reason}"
-                        )
+    try:
+        await repair_followup_obligations()
+        actions = await claim_due_actions()
+        for action in actions:
+            aid = action["id"]
+            try:
+                handler = HANDLERS.get(action["action_type"])
+                if not handler:
+                    await fail_action(
+                        aid,
+                        f"no handler for {action['action_type']}",
+                        action.get("attempts", 0),
+                    )
                     continue
 
-            result = await handler(action)
-            if result.retry_at:
-                await reschedule_action(aid, result.retry_at)
-                print(
-                    f"[SCHEDULED] retry {action['action_type']} fan={action['fan_id']} "
-                    f"at={result.retry_at.isoformat()}: {result.reason}"
-                )
-                continue
-            if result.sent_message:
-                try:
-                    await _record_message_action_resolution(action, sent=True)
-                except Exception as exc:
-                    # The external send already happened. Never turn a local
-                    # persistence failure into a duplicate proactive message.
-                    from db.queries import freeze_fan_for_review
+                if action["action_type"] not in {"PPV_RECONCILE", "OFFER_EXPIRY"}:
+                    check = await _should_still_send(action)
+                    if not check.ok:
+                        if check.retry_at:
+                            await _record_followup_postponed(action, check.retry_at)
+                            await reschedule_action(aid, check.retry_at)
+                            print(
+                                f"[SCHEDULED] postponed {action['action_type']} "
+                                f"fan={action['fan_id']} until={check.retry_at.isoformat()}: {check.reason}"
+                            )
+                        else:
+                            await complete_action(aid)
+                            await _record_message_action_resolution(action, sent=False)
+                            print(
+                                f"[SCHEDULED] skip {action['action_type']} "
+                                f"fan={action['fan_id']}: {check.reason}"
+                            )
+                        continue
 
-                    await freeze_fan_for_review(
-                        action["fan_id"],
-                        "followup_sent_but_resolution_not_persisted",
-                    )
-                    await complete_action(aid)
-                    sent += 1
+                result = await handler(action)
+                if result.retry_at:
+                    await reschedule_action(aid, result.retry_at)
                     print(
-                        f"[SCHEDULED PERSIST ERROR] {action['action_type']} "
-                        f"fan={action['fan_id']}: {exc}"
+                        f"[SCHEDULED] retry {action['action_type']} fan={action['fan_id']} "
+                        f"at={result.retry_at.isoformat()}: {result.reason}"
                     )
                     continue
-            else:
-                await _record_message_action_resolution(action, sent=False)
-            await complete_action(aid)
-            if result.sent_message:
-                sent += 1
-            print(
-                f"[SCHEDULED] completed {action['action_type']} fan={action['fan_id']} "
-                f"sent={result.sent_message} reason={result.reason}"
-            )
-        except Exception as e:
-            print(f"[SCHEDULED ERROR] {action.get('action_type')} fan={action.get('fan_id')}: {e}")
-            await fail_action(
-                aid,
-                str(e),
-                action.get("attempts", 0),
-                max_attempts=(50 if action.get("action_type") == "PPV_RECONCILE" else 3),
-            )
-    return sent
+                if result.sent_message:
+                    try:
+                        await _record_message_action_resolution(action, sent=True)
+                    except Exception as exc:
+                        # The external send already happened. Never turn a local
+                        # persistence failure into a duplicate proactive message.
+                        from db.queries import freeze_fan_for_review
+
+                        await freeze_fan_for_review(
+                            action["fan_id"],
+                            "followup_sent_but_resolution_not_persisted",
+                        )
+                        await complete_action(aid)
+                        sent += 1
+                        print(
+                            f"[SCHEDULED PERSIST ERROR] {action['action_type']} "
+                            f"fan={action['fan_id']}: {exc}"
+                        )
+                        continue
+                else:
+                    await _record_message_action_resolution(action, sent=False)
+                await complete_action(aid)
+                if result.sent_message:
+                    sent += 1
+                print(
+                    f"[SCHEDULED] completed {action['action_type']} fan={action['fan_id']} "
+                    f"sent={result.sent_message} reason={result.reason}"
+                )
+            except Exception as e:
+                print(f"[SCHEDULED ERROR] {action.get('action_type')} fan={action.get('fan_id')}: {e}")
+                await fail_action(
+                    aid,
+                    str(e),
+                    action.get("attempts", 0),
+                    max_attempts=(
+                        50 if action.get("action_type") == "PPV_RECONCILE" else 8
+                    ),
+                )
+        LAST_RUN_SENT = sent
+        return sent
+    except Exception as exc:
+        LAST_RUN_ERROR = str(exc)[:500]
+        raise
+    finally:
+        LAST_RUN_COMPLETED_AT = datetime.now(timezone.utc)
 
 
 async def scheduled_actions_loop() -> None:

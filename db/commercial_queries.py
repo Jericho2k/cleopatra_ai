@@ -437,6 +437,49 @@ async def reschedule_action(
     await asyncio.to_thread(_reschedule)
 
 
+async def update_action_payload(action_id: str, payload: dict) -> None:
+    """Persist delivery evidence while an action is still being processed.
+
+    Scheduled text delivery crosses two systems (API Fansly and Supabase), so the
+    payload doubles as a small durable send journal.  A stale worker can use it to
+    reconcile an accepted platform message instead of blindly sending it again.
+    """
+
+    def _update():
+        (
+            get_supabase().table("scheduled_actions")
+            .update({"payload": payload})
+            .eq("id", action_id)
+            .execute()
+        )
+
+    await asyncio.to_thread(_update)
+
+
+async def retry_failed_action_for_fan(action_id: str, fan_id: str) -> bool:
+    """Explicitly requeue one failed action after an operator reviews its error."""
+    now = datetime.now(timezone.utc).isoformat()
+
+    def _retry() -> bool:
+        response = (
+            get_supabase().table("scheduled_actions")
+            .update({
+                "status": "PENDING",
+                "execute_at": now,
+                "attempts": 0,
+                "locked_at": None,
+                "last_error": None,
+            })
+            .eq("id", action_id)
+            .eq("fan_id", fan_id)
+            .eq("status", "FAILED")
+            .execute()
+        )
+        return bool(response.data)
+
+    return await asyncio.to_thread(_retry)
+
+
 async def get_scheduled_actions_for_fan(
     fan_id: str,
     *,
@@ -456,18 +499,33 @@ async def get_scheduled_actions_for_fan(
     return await asyncio.to_thread(_get)
 
 
-async def get_followup_obligations(limit: int = 100) -> list[dict]:
+async def get_followup_obligations(page_size: int = 500) -> list[dict]:
+    """Return every durable follow-up obligation using stable pagination.
+
+    The former hard 100-row limit could permanently starve repairs once an
+    agency accumulated more than 100 active obligations.
+    """
     def _get():
-        return (
-            get_supabase().table("fan_commercial_states")
-            .select(
-                "fan_id, creator_id, next_followup_at, next_followup_type, "
-                "next_followup_payload, next_followup_dedupe_key"
-            )
-            .not_.is_("next_followup_at", "null")
-            .not_.is_("next_followup_type", "null")
-            .limit(limit)
-            .execute()
-        ).data or []
+        db = get_supabase()
+        size = max(1, min(int(page_size), 1_000))
+        offset = 0
+        rows: list[dict] = []
+        while True:
+            page = (
+                db.table("fan_commercial_states")
+                .select(
+                    "fan_id, creator_id, next_followup_at, next_followup_type, "
+                    "next_followup_payload, next_followup_dedupe_key"
+                )
+                .not_.is_("next_followup_at", "null")
+                .not_.is_("next_followup_type", "null")
+                .order("fan_id")
+                .range(offset, offset + size - 1)
+                .execute()
+            ).data or []
+            rows.extend(page)
+            if len(page) < size:
+                return rows
+            offset += size
 
     return await asyncio.to_thread(_get)
