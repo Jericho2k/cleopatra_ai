@@ -32,6 +32,7 @@ def test_operational_summary_counts_only_actionable_states():
         "human_review": 1,
         "failed_actions": 1,
         "processing_actions": 1,
+        "overdue_actions": 0,
     }
 
 

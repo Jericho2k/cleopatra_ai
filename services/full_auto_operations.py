@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.supabase import get_supabase
@@ -11,6 +11,7 @@ from db.commercial_queries import (
     cancel_actions_for_fan,
     get_fan_state,
     get_scheduled_actions_for_fan,
+    retry_failed_action_for_fan,
     save_fan_state,
 )
 from db.queries import get_fan_session
@@ -90,12 +91,31 @@ def summarize_operation_rows(
     fans: list[dict[str, Any]],
     actions: list[dict[str, Any]],
 ) -> dict[str, int]:
+    now = datetime.now(timezone.utc)
+
+    def _overdue(row: dict[str, Any]) -> bool:
+        status = row.get("status")
+        field = "locked_at" if status == "PROCESSING" else "execute_at"
+        threshold = timedelta(minutes=10 if status == "PROCESSING" else 2)
+        if status not in {"PENDING", "PROCESSING"}:
+            return False
+        try:
+            due = datetime.fromisoformat(
+                str(row.get(field) or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            return False
+        if due.tzinfo is None:
+            due = due.replace(tzinfo=timezone.utc)
+        return due < now - threshold
+
     return {
         "payment_pending": sum(row.get("status") == "PAYMENT_PENDING" for row in states),
         "followups_pending": sum(bool(row.get("next_followup_at")) for row in states),
         "human_review": sum(bool(row.get("needs_human_review")) for row in fans),
         "failed_actions": sum(row.get("status") == "FAILED" for row in actions),
         "processing_actions": sum(row.get("status") == "PROCESSING" for row in actions),
+        "overdue_actions": sum(_overdue(row) for row in actions),
     }
 
 
@@ -271,7 +291,7 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
 
 
 async def get_creator_full_auto_health(creator_id: str) -> dict[str, Any]:
-    def _load() -> tuple[list[dict], list[dict], list[dict]]:
+    def _load() -> tuple[list[dict], list[dict], list[dict], list[dict]]:
         db = get_supabase()
         states = (
             db.table("fan_commercial_states")
@@ -290,15 +310,28 @@ async def get_creator_full_auto_health(creator_id: str) -> dict[str, Any]:
         ).data or []
         actions = (
             db.table("scheduled_actions")
-            .select("id, fan_id, action_type, execute_at, status, attempts, last_error")
+            .select(
+                "id, fan_id, action_type, execute_at, status, attempts, "
+                "last_error, locked_at, payload"
+            )
             .eq("creator_id", creator_id)
             .in_("status", ["PENDING", "PROCESSING", "FAILED"])
             .order("execute_at")
             .execute()
         ).data or []
-        return states, fans, actions
+        recent = (
+            db.table("scheduled_actions")
+            .select("id, fan_id, action_type, execute_at, status, payload")
+            .eq("creator_id", creator_id)
+            .eq("status", "COMPLETED")
+            .in_("action_type", list(FOLLOWUP_ACTIONS))
+            .order("execute_at", desc=True)
+            .limit(50)
+            .execute()
+        ).data or []
+        return states, fans, actions, recent
 
-    states, fans, actions = await _retry_transient_operation(
+    states, fans, actions, recent = await _retry_transient_operation(
         lambda: asyncio.to_thread(_load),
         label="creator full-auto health",
     )
@@ -318,10 +351,29 @@ async def get_creator_full_auto_health(creator_id: str) -> dict[str, Any]:
     actionable_ids.update(
         str(row.get("fan_id")) for row in actions if row.get("status") == "FAILED"
     )
+    from workers.scheduled_actions import worker_health_snapshot
+
+    recent_deliveries = []
+    for row in recent:
+        delivery = (row.get("payload") or {}).get("_delivery") or {}
+        if not delivery.get("platform_message_id"):
+            continue
+        recent_deliveries.append({
+            "action_id": row.get("id"),
+            "fan_id": row.get("fan_id"),
+            "display_name": names.get(str(row.get("fan_id")), row.get("fan_id")),
+            "action_type": row.get("action_type"),
+            "scheduled_at": row.get("execute_at"),
+            "confirmed_at": delivery.get("confirmed_at"),
+            "platform_message_id": delivery.get("platform_message_id"),
+        })
+
     return {
         "creator_id": creator_id,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "summary": summarize_operation_rows(states, fans, actions),
+        "worker": worker_health_snapshot(),
+        "recent_deliveries": recent_deliveries[:20],
         "fans": [
             {
                 "fan_id": fan_id,
@@ -373,3 +425,12 @@ async def cancel_fan_followup(fan_id: str, action_type: str | None = None) -> di
         if creator_id:
             await save_fan_state(fan_id, creator_id, state)
     return {"status": "cancelled", "fan_id": fan_id, "action_type": selected_type}
+
+
+async def retry_fan_followup(fan_id: str, action_id: str) -> dict:
+    retried = await retry_failed_action_for_fan(action_id, fan_id)
+    return {
+        "status": "requeued" if retried else "not_failed",
+        "fan_id": fan_id,
+        "action_id": action_id,
+    }

@@ -22,6 +22,7 @@ from models.conversation_director import (
 from models.session_strategy import SessionGoal, derive_session_strategy
 from services.commercial_policy import CommercialContext, decide_next_action
 from services.human_delivery import build_delivery_schedule
+from services import suggestions
 
 
 def selected_event() -> CommercialEvent:
@@ -174,6 +175,20 @@ def test_delivery_timing_is_jittered_bounded_and_length_aware():
     split = build_delivery_schedule("hi", ["first bubble", "a much longer second bubble"], rng=random.Random(3))
     assert len(split.inter_part_delays_seconds) == 1
     assert 1.5 <= split.inter_part_delays_seconds[0] <= 14.0
+
+
+def test_stale_auto_reply_cannot_clear_newer_task(monkeypatch):
+    stale_task = object()
+    newer_task = object()
+    suggestions._pending_auto_replies["fan-1"] = newer_task
+    monkeypatch.setattr(suggestions.asyncio, "current_task", lambda: stale_task)
+
+    assert suggestions._release_auto_reply_slot("fan-1") is False
+    assert suggestions._pending_auto_replies["fan-1"] is newer_task
+
+    monkeypatch.setattr(suggestions.asyncio, "current_task", lambda: newer_task)
+    assert suggestions._release_auto_reply_slot("fan-1") is True
+    assert "fan-1" not in suggestions._pending_auto_replies
 
 
 def test_prompt_has_narrow_anti_witty_and_bounded_knowledge_rules():

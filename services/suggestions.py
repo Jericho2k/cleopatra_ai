@@ -106,6 +106,14 @@ together_client = AsyncOpenAI(
 _pending_auto_replies: dict[str, asyncio.Task] = {}
 
 
+def _release_auto_reply_slot(fan_id: str) -> bool:
+    """Clear a pending slot only when the current task still owns it."""
+    if _pending_auto_replies.get(fan_id) is not asyncio.current_task():
+        return False
+    _pending_auto_replies.pop(fan_id, None)
+    return True
+
+
 def _is_local_test_fan(platform_fan_id: object) -> bool:
     """Only explicitly namespaced test fans may bypass live platform delivery."""
     return str(platform_fan_id or "").startswith("test_")
@@ -1239,10 +1247,10 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
                 else:
                     from main import send_fansly_message
 
-                    delivered = await send_fansly_message(
+                    platform_message_id = await send_fansly_message(
                         apifansly_account_id, str(group_id), text_out
                     )
-                    if not delivered:
+                    if not platform_message_id:
                         raise RuntimeError("platform rejected text delivery")
             except Exception as exc:
                 print(f"[AUTO DELIVERY ERROR] fan={fan_id}: {exc}")
@@ -1360,7 +1368,10 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         import traceback
         traceback.print_exc()
     finally:
-        _pending_auto_replies.pop(fan_id, None)
+        # A cancelled older task may finish after schedule_auto_reply has already
+        # installed a newer one. Only the task that still owns this fan's slot may
+        # clear it; otherwise rapid fan messages can leave multiple replies alive.
+        _release_auto_reply_slot(fan_id)
 
 
 _REACTION_FISHING_LINES = [
@@ -1401,12 +1412,19 @@ async def _send_post_purchase_reaction(fan_id: str, creator_id: str) -> None:
             return
         from main import send_fansly_message
 
-        delivered = await send_fansly_message(account_id, str(group_id), line)
-        if not delivered:
+        platform_message_id = await send_fansly_message(account_id, str(group_id), line)
+        if not platform_message_id:
             print(f"[PPV REACTION] fan={fan_id} skipped=platform_rejected")
             return
         try:
-            await save_message(fan_id, creator_id, "creator", line, was_ai_suggested=True)
+            await save_message(
+                fan_id,
+                creator_id,
+                "creator",
+                line,
+                was_ai_suggested=True,
+                fansly_message_id=platform_message_id,
+            )
         except Exception as exc:
             await freeze_fan_for_review(fan_id, "reaction_sent_but_not_persisted")
             print(f"[PPV REACTION PERSIST ERROR] fan={fan_id}: {exc}")

@@ -121,6 +121,70 @@ def test_followup_obligation_recreates_missing_action(monkeypatch):
     assert calls[0]["payload"]["experience"] == "shower"
 
 
+def test_followup_obligation_scan_paginates_past_first_page(monkeypatch):
+    import db.commercial_queries as commercial_queries
+
+    ranges = []
+
+    class Query:
+        current_range = (0, 1)
+
+        def table(self, _name):
+            return self
+
+        def select(self, _columns):
+            return self
+
+        @property
+        def not_(self):
+            return self
+
+        def is_(self, _column, _value):
+            return self
+
+        def order(self, _column):
+            return self
+
+        def range(self, start, end):
+            self.current_range = (start, end)
+            ranges.append(self.current_range)
+            return self
+
+        def execute(self):
+            pages = {
+                (0, 1): [{"fan_id": "1"}, {"fan_id": "2"}],
+                (2, 3): [{"fan_id": "3"}],
+            }
+            return SimpleNamespace(data=pages[self.current_range])
+
+    monkeypatch.setattr(commercial_queries, "get_supabase", lambda: Query())
+
+    rows = run(commercial_queries.get_followup_obligations(page_size=2))
+
+    assert [row["fan_id"] for row in rows] == ["1", "2", "3"]
+    assert ranges == [(0, 1), (2, 3)]
+
+
+def test_message_followups_get_extended_delivery_retries(monkeypatch):
+    due = action("OFFER_EXPIRY")
+    failures = []
+
+    async def broken_handler(_action):
+        raise RuntimeError("temporary platform failure")
+
+    monkeypatch.setattr(worker, "repair_followup_obligations", lambda: async_value(0))
+    monkeypatch.setattr(worker, "claim_due_actions", lambda: async_value([due]))
+    monkeypatch.setitem(worker.HANDLERS, "OFFER_EXPIRY", broken_handler)
+
+    async def capture_failure(*args, **kwargs):
+        failures.append((args, kwargs))
+
+    monkeypatch.setattr(worker, "fail_action", capture_failure)
+
+    assert run(worker.process_once()) == 0
+    assert failures[0][1]["max_attempts"] == 8
+
+
 def test_post_session_goal_uses_buyer_stage_without_selling(monkeypatch):
     captured = []
     monkeypatch.setattr(
