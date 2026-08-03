@@ -21,6 +21,7 @@ from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from core.supabase import get_supabase
+from core.webhooks import valid_hmac_sha256_signature
 from core.tenancy import (
     require_account_path_access,
     require_creator_access,
@@ -792,7 +793,8 @@ _cors_origins = [
 # --- API authentication ---------------------------------------------------
 # Path-based policy so we don't have to touch ~33 route decorators:
 #   • OPTIONS (CORS preflight) and health/root  -> always open
-#   • external webhooks                         -> require WEBHOOK_SECRET
+#   • API Fansly webhook                        -> verify its HMAC signature in-route
+#   • internal database webhook                 -> require WEBHOOK_SECRET header
 #   • everything else (operator/CRUD/admin)     -> require DASHBOARD_API_SECRET
 # Unconfigured secrets fail open in dev, closed in prod (see core/auth.py).
 from starlette.responses import JSONResponse
@@ -804,13 +806,20 @@ from core.auth import (
 )
 
 _PUBLIC_PATHS = {"/health", "/"}
-_WEBHOOK_PATHS = {"/webhook/fansly", "/generate-suggestions"}
+_WEBHOOK_PATHS = {"/generate-suggestions"}
+_SIGNED_WEBHOOK_PATHS = {"/webhook/fansly"}
 
 
 @app.middleware("http")
 async def api_auth_middleware(request, call_next):
     path = request.url.path
     if request.method == "OPTIONS" or path in _PUBLIC_PATHS:
+        return await call_next(request)
+
+    # Signature verification needs the untouched raw request body, so the API
+    # Fansly route authenticates itself. Do not require a custom header that the
+    # provider does not send.
+    if path in _SIGNED_WEBHOOK_PATHS:
         return await call_next(request)
 
     if path in _WEBHOOK_PATHS:
@@ -3820,7 +3829,39 @@ async def _enrich_fan_profile(fan_id: str, creator_id: str, platform_fan_id: str
 
 
 @app.post("/webhook/fansly")
-async def fansly_webhook(payload: dict) -> dict:
+async def fansly_webhook(request: Request) -> dict:
+    raw_body = await request.body()
+    signing_secret = (
+        os.environ.get("APIFANSLY_WEBHOOK_SECRET")
+        or os.environ.get("WEBHOOK_SECRET", "")
+    )
+    supplied_signature = request.headers.get("signature")
+    legacy_secret = request.headers.get("x-webhook-secret")
+    signature_valid = valid_hmac_sha256_signature(
+        raw_body,
+        supplied_signature,
+        signing_secret,
+    )
+    # Retain the old shared-secret header for local tools while production API
+    # Fansly deliveries use the cryptographic Signature header.
+    legacy_valid = bool(
+        signing_secret
+        and legacy_secret
+        and _consteq(legacy_secret, signing_secret)
+    )
+    if not signing_secret:
+        if not _is_dev():
+            raise HTTPException(500, "Server webhook signing secret is not configured")
+    elif not signature_valid and not legacy_valid:
+        raise HTTPException(401, "Invalid webhook signature")
+
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(400, "Invalid webhook payload")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "Invalid webhook payload")
+
     print(
         f"[FANSLY WEBHOOK] event={payload.get('event')} "
         f"account={payload.get('accountId')}"
