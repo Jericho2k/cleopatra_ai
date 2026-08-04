@@ -175,6 +175,23 @@ def _sample_availability_delay(
     return generator.uniform(420.0, 720.0)
 
 
+def build_availability_delay(
+    conversation_history: Sequence[Any],
+    *,
+    conversation_phase: str | None = None,
+    active_session: dict[str, Any] | None = None,
+    rng: random.Random | None = None,
+) -> tuple[AvailabilityMode, float]:
+    """Choose a durable pre-composition pause from conversation cadence."""
+    generator = rng or random.Random()
+    mode = infer_availability_mode(
+        conversation_history,
+        conversation_phase=conversation_phase,
+        active_session=active_session,
+    )
+    return mode, round(_sample_availability_delay(mode, generator), 2)
+
+
 def build_delivery_schedule(
     incoming_text: str,
     outgoing_parts: Sequence[str],
@@ -188,13 +205,13 @@ def build_delivery_schedule(
     generator = rng or random.Random()
     parts = [visible_text(part) for part in outgoing_parts if visible_text(part)]
     first = parts[0] if parts else ""
-    mode = infer_availability_mode(
+    mode, availability = build_availability_delay(
         conversation_history,
         conversation_phase=conversation_phase,
         active_session=active_session,
+        rng=generator,
     )
 
-    availability = _sample_availability_delay(mode, generator)
     reading_seconds = min(
         7.0, len(str(incoming_text or "")) / generator.uniform(16.0, 28.0)
     )

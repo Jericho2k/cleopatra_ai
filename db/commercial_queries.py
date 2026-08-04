@@ -310,11 +310,16 @@ async def cancel_actions_for_fan(
     action_type: str | None = None,
 ) -> None:
     def _cancel():
+        cancellable_statuses = (
+            ["PENDING", "FAILED", "PROCESSING"]
+            if action_type == "AUTO_REPLY"
+            else ["PENDING", "FAILED"]
+        )
         query = (
             get_supabase().table("scheduled_actions")
             .update({"status": "CANCELLED"})
             .eq("fan_id", fan_id)
-            .in_("status", ["PENDING", "FAILED"])
+            .in_("status", cancellable_statuses)
         )
         if action_type:
             query = query.eq("action_type", action_type)
@@ -382,7 +387,7 @@ async def complete_action(action_id: str) -> None:
     def _done():
         get_supabase().table("scheduled_actions").update(
             {"status": "COMPLETED", "locked_at": None}
-        ).eq("id", action_id).execute()
+        ).eq("id", action_id).eq("status", "PROCESSING").execute()
 
     await asyncio.to_thread(_done)
 
@@ -409,7 +414,7 @@ async def fail_action(
             payload["execute_at"] = retry_at.isoformat()
         get_supabase().table("scheduled_actions").update(payload).eq(
             "id", action_id
-        ).execute()
+        ).eq("status", "PROCESSING").execute()
 
     await asyncio.to_thread(_fail)
 
@@ -432,7 +437,7 @@ async def reschedule_action(
     def _reschedule():
         get_supabase().table("scheduled_actions").update(update).eq(
             "id", action_id
-        ).execute()
+        ).eq("status", "PROCESSING").execute()
 
     await asyncio.to_thread(_reschedule)
 
