@@ -302,8 +302,9 @@ def test_reaction_prompt_is_purchase_gated_in_send_orchestration():
         Path(__file__).resolve().parents[1] / "services" / "suggestions.py"
     ).read_text(encoding="utf-8")
     assert "_send_reaction_fishing" not in source
-    assert "_send_post_purchase_reaction" in source
-    assert "purchase_confirmed=true" in source
+    assert 'action_type="POST_PURCHASE_REACTION"' in source
+    assert '"_delivery": {"text": line}' in source
+    assert "if creator_id and not already_recorded:" in source
     persistence = (
         Path(__file__).resolve().parents[1] / "services" / "ppv_persistence.py"
     ).read_text(encoding="utf-8")

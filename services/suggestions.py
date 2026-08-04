@@ -31,7 +31,7 @@ from db.commercial_queries import (
     schedule_action,
 )
 from services.session_planner import plan_session_for_fan
-from services.human_delivery import build_delivery_schedule
+from services.human_delivery import build_availability_delay, build_delivery_schedule
 from services.ppv_delivery import create_ppv_approval_request
 from services.db_reliability import retry_transient_db_operation
 from services.apifansly import (
@@ -627,19 +627,47 @@ async def _update_fan_ai_summary(
         traceback.print_exc()
 
 
-async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
+async def _debounced_auto_reply(
+    fan_id: str,
+    creator_id: str,
+    *,
+    skip_debounce: bool = False,
+    skip_availability: bool = False,
+    expected_trigger_at: str | None = None,
+) -> None:
     """Wait for fan to finish typing, then generate and send one reply."""
     try:
         # Short jittered debounce catches rapid multi-message bursts. A separate
         # length-aware delay is applied after generation to simulate reading/typing.
-        delay = random.uniform(7.0, 12.0)
-        await asyncio.sleep(delay)
+        if not skip_debounce:
+            delay = random.uniform(7.0, 12.0)
+            await asyncio.sleep(delay)
 
         situation: dict | None = None  # initialized early — assigned properly later
 
         # Fetch history now — after the wait — to get the most complete picture
         # including any messages the fan sent while we were waiting
         conversation_history = await get_conversation_history(fan_id)
+
+        if expected_trigger_at:
+            from datetime import datetime, timezone
+
+            trigger_at = datetime.fromisoformat(
+                expected_trigger_at.replace("Z", "+00:00")
+            )
+            if trigger_at.tzinfo is None:
+                trigger_at = trigger_at.replace(tzinfo=timezone.utc)
+            newer = [
+                message
+                for message in conversation_history
+                if message.sent_at and message.sent_at > trigger_at
+            ]
+            if newer:
+                print(
+                    f"[AUTO REPLY] durable trigger obsolete fan={fan_id} "
+                    f"newer_messages={len(newer)}"
+                )
+                return
 
         # Stale generation check: if another task is already pending for this fan
         # (meaning a newer message came in during our wait and reset the timer),
@@ -1114,7 +1142,7 @@ async def _debounced_auto_reply(fan_id: str, creator_id: str) -> None:
         )
 
         # Do not advertise typing while the simulated creator is unavailable.
-        if not await _sleep_while_current(
+        if not skip_availability and not await _sleep_while_current(
             fan_id,
             timing.availability_delay_seconds,
             phase="availability",
@@ -1401,55 +1429,6 @@ _REACTION_FISHING_LINES = [
 ]
 
 
-async def _send_post_purchase_reaction(fan_id: str, creator_id: str) -> None:
-    """Send a reaction prompt only after the platform confirmed the unlock."""
-    try:
-        await asyncio.sleep(random.uniform(20.0, 55.0))
-        db = get_supabase()
-        fan_row = await asyncio.to_thread(
-            lambda: db.table("fans")
-            .select("fansly_group_id")
-            .eq("id", fan_id)
-            .single()
-            .execute()
-        )
-        creator_row = await asyncio.to_thread(
-            lambda: db.table("creators")
-            .select("apifansly_account_id")
-            .eq("id", creator_id)
-            .single()
-            .execute()
-        )
-        group_id = (fan_row.data or {}).get("fansly_group_id")
-        account_id = (creator_row.data or {}).get("apifansly_account_id")
-        line = random.choice(_REACTION_FISHING_LINES)
-        if not group_id or not account_id:
-            print(f"[PPV REACTION] fan={fan_id} skipped=no_live_delivery_route")
-            return
-        from main import send_fansly_message
-
-        platform_message_id = await send_fansly_message(account_id, str(group_id), line)
-        if not platform_message_id:
-            print(f"[PPV REACTION] fan={fan_id} skipped=platform_rejected")
-            return
-        try:
-            await save_message(
-                fan_id,
-                creator_id,
-                "creator",
-                line,
-                was_ai_suggested=True,
-                fansly_message_id=platform_message_id,
-            )
-        except Exception as exc:
-            await freeze_fan_for_review(fan_id, "reaction_sent_but_not_persisted")
-            print(f"[PPV REACTION PERSIST ERROR] fan={fan_id}: {exc}")
-            return
-        print(f"[PPV REACTION] fan={fan_id} purchase_confirmed=true line={line}")
-    except Exception as e:
-        print(f"[PPV REACTION ERROR] {e}")
-
-
 async def record_ppv_purchase(
     fan_id: str,
     media_id: str,
@@ -1681,9 +1660,22 @@ async def record_ppv_purchase(
         await save_fan_state(fan_id, creator_id, state)
 
     if creator_id and not already_recorded:
-        spawn(
-            _send_post_purchase_reaction(fan_id, creator_id),
-            name="send_post_purchase_reaction",
+        from datetime import datetime, timedelta, timezone
+
+        purchased_at = datetime.now(timezone.utc)
+        line = random.choice(_REACTION_FISHING_LINES)
+        reaction_key = platform_order_id or reference or f"{media_id}:{purchased_at.isoformat()}"
+        await schedule_action(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            action_type="POST_PURCHASE_REACTION",
+            execute_at=purchased_at + timedelta(seconds=random.uniform(20.0, 55.0)),
+            payload={
+                "purchase_at": purchased_at.isoformat(),
+                "media_id": str(media_id),
+                "_delivery": {"text": line},
+            },
+            dedupe_key=f"post-purchase-reaction:{fan_id}:{reaction_key}",
         )
 
     # Whale handoff only on the threshold crossing, not duplicate webhooks.
@@ -1817,86 +1809,124 @@ async def sweep_stale_ppv_checks() -> None:
         print(f"[PPV SWEEP FATAL] {e}")
 
 
-def schedule_auto_reply(fan_id: str, creator_id: str) -> None:
-    """Cancel any pending reply for this fan and schedule a new one."""
+async def schedule_auto_reply(
+    fan_id: str,
+    creator_id: str,
+    *,
+    conversation_history: list[Message] | None = None,
+    source_message_id: str | None = None,
+) -> None:
+    """Persist a replaceable Auto reply obligation that survives redeploys."""
     existing = _pending_auto_replies.get(fan_id)
     if existing and not existing.done():
         existing.cancel()
         print(f"[AUTO REPLY] Reset timer for fan={fan_id}")
+    from datetime import datetime, timedelta, timezone
 
-    task = asyncio.create_task(_debounced_auto_reply_with_sleep_check(fan_id, creator_id))
+    from db.queries import get_creator_sleep_hours
+    from services.followup_lifecycle import next_awake_time
 
-    # Log any unhandled exceptions so they don't disappear silently
-    def _on_task_done(t: asyncio.Task) -> None:
-        if not t.cancelled() and t.exception():
-            import traceback
-            print(f"[AUTO REPLY TASK ERROR] fan={fan_id}")
-            traceback.print_exception(type(t.exception()), t.exception(), t.exception().__traceback__)
+    history = conversation_history or await get_conversation_history(fan_id)
+    latest_fan = next((message for message in reversed(history) if message.role == "fan"), None)
+    trigger_at = (
+        latest_fan.sent_at.astimezone(timezone.utc)
+        if latest_fan and latest_fan.sent_at
+        else datetime.now(timezone.utc)
+    )
+    active_session = await get_fan_session(fan_id)
+    mode, availability_seconds = build_availability_delay(
+        history,
+        active_session=active_session,
+    )
+    sleep_start, sleep_end = await get_creator_sleep_hours(creator_id)
+    now = datetime.now(timezone.utc)
+    awake_at = next_awake_time(
+        now,
+        sleep_start_hour=sleep_start,
+        sleep_end_hour=sleep_end,
+        timezone_name="UTC",
+    )
+    wake_jitter = random.uniform(60.0, 600.0) if awake_at > now else 0.0
+    execute_at = max(now, awake_at) + timedelta(
+        seconds=wake_jitter + random.uniform(7.0, 12.0) + availability_seconds
+    )
+    await cancel_actions_for_fan(fan_id, "AUTO_REPLY")
+    dedupe_source = source_message_id or trigger_at.isoformat()
+    await schedule_action(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        action_type="AUTO_REPLY",
+        execute_at=execute_at,
+        payload={
+            "trigger_message_id": source_message_id,
+            "trigger_content": latest_fan.content if latest_fan else "",
+            "trigger_sent_at": trigger_at.isoformat(),
+            "availability_mode": mode.value,
+        },
+        dedupe_key=f"auto-reply:{fan_id}:{dedupe_source}",
+    )
+    print(
+        f"[AUTO REPLY QUEUED] fan={fan_id} durable=true mode={mode.value} "
+        f"execute_at={execute_at.isoformat()}"
+    )
 
-    task.add_done_callback(_on_task_done)
-    _pending_auto_replies[fan_id] = task
 
+async def deliver_scheduled_auto_reply(action: dict) -> bool:
+    """Execute a claimed Auto obligation and report whether a reply now exists."""
+    fan_id = str(action["fan_id"])
+    creator_id = str(action["creator_id"])
+    payload = action.get("payload") or {}
+    trigger_at_raw = str(payload.get("trigger_sent_at") or "")
 
-async def _debounced_auto_reply_with_sleep_check(fan_id: str, creator_id: str) -> None:
-    """Check sleep hours before firing auto reply."""
-    try:
+    if action.get("status") == "PROCESSING":
+        from main import sync_recent_fan_messages
+
+        result = await sync_recent_fan_messages(creator_id, fan_id)
+        if result.get("status") != "ok":
+            raise RuntimeError("could not reconcile stale Auto reply before retry")
+
+    if trigger_at_raw:
         from datetime import datetime, timezone
-        db = get_supabase()
-        creator_row = await asyncio.to_thread(
-            lambda: db.table("creators")
-            .select("sleep_hours_start, sleep_hours_end")
-            .eq("id", creator_id)
-            .single()
-            .execute()
+
+        trigger_at = datetime.fromisoformat(trigger_at_raw.replace("Z", "+00:00"))
+        if trigger_at.tzinfo is None:
+            trigger_at = trigger_at.replace(tzinfo=timezone.utc)
+        current_history = await get_conversation_history(fan_id, limit=10)
+        newer = [
+            message
+            for message in current_history
+            if message.sent_at and message.sent_at > trigger_at
+        ]
+        if newer:
+            return any(message.role == "creator" for message in newer)
+
+    task = asyncio.create_task(
+        _debounced_auto_reply(
+            fan_id,
+            creator_id,
+            skip_debounce=True,
+            skip_availability=True,
+            expected_trigger_at=trigger_at_raw or None,
         )
-        data = creator_row.data or {}
-        sleep_start = data.get("sleep_hours_start", 0)
-        sleep_end = data.get("sleep_hours_end", 7)
+    )
+    _pending_auto_replies[fan_id] = task
+    try:
+        await task
+    except asyncio.CancelledError:
+        return False
 
-        current_hour = datetime.now(timezone.utc).hour
-        if sleep_start <= sleep_end:
-            in_sleep = sleep_start <= current_hour < sleep_end
-        else:
-            in_sleep = current_hour >= sleep_start or current_hour < sleep_end
-
-        if in_sleep:
-            # Calculate seconds until sleep ends
-            from datetime import datetime, timezone
-            now = datetime.now(timezone.utc)
-            wake_hour = sleep_end
-            if now.hour < wake_hour:
-                seconds_until_wake = (wake_hour - now.hour) * 3600 - now.minute * 60 - now.second
-            else:
-                seconds_until_wake = (24 - now.hour + wake_hour) * 3600 - now.minute * 60 - now.second
-            # Add small random offset so replies don't all fire at exactly wake time
-            seconds_until_wake += random.randint(60, 600)
-            print(f"[AUTO REPLY] Sleep hours active — queuing reply in {seconds_until_wake//60}min for fan={fan_id}")
-            await asyncio.sleep(seconds_until_wake)
-            # Re-check sleep hours after waking (in case settings changed)
-            creator_row2 = await asyncio.to_thread(
-                lambda: db.table("creators")
-                .select("sleep_hours_start, sleep_hours_end")
-                .eq("id", creator_id)
-                .single()
-                .execute()
-            )
-            data2 = creator_row2.data or {}
-            new_start = data2.get("sleep_hours_start", 0)
-            new_end = data2.get("sleep_hours_end", 7)
-            new_hour = datetime.now(timezone.utc).hour
-            if new_start <= new_end:
-                still_sleeping = new_start <= new_hour < new_end
-            else:
-                still_sleeping = new_hour >= new_start or new_hour < new_end
-            if still_sleeping:
-                print(f"[AUTO REPLY] Still in sleep hours after wake — skipping fan={fan_id}")
-                return
-            print(f"[AUTO REPLY] Sleep ended — sending queued reply for fan={fan_id}")
-
-        await _debounced_auto_reply(fan_id, creator_id)
-    except Exception as e:
-        print(f"[SLEEP CHECK ERROR] {e}")
-        await _debounced_auto_reply(fan_id, creator_id)
+    if not trigger_at_raw:
+        return False
+    trigger_at = datetime.fromisoformat(trigger_at_raw.replace("Z", "+00:00"))
+    if trigger_at.tzinfo is None:
+        trigger_at = trigger_at.replace(tzinfo=timezone.utc)
+    history = await get_conversation_history(fan_id, limit=10)
+    return any(
+        message.role == "creator"
+        and message.sent_at
+        and message.sent_at > trigger_at
+        for message in history
+    )
 
 
 def _should_update_memory(conversation_history: list[Message]) -> bool:

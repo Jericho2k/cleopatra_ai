@@ -125,6 +125,8 @@ async def _should_still_send(action: dict) -> ActionCheck:
 
     fan_id = action["fan_id"]
     creator_id = action["creator_id"]
+    action_type = str(action.get("action_type") or "")
+    payload = action.get("payload") or {}
 
     fan = await get_fan_by_id(fan_id)
     if not fan:
@@ -134,20 +136,61 @@ async def _should_still_send(action: dict) -> ActionCheck:
     if getattr(fan, "needs_human_review", False):
         return ActionCheck(False, "fan frozen for human review")
 
-    # Auto mode must still be on for this fan.
-    fan_auto = getattr(fan, "auto_mode", None)
-    if fan_auto is None:
-        try:
-            fan_auto = await _creator_auto_mode_default(creator_id)
-        except Exception:
-            fan_auto = False
-    if not fan_auto:
-        return ActionCheck(False, "auto mode off")
+    if action_type != "POST_PURCHASE_REACTION":
+        # Auto mode must still be on for this fan.
+        fan_auto = getattr(fan, "auto_mode", None)
+        if fan_auto is None:
+            try:
+                fan_auto = await _creator_auto_mode_default(creator_id)
+            except Exception:
+                fan_auto = False
+        if not fan_auto:
+            return ActionCheck(False, "auto mode off")
+
+    if action_type == "AUTO_REPLY":
+        from main import _creator_auto_availability
+
+        availability = await _creator_auto_availability(creator_id)
+        if not availability.get("auto_available"):
+            return ActionCheck(False, "no approved sets remain for Auto mode")
+        trigger_at = _parse_time(payload.get("trigger_sent_at"))
+        if not trigger_at:
+            return ActionCheck(False, "Auto reply trigger timestamp is missing")
+        history = await get_conversation_history(fan_id, limit=10)
+        if any(
+            (message_at := _parse_time(getattr(message, "sent_at", None)))
+            and message_at > trigger_at
+            for message in history
+        ):
+            return ActionCheck(False, "newer conversation activity replaced Auto reply")
+
+        sleep_start, sleep_end = await get_creator_sleep_hours(creator_id)
+        now = datetime.now(timezone.utc)
+        awake_at = next_awake_time(
+            now,
+            sleep_start_hour=sleep_start,
+            sleep_end_hour=sleep_end,
+            timezone_name="UTC",
+        )
+        if awake_at > now:
+            return ActionCheck(False, "creator sleep hours are active", retry_at=awake_at)
+        return ActionCheck(True)
+
+    if action_type == "POST_PURCHASE_REACTION":
+        purchase_at = _parse_time(payload.get("purchase_at"))
+        if not purchase_at:
+            return ActionCheck(False, "purchase reaction timestamp is missing")
+        history = await get_conversation_history(fan_id, limit=10)
+        if any(
+            (message_at := _parse_time(getattr(message, "sent_at", None)))
+            and message_at > purchase_at
+            for message in history
+        ):
+            return ActionCheck(False, "conversation continued after purchase")
+        return ActionCheck(True)
 
     state = await get_fan_state(fan_id)
     policy = await get_creator_policy(creator_id)
-    action_type = str(action.get("action_type") or "")
-    payload = action.get("payload") or {}
 
     if state.next_followup_type != action_type:
         return ActionCheck(False, "follow-up obligation was cancelled or replaced")
@@ -317,6 +360,37 @@ async def _run_inactivity_reengagement(action: dict) -> HandlerResult:
     return await _send_goal(action, goal)
 
 
+async def _run_auto_reply(action: dict) -> HandlerResult:
+    from services.suggestions import deliver_scheduled_auto_reply
+
+    sent = await deliver_scheduled_auto_reply(action)
+    if not sent:
+        from core.supabase import get_supabase
+
+        pending_approval = await asyncio.to_thread(
+            lambda: get_supabase().table("ppv_approval_requests")
+            .select("id")
+            .eq("fan_id", action["fan_id"])
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        )
+        if pending_approval.data:
+            return HandlerResult(
+                sent_message=False,
+                reason="durable Auto reply prepared a PPV approval",
+            )
+        raise RuntimeError("Auto reply completed without a confirmed message")
+    return HandlerResult(sent_message=sent, reason="durable Auto reply processed")
+
+
+async def _run_post_purchase_reaction(action: dict) -> HandlerResult:
+    return await _send_goal(
+        action,
+        "A purchase was just confirmed; send the already prepared short reaction.",
+    )
+
+
 async def _run_offer_expiry(action: dict) -> HandlerResult:
     """Turn the exact still-pending offer into a later follow-up obligation."""
     from services.followup_lifecycle import expire_pending_offer_state
@@ -372,6 +446,8 @@ async def _run_ppv_reconcile(action: dict) -> HandlerResult:
 
 
 HANDLERS = {
+    "AUTO_REPLY": _run_auto_reply,
+    "POST_PURCHASE_REACTION": _run_post_purchase_reaction,
     "PAYDAY_REENGAGEMENT": _run_payday_reengagement,
     "POST_SESSION_FOLLOWUP": _run_post_session_followup,
     "ABANDONED_PPV_FOLLOWUP": _run_abandoned_ppv_followup,
@@ -384,7 +460,7 @@ HANDLERS = {
 
 async def _record_message_action_resolution(action: dict, *, sent: bool) -> None:
     action_type = str(action.get("action_type") or "")
-    if action_type == "PPV_RECONCILE":
+    if action_type in {"AUTO_REPLY", "POST_PURCHASE_REACTION", "PPV_RECONCILE"}:
         return
     state = await get_fan_state(action["fan_id"])
     current_dedupe = str(state.next_followup_dedupe_key or "")

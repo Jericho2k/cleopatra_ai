@@ -346,7 +346,12 @@ async def process_incoming_fan_message(
     )
 
     if effective_auto:
-        schedule_auto_reply(fan_id, creator_id)
+        await schedule_auto_reply(
+            fan_id,
+            creator_id,
+            conversation_history=conversation_history,
+            source_message_id=message_id,
+        )
         fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
         print(
             f"[MEMORY CHECK] fan={fan_id} fan_messages={fan_msg_count} "
@@ -583,13 +588,13 @@ async def _scheduled_actions_scheduler():
     """Runs the commercial scheduled-actions queue (payday re-engagement, etc)."""
     from workers.scheduled_actions import process_once
     while True:
-        await asyncio.sleep(60)
         try:
             sent = await process_once()
             if sent:
                 print(f"[CRON] scheduled actions: sent {sent}")
         except Exception as e:
             print(f"[CRON SCHEDULED ACTIONS ERROR] {e}")
+        await asyncio.sleep(60)
 
 
 async def vault_autosync_scheduler():
