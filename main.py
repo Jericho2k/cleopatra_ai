@@ -121,6 +121,9 @@ from services.vault_metadata import (
 _processed_messages: set = set()
 _vault_sync_state: dict = {}
 _protected_video_download_gate = asyncio.Semaphore(1)
+_active_chat_binding_retry_after: dict[str, float] = {}
+_active_chat_binding_tasks: dict[str, asyncio.Task] = {}
+_ACTIVE_CHAT_BINDING_RETRY_SECONDS = 15 * 60
 
 
 async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id: str) -> str | None:
@@ -165,6 +168,44 @@ async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id:
     except Exception as e:
         print(f"[GROUP_ID ERROR] {e}")
     return None
+
+
+async def _resolve_active_chat_group_id(
+    *,
+    account_id: str,
+    platform_fan_id: str,
+    fan_id: str,
+) -> tuple[str | None, int]:
+    """Coalesce and throttle expensive chat-list scans for an unbound fan."""
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    existing = _active_chat_binding_tasks.get(fan_id)
+    retry_after = _active_chat_binding_retry_after.get(fan_id, 0.0)
+    if existing is None and now < retry_after:
+        return None, max(1, int(retry_after - now))
+
+    owner = existing is None
+    task = existing
+    if task is None:
+        _active_chat_binding_retry_after[fan_id] = (
+            now + _ACTIVE_CHAT_BINDING_RETRY_SECONDS
+        )
+        task = asyncio.create_task(
+            get_or_fetch_group_id(account_id, platform_fan_id, fan_id)
+        )
+        _active_chat_binding_tasks[fan_id] = task
+
+    try:
+        group_id = await task
+    finally:
+        if owner and _active_chat_binding_tasks.get(fan_id) is task:
+            _active_chat_binding_tasks.pop(fan_id, None)
+
+    if group_id:
+        _active_chat_binding_retry_after.pop(fan_id, None)
+        return str(group_id), 0
+    remaining = _active_chat_binding_retry_after.get(fan_id, loop.time()) - loop.time()
+    return None, max(1, int(remaining))
 
 
 async def send_fansly_message(account_id: str, group_id: str, text: str) -> str | None:
@@ -1523,7 +1564,7 @@ async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
         return await asyncio.gather(
             asyncio.to_thread(
                 lambda: db.table("fans")
-                .select("fansly_group_id")
+                .select("fansly_group_id, platform_fan_id")
                 .eq("id", fan_id)
                 .eq("creator_id", creator_id)
                 .single()
@@ -1547,11 +1588,44 @@ async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
     account_id = str(creator.get("apifansly_account_id") or "")
     platform_id = str(creator.get("fansly_account_id") or "")
     group_id = str(fan.get("fansly_group_id") or "")
-    if not account_id or not platform_id or not group_id:
+    platform_fan_id = str(fan.get("platform_fan_id") or "")
+    if not account_id or not platform_id or not platform_fan_id:
+        missing = [
+            name
+            for name, value in (
+                ("API Fansly account", account_id),
+                ("creator platform account", platform_id),
+                ("fan platform account", platform_fan_id),
+            )
+            if not value
+        ]
         raise HTTPException(
             status_code=409,
-            detail="The active chat is missing its API Fansly delivery binding.",
+            detail=(
+                "The active chat is missing its "
+                f"{', '.join(missing)} binding. Reconnect or resync this creator."
+            ),
         )
+
+    if not group_id:
+        group_id, retry_after_seconds = await _resolve_active_chat_group_id(
+            account_id=account_id,
+            platform_fan_id=platform_fan_id,
+            fan_id=fan_id,
+        )
+        if not group_id:
+            print(
+                f"[ACTIVE CHAT BINDING] fan={fan_id} group_missing=true "
+                f"retry_after={retry_after_seconds}s"
+            )
+            return {
+                "status": "binding_pending",
+                "imported": 0,
+                "inbound": 0,
+                "media_updated": 0,
+                "identity_reconciled": 0,
+                "retry_after_seconds": retry_after_seconds,
+            }
 
     async with httpx.AsyncClient() as client:
         result = await _sync_recent_fan_messages(
