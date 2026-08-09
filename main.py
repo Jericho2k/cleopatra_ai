@@ -100,6 +100,11 @@ from services.vault_operations import (
     manual_recategorization_usage,
     normalize_media_ids,
 )
+from services.vault_sync import (
+    ordered_vault_albums,
+    should_stop_album_scan,
+    vault_sync_cooldown,
+)
 from services.video_frames import (
     FrameSettings,
     build_contact_sheet,
@@ -120,10 +125,17 @@ from services.vault_metadata import (
 
 _processed_messages: set = set()
 _vault_sync_state: dict = {}
+_VAULT_SYNC_ACTIVE_STATUSES = {"running", "categorizing_new"}
 _protected_video_download_gate = asyncio.Semaphore(1)
 _active_chat_binding_retry_after: dict[str, float] = {}
 _active_chat_binding_tasks: dict[str, asyncio.Task] = {}
 _ACTIVE_CHAT_BINDING_RETRY_SECONDS = 15 * 60
+_VAULT_SYNC_INTERVAL_HOURS = max(
+    1.0, float(os.getenv("VAULT_SYNC_INTERVAL_HOURS", "24"))
+)
+_VAULT_AUTOSYNC_CHECK_SECONDS = max(
+    300, int(os.getenv("VAULT_AUTOSYNC_CHECK_SECONDS", "3600"))
+)
 
 
 async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id: str) -> str | None:
@@ -598,7 +610,7 @@ async def _scheduled_actions_scheduler():
 
 
 async def vault_autosync_scheduler():
-    """Once a day, sync creators whose vault is stale.
+    """Check hourly and incrementally sync each connected creator once per day.
 
     ``_run_vault_sync`` owns the exact IDs imported by that run and, when the
     creator opted in, categorizes only those IDs. The scheduler must never scan
@@ -606,25 +618,32 @@ async def vault_autosync_scheduler():
     the initial-vault job.
     """
     while True:
-        await asyncio.sleep(24 * 60 * 60)
         try:
             print("[CRON] Vault auto-sync pass...")
             db = get_supabase()
             creators = await asyncio.to_thread(
-                lambda: db.table("creators").select("id").execute()
+                lambda: db.table("creators")
+                .select("id, last_vault_sync_at")
+                .not_.is_("apifansly_account_id", "null")
+                .execute()
             )
             for c in (creators.data or []):
-                cid = c["id"]
-                cd = await _vault_cooldown_remaining(cid, "last_vault_sync_at")
+                cd = vault_sync_cooldown(
+                    c.get("last_vault_sync_at"),
+                    interval_hours=_VAULT_SYNC_INTERVAL_HOURS,
+                )
                 if not cd["allowed"]:
                     continue
-                # Reuse the guarded endpoint logic; it stamps + skips if already running.
-                res = await sync_vault_start(cid)
-                if res.get("status") != "started":
-                    continue
-                print(f"[CRON] auto-sync started creator={cid}")
+                cid = str(c["id"])
+                try:
+                    res = await sync_vault_start(cid)
+                    if res.get("status") == "started":
+                        print(f"[CRON] auto-sync started creator={cid}")
+                except Exception as exc:
+                    print(f"[CRON VAULT CREATOR ERROR] creator={cid}: {exc}")
         except Exception as e:
             print(f"[CRON VAULT AUTOSYNC ERROR] {e}")
+        await asyncio.sleep(_VAULT_AUTOSYNC_CHECK_SECONDS)
 
 
 _chat_reconcile_denied_bindings: set[tuple[str, str]] = set()
@@ -2175,15 +2194,15 @@ async def sync_vault(creator_id: str) -> dict:
     dependencies=[Depends(require_creator_path_access)],
 )
 async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
-    if creator_id in _vault_sync_state and _vault_sync_state[creator_id].get("status") == "running":
+    if _vault_sync_state.get(creator_id, {}).get("status") in _VAULT_SYNC_ACTIVE_STATUSES:
         return {"status": "already_running"}
-    # Cost guard: vault sync is expensive — once per 7 days unless forced.
+    # The background scheduler checks hourly, while API Fansly is called for a
+    # creator at most once per 24 hours unless an operator explicitly forces it.
     if not force:
         cd = await _vault_cooldown_remaining(creator_id, "last_vault_sync_at")
         if not cd["allowed"]:
             return {"status": "cooldown", **cd}
     _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": 0, "album": ""}
-    await _stamp_vault_op(creator_id, "last_vault_sync_at")
     spawn(_run_vault_sync(creator_id), name="run_vault_sync")
     return {"status": "started"}
 
@@ -2195,6 +2214,28 @@ async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
 async def sync_vault_status(creator_id: str) -> dict:
     state = _vault_sync_state.get(creator_id, {"status": "idle", "synced": 0, "total": 0, "album": ""})
     return state
+
+
+async def _vault_existing_media_ids(creator_id: str) -> set[str]:
+    """Load every existing media ID; Supabase caps ordinary selects at 1,000."""
+    db = get_supabase()
+    page_size = 1000
+    offset = 0
+    result: set[str] = set()
+    while True:
+        response = await asyncio.to_thread(
+            lambda start=offset: db.table("creator_vault_media")
+            .select("media_id")
+            .eq("creator_id", creator_id)
+            .order("media_id")
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        rows = response.data or []
+        result.update(str(row["media_id"]) for row in rows if row.get("media_id"))
+        if len(rows) < page_size:
+            return result
+        offset += page_size
 
 
 async def _run_vault_sync(creator_id: str) -> None:
@@ -2219,13 +2260,7 @@ async def _run_vault_sync(creator_id: str) -> None:
         initial_completed_at = (creator_row.data or {}).get(
             "vault_initial_categorized_at"
         )
-        existing_rows = await asyncio.to_thread(
-            lambda: db.table("creator_vault_media")
-            .select("media_id")
-            .eq("creator_id", creator_id)
-            .execute()
-        )
-        existing_ids = {r["media_id"] for r in (existing_rows.data or [])}
+        existing_ids = await _vault_existing_media_ids(creator_id)
 
         async with httpx.AsyncClient() as client:
             albums = await apifansly_list_vault_albums(
@@ -2248,13 +2283,14 @@ async def _run_vault_sync(creator_id: str) -> None:
 
             _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": 0, "album": "Starting..."}
 
-            for album in albums:
+            for album in ordered_vault_albums(albums):
                 album_id = album.get("id")
                 album_title = album.get("title") or f"Album_{album_id}"
                 cursor = None
                 consecutive_dupe_batches = 0
 
                 while True:
+                    is_first_page = cursor is None
                     items, cursor = await apifansly_list_vault_album_media(
                         str(apifansly_id),
                         str(album_id),
@@ -2296,8 +2332,6 @@ async def _run_vault_sync(creator_id: str) -> None:
                             "price": price,
                         })
                         existing_ids.add(media_id)
-                    consecutive_dupe_batches = consecutive_dupe_batches + 1 if all_dupes else 0
-
                     if batch:
                         saved_rows = await asyncio.to_thread(
                             lambda b=batch: db.table("creator_vault_media")
@@ -2325,11 +2359,25 @@ async def _run_vault_sync(creator_id: str) -> None:
                             ]
                         new_item_ids.extend(returned_ids)
                         synced += len(batch)
+                    consecutive_dupe_batches = (
+                        consecutive_dupe_batches + 1 if all_dupes else 0
+                    )
 
                     _vault_sync_state[creator_id] = {"status": "running", "synced": synced, "total": new_total, "album": album_title}
                     print(f"[VAULT SYNC] album={album_title} synced={synced}/{new_total} cursor={cursor}")
 
-                    if not cursor or consecutive_dupe_batches >= 3:
+                    # ``lastItemId`` proves that this is the newest page. If it is
+                    # entirely local, no older page can contain a later upload.
+                    # Keep the conservative three-page fallback for older API
+                    # responses that do not expose a comparable last-item ID.
+                    if should_stop_album_scan(
+                        items=items,
+                        next_cursor=cursor,
+                        is_first_page=is_first_page,
+                        last_item_id=album.get("lastItemId"),
+                        all_items_known=all_dupes,
+                        consecutive_known_batches=consecutive_dupe_batches,
+                    ):
                         break
 
         new_item_ids = normalize_media_ids(new_item_ids)
@@ -2363,6 +2411,7 @@ async def _run_vault_sync(creator_id: str) -> None:
             categorized_new = int(category_state.get("done") or 0)
             category_errors = int(category_state.get("errors") or 0)
 
+        await _stamp_vault_op(creator_id, "last_vault_sync_at")
         _vault_sync_state[creator_id] = {
             "status": "done",
             "synced": synced,
@@ -3039,35 +3088,17 @@ async def _categorize_single_item(
         raise
 
 
-_VAULT_COOLDOWN_DAYS = 7
-
-
 async def _vault_cooldown_remaining(creator_id: str, column: str) -> dict:
-    """Returns cooldown info for an expensive vault op.
-    {allowed: bool, last_at: str|None, days_remaining: float, next_allowed_at: str|None}.
-    column is 'last_vault_sync_at' or 'last_categorize_at'."""
-    from datetime import datetime, timezone, timedelta
+    """Return the daily API Fansly vault-sync cooldown for one creator."""
     db = get_supabase()
     row = await asyncio.to_thread(
         lambda: db.table("creators").select(column).eq("id", creator_id).single().execute()
     )
     last_str = (row.data or {}).get(column)
-    if not last_str:
-        return {"allowed": True, "last_at": None, "days_remaining": 0, "next_allowed_at": None}
-    try:
-        last = datetime.fromisoformat(last_str.replace("Z", "+00:00"))
-    except Exception:
-        return {"allowed": True, "last_at": last_str, "days_remaining": 0, "next_allowed_at": None}
-    now = datetime.now(timezone.utc)
-    next_allowed = last + timedelta(days=_VAULT_COOLDOWN_DAYS)
-    if now >= next_allowed:
-        return {"allowed": True, "last_at": last_str, "days_remaining": 0, "next_allowed_at": None}
-    remaining = (next_allowed - now).total_seconds() / 86400
-    return {
-        "allowed": False, "last_at": last_str,
-        "days_remaining": round(remaining, 1),
-        "next_allowed_at": next_allowed.isoformat(),
-    }
+    return vault_sync_cooldown(
+        last_str,
+        interval_hours=_VAULT_SYNC_INTERVAL_HOURS,
+    )
 
 
 async def _stamp_vault_op(creator_id: str, column: str) -> None:
@@ -3339,7 +3370,10 @@ async def vault_categorization_overview(creator_id: str) -> dict:
     db = get_supabase()
     creator = await asyncio.to_thread(
         lambda: db.table("creators")
-        .select("vault_initial_categorized_at, auto_categorize_new_media")
+        .select(
+            "vault_initial_categorized_at, auto_categorize_new_media, "
+            "last_vault_sync_at"
+        )
         .eq("id", creator_id)
         .single()
         .execute()
@@ -3351,6 +3385,12 @@ async def vault_categorization_overview(creator_id: str) -> dict:
         "initial_completed_at": creator.data.get("vault_initial_categorized_at"),
         "auto_categorize_new_media": bool(
             creator.data.get("auto_categorize_new_media", True)
+        ),
+        "last_vault_sync_at": creator.data.get("last_vault_sync_at"),
+        "vault_sync_interval_hours": _VAULT_SYNC_INTERVAL_HOURS,
+        "active_sync": _vault_sync_state.get(
+            creator_id,
+            {"status": "idle", "synced": 0, "total": 0, "album": ""},
         ),
         "uncategorized": await _count_uncategorized(creator_id),
         "stale_classifications": await _count_stale_classifications(creator_id),
