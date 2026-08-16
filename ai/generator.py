@@ -10,6 +10,10 @@ from ai.model_providers import complete, get_runtime_target
 from models.model_runtime import ModelTarget, ModelTelemetryContext
 from models.schemas import Persona
 from services.model_telemetry import record_model_failure, record_model_result
+from services.model_availability import (
+    record_model_transport_failure,
+    record_model_transport_success,
+)
 
 BANNED_PHRASES = [
     "hehe",
@@ -303,6 +307,7 @@ async def generate_replies(
                 messages=messages,
                 max_tokens=1000,
             )
+            record_model_transport_success(attempt_target.model)
             try:
                 replies = parse_reply_candidates(result.text, creator_persona)
             except Exception as parse_error:
@@ -337,6 +342,7 @@ async def generate_replies(
                     )
                 return replies
         except Exception as error:
+            record_model_transport_failure(attempt_target.model, error)
             await record_model_failure(
                 attempt_target,
                 context,

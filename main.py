@@ -7,6 +7,7 @@ import asyncio
 from core.tasks import spawn
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -73,6 +74,10 @@ from services.apifansly import (
 from services.auto_audience import AutoAudiencePolicy
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
+from services.model_availability import (
+    current_model_availability,
+    model_availability_scheduler,
+)
 from services.shoot_fingerprint import (
     add_semantic_shoot_evidence,
     build_shoot_clusters,
@@ -125,6 +130,7 @@ from services.vault_metadata import (
 
 _processed_messages: set = set()
 _vault_sync_state: dict = {}
+_vault_sync_retry_after: dict[str, float] = {}
 _VAULT_SYNC_ACTIVE_STATUSES = {"running", "categorizing_new"}
 _protected_video_download_gate = asyncio.Semaphore(1)
 _active_chat_binding_retry_after: dict[str, float] = {}
@@ -135,6 +141,9 @@ _VAULT_SYNC_INTERVAL_HOURS = max(
 )
 _VAULT_AUTOSYNC_CHECK_SECONDS = max(
     300, int(os.getenv("VAULT_AUTOSYNC_CHECK_SECONDS", "3600"))
+)
+_VAULT_ACCESS_DENIED_RETRY_SECONDS = max(
+    3600, int(os.getenv("VAULT_ACCESS_DENIED_RETRY_SECONDS", str(24 * 60 * 60)))
 )
 
 
@@ -581,6 +590,7 @@ ppv_sweep_task: asyncio.Task | None = None
 vault_autosync_task: asyncio.Task | None = None
 scheduled_actions_task: asyncio.Task | None = None
 chat_reconcile_task: asyncio.Task | None = None
+model_availability_task: asyncio.Task | None = None
 
 
 async def ppv_sweep_scheduler():
@@ -628,13 +638,15 @@ async def vault_autosync_scheduler():
                 .execute()
             )
             for c in (creators.data or []):
+                cid = str(c["id"])
+                if _vault_sync_retry_after.get(cid, 0) > time.time():
+                    continue
                 cd = vault_sync_cooldown(
                     c.get("last_vault_sync_at"),
                     interval_hours=_VAULT_SYNC_INTERVAL_HOURS,
                 )
                 if not cd["allowed"]:
                     continue
-                cid = str(c["id"])
                 try:
                     res = await sync_vault_start(cid)
                     if res.get("status") == "started":
@@ -823,7 +835,7 @@ async def chat_reconciliation_scheduler():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global session_store, fansly_poller, ppv_sweep_task, vault_autosync_task, scheduled_actions_task, chat_reconcile_task
+    global session_store, fansly_poller, ppv_sweep_task, vault_autosync_task, scheduled_actions_task, chat_reconcile_task, model_availability_task
 
     supabase = get_supabase()
     session_store = SessionStore(
@@ -841,6 +853,7 @@ async def lifespan(app: FastAPI):
     vault_autosync_task = asyncio.create_task(vault_autosync_scheduler())
     scheduled_actions_task = asyncio.create_task(_scheduled_actions_scheduler())
     chat_reconcile_task = asyncio.create_task(chat_reconciliation_scheduler())
+    model_availability_task = asyncio.create_task(model_availability_scheduler())
 
     yield
 
@@ -854,6 +867,8 @@ async def lifespan(app: FastAPI):
         scheduled_actions_task.cancel()
     if chat_reconcile_task:
         chat_reconcile_task.cancel()
+    if model_availability_task:
+        model_availability_task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -2196,6 +2211,15 @@ async def sync_vault(creator_id: str) -> dict:
 async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
     if _vault_sync_state.get(creator_id, {}).get("status") in _VAULT_SYNC_ACTIVE_STATUSES:
         return {"status": "already_running"}
+    retry_after = _vault_sync_retry_after.get(creator_id, 0)
+    if not force and retry_after > time.time():
+        return {
+            "status": "retry_backoff",
+            "retry_after_seconds": round(retry_after - time.time()),
+            "requires_reconnect": True,
+        }
+    if force:
+        _vault_sync_retry_after.pop(creator_id, None)
     # The background scheduler checks hourly, while API Fansly is called for a
     # creator at most once per 24 hours unless an operator explicitly forces it.
     if not force:
@@ -2412,6 +2436,7 @@ async def _run_vault_sync(creator_id: str) -> None:
             category_errors = int(category_state.get("errors") or 0)
 
         await _stamp_vault_op(creator_id, "last_vault_sync_at")
+        _vault_sync_retry_after.pop(creator_id, None)
         _vault_sync_state[creator_id] = {
             "status": "done",
             "synced": synced,
@@ -2426,6 +2451,22 @@ async def _run_vault_sync(creator_id: str) -> None:
             f"category_errors={category_errors}"
         )
 
+    except ApiFanslyAccountAccessError as e:
+        _vault_sync_retry_after[creator_id] = (
+            time.time() + _VAULT_ACCESS_DENIED_RETRY_SECONDS
+        )
+        print(
+            f"[VAULT SYNC ACCESS DENIED] creator={creator_id} "
+            f"retry_in={_VAULT_ACCESS_DENIED_RETRY_SECONDS}s: {e}"
+        )
+        _vault_sync_state[creator_id] = {
+            "status": "error",
+            "synced": 0,
+            "total": 0,
+            "album": str(e),
+            "requires_reconnect": True,
+            "retry_after_seconds": _VAULT_ACCESS_DENIED_RETRY_SECONDS,
+        }
     except Exception as e:
         import traceback
         print(f"[VAULT SYNC ERROR] {e}")
@@ -5597,6 +5638,12 @@ async def health() -> dict:
             os.environ.get("VAULT_SEMANTIC_BASE_URL", "").strip()
         ),
     }
+
+
+@app.get("/model-runtime-health")
+async def model_runtime_health() -> dict:
+    """Expose cached provider-model availability without spending AI tokens."""
+    return current_model_availability()
 
 
 from routes.fansly import fansly_router

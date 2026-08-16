@@ -116,6 +116,45 @@ def test_sync_cannot_restart_while_new_media_is_being_categorized(monkeypatch):
     assert result == {"status": "already_running"}
 
 
+def test_automatic_sync_backs_off_after_binding_access_denied(monkeypatch):
+    import main
+
+    monkeypatch.delitem(main._vault_sync_state, "creator-denied", raising=False)
+    monkeypatch.setitem(
+        main._vault_sync_retry_after,
+        "creator-denied",
+        main.time.time() + 3600,
+    )
+
+    result = asyncio.run(main.sync_vault_start("creator-denied"))
+
+    assert result["status"] == "retry_backoff"
+    assert result["requires_reconnect"] is True
+    assert 3590 <= result["retry_after_seconds"] <= 3600
+
+
+def test_operator_can_force_sync_during_binding_backoff(monkeypatch):
+    import main
+
+    monkeypatch.delitem(main._vault_sync_state, "creator-manual", raising=False)
+    monkeypatch.setitem(
+        main._vault_sync_retry_after,
+        "creator-manual",
+        main.time.time() + 3600,
+    )
+
+    def close_spawned_coroutine(coroutine, *, name):
+        assert name == "run_vault_sync"
+        coroutine.close()
+
+    monkeypatch.setattr(main, "spawn", close_spawned_coroutine)
+
+    result = asyncio.run(main.sync_vault_start("creator-manual", force=True))
+
+    assert result == {"status": "started"}
+    assert "creator-manual" not in main._vault_sync_retry_after
+
+
 def test_autosync_checks_due_creators_before_its_first_sleep(monkeypatch):
     import main
 
