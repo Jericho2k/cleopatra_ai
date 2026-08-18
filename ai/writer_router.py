@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from ai.model_migrations import resolve_supported_model
 from ai.model_providers import find_catalog_target, get_runtime_target
 from models.model_runtime import ModelTarget
 
@@ -74,7 +75,10 @@ def _resolve_target(
     default_model: str,
 ) -> ModelTarget:
     provider = os.getenv(provider_env, default_provider).strip().lower()
-    model = os.getenv(model_env, default_model).strip()
+    model = resolve_supported_model(
+        provider,
+        os.getenv(model_env, default_model),
+    )
 
     catalog_target = find_catalog_target(provider, model)
     if catalog_target is not None:
@@ -124,7 +128,7 @@ def select_writer_route(ctx: Any) -> WriterRouteDecision:
         provider_env="WRITER_DEFAULT_PROVIDER",
         model_env="WRITER_DEFAULT_MODEL",
         default_provider="together",
-        default_model="moonshotai/Kimi-K2.6",
+        default_model="moonshotai/Kimi-K3",
     )
     complex_target = _resolve_target(
         provider_env="WRITER_COMPLEX_PROVIDER",

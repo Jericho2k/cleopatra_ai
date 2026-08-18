@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-07-13",
+  "updated_at": "2026-08-18",
   "notes": [
     "Pricing is a snapshot and must be reviewed before production decisions.",
     "adult_policy describes provider eligibility, not raw model capability.",
@@ -46,14 +46,14 @@
       "timeout_seconds": 90
     },
     {
-      "name": "Together Kimi K2.6",
+      "name": "Together Kimi K3",
       "provider": "together",
-      "model": "moonshotai/Kimi-K2.6",
+      "model": "moonshotai/Kimi-K3",
       "base_url": "https://api.together.xyz/v1",
       "api_key_env": "TOGETHER_API_KEY",
-      "input_per_million": 1.20,
-      "output_per_million": 4.50,
-      "cache_read_per_million": 0.20,
+      "input_per_million": 3.00,
+      "output_per_million": 15.00,
+      "cache_read_per_million": 0.30,
       "adult_policy": "unverified",
       "enabled": true,
       "stream": true,

@@ -15,6 +15,8 @@ from typing import Any
 
 import httpx
 
+from ai.model_migrations import resolve_supported_model
+
 _DEFAULT_CHECK_SECONDS = 6 * 60 * 60
 _MODEL_LIST_URL = "https://api.together.xyz/v1/models"
 
@@ -29,20 +31,24 @@ _runtime_attempts: dict[str, dict[str, Any]] = {}
 
 def configured_writer_models() -> list[dict[str, str]]:
     """Return the ordinary writer and its complex-turn/fallback target."""
+    default_provider = os.getenv("WRITER_DEFAULT_PROVIDER", "together").strip().lower()
+    complex_provider = os.getenv("WRITER_COMPLEX_PROVIDER", "together").strip().lower()
     configured = [
         {
             "role": "ordinary_writer",
-            "provider": os.getenv("WRITER_DEFAULT_PROVIDER", "together").strip().lower(),
-            "model": os.getenv(
-                "WRITER_DEFAULT_MODEL", "moonshotai/Kimi-K2.6"
-            ).strip(),
+            "provider": default_provider,
+            "model": resolve_supported_model(
+                default_provider,
+                os.getenv("WRITER_DEFAULT_MODEL", "moonshotai/Kimi-K3"),
+            ),
         },
         {
             "role": "complex_writer_and_fallback",
-            "provider": os.getenv("WRITER_COMPLEX_PROVIDER", "together").strip().lower(),
-            "model": os.getenv(
-                "WRITER_COMPLEX_MODEL", "deepseek-ai/DeepSeek-V4-Pro"
-            ).strip(),
+            "provider": complex_provider,
+            "model": resolve_supported_model(
+                complex_provider,
+                os.getenv("WRITER_COMPLEX_MODEL", "deepseek-ai/DeepSeek-V4-Pro"),
+            ),
         },
     ]
     return [row for row in configured if row["model"]]

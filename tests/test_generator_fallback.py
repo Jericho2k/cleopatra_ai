@@ -16,7 +16,7 @@ def _target(name: str, model: str) -> ModelTarget:
 
 
 def test_generator_uses_deepseek_after_two_invalid_kimi_outputs(monkeypatch):
-    kimi = _target("Kimi", "moonshotai/Kimi-K2.6")
+    kimi = _target("Kimi", "moonshotai/Kimi-K3")
     deepseek = _target("DeepSeek", "deepseek-ai/DeepSeek-V4-Pro")
     calls: list[str] = []
     telemetry = []

@@ -19,14 +19,24 @@ def _ctx(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_default_route_uses_kimi_with_deepseek_fallback(monkeypatch):
+def test_default_route_uses_kimi_k3_with_deepseek_fallback(monkeypatch):
     monkeypatch.setenv("WRITER_ROUTING_ENABLED", "true")
     decision = select_writer_route(_ctx())
 
     assert decision.route == WriterRoute.DEFAULT
-    assert decision.primary_target.model == "moonshotai/Kimi-K2.6"
+    assert decision.primary_target.model == "moonshotai/Kimi-K3"
     assert decision.fallback_target is not None
     assert decision.fallback_target.model == "deepseek-ai/DeepSeek-V4-Pro"
+
+
+def test_deprecated_kimi_environment_setting_is_redirected(monkeypatch):
+    monkeypatch.setenv("WRITER_ROUTING_ENABLED", "true")
+    monkeypatch.setenv("WRITER_DEFAULT_PROVIDER", "together")
+    monkeypatch.setenv("WRITER_DEFAULT_MODEL", "moonshotai/Kimi-K2.6")
+
+    decision = select_writer_route(_ctx())
+
+    assert decision.primary_target.model == "moonshotai/Kimi-K3"
 
 
 def test_commercial_action_routes_to_deepseek(monkeypatch):
