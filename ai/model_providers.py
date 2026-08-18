@@ -9,6 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from ai.model_migrations import resolve_supported_model
 from models.model_runtime import ModelResult, ModelTarget, ModelUsage
 
 _DEFAULT_CATALOG = Path(__file__).resolve().parents[1] / "config" / "model_candidates.json"
@@ -44,7 +45,10 @@ def get_runtime_target(prefix: str) -> ModelTarget:
     default_provider, default_model = defaults.get(prefix, ("together", ""))
 
     provider = os.getenv(f"{prefix}_PROVIDER", default_provider).strip().lower()
-    model = os.getenv(f"{prefix}_MODEL", default_model).strip()
+    model = resolve_supported_model(
+        provider,
+        os.getenv(f"{prefix}_MODEL", default_model),
+    )
     base_url = os.getenv(f"{prefix}_BASE_URL") or None
     api_key_env = os.getenv(f"{prefix}_API_KEY_ENV") or None
 

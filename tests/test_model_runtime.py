@@ -1,3 +1,4 @@
+from ai.model_providers import get_runtime_target
 from models.model_runtime import ModelTarget, ModelUsage, estimate_cost_usd
 
 
@@ -61,4 +62,14 @@ def test_model_target_preserves_reasoning_metadata():
         }
     )
 
+    assert target.metadata["reasoning_enabled"] is False
+
+
+def test_generic_chat_runtime_redirects_deprecated_kimi(monkeypatch):
+    monkeypatch.setenv("CHAT_PROVIDER", "together")
+    monkeypatch.setenv("CHAT_MODEL", "moonshotai/Kimi-K2.6")
+
+    target = get_runtime_target("CHAT")
+
+    assert target.model == "moonshotai/Kimi-K3"
     assert target.metadata["reasoning_enabled"] is False

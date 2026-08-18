@@ -43,7 +43,7 @@ class Client:
 def test_writer_models_are_checked_without_generation_tokens(monkeypatch):
     monkeypatch.setenv("TOGETHER_API_KEY", "test-key")
     client = Client(
-        ["moonshotai/Kimi-K2.6", "deepseek-ai/DeepSeek-V4-Pro"]
+        ["moonshotai/Kimi-K3", "deepseek-ai/DeepSeek-V4-Pro"]
     )
 
     result = asyncio.run(refresh_model_availability(client=client, now=NOW))
@@ -63,7 +63,7 @@ def test_missing_primary_model_surfaces_degraded_fallback(monkeypatch):
     assert result["status"] == "degraded"
     assert result["models"][0]["role"] == "ordinary_writer"
     assert result["models"][0]["provider"] == "together"
-    assert result["models"][0]["model"] == "moonshotai/Kimi-K2.6"
+    assert result["models"][0]["model"] == "moonshotai/Kimi-K3"
     assert result["models"][0]["available"] is False
     assert result["models"][1]["available"] is True
 
@@ -84,17 +84,26 @@ def test_repeated_live_primary_failures_surface_even_when_catalog_is_healthy(
 ):
     monkeypatch.setenv("TOGETHER_API_KEY", "test-key")
     client = Client(
-        ["moonshotai/Kimi-K2.6", "deepseek-ai/DeepSeek-V4-Pro"]
+        ["moonshotai/Kimi-K3", "deepseek-ai/DeepSeek-V4-Pro"]
     )
     asyncio.run(refresh_model_availability(client=client, now=NOW))
 
-    record_model_transport_failure("moonshotai/Kimi-K2.6", "404 model removed")
-    record_model_transport_failure("moonshotai/Kimi-K2.6", "404 model removed")
+    record_model_transport_failure("moonshotai/Kimi-K3", "404 model removed")
+    record_model_transport_failure("moonshotai/Kimi-K3", "404 model removed")
     record_model_transport_success("deepseek-ai/DeepSeek-V4-Pro")
 
     result = current_model_availability()
 
     assert result["status"] == "degraded"
-    assert "moonshotai/Kimi-K2.6" in result["detail"]
+    assert "moonshotai/Kimi-K3" in result["detail"]
     assert result["models"][0]["runtime"]["consecutive_failures"] == 2
     assert result["models"][1]["runtime"]["consecutive_failures"] == 0
+
+
+def test_availability_redirects_deprecated_kimi_environment_setting(monkeypatch):
+    monkeypatch.setenv("WRITER_DEFAULT_PROVIDER", "together")
+    monkeypatch.setenv("WRITER_DEFAULT_MODEL", "moonshotai/Kimi-K2.6")
+
+    configured = model_availability.configured_writer_models()
+
+    assert configured[0]["model"] == "moonshotai/Kimi-K3"
