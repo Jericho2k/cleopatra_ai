@@ -4832,8 +4832,20 @@ async def preview_auto_audience(creator_id: str) -> dict:
     from collections import Counter
     from services.auto_audience import AutoAudiencePolicy, evaluate_auto_eligibility
 
+    from core.pagination import fetch_all_rows_async
+
     db = get_supabase()
-    creator_result, fan_result, lists_result, messages_result = await asyncio.gather(
+
+    # SEC-002. The membership read used to have no creator filter at all and was
+    # executed with service-role credentials, so every agency's rows were pulled
+    # into this request and filtered in Python. Worse, PostgREST truncates at
+    # 1,000 rows *globally*, so past that point the requesting creator's own rows
+    # were usually absent and the exclusion policy silently stopped applying.
+    #
+    # The creator's own list ids are resolved first, and the membership query is
+    # constrained to them inside Postgres. Every read here is paginated with a
+    # deterministic order; each is scoped to this creator.
+    creator_result, fan_rows, list_rows, message_rows = await asyncio.gather(
         asyncio.to_thread(
             lambda: db.table("creators")
             .select("auto_mode, auto_audience_policy")
@@ -4841,22 +4853,32 @@ async def preview_auto_audience(creator_id: str) -> dict:
             .single()
             .execute()
         ),
-        asyncio.to_thread(
-            lambda: db.table("fans")
+        fetch_all_rows_async(
+            lambda start, end: db.table("fans")
             .select("id, auto_mode, total_spent, spend_tier, needs_human_review")
             .eq("creator_id", creator_id)
+            .order("id")
+            .range(start, end)
             .execute()
         ),
-        asyncio.to_thread(
-            lambda: db.table("fan_list_members")
-            .select("fan_id, list_id, fan_lists(exclude_from_auto, creator_id)")
+        fetch_all_rows_async(
+            lambda start, end: db.table("fan_lists")
+            .select("id, exclude_from_auto")
+            .eq("creator_id", creator_id)
+            .order("id")
+            .range(start, end)
             .execute()
         ),
-        asyncio.to_thread(
-            lambda: db.table("messages")
-            .select("fan_id")
+        # Only "has this creator ever messaged this fan" is needed. Ordering by
+        # the primary key keeps paging total; ordering by fan_id alone would let
+        # Postgres break ties differently between pages.
+        fetch_all_rows_async(
+            lambda start, end: db.table("messages")
+            .select("id, fan_id")
             .eq("creator_id", creator_id)
             .eq("role", "creator")
+            .order("id")
+            .range(start, end)
             .execute()
         ),
     )
@@ -4868,30 +4890,46 @@ async def preview_auto_audience(creator_id: str) -> dict:
     except Exception:
         policy = AutoAudiencePolicy()
     creator_message_fans = {
-        str(row.get("fan_id")) for row in (messages_result.data or []) if row.get("fan_id")
+        str(row.get("fan_id")) for row in message_rows if row.get("fan_id")
     }
+
+    creator_list_ids = [str(row["id"]) for row in list_rows if row.get("id")]
+    legacy_exclusions: set[str] = {
+        str(row["id"]) for row in list_rows
+        if row.get("id") and row.get("exclude_from_auto")
+    }
+
+    membership_rows: list[dict] = []
+    if creator_list_ids:
+        membership_rows = await fetch_all_rows_async(
+            lambda start, end: db.table("fan_list_members")
+            .select("fan_id, list_id")
+            .in_("list_id", creator_list_ids)
+            .order("list_id")
+            .order("fan_id")
+            .range(start, end)
+            .execute()
+        )
+
     memberships: dict[str, set[str]] = {}
-    legacy_exclusions: set[str] = set()
-    for row in (lists_result.data or []):
-        joined = row.get("fan_lists") or {}
-        if str(joined.get("creator_id") or "") != str(creator_id):
-            continue
+    for row in membership_rows:
         fan_key = str(row.get("fan_id") or "")
         list_key = str(row.get("list_id") or "")
         if fan_key and list_key:
             memberships.setdefault(fan_key, set()).add(list_key)
-            if joined.get("exclude_from_auto"):
-                legacy_exclusions.add(list_key)
     if legacy_exclusions:
+        # sorted() so the merged list is stable across requests; set iteration
+        # order is not. Only membership in this list is tested, so order is not
+        # behavioural — it just makes the response reproducible.
         policy.exclude_list_ids = list(
-            dict.fromkeys([*policy.exclude_list_ids, *legacy_exclusions])
+            dict.fromkeys([*policy.exclude_list_ids, *sorted(legacy_exclusions)])
         )
 
     reasons: Counter[str] = Counter()
     reasons_if_creator_on: Counter[str] = Counter()
     eligible = 0
     eligible_if_creator_on = 0
-    for fan in (fan_result.data or []):
+    for fan in fan_rows:
         fan_id = str(fan["id"])
         eligibility_inputs = {
             "fan_auto_override": fan.get("auto_mode"),
@@ -4914,7 +4952,7 @@ async def preview_auto_audience(creator_id: str) -> dict:
         reasons_if_creator_on[enabled_result.reason] += 1
         eligible += int(result.eligible)
         eligible_if_creator_on += int(enabled_result.eligible)
-    total = len(fan_result.data or [])
+    total = len(fan_rows)
     return {
         "creator_id": creator_id,
         "creator_auto_mode": bool(creator.get("auto_mode", False)),
