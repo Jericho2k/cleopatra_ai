@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from ai.model_providers import complete, get_runtime_target
+from ai.session_affinity import writer_end_user_id, writer_session_id
 from models.model_runtime import ModelTarget, ModelTelemetryContext
 from models.schemas import Persona
 from services.model_telemetry import record_model_failure, record_model_result
@@ -208,6 +209,32 @@ def parse_reply_candidates(
 
     return []
 
+def flatten_message_content(content: Any) -> str:
+    """Collapse a prompt message into the plain string the transport expects.
+
+    build_prompt emits the system message as ordered content blocks so the
+    stable prefix stays first and volatile additions stay last. Anthropic
+    consumes those blocks directly, but every OpenAI-compatible provider —
+    OpenRouter and Together included — wants a single string. Joining the block
+    text preserves that ordering, which is what keeps the cacheable prefix
+    byte-identical between turns.
+    """
+
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return str(content)
+
+
 def _same_model_target(left: ModelTarget, right: ModelTarget | None) -> bool:
     return bool(
         right
@@ -289,8 +316,24 @@ async def generate_replies(
     attempt_targets.append(fallback_target or primary_target)
 
     metadata = dict(telemetry_context or {})
-    system = str(prompt_messages[0]["content"])
-    messages = [{"role": "user", "content": str(prompt_messages[1]["content"])}]
+    system = flatten_message_content(prompt_messages[0]["content"])
+    messages = [
+        {
+            "role": "user",
+            "content": flatten_message_content(prompt_messages[1]["content"]),
+        }
+    ]
+
+    # One fan conversation keeps one affinity key for its whole life, so a
+    # provider that caches prompt prefixes keeps serving the same warm cache.
+    session_id = writer_session_id(
+        metadata.get("creator_id"),
+        metadata.get("fan_id"),
+    )
+    end_user_id = writer_end_user_id(
+        metadata.get("creator_id"),
+        metadata.get("fan_id"),
+    )
 
     for attempt, attempt_target in enumerate(attempt_targets):
         context = _telemetry_context_for_attempt(
@@ -306,6 +349,8 @@ async def generate_replies(
                 system=system,
                 messages=messages,
                 max_tokens=1000,
+                session_id=session_id,
+                end_user_id=end_user_id,
             )
             record_model_transport_success(attempt_target.model)
             try:

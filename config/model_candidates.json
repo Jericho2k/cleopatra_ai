@@ -1,9 +1,10 @@
 {
-  "updated_at": "2026-08-18",
+  "updated_at": "2026-09-07",
   "notes": [
     "Pricing is a snapshot and must be reviewed before production decisions.",
     "adult_policy describes provider eligibility, not raw model capability.",
-    "Do not run adult scenarios through a provider marked ineligible."
+    "Do not run adult scenarios through a provider marked ineligible.",
+    "OpenRouter reports the real charged cost per generation; telemetry prefers that over these figures and falls back to them only when it is absent."
   ],
   "models": [
     {
@@ -13,11 +14,34 @@
       "api_key_env": "ANTHROPIC_API_KEY",
       "input_per_million": 3.0,
       "output_per_million": 15.0,
-      "cache_read_per_million": 0.30,
+      "cache_read_per_million": 0.3,
       "cache_write_per_million": 3.75,
       "adult_policy": "ineligible",
       "enabled": true,
-      "metadata": {"role": "quality baseline for non-adult scenarios only"}
+      "metadata": {
+        "role": "quality baseline for non-adult scenarios only"
+      }
+    },
+    {
+      "name": "OpenRouter Kimi K2.6 (Inceptron pinned)",
+      "provider": "openrouter",
+      "model": "moonshotai/kimi-k2.6",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "input_per_million": 0.8,
+      "output_per_million": 3.5,
+      "cache_read_per_million": 0.16,
+      "adult_policy": "unverified",
+      "enabled": true,
+      "stream": false,
+      "timeout_seconds": 90,
+      "metadata": {
+        "role": "ordinary conversational writer",
+        "openrouter_providers": [
+          "Inceptron"
+        ],
+        "note": "Pinned upstream. OPENROUTER_PROVIDERS overrides this list without a deploy. Cache-read pricing is an unverified snapshot; the reported usage.cost is authoritative."
+      }
     },
     {
       "name": "Together MiniMax M3",
@@ -25,8 +49,8 @@
       "model": "MiniMaxAI/MiniMax-M3",
       "base_url": "https://api.together.xyz/v1",
       "api_key_env": "TOGETHER_API_KEY",
-      "input_per_million": 0.30,
-      "output_per_million": 1.20,
+      "input_per_million": 0.3,
+      "output_per_million": 1.2,
       "cache_read_per_million": 0.06,
       "timeout_seconds": 90,
       "adult_policy": "unverified",
@@ -51,9 +75,9 @@
       "model": "moonshotai/Kimi-K3",
       "base_url": "https://api.together.xyz/v1",
       "api_key_env": "TOGETHER_API_KEY",
-      "input_per_million": 3.00,
-      "output_per_million": 15.00,
-      "cache_read_per_million": 0.30,
+      "input_per_million": 3.0,
+      "output_per_million": 15.0,
+      "cache_read_per_million": 0.3,
       "adult_policy": "unverified",
       "enabled": true,
       "stream": true,
@@ -70,7 +94,7 @@
       "api_key_env": "TOGETHER_API_KEY",
       "input_per_million": 1.74,
       "output_per_million": 3.48,
-      "cache_read_per_million": 0.20,
+      "cache_read_per_million": 0.2,
       "adult_policy": "unverified",
       "enabled": true,
       "stream": true,
@@ -103,7 +127,7 @@
       "base_url": "https://api.together.xyz/v1",
       "api_key_env": "TOGETHER_API_KEY",
       "input_per_million": 0.15,
-      "output_per_million": 0.60,
+      "output_per_million": 0.6,
       "adult_policy": "unverified",
       "enabled": true
     },
@@ -128,7 +152,9 @@
       "output_per_million": 0.0,
       "adult_policy": "operator_responsibility",
       "enabled": false,
-      "metadata": {"note": "Set real amortized GPU cost before comparing economics."}
+      "metadata": {
+        "note": "Set real amortized GPU cost before comparing economics."
+      }
     }
   ]
 }
