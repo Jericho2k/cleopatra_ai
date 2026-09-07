@@ -5914,7 +5914,15 @@ async def health() -> dict:
 @app.get("/model-runtime-health")
 async def model_runtime_health() -> dict:
     """Expose cached provider-model availability without spending AI tokens."""
-    return current_model_availability()
+    from services.analyzer_telemetry import analyzer_health
+
+    return {
+        **current_model_availability(),
+        # REL-001 — degraded-analysis counts, so an analyzer incident is
+        # countable without reading logs.
+        "analyzer": analyzer_health(hours=1),
+        "analyzer_24h": analyzer_health(hours=24),
+    }
 
 
 from routes.fansly import fansly_router

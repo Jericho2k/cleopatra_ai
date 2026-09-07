@@ -147,6 +147,12 @@ class SuggestionResponse(BaseModel):
 
     suggestions: list[str]
     stage: StageType = StageType.WARMING_UP
+    # REL-001 — true when the situation analysis behind these suggestions was
+    # fabricated because the analyzer failed. Assisted still returns copy (an
+    # operator reads it before anything is sent), but it must not be presented
+    # as a normally analysed suggestion.
+    analysis_degraded: bool = False
+    analysis_degraded_reason: str = ""
 
     @field_validator("suggestions")
     @classmethod

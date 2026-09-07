@@ -3,6 +3,13 @@
 This module extracts observations only. Commercial decisions are made by the
 policy layer. A deterministic normalizer handles common offer-selection phrases
 so one mixed sentence cannot be collapsed into a generic decline.
+
+REL-001 — a failed analysis is now distinguishable from a real one. The fallback
+used to be a complete, well-formed, entirely neutral analysis with no marker, so
+downstream code could not tell "the fan said nothing commercial" from "we never
+got an answer and guessed". During a provider incident Full Auto kept selling on
+guessed state. Every result now carries ``analysis_degraded``; callers that make
+autonomous commercial decisions must check it with ``analysis_is_degraded``.
 """
 
 from __future__ import annotations
@@ -14,8 +21,24 @@ from typing import Any
 from ai.model_providers import complete, get_runtime_target
 from models.model_runtime import ModelTelemetryContext
 from models.schemas import ConversationContext
+from services.analyzer_telemetry import record_analysis_outcome
 from services.commercial_events import normalize_commercial_facts
 from services.model_telemetry import record_model_failure, record_model_result
+
+# Why an analysis could not be trusted. Deliberately coarse: these travel into
+# telemetry and the dashboard, and must never carry provider payloads or keys.
+DEGRADED_TRANSPORT = "transport_error"
+DEGRADED_PARSE = "parse_error"
+DEGRADED_SHAPE = "unexpected_response"
+
+
+def analysis_is_degraded(situation: dict | None) -> bool:
+    """True when this analysis was fabricated rather than returned by the model."""
+    return bool((situation or {}).get("analysis_degraded"))
+
+
+def degraded_reason(situation: dict | None) -> str:
+    return str((situation or {}).get("degraded_reason") or "")
 
 
 async def analyze_situation(
@@ -122,7 +145,7 @@ SAFETY:
             result = json.loads(content)
             parse_valid = isinstance(result, dict)
         except Exception as error:
-            result = _fallback_result()
+            result = _fallback_result(DEGRADED_PARSE)
             parse_valid = False
             await record_model_result(
                 response,
@@ -132,6 +155,17 @@ SAFETY:
                 error=f"parse_error: {error}",
             )
         else:
+            if parse_valid:
+                # A genuine answer. State it positively rather than relying on
+                # the key's absence, so a caller cannot mistake an older or
+                # partially built dict for a trusted analysis.
+                result["analysis_degraded"] = False
+                result["degraded_reason"] = ""
+            else:
+                # Valid JSON of the wrong shape — a list, a string, a number.
+                # Just as unusable as a parse error, and previously it sailed
+                # through as a truthy non-dict.
+                result = _fallback_result(DEGRADED_SHAPE)
             await record_model_result(
                 response,
                 model_context,
@@ -140,18 +174,40 @@ SAFETY:
             )
     except Exception as error:
         await record_model_failure(target, model_context, error=str(error))
+        # The message is logged but never put in the result: provider errors can
+        # echo request payloads, and this dict reaches the dashboard.
         print(f"[SITUATION ANALYZER ERROR] provider={target.provider} model={target.model} error={error}")
-        result = _fallback_result()
+        result = _fallback_result(DEGRADED_TRANSPORT)
 
+    # Deterministic safety backstop. It runs on degraded results too — a failed
+    # analyzer must never weaken crisis detection.
     if _looks_like_self_harm(ctx.fan_message):
         result["crisis_signal"] = "self_harm"
 
     creator_lines = [message.content for message in recent if message.role == "creator"]
-    return normalize_commercial_facts(result, ctx.fan_message, creator_lines)
+    normalized = normalize_commercial_facts(result, ctx.fan_message, creator_lines)
+    # normalize_commercial_facts merges over its own defaults, so re-assert the
+    # markers rather than trusting them to survive a future change there.
+    normalized["analysis_degraded"] = bool(result.get("analysis_degraded"))
+    normalized["degraded_reason"] = str(result.get("degraded_reason") or "")
+
+    record_analysis_outcome(
+        degraded=normalized["analysis_degraded"],
+        reason=normalized["degraded_reason"],
+        feature=model_context.feature,
+    )
+    return normalized
 
 
-def _fallback_result() -> dict:
+def _fallback_result(reason: str = DEGRADED_TRANSPORT) -> dict:
+    """A syntactically complete analysis that is explicitly marked as guessed.
+
+    The shape has to stay complete so downstream key access does not crash, but
+    every consumer that acts autonomously must gate on analysis_degraded.
+    """
     return {
+        "analysis_degraded": True,
+        "degraded_reason": reason,
         "fan_mood": "curious",
         "fan_intent": "engaging with creator",
         "conversation_energy": "flat",

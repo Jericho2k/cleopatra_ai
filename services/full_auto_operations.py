@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.supabase import get_supabase
+from services.analyzer_telemetry import analyzer_health
 from db.commercial_queries import (
     cancel_actions_for_fan,
     get_fan_state,
@@ -373,6 +374,11 @@ async def get_creator_full_auto_health(creator_id: str) -> dict[str, Any]:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "summary": summarize_operation_rows(states, fans, actions),
         "worker": worker_health_snapshot(),
+        # REL-001 — makes "how many replies this hour had a failed analyzer?"
+        # answerable from the surface operators already watch, rather than from
+        # Railway logs. Process-wide rather than per-creator: an analyzer outage
+        # is a provider incident, not a creator's problem.
+        "analyzer": analyzer_health(hours=1),
         "recent_deliveries": recent_deliveries[:20],
         "fans": [
             {
