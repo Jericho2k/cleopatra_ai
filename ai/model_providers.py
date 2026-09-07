@@ -1,4 +1,4 @@
-"""Provider-neutral model access for Anthropic, Together, and local endpoints."""
+"""Provider-neutral model access for Anthropic, OpenRouter, Together, and local endpoints."""
 
 from __future__ import annotations
 
@@ -9,8 +9,14 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from ai import openrouter_routing
 from ai.model_migrations import resolve_supported_model
 from models.model_runtime import ModelResult, ModelTarget, ModelUsage
+
+# Providers that speak the OpenAI chat-completions wire format.
+OPENAI_COMPATIBLE_PROVIDERS = frozenset(
+    {"together", "openrouter", "self_hosted", "openai_compatible"}
+)
 
 _DEFAULT_CATALOG = Path(__file__).resolve().parents[1] / "config" / "model_candidates.json"
 
@@ -31,6 +37,34 @@ def find_catalog_target(provider: str, model: str) -> ModelTarget | None:
         if target.provider == provider and target.model == model:
             return target
     return None
+
+
+def provider_transport_defaults(
+    provider: str,
+    *,
+    base_url: str | None = None,
+    api_key_env: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Return the conventional base URL and key variable for one provider.
+
+    Both the generic CHAT_*/ANALYZER_* runtime and the production writer router
+    resolve targets that are absent from the catalog. They must agree on how a
+    provider is reached, so the defaults live here rather than being duplicated.
+    """
+
+    provider = provider.strip().lower()
+    if provider == "anthropic":
+        api_key_env = api_key_env or "ANTHROPIC_API_KEY"
+    elif provider == "together":
+        base_url = base_url or "https://api.together.xyz/v1"
+        api_key_env = api_key_env or "TOGETHER_API_KEY"
+    elif provider == "openrouter":
+        base_url = base_url or openrouter_routing.base_url()
+        api_key_env = api_key_env or openrouter_routing.DEFAULT_API_KEY_ENV
+    elif provider in {"self_hosted", "openai_compatible"}:
+        base_url = base_url or os.getenv("SELF_HOSTED_BASE_URL")
+        api_key_env = api_key_env or "SELF_HOSTED_API_KEY"
+    return base_url, api_key_env
 
 
 def get_runtime_target(prefix: str) -> ModelTarget:
@@ -62,14 +96,11 @@ def get_runtime_target(prefix: str) -> ModelTarget:
             }
         )
 
-    if provider == "anthropic":
-        api_key_env = api_key_env or "ANTHROPIC_API_KEY"
-    elif provider == "together":
-        base_url = base_url or "https://api.together.xyz/v1"
-        api_key_env = api_key_env or "TOGETHER_API_KEY"
-    elif provider in {"self_hosted", "openai_compatible"}:
-        base_url = base_url or os.getenv("SELF_HOSTED_BASE_URL")
-        api_key_env = api_key_env or "SELF_HOSTED_API_KEY"
+    base_url, api_key_env = provider_transport_defaults(
+        provider,
+        base_url=base_url,
+        api_key_env=api_key_env,
+    )
 
     return ModelTarget(
         name=f"{provider}:{model}",
@@ -116,8 +147,15 @@ async def complete(
     messages: list[dict[str, str]],
     max_tokens: int,
     temperature: float | None = None,
+    session_id: str | None = None,
+    end_user_id: str | None = None,
 ) -> ModelResult:
-    """Call a configured model endpoint and normalize text, usage, and latency."""
+    """Call a configured model endpoint and normalize text, usage, and latency.
+
+    ``session_id`` is the stable per-conversation affinity key. Providers that
+    support sticky routing use it to keep consecutive turns on one upstream so
+    prefix caching survives; providers that do not simply ignore it.
+    """
 
     started = time.perf_counter()
     if target.provider == "anthropic":
@@ -128,13 +166,15 @@ async def complete(
             max_tokens=max_tokens,
             temperature=temperature,
         )
-    elif target.provider in {"together", "self_hosted", "openai_compatible"}:
+    elif target.provider in OPENAI_COMPATIBLE_PROVIDERS:
         result = await _complete_openai_compatible(
             target,
             system=system,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
+            session_id=session_id,
+            end_user_id=end_user_id,
         )
     else:
         raise ValueError(f"Unsupported model provider: {target.provider}")
@@ -146,6 +186,8 @@ async def complete(
         usage=result.usage,
         latency_ms=elapsed_ms,
         raw_response_id=result.raw_response_id,
+        upstream_provider=result.upstream_provider,
+        reported_cost_usd=result.reported_cost_usd,
     )
 
 
@@ -188,6 +230,38 @@ async def _complete_anthropic(
     )
 
 
+def _int_field(source: Any, name: str) -> int:
+    """Read one integer usage field from a mapping or a response model."""
+
+    if source is None:
+        return 0
+    value = (
+        source.get(name)
+        if isinstance(source, dict)
+        else getattr(source, name, None)
+    )
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_field(source: Any, name: str) -> float | None:
+    if source is None:
+        return None
+    value = (
+        source.get(name)
+        if isinstance(source, dict)
+        else getattr(source, name, None)
+    )
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 async def _complete_openai_compatible(
     target: ModelTarget,
     *,
@@ -195,6 +269,8 @@ async def _complete_openai_compatible(
     messages: list[dict[str, str]],
     max_tokens: int,
     temperature: float | None,
+    session_id: str | None = None,
+    end_user_id: str | None = None,
 ) -> ModelResult:
     if not target.base_url:
         raise RuntimeError(f"No base URL configured for {target.name}")
@@ -219,16 +295,34 @@ async def _complete_openai_compatible(
     if temperature is not None:
         kwargs["temperature"] = temperature
 
+    extra_body: dict[str, Any] = {}
+
     reasoning_enabled = target.metadata.get("reasoning_enabled")
     if reasoning_enabled is not None:
-        extra_body = dict(kwargs.get("extra_body") or {})
         extra_body["reasoning"] = {
             "enabled": bool(reasoning_enabled),
         }
+
+    if target.provider == "openrouter":
+        # Provider pinning, privacy controls, and the sticky-routing key that
+        # keeps one fan conversation on one upstream so its prefix cache stays
+        # warm. These are OpenRouter body fields, not OpenAI ones, so they
+        # travel in extra_body.
+        extra_body.update(
+            openrouter_routing.request_options(
+                target_metadata=target.metadata,
+                session_id=session_id,
+                end_user_id=end_user_id,
+            )
+        )
+
+    if extra_body:
         kwargs["extra_body"] = extra_body
 
     raw_response_id: str | None = None
     usage = None
+    upstream_provider: str | None = None
+    reported_cost_usd: float | None = None
 
     if target.stream:
         stream = await client.chat.completions.create(
@@ -242,6 +336,9 @@ async def _complete_openai_compatible(
         async for chunk in stream:
             if raw_response_id is None:
                 raw_response_id = getattr(chunk, "id", None)
+
+            if upstream_provider is None:
+                upstream_provider = openrouter_routing.upstream_provider(chunk)
 
             choices = getattr(chunk, "choices", None) or []
 
@@ -265,6 +362,7 @@ async def _complete_openai_compatible(
         content = response.choices[0].message.content or ""
         usage = response.usage
         raw_response_id = getattr(response, "id", None)
+        upstream_provider = openrouter_routing.upstream_provider(response)
 
     prompt_tokens = (
         int(getattr(usage, "prompt_tokens", 0) or 0)
@@ -282,29 +380,47 @@ async def _complete_openai_compatible(
         if usage
         else None
     )
-    nested_cached_tokens = int(
-        getattr(prompt_details, "cached_tokens", 0) or 0
-    )
+    nested_cached_tokens = _int_field(prompt_details, "cached_tokens")
 
-    flat_cached_tokens = int(
-        getattr(usage, "cached_tokens", 0) or 0
-        if usage
-        else 0
-    )
+    flat_cached_tokens = _int_field(usage, "cached_tokens")
 
     cached_tokens = max(
         nested_cached_tokens,
         flat_cached_tokens,
     )
 
+    # OpenRouter reports cache writes separately from cache reads. Providers
+    # disagree about whether written tokens are also inside prompt_tokens, so
+    # they are only subtracted from uncached input when the arithmetic shows
+    # they were included. Subtracting unconditionally would understate input on
+    # providers that report them additively.
+    cache_write_tokens = max(
+        _int_field(prompt_details, "cache_write_tokens"),
+        _int_field(usage, "cache_write_tokens"),
+    )
+    billed_cache_write_tokens = (
+        cache_write_tokens
+        if cached_tokens + cache_write_tokens <= prompt_tokens
+        else 0
+    )
+
+    if usage is not None:
+        reported_cost_usd = _float_field(usage, "cost")
+
     return ModelResult(
         text=content,
         target=target,
         usage=ModelUsage(
-            input_tokens=max(prompt_tokens - cached_tokens, 0),
+            input_tokens=max(
+                prompt_tokens - cached_tokens - billed_cache_write_tokens,
+                0,
+            ),
             output_tokens=completion_tokens,
             cache_read_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
         ),
         latency_ms=0,
         raw_response_id=raw_response_id,
+        upstream_provider=upstream_provider,
+        reported_cost_usd=reported_cost_usd,
     )

@@ -12,7 +12,7 @@ from models.model_runtime import (
     ModelTarget,
     ModelTelemetryContext,
     ModelUsage,
-    estimate_cost_usd,
+    resolve_cost_usd,
 )
 
 _MAX_PENDING_WRITES = 500
@@ -47,6 +47,8 @@ async def record_model_result(
         parse_valid=parse_valid,
         error=error,
         raw_response_id=result.raw_response_id,
+        upstream_provider=result.upstream_provider,
+        reported_cost_usd=result.reported_cost_usd,
     )
 
 
@@ -101,9 +103,26 @@ async def _record(
     parse_valid: bool | None,
     error: str | None,
     raw_response_id: str | None,
+    upstream_provider: str | None = None,
+    reported_cost_usd: float | None = None,
 ) -> None:
     if not telemetry_enabled():
         return
+
+    # provider stays the logical route (for example "openrouter"). The upstream
+    # that actually served the request, plus whether the cost is reported or
+    # estimated, travel in metadata so no schema change is needed to answer
+    # "did the pin hold and did caching work?".
+    metadata = dict(context.metadata or {})
+    metadata["upstream_provider"] = upstream_provider
+    metadata["cost_source"] = (
+        "provider_reported" if reported_cost_usd is not None else "catalog_estimate"
+    )
+    metadata["cached_input_tokens"] = usage.cache_read_tokens
+    prompt_tokens = usage.input_tokens + usage.cache_read_tokens
+    metadata["cache_hit_ratio"] = (
+        round(usage.cache_read_tokens / prompt_tokens, 4) if prompt_tokens else None
+    )
 
     row: dict[str, Any] = {
         "creator_id": context.creator_id,
@@ -119,12 +138,16 @@ async def _record(
         "retry_count": retry_count,
         "success": success,
         "parse_valid": parse_valid,
-        "estimated_cost_usd": estimate_cost_usd(target, usage),
+        "estimated_cost_usd": resolve_cost_usd(
+            target,
+            usage,
+            reported_cost_usd=reported_cost_usd,
+        ),
         "error": (error[:1000] if error else None),
         "raw_response_id": raw_response_id,
         "evaluation_run_id": context.evaluation_run_id,
         "scenario_id": context.scenario_id,
-        "metadata": context.metadata,
+        "metadata": metadata,
     }
 
     try:

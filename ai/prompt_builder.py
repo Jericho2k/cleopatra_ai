@@ -765,10 +765,20 @@ WELCOME MESSAGE (your opening style):
         if transcript_lines else ""
     )
 
+    # ---- Ordering for provider-side prefix caching ----
+    # The durable fan profile and the transcript are appended to, not rewritten,
+    # between turns, so they belong in front of the values that change on every
+    # single message (stage, situation, tip, the newest message itself). The
+    # wording of each block is unchanged; only their order moved, so the shared
+    # prefix between two consecutive calls in one conversation is as long as
+    # possible. The response instruction deliberately stays last: it must be the
+    # most recent thing the model reads.
     user_prompt = f"""FAN: {fan.display_name} | ${fan.total_spent} spent | {fan.spend_tier} tier
 
 WHAT YOU KNOW ABOUT THIS FAN:
 {fan_context if fan_context else "New fan — no profile yet. Focus on learning about them."}{missing_details_block}
+
+{transcript_block}
 
 CONVERSATION STAGE: {stage.value}
 {stage_instruction}
@@ -782,8 +792,6 @@ CURRENT SITUATION: {strategy} (fan mood: {mood}, energy: {energy})
 {avoid_block}
 
 {rag_section}
-
-{transcript_block}
 
 Fan just said: "{fan_message}"
 

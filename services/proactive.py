@@ -134,7 +134,15 @@ async def send_proactive_message(
             "scheduled campaign."
         )
 
-        replies = await generate_replies(prompt, persona)
+        replies = await generate_replies(
+            prompt,
+            persona,
+            telemetry_context={
+                "creator_id": creator_id,
+                "fan_id": fan_id,
+                "feature": "proactive_message",
+            },
+        )
         if not replies:
             print(f"[PROACTIVE] generation failed for fan={fan_id} — sending nothing")
             return False

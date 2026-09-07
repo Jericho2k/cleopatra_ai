@@ -65,6 +65,13 @@ class ModelResult:
     latency_ms: int
     raw_response_id: str | None = None
 
+    # Aggregator routes (OpenRouter) name the upstream provider that actually
+    # served the request and report the real charged cost. Both stay None for
+    # direct providers, where the logical provider is the upstream provider and
+    # cost is derived from catalog pricing.
+    upstream_provider: str | None = None
+    reported_cost_usd: float | None = None
+
 
 @dataclass(frozen=True)
 class ModelTelemetryContext:
@@ -74,6 +81,29 @@ class ModelTelemetryContext:
     evaluation_run_id: str | None = None
     scenario_id: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+def resolve_cost_usd(
+    target: ModelTarget,
+    usage: ModelUsage,
+    *,
+    reported_cost_usd: float | None = None,
+) -> float:
+    """Prefer the provider's reported cost, falling back to catalog pricing.
+
+    OpenRouter returns the amount actually charged for a generation. That is
+    strictly better than a catalog snapshot, and using it keeps one accounting
+    path rather than a second cost system alongside estimate_cost_usd.
+    """
+
+    if reported_cost_usd is not None:
+        try:
+            value = float(reported_cost_usd)
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and value >= 0:
+            return round(value, 8)
+    return estimate_cost_usd(target, usage)
 
 
 def estimate_cost_usd(target: ModelTarget, usage: ModelUsage) -> float:

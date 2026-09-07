@@ -1,9 +1,14 @@
 """Deterministic production writer routing for Cleopatra.
 
-Kimi handles ordinary conversation. DeepSeek handles commercially complex,
-high-value, session-active, and safety-sensitive turns. The router never asks a
-model to decide which business action should happen; it only chooses the writer
-that expresses the already-known context.
+Kimi K2.6 through OpenRouter, pinned to one upstream provider, handles ordinary
+conversation. DeepSeek on Together handles commercially complex, high-value,
+session-active, and safety-sensitive turns. The router never asks a model to
+decide which business action should happen; it only chooses the writer that
+expresses the already-known context.
+
+The two routes are deliberately on different providers: an OpenRouter outage
+must not take the commercial writer down with it, and the ordinary route's
+fail-closed provider pin must not be able to divert commercial turns.
 """
 
 from __future__ import annotations
@@ -14,8 +19,23 @@ from enum import Enum
 from typing import Any
 
 from ai.model_migrations import resolve_supported_model
-from ai.model_providers import find_catalog_target, get_runtime_target
+from ai.model_providers import (
+    find_catalog_target,
+    get_runtime_target,
+    provider_transport_defaults,
+)
 from models.model_runtime import ModelTarget
+
+
+# Ordinary conversational writer. Kimi K2.6 is reached through OpenRouter and
+# pinned to a single upstream provider (see ai/openrouter_routing.py).
+DEFAULT_WRITER_PROVIDER = "openrouter"
+DEFAULT_WRITER_MODEL = "moonshotai/kimi-k2.6"
+
+# Commercially complex and safety-sensitive turns. Unchanged by the OpenRouter
+# migration and deliberately not routed through OpenRouter.
+COMPLEX_WRITER_PROVIDER = "together"
+COMPLEX_WRITER_MODEL = "deepseek-ai/DeepSeek-V4-Pro"
 
 
 class WriterRoute(str, Enum):
@@ -84,16 +104,7 @@ def _resolve_target(
     if catalog_target is not None:
         return catalog_target
 
-    base_url: str | None = None
-    api_key_env: str | None = None
-    if provider == "together":
-        base_url = "https://api.together.xyz/v1"
-        api_key_env = "TOGETHER_API_KEY"
-    elif provider == "anthropic":
-        api_key_env = "ANTHROPIC_API_KEY"
-    elif provider in {"self_hosted", "openai_compatible"}:
-        base_url = os.getenv("SELF_HOSTED_BASE_URL")
-        api_key_env = "SELF_HOSTED_API_KEY"
+    base_url, api_key_env = provider_transport_defaults(provider)
 
     return ModelTarget(
         name=f"{provider}:{model}",
@@ -127,14 +138,14 @@ def select_writer_route(ctx: Any) -> WriterRouteDecision:
     default_target = _resolve_target(
         provider_env="WRITER_DEFAULT_PROVIDER",
         model_env="WRITER_DEFAULT_MODEL",
-        default_provider="together",
-        default_model="moonshotai/Kimi-K3",
+        default_provider=DEFAULT_WRITER_PROVIDER,
+        default_model=DEFAULT_WRITER_MODEL,
     )
     complex_target = _resolve_target(
         provider_env="WRITER_COMPLEX_PROVIDER",
         model_env="WRITER_COMPLEX_MODEL",
-        default_provider="together",
-        default_model="deepseek-ai/DeepSeek-V4-Pro",
+        default_provider=COMPLEX_WRITER_PROVIDER,
+        default_model=COMPLEX_WRITER_MODEL,
     )
 
     situation = _mapping(getattr(ctx, "situation", None))
