@@ -1679,6 +1679,77 @@ async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
     return {"status": "ok", **result}
 
 
+_FANSLY_LISTS_DEFAULT_INTERVAL_HOURS = 6
+
+
+def _fansly_lists_interval_hours() -> float:
+    try:
+        return max(
+            0.25,
+            float(os.environ.get("FANSLY_LISTS_SYNC_INTERVAL_HOURS", "6")),
+        )
+    except (TypeError, ValueError):
+        return float(_FANSLY_LISTS_DEFAULT_INTERVAL_HOURS)
+
+
+async def _fansly_lists_sync_due(creator_id: str) -> bool:
+    """Whether the mirrored lists are stale enough to refresh on this pass."""
+    db = get_supabase()
+    rows = (
+        await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("last_fansly_lists_sync_at")
+            .eq("id", creator_id)
+            .limit(1)
+            .execute()
+        )
+    ).data or []
+    if not rows:
+        return False
+    raw = rows[0].get("last_fansly_lists_sync_at")
+    if not raw:
+        return True
+    try:
+        last = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    age_hours = (
+        datetime.now(timezone.utc) - last
+    ).total_seconds() / 3600
+    return age_hours >= _fansly_lists_interval_hours()
+
+
+async def _sync_fansly_lists_if_due(
+    creator_id: str,
+    account_id: str,
+    *,
+    force: bool,
+) -> dict | None:
+    """Refresh mirrored Fansly lists, never failing the surrounding chat sync.
+
+    A 401/403 is surfaced as an explicit reconnect state rather than swallowed;
+    services.fansly_lists has already recorded it against the creator, and the
+    caller's own binding backoff still owns the retry cadence.
+    """
+    from services.apifansly import ApiFanslyAccountAccessError
+    from services.fansly_lists import lists_sync_enabled, sync_fansly_lists
+
+    if not lists_sync_enabled():
+        return None
+    try:
+        if not force and not await _fansly_lists_sync_due(creator_id):
+            return None
+        return await sync_fansly_lists(creator_id, account_id)
+    except ApiFanslyAccountAccessError as exc:
+        print(f"[FANSLY LISTS ACCESS DENIED] creator={creator_id}: {exc}")
+        return {"status": "access_denied", "detail": str(exc)}
+    except Exception as exc:
+        print(f"[FANSLY LISTS ERROR] creator={creator_id}: {exc}")
+        return {"status": "error", "detail": str(exc)}
+
+
 @app.post(
     "/sync-chats/{creator_id}",
     dependencies=[Depends(require_creator_path_access)],
@@ -1869,6 +1940,14 @@ async def sync_chats(
                 print(
                     f"[FANSLY AUDIENCE ERROR] creator={creator_id}: {exc}"
                 )
+        # Fansly list mirroring rides the same account-synchronization lifecycle
+        # rather than adding a scheduler: every full sync refreshes it, and an
+        # incremental pass refreshes it only once the mirror is stale.
+        lists_sync = await _sync_fansly_lists_if_due(
+            creator_id,
+            str(apifansly_id),
+            force=bool(force or not incremental),
+        )
         print(
             f"[SYNC CHATS] incremental={incremental} total_chats={len(all_chats)} "
             f"synced={synced} new={new_chats}"
@@ -1880,6 +1959,7 @@ async def sync_chats(
             "new_chats": new_chats,
             "new_messages": new_messages,
             "audience": audience_sync,
+            "lists": lists_sync,
         }
 
 
@@ -4666,6 +4746,74 @@ async def update_auto_audience_policy(
     if not result.data:
         raise HTTPException(status_code=404, detail="creator not found")
     return {"status": "ok", "creator_id": creator_id, "policy": policy.model_dump(mode="json")}
+
+
+@app.get(
+    "/creator/{creator_id}/fansly-lists",
+    dependencies=[Depends(require_creator_path_access)],
+)
+async def read_fansly_lists(creator_id: str) -> dict:
+    """Return the creator's mirrored Fansly lists and their sync state.
+
+    A read, not a refresh: the dashboard calls this on load, while the actual
+    API Fansly work happens on the account-synchronization lifecycle or through
+    the explicit refresh below.
+    """
+    from services.fansly_lists import lists_sync_enabled, read_lists_sync_state
+
+    state = await read_lists_sync_state(creator_id)
+    return {"creator_id": creator_id, "enabled": lists_sync_enabled(), **state}
+
+
+@app.post(
+    "/creator/{creator_id}/sync-fansly-lists",
+    dependencies=[Depends(require_creator_path_access)],
+)
+async def sync_creator_fansly_lists(creator_id: str) -> dict:
+    """Explicit operator-triggered refresh of the creator's Fansly lists.
+
+    creator_id is never trusted on its own: require_creator_path_access has
+    already confirmed the caller is assigned to this creator, and the API
+    Fansly account ID is read from the creator row rather than the request.
+    """
+    from services.apifansly import ApiFanslyAccountAccessError
+    from services.fansly_lists import (
+        lists_sync_enabled,
+        read_lists_sync_state,
+        sync_fansly_lists,
+    )
+
+    if not lists_sync_enabled():
+        raise HTTPException(
+            status_code=409,
+            detail="Fansly list synchronization is disabled",
+        )
+
+    db = get_supabase()
+    rows = (
+        await asyncio.to_thread(
+            lambda: db.table("creators")
+            .select("apifansly_account_id")
+            .eq("id", creator_id)
+            .limit(1)
+            .execute()
+        )
+    ).data or []
+    account_id = str((rows[0] if rows else {}).get("apifansly_account_id") or "")
+    if not account_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Creator is not connected to an API Fansly account",
+        )
+
+    try:
+        result = await sync_fansly_lists(creator_id, account_id)
+    except ApiFanslyAccountAccessError as exc:
+        # Same reconnect semantics every other API Fansly access failure uses.
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    state = await read_lists_sync_state(creator_id)
+    return {"creator_id": creator_id, **result, **state}
 
 
 @app.get(

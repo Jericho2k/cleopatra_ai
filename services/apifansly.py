@@ -714,6 +714,165 @@ async def list_vault_album_media(
     return items, response_cursor(payload, response=response)
 
 
+# --- Account lists -----------------------------------------------------------
+#
+# Agencies build Lists (VIP, Whales, Buyers, Re-engage, ...) directly on the
+# creator's Fansly account. Cleopatra mirrors them read-only; it never creates,
+# renames or deletes a remote list.
+#
+# The path segments follow the same {accountId}/<resource> shape as every other
+# endpoint in this module, and are overridable without a deploy so a
+# documentation change does not require one.
+_LISTS_PATH = "lists"
+_LIST_ITEMS_PATH = "items"
+
+# Remote payloads vary in which key carries the collection and which carries the
+# identifier, exactly as they do for vault albums and followers above. Parsing
+# stays tolerant rather than asserting one shape.
+_LIST_COLLECTION_KEYS = ("lists", "items", "data", "accountLists")
+_LIST_ID_KEYS = ("id", "listId", "_id")
+_LIST_NAME_KEYS = ("label", "name", "title")
+_LIST_ITEM_COLLECTION_KEYS = ("items", "listItems", "accounts", "data", "members")
+_LIST_MEMBER_ID_KEYS = ("accountId", "itemId", "id", "userId", "followerId")
+
+
+def _lists_path() -> str:
+    return str(os.environ.get("APIFANSLY_LISTS_PATH") or _LISTS_PATH).strip("/")
+
+
+def _list_items_path() -> str:
+    return str(
+        os.environ.get("APIFANSLY_LIST_ITEMS_PATH") or _LIST_ITEMS_PATH
+    ).strip("/")
+
+
+def _first_value(row: dict[str, Any], keys: Iterable[str]) -> str | None:
+    for key in keys:
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _collection(response: Any, keys: Iterable[str]) -> list[Any]:
+    """Return the collection from a list-shaped or object-shaped response."""
+    if isinstance(response, list):
+        return response
+    if not isinstance(response, dict):
+        return []
+    for key in keys:
+        value = response.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def parse_account_lists(response: Any) -> list[dict[str, Any]]:
+    """Normalize one page of remote lists into id/name/count records.
+
+    A list with no usable remote identifier is dropped rather than mirrored:
+    the remote id is the only stable mapping key, and a mirror without one would
+    duplicate itself on the next sync.
+    """
+    parsed: list[dict[str, Any]] = []
+    for row in _collection(response, _LIST_COLLECTION_KEYS):
+        if not isinstance(row, dict):
+            continue
+        external_id = _first_value(row, _LIST_ID_KEYS)
+        if not external_id:
+            continue
+        name = _first_value(row, _LIST_NAME_KEYS) or f"Fansly list {external_id}"
+        try:
+            item_count = int(row.get("itemCount") or row.get("count") or 0)
+        except (TypeError, ValueError):
+            item_count = 0
+        parsed.append(
+            {
+                "external_list_id": external_id,
+                "name": name,
+                "item_count": max(item_count, 0),
+            }
+        )
+    return parsed
+
+
+def parse_list_member_ids(response: Any) -> list[str]:
+    """Normalize one page of list membership into platform account IDs.
+
+    Members are identified only by their Fansly account ID. Usernames and
+    display names are deliberately ignored: they are mutable and not unique.
+    """
+    member_ids: list[str] = []
+    seen: set[str] = set()
+    for row in _collection(response, _LIST_ITEM_COLLECTION_KEYS):
+        if isinstance(row, (str, int)):
+            account_id = str(row).strip()
+        elif isinstance(row, dict):
+            account_id = _first_value(row, _LIST_MEMBER_ID_KEYS) or ""
+        else:
+            continue
+        if account_id and account_id not in seen:
+            seen.add(account_id)
+            member_ids.append(account_id)
+    return member_ids
+
+
+async def list_account_lists(
+    account_id: str,
+    *,
+    cursor: str | None = None,
+    limit: int = 100,
+    client: httpx.AsyncClient | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return one page of the creator's own Fansly lists."""
+    params: dict[str, Any] = {"limit": max(1, int(limit))}
+    if cursor:
+        params["cursor"] = cursor
+    payload = await request(
+        "GET",
+        f"{account_id}/{_lists_path()}",
+        operation="account list listing",
+        account_id=account_id,
+        params=params,
+        client=client,
+    )
+    response = response_data(payload)
+    if response is None:
+        raise ApiFanslyProtocolError("API Fansly account list response is invalid")
+    return parse_account_lists(response), response_cursor(payload, response=response)
+
+
+async def list_account_list_members(
+    account_id: str,
+    list_id: str,
+    *,
+    cursor: str | None = None,
+    limit: int = 100,
+    client: httpx.AsyncClient | None = None,
+) -> tuple[list[str], str | None]:
+    """Return one page of Fansly account IDs belonging to a remote list."""
+    params: dict[str, Any] = {"limit": max(1, int(limit))}
+    if cursor:
+        params["cursor"] = cursor
+    payload = await request(
+        "GET",
+        f"{account_id}/{_lists_path()}/{list_id}/{_list_items_path()}",
+        operation="account list member listing",
+        account_id=account_id,
+        params=params,
+        client=client,
+    )
+    response = response_data(payload)
+    if response is None:
+        raise ApiFanslyProtocolError(
+            "API Fansly account list member response is invalid"
+        )
+    return parse_list_member_ids(response), response_cursor(
+        payload,
+        response=response,
+    )
+
+
 async def list_followers(
     account_id: str,
     *,
