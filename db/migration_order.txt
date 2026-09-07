@@ -32,6 +32,7 @@ model_lab_v1.sql
 payment_pending_status_v1.sql
 price_learning_v1.sql
 vault_metadata_v2.sql
+summaries_security_invoker_v1.sql
 
 # Always last: discovers creator-owned tables at run time.
 tenant_isolation_v1.sql
