@@ -106,6 +106,35 @@ Specifically to confirm:
 | `fan_list_members` | `fan_id` | Auto Audience and list reconciliation |
 | `scheduled_actions` | `(status, execute_at)`, `dedupe_key` | The durable queue |
 
+### Before applying `message_platform_identity_v1.sql` (REL-002)
+
+Run this against production first. The migration refuses to create the index if
+it finds duplicates, reports how many and which, and changes nothing — but
+knowing the answer beforehand is better than learning it from a failed
+migration.
+
+```sql
+select creator_id, fansly_message_id, count(*) as copies,
+       min(sent_at) as first_seen, max(sent_at) as last_seen
+  from public.messages
+ where fansly_message_id is not null
+ group by creator_id, fansly_message_id
+having count(*) > 1
+ order by copies desc;
+```
+
+An empty result means the migration applies cleanly. A non-empty result is
+**production history** — investigate which ingestion path produced each pair and
+design an explicit cleanup. Do not delete rows to make the migration pass.
+
+The key is `(creator_id, fansly_message_id)`, not `fansly_message_id` alone.
+Fansly ids look globally unique — the webhook has always looked them up with no
+creator filter and production has not mis-deduplicated — but the two choices
+fail asymmetrically. If ids really are global, the composite key still catches
+every race, because writers racing on one message always share a `creator_id`.
+If ids turn out to be per-account, a global key silently rejects a second
+creator's legitimately distinct message. Composite is correct under both.
+
 And for SEC-003:
 
 ```sql

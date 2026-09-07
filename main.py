@@ -4437,23 +4437,32 @@ async def fansly_webhook(request: Request) -> dict:
                 f"message={mid} error={type(exc).__name__}"
             )
 
-    if mid:
-        await save_message(
-            fan.id,
-            creator_id,
-            "fan",
-            message_content,
-            fansly_message_id=mid,
-            media_context=media_context,
+    # REL-002 — the database decides whether this is a new message.
+    #
+    # The pre-check above narrows the common case, but it is a read followed by
+    # a non-atomic write: a redelivery racing the poller, or two workers, can
+    # both see "absent". save_message_result upserts on
+    # (creator_id, fansly_message_id) and reports which caller actually inserted,
+    # so the pipeline runs at most once per platform message however the race
+    # resolves. Without this, one fan message could produce two analyzer calls,
+    # two writer generations, and its own text twice in the writer's history.
+    from db.queries import save_message_result
+
+    write = await save_message_result(
+        fan.id,
+        creator_id,
+        "fan",
+        message_content,
+        fansly_message_id=mid or None,
+        media_context=media_context,
+    )
+
+    if not write.inserted:
+        print(
+            f"[WEBHOOK] duplicate platform message creator={creator_id} "
+            f"message={mid} — pipeline not re-run"
         )
-    else:
-        await save_message(
-            fan.id,
-            creator_id,
-            "fan",
-            message_content,
-            media_context=media_context,
-        )
+        return {"status": "duplicate"}
 
     await process_incoming_fan_message(
         fan.id,
