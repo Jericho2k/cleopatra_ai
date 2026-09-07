@@ -13,6 +13,10 @@ jobs:
     services:
       # Schema tests apply db/*.sql for real, so a unique index or check
       # constraint that would not actually reject bad data cannot pass.
+      # tests/test_schema_pipeline.py additionally builds the WHOLE schema from
+      # scratch here — base schema then every migration in db/migration_order.txt
+      # — so a migration that only applies to the live database cannot pass
+      # either (DB-000). CI never writes to production.
       postgres:
         image: postgres:16
         env:
@@ -36,4 +40,8 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
+      # Fail fast and unambiguously if the schema pipeline itself is broken,
+      # before the rest of the suite muddies the output.
+      - name: Schema pipeline (base schema + ordered migrations)
+        run: pytest -q tests/test_schema_pipeline.py
       - run: pytest -q
