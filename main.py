@@ -837,6 +837,13 @@ async def chat_reconciliation_scheduler():
 async def lifespan(app: FastAPI):
     global session_store, fansly_poller, ppv_sweep_task, vault_autosync_task, scheduled_actions_task, chat_reconcile_task, model_availability_task
 
+    # SEC-004: state the resolved deployment mode once at boot. An unset or
+    # unrecognised APP_ENV resolves to production, so a misconfigured deploy is
+    # visible in the logs instead of silently running with relaxed auth.
+    from core.environment import describe_environment
+
+    print(f"[STARTUP] {describe_environment()}")
+
     supabase = get_supabase()
     session_store = SessionStore(
         supabase=supabase,
@@ -888,7 +895,8 @@ _cors_origins = [
 #   • API Fansly webhook                        -> verify its HMAC signature in-route
 #   • internal database webhook                 -> require WEBHOOK_SECRET header
 #   • everything else (operator/CRUD/admin)     -> require DASHBOARD_API_SECRET
-# Unconfigured secrets fail open in dev, closed in prod (see core/auth.py).
+# Unconfigured secrets fail open only under an explicit APP_ENV=development,
+# and closed everywhere else including an unset APP_ENV (see core/environment.py).
 from starlette.responses import JSONResponse
 from core.auth import (
     _is_dev,

@@ -11,8 +11,12 @@ Two independent secrets guard two kinds of caller:
   (header: X-Webhook-Secret). Prevents anyone from injecting fake fan messages.
 
 If a secret is not configured in the environment, the corresponding guard fails
-CLOSED in production (APP_ENV != 'development') and OPEN in development, so local
-work isn't blocked but a misconfigured prod deploy can't silently run wide open.
+CLOSED unless APP_ENV explicitly names a development environment, so local work
+isn't blocked but a misconfigured prod deploy can't silently run wide open.
+
+SEC-004: the relaxed branch is selected by an explicit APP_ENV=development only.
+A missing, empty, or unrecognised APP_ENV resolves to production — see
+core/environment.py.
 """
 import os
 import time
@@ -20,6 +24,7 @@ from hashlib import sha256
 
 from fastapi import Header, HTTPException, Request, status
 
+from core.environment import is_development
 from core.supabase import get_supabase
 
 
@@ -28,7 +33,12 @@ _USER_CACHE_TTL_SECONDS = 60.0
 
 
 def _is_dev() -> bool:
-    return os.environ.get("APP_ENV", "development") == "development"
+    """Whether relaxed local-development auth applies.
+
+    Fails closed: only an explicit development APP_ENV enables it. Kept as a
+    module-level name because core/tenancy.py and main.py import it.
+    """
+    return is_development()
 
 
 async def require_dashboard(x_api_key: str | None = Header(default=None)) -> None:

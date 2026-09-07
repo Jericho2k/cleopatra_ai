@@ -37,6 +37,9 @@ async def require_creator_access(
     creator_id: str,
 ) -> None:
     user_id = dashboard_user_id(request)
+    # SEC-004: this early return makes every tenancy check a no-op, so it must
+    # require an explicit development APP_ENV. _is_dev() fails closed on an
+    # unset or unrecognised value.
     if not user_id and _is_dev():
         return
     if not user_id:
