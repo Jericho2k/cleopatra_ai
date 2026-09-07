@@ -5452,9 +5452,24 @@ async def enrich_fan_endpoint(fan_id: str) -> dict:
     return {"status": "ok"}
 
 
+async def require_local_test_endpoints() -> None:
+    """SEC-005 — the /test/* helpers must not exist outside development/test.
+
+    404 rather than 403: production should not advertise that these routes are
+    implemented at all.
+    """
+    from core.environment import local_test_endpoints_enabled
+
+    if not local_test_endpoints_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
 @app.post(
     "/test/simulate-ppv-purchase",
-    dependencies=[Depends(require_fan_path_access)],
+    dependencies=[
+        Depends(require_local_test_endpoints),
+        Depends(require_fan_path_access),
+    ],
 )
 async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
     """Dev only — simulate a fan purchasing a pending PPV."""
@@ -5466,7 +5481,12 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
     # Get pending PPV check
     fan_row = await asyncio.to_thread(
         lambda: db.table("fans")
-        .select("pending_ppv_check, total_spent, active_session, ai_summary")
+        # sales_log must be selected: it used to be read from a row that never
+        # contained it, so the append below silently replaced the fan's entire
+        # sales history with one fabricated entry (SEC-005).
+        .select(
+            "pending_ppv_check, total_spent, active_session, ai_summary, sales_log"
+        )
         .eq("id", fan_id)
         .single()
         .execute()
@@ -5485,8 +5505,18 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
     summary = fan_data.get("ai_summary") or {}
 
     from datetime import datetime
-    # Get existing sales_log
-    sales_log = fan_data.get("sales_log") or []
+
+    # Append to the existing history rather than replacing it. A non-list value
+    # would otherwise be silently discarded, so refuse instead of destroying it.
+    existing_sales_log = fan_data.get("sales_log")
+    if existing_sales_log is None:
+        existing_sales_log = []
+    if not isinstance(existing_sales_log, list):
+        return {
+            "status": "error",
+            "message": "fan sales_log is not a list; refusing to overwrite it",
+        }
+    sales_log = [*existing_sales_log]
     sales_log.append({
         "date": datetime.utcnow().strftime("%d.%m.%Y"),
         "item": f"PPV media {media_id}",
@@ -5532,14 +5562,61 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
 
 @app.post(
     "/test/inject-message",
-    dependencies=[Depends(require_creator_fan_access)],
+    dependencies=[
+        Depends(require_local_test_endpoints),
+        Depends(require_creator_fan_access),
+    ],
 )
-async def test_inject_message(fan_id: str, creator_id: str, content: str) -> dict:
-    """Dev testing only — simulate a fan message without Fansly webhook."""
+async def test_inject_message(
+    fan_id: str,
+    creator_id: str,
+    content: str,
+    auto_mode: bool | None = None,
+) -> dict:
+    """Dev testing only — simulate a fan message without a Fansly webhook.
+
+    auto_mode used to be hardcoded True, so a helper call could trigger a real
+    Full Auto send to a real fan for a creator whose Auto is off (SEC-005). It
+    now resolves the creator's actual setting. An explicit auto_mode=false can
+    force a non-delivering injection; auto_mode=true is honoured only when the
+    creator really has Auto on, so the helper can never be the reason a message
+    is sent.
+    """
     from db.queries import save_message
+
+    creator_auto = False
+    try:
+        creator_row = await asyncio.to_thread(
+            lambda: get_supabase()
+            .table("creators")
+            .select("auto_mode")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+        creator_auto = bool((creator_row.data or {}).get("auto_mode", False))
+    except Exception as exc:
+        # Fail closed: an unreadable creator row must not authorise a send.
+        print(f"[TEST INJECT] creator auto_mode unreadable creator={creator_id}: {exc}")
+        creator_auto = False
+
+    effective_auto = creator_auto if auto_mode is None else (creator_auto and auto_mode)
+
     await save_message(fan_id, creator_id, "fan", content, was_ai_suggested=False)
-    await process_incoming_fan_message(fan_id, creator_id, content, auto_mode=True, message_id=None)
-    return {"status": "ok", "fan_id": fan_id, "content": content}
+    await process_incoming_fan_message(
+        fan_id,
+        creator_id,
+        content,
+        auto_mode=effective_auto,
+        message_id=None,
+    )
+    return {
+        "status": "ok",
+        "fan_id": fan_id,
+        "content": content,
+        "auto_mode": effective_auto,
+        "creator_auto_mode": creator_auto,
+    }
 
 
 @app.post(
