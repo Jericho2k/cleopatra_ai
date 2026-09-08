@@ -213,6 +213,33 @@ python scripts/load_test_scheduled_actions.py --sequential   # the pre-sprint sh
 `tests/test_scheduled_action_load_harness.py` runs the same harness at
 compressed latencies on every commit.
 
+### Measured results
+
+Model latency 2.0 s per call (two calls per reply), composition delay 6.8 s (the
+value the audit measured), API send 150 ms, DB 4 ms per round trip.
+
+| Burst | Before: drain | Before: actions/min | After: drain | After: actions/min | Speed-up |
+|---|---|---|---|---|---|
+| 10 | 110.8 s | 5.4 | **22.2 s** | **27.1** | 5.0x |
+| 50 | 554.7 s | 5.4 | **78.1 s** | **38.4** | 7.1x |
+| 100 | 1109.4 s | 5.4 | **145.1 s** | **41.3** | 7.6x |
+
+Peak action concurrency 8/8, peak model concurrency 8/8, zero duplicate sends,
+zero same-fan overlaps, zero errors at every size.
+
+Two things the table deliberately does not claim:
+
+- **The "before" column is generous to the old design.** It runs the harness at
+  concurrency 1 but still uses the new short inter-cycle poll. The real old loop
+  slept a flat 60 s after every batch of 20, which puts it at roughly 170 s /
+  3.5 per min for 10, 734 s / 4.1 for 50, and 1407 s / 4.3 for 100 — matching
+  the audit's estimate of 3-6 replies per minute for the whole deployment.
+- **Per-action completion time did not improve, and should not have.** p50 and
+  p95 are 11.07 s in both columns, because 6.8 s of that is the deliberate
+  composition delay and 4 s is provider latency. What collapsed is the time a
+  fan spends waiting *behind other fans*. That is the correct outcome: parallel
+  conversations, not faster robotic sends.
+
 ## 9. Configuration
 
 | Variable | Default | Meaning |
