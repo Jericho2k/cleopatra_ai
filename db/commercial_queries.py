@@ -289,15 +289,14 @@ async def ensure_action_pending(
             .limit(1)
             .execute()
         ).data or []
-        if not existing:
-            db.table("scheduled_actions").insert(row).execute()
+        current = existing[0] if existing else None
+        # Shared with the batched repair pass so the two can never disagree
+        # about what "needs repair" means.
+        if not action_needs_repair(current):
             return
-        current = existing[0]
-        recoverable_compatibility_failure = (
-            current.get("status") == "FAILED"
-            and "get_creator_auto_mode_default" in str(current.get("last_error") or "")
-        )
-        if current.get("status") == "COMPLETED" or recoverable_compatibility_failure:
+        if current is None:
+            db.table("scheduled_actions").insert(row).execute()
+        else:
             db.table("scheduled_actions").update(row).eq(
                 "id", current["id"]
             ).execute()
@@ -504,8 +503,18 @@ async def get_scheduled_actions_for_fan(
     return await asyncio.to_thread(_get)
 
 
-async def get_followup_obligations(page_size: int = 500) -> list[dict]:
-    """Return every durable follow-up obligation using stable pagination.
+async def get_followup_obligations(
+    page_size: int = 500,
+    *,
+    due_before: datetime | None = None,
+) -> list[dict]:
+    """Return durable follow-up obligations using stable pagination.
+
+    ``due_before`` bounds the scan to obligations that could fire soon. Without
+    it every row with a future ``next_followup_at`` — including one scheduled for
+    next Friday — was fetched on every worker cycle for a week. The repair pass
+    only has to guarantee that a durable action exists *before* its execute time,
+    so a short upcoming horizon is sufficient and the invariant is unchanged.
 
     The former hard 100-row limit could permanently starve repairs once an
     agency accumulated more than 100 active obligations.
@@ -516,7 +525,7 @@ async def get_followup_obligations(page_size: int = 500) -> list[dict]:
         offset = 0
         rows: list[dict] = []
         while True:
-            page = (
+            query = (
                 db.table("fan_commercial_states")
                 .select(
                     "fan_id, creator_id, next_followup_at, next_followup_type, "
@@ -524,6 +533,11 @@ async def get_followup_obligations(page_size: int = 500) -> list[dict]:
                 )
                 .not_.is_("next_followup_at", "null")
                 .not_.is_("next_followup_type", "null")
+            )
+            if due_before is not None:
+                query = query.lte("next_followup_at", due_before.isoformat())
+            page = (
+                query
                 .order("fan_id")
                 .range(offset, offset + size - 1)
                 .execute()
@@ -534,3 +548,84 @@ async def get_followup_obligations(page_size: int = 500) -> list[dict]:
             offset += size
 
     return await asyncio.to_thread(_get)
+
+
+# PostgREST puts ``in.(...)`` filters in the query string, so the key list has to
+# stay well inside a sane URL length. 200 keys per request keeps the repair pass
+# at a handful of round trips even with a large horizon.
+_DEDUPE_KEY_CHUNK = 200
+
+
+async def get_action_states_by_dedupe_key(dedupe_keys: list[str]) -> dict[str, dict]:
+    """Return ``{dedupe_key: {id, status, last_error}}`` for the given keys.
+
+    One bounded query per chunk replaces the per-obligation SELECT that made the
+    repair pass cost two round trips for every outstanding obligation.
+    """
+    keys = [key for key in dict.fromkeys(str(k) for k in dedupe_keys) if key]
+    if not keys:
+        return {}
+
+    def _get() -> dict[str, dict]:
+        db = get_supabase()
+        found: dict[str, dict] = {}
+        for start in range(0, len(keys), _DEDUPE_KEY_CHUNK):
+            chunk = keys[start:start + _DEDUPE_KEY_CHUNK]
+            rows = (
+                db.table("scheduled_actions")
+                .select("id, dedupe_key, status, last_error")
+                .in_("dedupe_key", chunk)
+                .execute()
+            ).data or []
+            for row in rows:
+                key = str(row.get("dedupe_key") or "")
+                if key:
+                    found[key] = row
+        return found
+
+    return await asyncio.to_thread(_get)
+
+
+async def bulk_upsert_pending_actions(rows: list[dict]) -> int:
+    """Insert or reset a batch of durable actions, keyed on ``dedupe_key``.
+
+    Used only by the repair pass, which has already established that each row
+    either has no action at all or has one in a terminal state that must be
+    recreated. Rows with a live PENDING/PROCESSING action are never passed here,
+    so this cannot disturb an in-flight claim.
+    """
+    if not rows:
+        return 0
+
+    def _upsert() -> int:
+        db = get_supabase()
+        written = 0
+        for start in range(0, len(rows), _DEDUPE_KEY_CHUNK):
+            chunk = rows[start:start + _DEDUPE_KEY_CHUNK]
+            db.table("scheduled_actions").upsert(
+                chunk,
+                on_conflict="dedupe_key",
+            ).execute()
+            written += len(chunk)
+        return written
+
+    return await asyncio.to_thread(_upsert)
+
+
+def action_needs_repair(existing: dict | None) -> bool:
+    """Decide whether a durable action must be recreated for a live obligation.
+
+    Deliberately identical to the single-row logic in ``ensure_action_pending``:
+    a missing action, an action already COMPLETED for an obligation that is still
+    current, or one FAILED by the rolling-deployment compatibility error. Every
+    other state (PENDING, PROCESSING, CANCELLED, other FAILED) is left alone.
+    """
+    if not existing:
+        return True
+    status = existing.get("status")
+    if status == "COMPLETED":
+        return True
+    return (
+        status == "FAILED"
+        and "get_creator_auto_mode_default" in str(existing.get("last_error") or "")
+    )

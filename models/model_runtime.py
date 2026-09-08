@@ -72,6 +72,11 @@ class ModelResult:
     upstream_provider: str | None = None
     reported_cost_usd: float | None = None
 
+    # Milliseconds spent waiting for a slot in the global model gate before the
+    # provider was called at all. Kept separate from ``latency_ms`` so a
+    # saturated deployment is never misread as a slow provider.
+    gate_wait_ms: int = 0
+
 
 @dataclass(frozen=True)
 class ModelTelemetryContext:

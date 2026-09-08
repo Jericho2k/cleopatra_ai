@@ -34,7 +34,7 @@ def test_reconciliation_retry_reschedules_without_marking_complete(monkeypatch):
     calls = []
 
     monkeypatch.setattr(worker, "repair_followup_obligations", lambda: async_value(0))
-    monkeypatch.setattr(worker, "claim_due_actions", lambda: async_value([due]))
+    monkeypatch.setattr(worker, "claim_due_actions", lambda **_: async_value([due]))
     monkeypatch.setitem(
         worker.HANDLERS,
         "PPV_RECONCILE",
@@ -108,17 +108,23 @@ def test_followup_obligation_recreates_missing_action(monkeypatch):
     monkeypatch.setattr(
         worker,
         "get_followup_obligations",
-        lambda: async_value([obligation]),
+        lambda **_: async_value([obligation]),
     )
     monkeypatch.setattr(
         worker,
-        "ensure_action_pending",
-        lambda **kwargs: async_append(calls, kwargs),
+        "get_action_states_by_dedupe_key",
+        lambda _keys: async_value({}),
+    )
+    monkeypatch.setattr(
+        worker,
+        "bulk_upsert_pending_actions",
+        lambda rows: async_append(calls, rows),
     )
 
-    assert run(worker.repair_followup_obligations()) == 1
-    assert calls[0]["action_type"] == "POST_SESSION_FOLLOWUP"
-    assert calls[0]["payload"]["experience"] == "shower"
+    assert run(worker.repair_followup_obligations(horizon_seconds=10 ** 9)) == 1
+    assert calls[0][0]["action_type"] == "POST_SESSION_FOLLOWUP"
+    assert calls[0][0]["payload"]["experience"] == "shower"
+    assert calls[0][0]["status"] == "PENDING"
 
 
 def test_followup_obligation_scan_paginates_past_first_page(monkeypatch):
@@ -173,7 +179,7 @@ def test_message_followups_get_extended_delivery_retries(monkeypatch):
         raise RuntimeError("temporary platform failure")
 
     monkeypatch.setattr(worker, "repair_followup_obligations", lambda: async_value(0))
-    monkeypatch.setattr(worker, "claim_due_actions", lambda: async_value([due]))
+    monkeypatch.setattr(worker, "claim_due_actions", lambda **_: async_value([due]))
     monkeypatch.setitem(worker.HANDLERS, "OFFER_EXPIRY", broken_handler)
 
     async def capture_failure(*args, **kwargs):

@@ -49,6 +49,9 @@ async def record_model_result(
         raw_response_id=result.raw_response_id,
         upstream_provider=result.upstream_provider,
         reported_cost_usd=result.reported_cost_usd,
+        # getattr keeps a rolling deploy (or a test double) that predates the
+        # model gate from turning telemetry into a generation failure.
+        gate_wait_ms=getattr(result, "gate_wait_ms", 0) or 0,
     )
 
 
@@ -105,6 +108,7 @@ async def _record(
     raw_response_id: str | None,
     upstream_provider: str | None = None,
     reported_cost_usd: float | None = None,
+    gate_wait_ms: int = 0,
 ) -> None:
     if not telemetry_enabled():
         return
@@ -119,6 +123,9 @@ async def _record(
         "provider_reported" if reported_cost_usd is not None else "catalog_estimate"
     )
     metadata["cached_input_tokens"] = usage.cache_read_tokens
+    # Admission latency, not provider latency. Without it a saturated gate is
+    # indistinguishable from a slow upstream in the telemetry table.
+    metadata["model_gate_wait_ms"] = int(gate_wait_ms)
     prompt_tokens = usage.input_tokens + usage.cache_read_tokens
     metadata["cache_hit_ratio"] = (
         round(usage.cache_read_tokens / prompt_tokens, 4) if prompt_tokens else None

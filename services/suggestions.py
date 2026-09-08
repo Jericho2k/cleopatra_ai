@@ -9,6 +9,7 @@ import json
 import os
 import random
 import re
+import time
 import uuid
 
 import httpx
@@ -31,6 +32,7 @@ from db.commercial_queries import (
     schedule_action,
 )
 from services.session_planner import plan_session_for_fan
+from core.action_telemetry import record_stage, stage as action_stage
 from services.human_delivery import build_availability_delay, build_delivery_schedule
 from services.ppv_delivery import create_ppv_approval_request
 from services.db_reliability import retry_transient_db_operation
@@ -120,18 +122,30 @@ def _is_local_test_fan(platform_fan_id: object) -> bool:
 
 
 async def _sleep_while_current(fan_id: str, seconds: float, *, phase: str) -> bool:
-    """Sleep in short slices so a newer fan message can cancel simulated typing."""
+    """Sleep in short slices so a newer fan message can cancel simulated typing.
+
+    This is deliberate human realism, not queue latency, so it is attributed to
+    its own telemetry stage. Reading a reply's total time without that split
+    makes an intentional 8-second typing pause look like a capacity problem.
+    """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(0.0, float(seconds))
-    while True:
-        current_task = _pending_auto_replies.get(fan_id)
-        if current_task and current_task is not asyncio.current_task():
-            print(f"[AUTO TIMING] fan={fan_id} cancelled phase={phase} newer_task=true")
-            return False
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            return True
-        await asyncio.sleep(min(0.5, remaining))
+    started = loop.time()
+    deadline = started + max(0.0, float(seconds))
+    bucket = (
+        "availability_delay_ms" if phase == "availability" else "composition_delay_ms"
+    )
+    try:
+        while True:
+            current_task = _pending_auto_replies.get(fan_id)
+            if current_task and current_task is not asyncio.current_task():
+                print(f"[AUTO TIMING] fan={fan_id} cancelled phase={phase} newer_task=true")
+                return False
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return True
+            await asyncio.sleep(min(0.5, remaining))
+    finally:
+        record_stage(bucket, (loop.time() - started) * 1000.0)
 
 
 _CONTENT_REQUEST_RE = re.compile(
@@ -770,10 +784,11 @@ async def _debounced_auto_reply(
             price_learning=price_learning,
         )
 
-        situation = await analyze_situation(
-            ctx_without_situation,
-            telemetry_context={"creator_id": creator_id, "fan_id": fan_id},
-        )
+        with action_stage("analyzer_ms"):
+            situation = await analyze_situation(
+                ctx_without_situation,
+                telemetry_context={"creator_id": creator_id, "fan_id": fan_id},
+            )
         if fan_intelligence:
             situation["learned_fan_intelligence"] = fan_intelligence
         affordability = await refresh_affordability_from_situation(
@@ -1057,26 +1072,27 @@ async def _debounced_auto_reply(
             f"fallback={(route.fallback_target.model if route.fallback_target else 'none')}"
         )
         prompt = build_prompt(ctx)
-        replies = await generate_replies(
-            prompt,
-            creator_persona,
-            telemetry_context={
-                "creator_id": creator_id,
-                "fan_id": fan_id,
-                "feature": "auto_reply",
-                **route.telemetry_metadata(),
-            "buyer_lifecycle_stage": buyer_lifecycle.get("stage"),
-            "price_learning_mode": price_learning.get("mode"),
-            "price_learning_confidence": price_learning.get("confidence"),
-            "session_strategy_goal": session_strategy.get("goal"),
-            "session_strategy_action": session_strategy.get("next_action"),
-            "conversation_director_phase": conversation_director.get("phase"),
-            "conversation_director_action": conversation_director.get("action"),
-            "conversation_director_reason": conversation_director.get("transition_reason"),
-            },
-            target_override=route.primary_target,
-            fallback_target_override=route.fallback_target,
-        )
+        with action_stage("writer_ms"):
+            replies = await generate_replies(
+                prompt,
+                creator_persona,
+                telemetry_context={
+                    "creator_id": creator_id,
+                    "fan_id": fan_id,
+                    "feature": "auto_reply",
+                    **route.telemetry_metadata(),
+                "buyer_lifecycle_stage": buyer_lifecycle.get("stage"),
+                "price_learning_mode": price_learning.get("mode"),
+                "price_learning_confidence": price_learning.get("confidence"),
+                "session_strategy_goal": session_strategy.get("goal"),
+                "session_strategy_action": session_strategy.get("next_action"),
+                "conversation_director_phase": conversation_director.get("phase"),
+                "conversation_director_action": conversation_director.get("action"),
+                "conversation_director_reason": conversation_director.get("transition_reason"),
+                },
+                target_override=route.primary_target,
+                fallback_target_override=route.fallback_target,
+            )
 
         if not replies:
             return
@@ -1256,6 +1272,7 @@ async def _debounced_auto_reply(
                 return
 
             platform_message_id = None
+            send_started = time.perf_counter()
             try:
                 if local_test_delivery:
                     platform_message_id = (
@@ -1297,10 +1314,12 @@ async def _debounced_auto_reply(
                     if not platform_message_id:
                         raise RuntimeError("platform rejected text delivery")
             except Exception as exc:
+                record_stage("fansly_send_ms", (time.perf_counter() - send_started) * 1000)
                 print(f"[AUTO DELIVERY ERROR] fan={fan_id}: {exc}")
                 if ppv_match:
                     await freeze_fan_for_review(fan_id, "ppv_send_failed")
                 return
+            record_stage("fansly_send_ms", (time.perf_counter() - send_started) * 1000)
 
             try:
                 if ppv_match:

@@ -4,6 +4,7 @@ Routes are thin and delegate all logic to services.
 """
 
 import asyncio
+import hashlib
 from core.tasks import spawn
 import json
 import os
@@ -11,7 +12,7 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
@@ -21,6 +22,7 @@ from ai.prompt_builder import build_prompt
 from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
+from core.action_telemetry import stage as action_stage
 from core.supabase import get_supabase
 from core.webhooks import valid_hmac_sha256_signature
 from core.tenancy import (
@@ -41,7 +43,9 @@ from db.queries import (
     get_fan_by_id,
     get_ppv_offers,
     save_message,
+    update_message_media_context,
 )
+from db.commercial_queries import schedule_action
 from models.commercial import CreatorPolicy
 from models.schemas import (
     ConversationContext,
@@ -253,6 +257,183 @@ async def send_fansly_message(account_id: str, group_id: str, text: str) -> str 
     except Exception as e:
         print(f"[SEND ERROR] {e}")
         return None
+
+
+def inbound_message_dedupe_key(
+    fan_id: str,
+    platform_message_id: str,
+    content: str,
+    group_id: str,
+) -> str:
+    """One stable key per inbound platform event.
+
+    The platform message id is the natural key and is present on every real
+    delivery. The content-hash fallback keeps a rare id-less delivery idempotent
+    across redeliveries of the same payload rather than silently creating a
+    second obligation each time.
+    """
+    if platform_message_id:
+        return f"inbound-message:{fan_id}:{platform_message_id}"
+    digest = hashlib.sha256(
+        f"{fan_id}|{group_id}|{content}".encode("utf-8", "replace")
+    ).hexdigest()[:32]
+    return f"inbound-message:{fan_id}:h{digest}"
+
+
+async def accept_inbound_message(
+    *,
+    fan_id: str,
+    creator_id: str,
+    content: str,
+    platform_message_id: str,
+    group_id: str,
+    api_account_id: str,
+    creator_platform_id: str,
+    auto_mode: bool,
+    attachments: list[dict],
+) -> str:
+    """Persist a fan message and ensure exactly one processing obligation.
+
+    This is the durable acceptance boundary shared by the webhook and the poller
+    fallback. Both can deliver the same platform message; the unique index on
+    ``messages.fansly_message_id`` collapses them to one canonical row, and the
+    scheduled-action dedupe key collapses them to one processing obligation.
+
+    ``replace_existing=False`` is the important detail: a redelivery must not
+    reset an action that is already PENDING (it would run twice), PROCESSING (it
+    would race an in-flight run), or COMPLETED (it would reprocess a message
+    already answered). It must, however, still create the action if a crash
+    landed between the message insert and this call — which the insert-if-absent
+    behaviour does for free.
+
+    Returns the dedupe key of the obligation.
+    """
+    media_context = (
+        {
+            "attachments": [
+                {
+                    "contentId": item.get("contentId"),
+                    "type": item.get("contentType", 1),
+                }
+                for item in attachments
+                if isinstance(item, dict) and item.get("contentId")
+            ]
+        }
+        if attachments
+        else None
+    )
+    saved_message_id = await save_message(
+        fan_id,
+        creator_id,
+        "fan",
+        content,
+        fansly_message_id=platform_message_id or None,
+        media_context=media_context,
+    )
+    dedupe_key = inbound_message_dedupe_key(
+        fan_id, platform_message_id, content, group_id
+    )
+    await schedule_action(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        action_type="PROCESS_INBOUND_MESSAGE",
+        execute_at=datetime.now(timezone.utc),
+        payload={
+            "platform_message_id": platform_message_id or None,
+            "message_row_id": saved_message_id,
+            "message_content": content,
+            "group_id": group_id,
+            "api_account_id": api_account_id,
+            "creator_platform_id": creator_platform_id,
+            "auto_mode": bool(auto_mode),
+            "attachments": (media_context or {}).get("attachments", []),
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        },
+        dedupe_key=dedupe_key,
+        replace_existing=False,
+    )
+    return dedupe_key
+
+
+def notify_scheduled_worker() -> None:
+    """Ask the scheduled-actions loop to start its next cycle immediately."""
+    try:
+        from workers.scheduled_actions import notify_work_available
+
+        notify_work_available()
+    except Exception:  # pragma: no cover - never fail a durable ACK on a nudge
+        pass
+
+
+async def run_durable_inbound_message(action: dict) -> "object":
+    """Process one accepted inbound message outside the webhook request.
+
+    Called by the scheduled-actions worker for PROCESS_INBOUND_MESSAGE. Every
+    slow dependency the webhook used to carry lives here: the API Fansly media
+    lookup, the analyzer, the writer, and Auto scheduling. A failure retries with
+    the queue's normal backoff instead of becoming a webhook timeout.
+    """
+    from workers.scheduled_actions import HandlerResult
+
+    payload = action.get("payload") or {}
+    fan_id = str(action["fan_id"])
+    creator_id = str(action["creator_id"])
+    message_content = str(payload.get("message_content") or "")
+    mid = str(payload.get("platform_message_id") or "")
+    group_id = str(payload.get("group_id") or "")
+    api_account_id = str(payload.get("api_account_id") or "")
+    creator_platform_id = str(payload.get("creator_platform_id") or "")
+    message_row_id = payload.get("message_row_id")
+    attachments = payload.get("attachments") or []
+
+    # Media enrichment: the webhook knows attachment IDs but not signed
+    # locations. Best effort — active-chat reconciliation is still the fallback,
+    # exactly as before, and a failure here must not block the reply pipeline.
+    if attachments and api_account_id and group_id and message_row_id:
+        try:
+            with action_stage("media_enrich_ms"):
+                recent_messages, account_media, _ = await apifansly_list_chat_messages(
+                    api_account_id,
+                    group_id,
+                    limit=10,
+                )
+                source_message = next(
+                    (
+                        item for item in recent_messages
+                        if str(item.get("id") or "") == mid
+                    ),
+                    None,
+                )
+                resolved = (
+                    _apifansly_message_row(
+                        source_message,
+                        fan_id=fan_id,
+                        creator_id=creator_id,
+                        creator_platform_id=creator_platform_id,
+                        media_lookup=_apifansly_account_media_lookup(account_media),
+                    )
+                    if source_message
+                    else None
+                )
+                if resolved and resolved.get("media_context"):
+                    await update_message_media_context(
+                        str(message_row_id), resolved["media_context"]
+                    )
+        except Exception as exc:
+            print(
+                f"[WEBHOOK MEDIA ENRICH] deferred fan={fan_id} "
+                f"message={mid} error={type(exc).__name__}"
+            )
+
+    with action_stage("inbound_pipeline_ms"):
+        await process_incoming_fan_message(
+            fan_id,
+            creator_id,
+            message_content,
+            bool(payload.get("auto_mode")),
+            mid or None,
+        )
+    return HandlerResult(sent_message=False, reason="inbound message processed")
 
 
 async def process_incoming_fan_message(
@@ -559,29 +740,22 @@ async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
             .execute()
         )
 
-    media_context = (
-        {
-            "attachments": [
-                {"contentId": attachment.get("contentId")}
-                for attachment in attachments
-                if attachment.get("contentId")
-            ]
-        }
-        if has_attachments
-        else None
+    # Same durable acceptance as the webhook. The shared dedupe key is what makes
+    # webhook-and-poller delivery of one message safe: whichever arrives second
+    # finds the obligation already present and does nothing, instead of running a
+    # second analyzer and writer pass over the same fan message.
+    await accept_inbound_message(
+        fan_id=str(fan.id),
+        creator_id=str(creator_id),
+        content=content,
+        platform_message_id=message_id or "",
+        group_id=str(group_id or ""),
+        api_account_id="",
+        creator_platform_id=str(account_id or ""),
+        auto_mode=bool(auto_mode),
+        attachments=[a for a in attachments if isinstance(a, dict)],
     )
-    await save_message(
-        str(fan.id),
-        creator_id,
-        "fan",
-        content,
-        fansly_message_id=message_id or None,
-        media_context=media_context,
-    )
-
-    await process_incoming_fan_message(
-        str(fan.id), creator_id, content, auto_mode, message_id or None,
-    )
+    notify_scheduled_worker()
 
 
 session_store: SessionStore = None
@@ -607,16 +781,21 @@ async def ppv_sweep_scheduler():
 
 
 async def _scheduled_actions_scheduler():
-    """Runs the commercial scheduled-actions queue (payday re-engagement, etc)."""
-    from workers.scheduled_actions import process_once
-    while True:
-        try:
-            sent = await process_once()
-            if sent:
-                print(f"[CRON] scheduled actions: sent {sent}")
-        except Exception as e:
-            print(f"[CRON SCHEDULED ACTIONS ERROR] {e}")
-        await asyncio.sleep(60)
+    """Runs the commercial scheduled-actions queue (payday re-engagement, etc).
+
+    The loop itself lives in the worker module so its polling, backlog and
+    repair-cadence behaviour is testable without starting FastAPI. It replaces
+    the old flat 60-second sleep, which drained at most one batch per minute no
+    matter how deep the queue was.
+    """
+    from workers.scheduled_actions import scheduled_actions_loop
+
+    try:
+        await scheduled_actions_loop()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"[CRON SCHEDULED ACTIONS ERROR] {e}")
 
 
 async def vault_autosync_scheduler():
@@ -897,7 +1076,7 @@ from core.auth import (
     dashboard_user_id,
 )
 
-_PUBLIC_PATHS = {"/health", "/"}
+_PUBLIC_PATHS = {"/health", "/health/ready", "/"}
 _WEBHOOK_PATHS = {"/generate-suggestions"}
 _SIGNED_WEBHOOK_PATHS = {"/webhook/fansly"}
 
@@ -4355,107 +4534,64 @@ async def fansly_webhook(request: Request) -> dict:
 
     creator_id = creator["id"]
     auto_mode = creator.get("auto_mode", False)
-
-    fan = await get_fan(creator_id, platform_fan_id)
-    if not fan:
-        fan = await create_fan(creator_id, platform_fan_id, f"Fan_{platform_fan_id[-6:]}")
-        spawn(_enrich_fan_profile(fan.id, creator_id, platform_fan_id), name="enrich_fan_profile")
-
-    if message_id:
-        mid = str(message_id)
-        existing = await asyncio.to_thread(
-            lambda: db.table("messages")
-            .select("id")
-            .eq("fansly_message_id", mid)
-            .limit(1)
-            .execute()
-        )
-        if existing.data:
-            return {"status": "duplicate"}
-
-    if group_id:
-        await asyncio.to_thread(
-            lambda: db.table("fans")
-            .update({"fansly_group_id": str(group_id)})
-            .eq("id", fan.id)
-            .execute()
-        )
-
     mid = str(message_id) if message_id else ""
 
-    media_context = (
-        {
-            "attachments": [
-                {
-                    "contentId": a.get("contentId"),
-                    "type": a.get("contentType", 1),
-                }
-                for a in attachments_raw
-                if isinstance(a, dict) and a.get("contentId")
-            ]
-        }
-        if attachments_raw
-        else None
-    )
-    # Webhooks contain attachment IDs but not the signed media locations.
-    # Enrich the new row immediately when possible; active-chat reconciliation
-    # remains the fallback if Fansly has not exposed accountMedia yet.
-    if media_context and api_account_id and group_id:
-        try:
-            recent_messages, account_media, _ = await apifansly_list_chat_messages(
-                api_account_id,
-                str(group_id),
-                limit=10,
+    # ---- Durable acceptance boundary -------------------------------------
+    #
+    # Everything from here to the 2xx is the minimum needed to make the event
+    # survive a restart: identify the fan, persist the message under the
+    # platform-message unique index, and ensure exactly one processing
+    # obligation exists. Media resolution (a live API Fansly call), the
+    # analyzer, the writer and Auto scheduling all moved into the durable
+    # PROCESS_INBOUND_MESSAGE action.
+    #
+    # If any of it fails we must NOT acknowledge: a 5xx makes the platform
+    # redeliver, and redelivery is now harmless. Acknowledging a lost event is
+    # not.
+    try:
+        fan = await get_fan(creator_id, platform_fan_id)
+        if not fan:
+            fan = await create_fan(
+                creator_id, platform_fan_id, f"Fan_{platform_fan_id[-6:]}"
             )
-            source_message = next(
-                (
-                    item for item in recent_messages
-                    if str(item.get("id") or "") == mid
-                ),
-                data,
-            )
-            resolved = _apifansly_message_row(
-                source_message,
-                fan_id=str(fan.id),
-                creator_id=str(creator_id),
-                creator_platform_id=creator_platform_id,
-                media_lookup=_apifansly_account_media_lookup(account_media),
-            )
-            if resolved and resolved.get("media_context"):
-                media_context = resolved["media_context"]
-        except Exception as exc:
-            print(
-                f"[WEBHOOK MEDIA ENRICH] deferred fan={fan.id} "
-                f"message={mid} error={type(exc).__name__}"
+            spawn(
+                _enrich_fan_profile(fan.id, creator_id, platform_fan_id),
+                name="enrich_fan_profile",
             )
 
-    if mid:
-        await save_message(
-            fan.id,
-            creator_id,
-            "fan",
-            message_content,
-            fansly_message_id=mid,
-            media_context=media_context,
+        if group_id:
+            await asyncio.to_thread(
+                lambda: db.table("fans")
+                .update({"fansly_group_id": str(group_id)})
+                .eq("id", fan.id)
+                .execute()
+            )
+
+        await accept_inbound_message(
+            fan_id=str(fan.id),
+            creator_id=str(creator_id),
+            content=message_content,
+            platform_message_id=mid,
+            group_id=str(group_id or ""),
+            api_account_id=api_account_id,
+            creator_platform_id=creator_platform_id,
+            auto_mode=bool(auto_mode),
+            attachments=attachments_raw,
         )
-    else:
-        await save_message(
-            fan.id,
-            creator_id,
-            "fan",
-            message_content,
-            media_context=media_context,
+    except Exception as exc:
+        # Never acknowledge an event we did not durably accept.
+        print(
+            f"[WEBHOOK INGEST ERROR] fan={platform_fan_id} message={mid}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Could not durably accept the event; please redeliver.",
         )
 
-    await process_incoming_fan_message(
-        fan.id,
-        creator_id,
-        message_content,
-        auto_mode,
-        mid if mid else None,
-    )
-
-    return {"status": "ok"}
+    # Durable. Start the worker's next cycle now rather than at its idle poll.
+    notify_scheduled_worker()
+    return {"status": "accepted"}
 
 
 @app.delete(
@@ -5777,15 +5913,86 @@ async def debug_scenes(creator_id: str) -> dict:
     }
 
 
+# /health and /health/ready are in _PUBLIC_PATHS so the platform healthcheck can
+# reach them without a credential. Queue depths, cycle timings and gate counters
+# are operational detail rather than a public fact about the deployment, so the
+# full document is returned only to a caller that already holds the dashboard
+# key. An anonymous prober gets the status and the reason categories, which is
+# everything a healthcheck needs.
+_HEALTH_PUBLIC_KEYS = (
+    "status",
+    "liveness",
+    "checked_at",
+    "degraded_reasons",
+    "fatal_reasons",
+)
+
+
+def _health_detail_allowed(request: Request | None) -> bool:
+    if request is None:
+        return True
+    expected = os.environ.get("DASHBOARD_API_SECRET")
+    if not expected:
+        return bool(_is_dev())
+    supplied = request.headers.get("x-api-key")
+    return bool(supplied and _consteq(supplied, expected))
+
+
+def _health_payload(document: dict, request: Request | None) -> dict:
+    if _health_detail_allowed(request):
+        return dict(document)
+    return {key: document[key] for key in _HEALTH_PUBLIC_KEYS if key in document}
+
+
 @app.get("/health")
-async def health() -> dict:
+async def health(request: Request = None) -> dict:
+    """Operator-facing health. Always HTTP 200 while the process is alive.
+
+    Railway's healthcheck hits this path, so it deliberately does not fail the
+    request for degraded external state. A throttled model provider must never
+    restart a container that is holding a durable queue; that turns a provider
+    incident into an outage. Infrastructure-fatal conditions are reported in
+    ``fatal_reasons`` and are what ``/health/ready`` refuses on.
+    """
+    from services.operational_health import collect
+
+    try:
+        document = await collect()
+    except Exception as exc:  # pragma: no cover - health must not 500
+        return {
+            "status": "unknown",
+            "liveness": "ok",
+            "error": type(exc).__name__,
+            "vault_classifier_version": VAULT_CLASSIFIER_VERSION,
+        }
     return {
-        "status": "ok",
+        **_health_payload(document, request),
         "vault_classifier_version": VAULT_CLASSIFIER_VERSION,
         "vault_semantics_configured": bool(
             os.environ.get("VAULT_SEMANTIC_BASE_URL", "").strip()
         ),
     }
+
+
+@app.get("/health/ready")
+async def health_ready(response: Response, request: Request = None) -> dict:
+    """Readiness. 503 only when the process genuinely cannot do its job.
+
+    That is the database being unreachable, and nothing else. Queue depth and
+    provider availability are reported here too, but they never change the
+    status code — they are backlog signals, not reasons to take the process out
+    of service.
+    """
+    from services.operational_health import collect
+
+    try:
+        document = await collect()
+    except Exception as exc:  # pragma: no cover
+        response.status_code = 503
+        return {"status": "unhealthy", "error": type(exc).__name__}
+    if document.get("fatal_reasons"):
+        response.status_code = 503
+    return _health_payload(document, request)
 
 
 @app.get("/model-runtime-health")

@@ -228,6 +228,20 @@ async def get_conversation_history(fan_id: str, limit: int = 40) -> list[Message
     return await asyncio.to_thread(_get)
 
 
+# PostgREST surfaces a unique-constraint conflict as SQLSTATE 23505 / HTTP 409.
+# The Supabase client raises its own error type, so match on the codes rather
+# than on an exception class that would tie this module to the client version.
+_UNIQUE_VIOLATION_MARKERS = ("23505", "duplicate key value", "already exists")
+
+
+def _is_unique_violation(exc: BaseException) -> bool:
+    code = str(getattr(exc, "code", "") or "")
+    if code == "23505":
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in _UNIQUE_VIOLATION_MARKERS)
+
+
 async def save_message(
     fan_id: str,
     creator_id: str,
@@ -243,20 +257,27 @@ async def save_message(
     it as evidence provenance for manually submitted fan messages.
     """
 
+    def _existing_id() -> str | None:
+        response = (
+            get_supabase().table("messages")
+            .select("id")
+            .eq("fan_id", fan_id)
+            .eq("creator_id", creator_id)
+            .eq("fansly_message_id", fansly_message_id)
+            .limit(1)
+            .execute()
+        )
+        data = response.data or []
+        if data and data[0].get("id") is not None:
+            return str(data[0]["id"])
+        return None
+
     def _save() -> str | None:
         if fansly_message_id is not None:
             try:
-                existing = (
-                    get_supabase().table("messages")
-                    .select("id")
-                    .eq("fan_id", fan_id)
-                    .eq("creator_id", creator_id)
-                    .eq("fansly_message_id", fansly_message_id)
-                    .limit(1)
-                    .execute()
-                )
-                if existing.data and existing.data[0].get("id") is not None:
-                    return str(existing.data[0]["id"])
+                found = _existing_id()
+                if found is not None:
+                    return found
             except Exception as exc:
                 # Delivery already happened. A failed defensive read must not
                 # turn the response into an apparent send failure.
@@ -275,13 +296,51 @@ async def save_message(
             row["fansly_message_id"] = fansly_message_id
         if media_context is not None:
             row["media_context"] = media_context
-        response = get_supabase().table("messages").insert(row).execute()
+        try:
+            response = get_supabase().table("messages").insert(row).execute()
+        except Exception as exc:
+            # The read above is advisory; the unique index on
+            # messages(fansly_message_id) is the actual guarantee (see
+            # db/durable_ingestion_v1.sql). Two concurrent webhook deliveries of
+            # the same platform message both pass the read and one of them loses
+            # the insert -- that loser must resolve to the surviving row, not
+            # report a failure, or the webhook would answer 5xx and provoke yet
+            # another redelivery.
+            if fansly_message_id is None or not _is_unique_violation(exc):
+                raise
+            found = _existing_id()
+            if found is None:
+                raise
+            print(
+                "[MESSAGE DEDUPE] concurrent insert resolved to existing row "
+                f"fan={fan_id} platform_message={fansly_message_id}"
+            )
+            return found
         data = response.data or []
         if data and data[0].get("id") is not None:
             return str(data[0]["id"])
         return None
 
     return await asyncio.to_thread(_save)
+
+
+async def update_message_media_context(message_id: str, media_context: dict) -> None:
+    """Attach resolved media locations to an already-persisted message.
+
+    Webhooks carry attachment IDs but not signed media URLs, and resolving them
+    costs a live API Fansly call. That call no longer runs inside the webhook
+    request, so the row is written first and enriched by the durable ingestion
+    worker moments later.
+    """
+    def _update():
+        (
+            get_supabase().table("messages")
+            .update({"media_context": media_context})
+            .eq("id", message_id)
+            .execute()
+        )
+
+    await asyncio.to_thread(_update)
 
 
 async def get_creator_fansly_account_id(creator_id: str) -> str | None:
