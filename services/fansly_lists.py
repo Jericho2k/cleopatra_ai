@@ -18,6 +18,12 @@ Reconciliation rules:
   placeholder fan row is invented to satisfy a membership.
 * A member removed remotely has its mirrored membership removed. Memberships an
   operator created by hand are never touched, even on the same fan.
+* Removal requires POSITIVE evidence that the fan is gone remotely (SCALE-003).
+  If any input to that judgement is incomplete — a truncated local read, a
+  database error, a remote member listing that hit its page cap — the removal
+  phase is skipped and the sync reports a degraded result. A stale membership
+  that survives one cycle is recoverable; a correct membership deleted because
+  our snapshot was short is not.
 * A mirror that disappears remotely is archived, not deleted. Auto Audience and
   re-engagement rules reference ``fan_lists.id``; deleting the row would silently
   change which fans those rules select.
@@ -27,11 +33,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
+from core.pagination import fetch_all_rows
 from core.supabase import get_supabase
 from services.apifansly import (
     ApiFanslyAccountAccessError,
@@ -97,11 +105,17 @@ async def fetch_remote_members(
     external_list_id: str,
     *,
     client: httpx.AsyncClient,
-) -> list[str]:
-    """Page through every member of one remote list."""
+) -> tuple[list[str], bool]:
+    """Page through every member of one remote list.
+
+    Returns the members and whether the listing reached the end. A run that stops
+    at _MAX_MEMBER_PAGES with a live cursor holds only part of the remote list,
+    and a partial remote snapshot must never drive deletions (SCALE-003).
+    """
     members: list[str] = []
     seen: set[str] = set()
     cursor: str | None = None
+    complete = False
     for _ in range(_MAX_MEMBER_PAGES):
         page, cursor = await list_account_list_members(
             account_id,
@@ -114,59 +128,127 @@ async def fetch_remote_members(
                 seen.add(platform_fan_id)
                 members.append(platform_fan_id)
         if not cursor:
+            complete = True
             break
-    return members
+    return members, complete
 
 
-def _load_state(creator_id: str) -> tuple[list[dict], dict[str, str], dict[str, set[str]]]:
-    """Read the creator's current mirrors, fan id map, and mirrored memberships."""
+@dataclass
+class _LocalState:
+    """The local snapshot reconciliation compares the remote list against.
+
+    ``complete`` is the safety interlock for SCALE-003. Every read below feeds
+    the decision "this fan is no longer on the remote list, delete its mirrored
+    membership". If any of them returned only part of the truth, absence from
+    the snapshot is not evidence of absence remotely.
+    """
+
+    mirrors: list[dict] = field(default_factory=list)
+    fan_by_platform_id: dict[str, str] = field(default_factory=dict)
+    memberships: dict[str, set[str]] = field(default_factory=dict)
+    complete: bool = True
+    incomplete_reason: str = ""
+
+    def degrade(self, reason: str) -> None:
+        self.complete = False
+        if not self.incomplete_reason:
+            self.incomplete_reason = reason
+
+
+def _load_state(creator_id: str) -> _LocalState:
+    """Read the creator's current mirrors, fan id map, and mirrored memberships.
+
+    Every read is paginated with a deterministic order. Previously ``fans`` and
+    ``fan_list_members`` were unranged and unordered, so PostgREST returned an
+    arbitrary 1,000-row prefix: a fan inside the prefix on one sync and outside
+    it on the next could not be mapped, landed in ``current - desired``, and had
+    its membership deleted — then re-added on the following run. That flapped
+    VIP/Whale targeting for every creator with more than 1,000 fans (SCALE-003).
+    """
     db = get_supabase()
-    mirrors = (
-        db.table("fan_lists")
-        .select("id, name, source, external_list_id, external_archived_at")
-        .eq("creator_id", creator_id)
-        .eq("source", FANSLY_SOURCE)
-        .execute()
-    ).data or []
-    fans = (
-        db.table("fans")
-        .select("id, platform_fan_id")
-        .eq("creator_id", creator_id)
-        .execute()
-    ).data or []
-    fan_by_platform_id = {
+    state = _LocalState()
+
+    try:
+        state.mirrors = fetch_all_rows(
+            lambda start, end: db.table("fan_lists")
+            .select("id, name, source, external_list_id, external_archived_at")
+            .eq("creator_id", creator_id)
+            .eq("source", FANSLY_SOURCE)
+            .order("id")
+            .range(start, end)
+            .execute()
+        )
+    except Exception as exc:
+        # Without the mirror list there is nothing to reconcile at all.
+        # PaginationIncompleteError lands here too: a partial mirror list is as
+        # unusable as a failed read.
+        state.degrade(f"fan_lists read failed: {exc}")
+        return state
+
+    try:
+        fans = fetch_all_rows(
+            lambda start, end: db.table("fans")
+            .select("id, platform_fan_id")
+            .eq("creator_id", creator_id)
+            .order("id")
+            .range(start, end)
+            .execute()
+        )
+    except Exception as exc:
+        state.degrade(f"fans read failed: {exc}")
+        fans = []
+    state.fan_by_platform_id = {
         str(row["platform_fan_id"]): str(row["id"])
         for row in fans
         if row.get("platform_fan_id") and row.get("id")
     }
 
-    memberships: dict[str, set[str]] = {}
-    mirror_ids = [str(row["id"]) for row in mirrors if row.get("id")]
+    mirror_ids = [str(row["id"]) for row in state.mirrors if row.get("id")]
     if mirror_ids:
-        rows = (
-            db.table("fan_list_members")
-            .select("list_id, fan_id, source")
-            .in_("list_id", mirror_ids)
-            .eq("source", FANSLY_SOURCE)
-            .execute()
-        ).data or []
+        try:
+            rows = fetch_all_rows(
+                lambda start, end: db.table("fan_list_members")
+                .select("list_id, fan_id, source")
+                .in_("list_id", mirror_ids)
+                .eq("source", FANSLY_SOURCE)
+                .order("list_id")
+                .order("fan_id")
+                .range(start, end)
+                .execute()
+            )
+        except Exception as exc:
+            state.degrade(f"fan_list_members read failed: {exc}")
+            rows = []
         for row in rows:
             list_id = str(row.get("list_id") or "")
             fan_id = str(row.get("fan_id") or "")
             if list_id and fan_id:
-                memberships.setdefault(list_id, set()).add(fan_id)
-    return mirrors, fan_by_platform_id, memberships
+                state.memberships.setdefault(list_id, set()).add(fan_id)
+    return state
 
 
 def _reconcile(
     creator_id: str,
     remote_lists: list[dict[str, Any]],
     remote_members: dict[str, list[str]],
+    incomplete_remote_lists: set[str] | None = None,
 ) -> dict[str, int]:
-    """Apply one full remote snapshot to the local mirrors."""
+    """Apply one remote snapshot to the local mirrors.
+
+    ``incomplete_remote_lists`` names remote lists whose member listing did not
+    reach the end. Those lists still gain additions, but never lose memberships.
+    """
     db = get_supabase()
     now = _now()
-    mirrors, fan_by_platform_id, mirrored_memberships = _load_state(creator_id)
+    truncated_remote = set(incomplete_remote_lists or set())
+    state = _load_state(creator_id)
+    mirrors = state.mirrors
+    fan_by_platform_id = state.fan_by_platform_id
+    # Reverse direction, used to justify each individual removal below.
+    platform_id_by_fan_id = {
+        fan_id: platform_id for platform_id, fan_id in fan_by_platform_id.items()
+    }
+    mirrored_memberships = state.memberships
     mirror_by_external_id = {
         str(row["external_list_id"]): row
         for row in mirrors
@@ -182,7 +264,14 @@ def _reconcile(
         "added_members": 0,
         "removed_members": 0,
         "unmapped_members": 0,
+        # SCALE-003 observability: how many removals were withheld because the
+        # snapshot could not justify them.
+        "skipped_removals": 0,
+        "degraded": 0,
     }
+    degraded_reasons: list[str] = []
+    if not state.complete:
+        degraded_reasons.append(state.incomplete_reason or "local snapshot incomplete")
 
     seen_external_ids: set[str] = set()
 
@@ -226,6 +315,7 @@ def _reconcile(
                 "creator_id", creator_id
             ).execute()
 
+        remote_platform_ids = set(remote_members.get(external_id, []))
         desired_fan_ids: set[str] = set()
         for platform_fan_id in remote_members.get(external_id, []):
             fan_id = fan_by_platform_id.get(platform_fan_id)
@@ -250,7 +340,59 @@ def _reconcile(
             ).execute()
             counters["added_members"] += 1
 
-        for fan_id in sorted(current_fan_ids - desired_fan_ids):
+        # SCALE-003 — removal requires positive evidence that the fan is gone
+        # from the remote list, not merely its absence from `desired_fan_ids`.
+        #
+        # A fan lands in `current - desired` for two indistinguishable reasons:
+        # it really was removed remotely, or we could not map it locally. The
+        # old code deleted in both cases, so a fan dropped by the 1,000-row cap
+        # lost its membership and got it back on the next run.
+        #
+        # Two interlocks now stand between a difference and a delete. First, the
+        # phase is skipped entirely unless both snapshots are known-complete.
+        # Second, each candidate is individually justified: we resolve the fan's
+        # own platform id and require it to be genuinely absent remotely.
+        removal_blocker = ""
+        if not state.complete:
+            removal_blocker = state.incomplete_reason or "local snapshot incomplete"
+        elif external_id in truncated_remote:
+            removal_blocker = f"remote member listing truncated for list {external_id}"
+
+        stale_fan_ids = sorted(current_fan_ids - desired_fan_ids)
+        if removal_blocker and stale_fan_ids:
+            counters["skipped_removals"] += len(stale_fan_ids)
+            degraded_reasons.append(removal_blocker)
+            print(
+                f"[FANSLY LISTS] withheld {len(stale_fan_ids)} membership "
+                f"removal(s) creator={creator_id} list={external_id}: "
+                f"{removal_blocker}"
+            )
+            stale_fan_ids = []
+
+        for fan_id in stale_fan_ids:
+            platform_fan_id = platform_id_by_fan_id.get(fan_id)
+            if platform_fan_id is None:
+                # The membership names a fan absent from our own fans read. That
+                # is the exact SCALE-003 signature: the row was truncated away,
+                # so its absence is evidence about our snapshot, not about
+                # Fansly. Leave the membership alone.
+                counters["skipped_removals"] += 1
+                degraded_reasons.append(
+                    f"membership on list {external_id} references fan {fan_id} "
+                    "missing from the local fans snapshot"
+                )
+                continue
+            if platform_fan_id in remote_platform_ids:
+                # Present remotely but not in desired_fan_ids — the two maps
+                # disagree. Never resolve that disagreement by deleting.
+                counters["skipped_removals"] += 1
+                degraded_reasons.append(
+                    f"fan {fan_id} is still on remote list {external_id} but did "
+                    "not map; membership kept"
+                )
+                continue
+            # Positive evidence: the fan exists locally, both snapshots are
+            # complete, and its platform id is not on the remote list.
             # Scoped to this mirror and to fansly-sourced rows, so an operator's
             # own membership on a local list is never affected.
             db.table("fan_list_members").delete().eq("list_id", list_id).eq(
@@ -267,13 +409,27 @@ def _reconcile(
         ).eq("id", str(mirror["id"])).eq("creator_id", creator_id).execute()
         counters["archived_lists"] += 1
 
-    db.table("creators").update(
-        {
-            "last_fansly_lists_sync_at": now,
-            "fansly_lists_sync_error": None,
-            "fansly_lists_sync_failed_at": None,
-        }
-    ).eq("id", creator_id).execute()
+    counters["degraded"] = 1 if degraded_reasons else 0
+    if degraded_reasons:
+        # A degraded run did real work (creates, renames, additions) but could
+        # not be trusted to remove. Record it rather than reporting success, so
+        # a persistently short snapshot is visible instead of looking healthy.
+        summary = "; ".join(dict.fromkeys(degraded_reasons))[:500]
+        db.table("creators").update(
+            {
+                "last_fansly_lists_sync_at": now,
+                "fansly_lists_sync_error": f"degraded: {summary}",
+                "fansly_lists_sync_failed_at": now,
+            }
+        ).eq("id", creator_id).execute()
+    else:
+        db.table("creators").update(
+            {
+                "last_fansly_lists_sync_at": now,
+                "fansly_lists_sync_error": None,
+                "fansly_lists_sync_failed_at": None,
+            }
+        ).eq("id", creator_id).execute()
 
     return counters
 
@@ -310,12 +466,17 @@ async def sync_fansly_lists(
     try:
         remote_lists = await fetch_remote_lists(account_id, client=active_client)
         remote_members: dict[str, list[str]] = {}
+        incomplete_remote_lists: set[str] = set()
         for remote in remote_lists:
-            remote_members[remote["external_list_id"]] = await fetch_remote_members(
+            external_list_id = remote["external_list_id"]
+            members, complete = await fetch_remote_members(
                 account_id,
-                remote["external_list_id"],
+                external_list_id,
                 client=active_client,
             )
+            remote_members[external_list_id] = members
+            if not complete:
+                incomplete_remote_lists.add(external_list_id)
     except ApiFanslyAccountAccessError as exc:
         # The creator binding needs reconnecting. Record it and re-raise so the
         # caller applies the same backoff it uses for every other API Fansly
@@ -334,15 +495,17 @@ async def sync_fansly_lists(
         creator_id,
         remote_lists,
         remote_members,
+        incomplete_remote_lists,
     )
     print(
         f"[FANSLY LISTS] creator={creator_id} remote={counters['remote_lists']} "
         f"created={counters['created_lists']} renamed={counters['renamed_lists']} "
         f"archived={counters['archived_lists']} "
         f"members+{counters['added_members']}/-{counters['removed_members']} "
-        f"unmapped={counters['unmapped_members']}"
+        f"unmapped={counters['unmapped_members']} "
+        f"skipped_removals={counters['skipped_removals']}"
     )
-    return {"status": "ok", **counters}
+    return {"status": "degraded" if counters["degraded"] else "ok", **counters}
 
 
 async def read_lists_sync_state(creator_id: str) -> dict[str, Any]:

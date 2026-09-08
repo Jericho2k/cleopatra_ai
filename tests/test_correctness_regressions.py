@@ -170,7 +170,7 @@ def test_poller_persists_before_processing():
     assert "await process_incoming_fan_message(" not in poller_source
 
     acceptance = inspect.getsource(accept_inbound_message)
-    assert acceptance.index("await save_message(") < acceptance.index(
+    assert acceptance.index("await save_message_result(") < acceptance.index(
         "await schedule_action("
     )
 

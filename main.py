@@ -42,7 +42,9 @@ from db.queries import (
     get_fan,
     get_fan_by_id,
     get_ppv_offers,
+    MessageWriteResult,
     save_message,
+    save_message_result,
     update_message_media_context,
 )
 from db.commercial_queries import schedule_action
@@ -291,22 +293,32 @@ async def accept_inbound_message(
     creator_platform_id: str,
     auto_mode: bool,
     attachments: list[dict],
-) -> str:
+) -> "MessageWriteResult":
     """Persist a fan message and ensure exactly one processing obligation.
 
     This is the durable acceptance boundary shared by the webhook and the poller
-    fallback. Both can deliver the same platform message; the unique index on
-    ``messages.fansly_message_id`` collapses them to one canonical row, and the
-    scheduled-action dedupe key collapses them to one processing obligation.
+    fallback. Both can deliver the same platform message, and two database
+    constraints collapse that to one unit of work:
 
-    ``replace_existing=False`` is the important detail: a redelivery must not
-    reset an action that is already PENDING (it would run twice), PROCESSING (it
-    would race an in-flight run), or COMPLETED (it would reprocess a message
-    already answered). It must, however, still create the action if a crash
-    landed between the message insert and this call — which the insert-if-absent
-    behaviour does for free.
+    * ``save_message_result`` upserts on ``(creator_id, fansly_message_id)``
+      (REL-002), so one platform message is one row however a race resolves, and
+      reports which caller actually inserted it.
+    * the scheduled-action dedupe key, written with ``replace_existing=False``,
+      makes one processing obligation per event. A redelivery must not reset an
+      action that is already PENDING (it would run twice), PROCESSING (it would
+      race an in-flight run), or COMPLETED (it would reprocess an answered
+      message).
 
-    Returns the dedupe key of the obligation.
+    The obligation is ensured even when ``inserted`` is False, and that is
+    deliberate. Skipping it on a duplicate would reopen the exact window this
+    boundary exists to close: a process killed between the message insert and
+    this call would leave a persisted message that nothing is obliged to
+    process, and every later redelivery would see ``inserted=False`` and decline
+    to repair it. The insert-if-absent action write is what makes the crash
+    recoverable; it is a no-op in every other case.
+
+    Returns the message write result so the caller can report a redelivery
+    without changing what was durably accepted.
     """
     media_context = (
         {
@@ -322,7 +334,7 @@ async def accept_inbound_message(
         if attachments
         else None
     )
-    saved_message_id = await save_message(
+    write = await save_message_result(
         fan_id,
         creator_id,
         "fan",
@@ -340,7 +352,7 @@ async def accept_inbound_message(
         execute_at=datetime.now(timezone.utc),
         payload={
             "platform_message_id": platform_message_id or None,
-            "message_row_id": saved_message_id,
+            "message_row_id": write.message_id,
             "message_content": content,
             "group_id": group_id,
             "api_account_id": api_account_id,
@@ -352,7 +364,7 @@ async def accept_inbound_message(
         dedupe_key=dedupe_key,
         replace_existing=False,
     )
-    return dedupe_key
+    return write
 
 
 def notify_scheduled_worker() -> None:
@@ -1016,6 +1028,13 @@ async def chat_reconciliation_scheduler():
 async def lifespan(app: FastAPI):
     global session_store, fansly_poller, ppv_sweep_task, vault_autosync_task, scheduled_actions_task, chat_reconcile_task, model_availability_task
 
+    # SEC-004: state the resolved deployment mode once at boot. An unset or
+    # unrecognised APP_ENV resolves to production, so a misconfigured deploy is
+    # visible in the logs instead of silently running with relaxed auth.
+    from core.environment import describe_environment
+
+    print(f"[STARTUP] {describe_environment()}")
+
     supabase = get_supabase()
     session_store = SessionStore(
         supabase=supabase,
@@ -1067,7 +1086,8 @@ _cors_origins = [
 #   • API Fansly webhook                        -> verify its HMAC signature in-route
 #   • internal database webhook                 -> require WEBHOOK_SECRET header
 #   • everything else (operator/CRUD/admin)     -> require DASHBOARD_API_SECRET
-# Unconfigured secrets fail open in dev, closed in prod (see core/auth.py).
+# Unconfigured secrets fail open only under an explicit APP_ENV=development,
+# and closed everywhere else including an unset APP_ENV (see core/environment.py).
 from starlette.responses import JSONResponse
 from core.auth import (
     _is_dev,
@@ -4567,7 +4587,7 @@ async def fansly_webhook(request: Request) -> dict:
                 .execute()
             )
 
-        await accept_inbound_message(
+        write = await accept_inbound_message(
             fan_id=str(fan.id),
             creator_id=str(creator_id),
             content=message_content,
@@ -4591,6 +4611,12 @@ async def fansly_webhook(request: Request) -> dict:
 
     # Durable. Start the worker's next cycle now rather than at its idle poll.
     notify_scheduled_worker()
+    if not write.inserted:
+        print(
+            f"[WEBHOOK] duplicate platform message creator={creator_id} "
+            f"message={mid} — pipeline not re-run"
+        )
+        return {"status": "duplicate"}
     return {"status": "accepted"}
 
 
@@ -4960,8 +4986,20 @@ async def preview_auto_audience(creator_id: str) -> dict:
     from collections import Counter
     from services.auto_audience import AutoAudiencePolicy, evaluate_auto_eligibility
 
+    from core.pagination import fetch_all_rows_async
+
     db = get_supabase()
-    creator_result, fan_result, lists_result, messages_result = await asyncio.gather(
+
+    # SEC-002. The membership read used to have no creator filter at all and was
+    # executed with service-role credentials, so every agency's rows were pulled
+    # into this request and filtered in Python. Worse, PostgREST truncates at
+    # 1,000 rows *globally*, so past that point the requesting creator's own rows
+    # were usually absent and the exclusion policy silently stopped applying.
+    #
+    # The creator's own list ids are resolved first, and the membership query is
+    # constrained to them inside Postgres. Every read here is paginated with a
+    # deterministic order; each is scoped to this creator.
+    creator_result, fan_rows, list_rows, message_rows = await asyncio.gather(
         asyncio.to_thread(
             lambda: db.table("creators")
             .select("auto_mode, auto_audience_policy")
@@ -4969,22 +5007,32 @@ async def preview_auto_audience(creator_id: str) -> dict:
             .single()
             .execute()
         ),
-        asyncio.to_thread(
-            lambda: db.table("fans")
+        fetch_all_rows_async(
+            lambda start, end: db.table("fans")
             .select("id, auto_mode, total_spent, spend_tier, needs_human_review")
             .eq("creator_id", creator_id)
+            .order("id")
+            .range(start, end)
             .execute()
         ),
-        asyncio.to_thread(
-            lambda: db.table("fan_list_members")
-            .select("fan_id, list_id, fan_lists(exclude_from_auto, creator_id)")
+        fetch_all_rows_async(
+            lambda start, end: db.table("fan_lists")
+            .select("id, exclude_from_auto")
+            .eq("creator_id", creator_id)
+            .order("id")
+            .range(start, end)
             .execute()
         ),
-        asyncio.to_thread(
-            lambda: db.table("messages")
-            .select("fan_id")
+        # Only "has this creator ever messaged this fan" is needed. Ordering by
+        # the primary key keeps paging total; ordering by fan_id alone would let
+        # Postgres break ties differently between pages.
+        fetch_all_rows_async(
+            lambda start, end: db.table("messages")
+            .select("id, fan_id")
             .eq("creator_id", creator_id)
             .eq("role", "creator")
+            .order("id")
+            .range(start, end)
             .execute()
         ),
     )
@@ -4996,30 +5044,46 @@ async def preview_auto_audience(creator_id: str) -> dict:
     except Exception:
         policy = AutoAudiencePolicy()
     creator_message_fans = {
-        str(row.get("fan_id")) for row in (messages_result.data or []) if row.get("fan_id")
+        str(row.get("fan_id")) for row in message_rows if row.get("fan_id")
     }
+
+    creator_list_ids = [str(row["id"]) for row in list_rows if row.get("id")]
+    legacy_exclusions: set[str] = {
+        str(row["id"]) for row in list_rows
+        if row.get("id") and row.get("exclude_from_auto")
+    }
+
+    membership_rows: list[dict] = []
+    if creator_list_ids:
+        membership_rows = await fetch_all_rows_async(
+            lambda start, end: db.table("fan_list_members")
+            .select("fan_id, list_id")
+            .in_("list_id", creator_list_ids)
+            .order("list_id")
+            .order("fan_id")
+            .range(start, end)
+            .execute()
+        )
+
     memberships: dict[str, set[str]] = {}
-    legacy_exclusions: set[str] = set()
-    for row in (lists_result.data or []):
-        joined = row.get("fan_lists") or {}
-        if str(joined.get("creator_id") or "") != str(creator_id):
-            continue
+    for row in membership_rows:
         fan_key = str(row.get("fan_id") or "")
         list_key = str(row.get("list_id") or "")
         if fan_key and list_key:
             memberships.setdefault(fan_key, set()).add(list_key)
-            if joined.get("exclude_from_auto"):
-                legacy_exclusions.add(list_key)
     if legacy_exclusions:
+        # sorted() so the merged list is stable across requests; set iteration
+        # order is not. Only membership in this list is tested, so order is not
+        # behavioural — it just makes the response reproducible.
         policy.exclude_list_ids = list(
-            dict.fromkeys([*policy.exclude_list_ids, *legacy_exclusions])
+            dict.fromkeys([*policy.exclude_list_ids, *sorted(legacy_exclusions)])
         )
 
     reasons: Counter[str] = Counter()
     reasons_if_creator_on: Counter[str] = Counter()
     eligible = 0
     eligible_if_creator_on = 0
-    for fan in (fan_result.data or []):
+    for fan in fan_rows:
         fan_id = str(fan["id"])
         eligibility_inputs = {
             "fan_auto_override": fan.get("auto_mode"),
@@ -5042,7 +5106,7 @@ async def preview_auto_audience(creator_id: str) -> dict:
         reasons_if_creator_on[enabled_result.reason] += 1
         eligible += int(result.eligible)
         eligible_if_creator_on += int(enabled_result.eligible)
-    total = len(fan_result.data or [])
+    total = len(fan_rows)
     return {
         "creator_id": creator_id,
         "creator_auto_mode": bool(creator.get("auto_mode", False)),
@@ -5580,9 +5644,24 @@ async def enrich_fan_endpoint(fan_id: str) -> dict:
     return {"status": "ok"}
 
 
+async def require_local_test_endpoints() -> None:
+    """SEC-005 — the /test/* helpers must not exist outside development/test.
+
+    404 rather than 403: production should not advertise that these routes are
+    implemented at all.
+    """
+    from core.environment import local_test_endpoints_enabled
+
+    if not local_test_endpoints_enabled():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
 @app.post(
     "/test/simulate-ppv-purchase",
-    dependencies=[Depends(require_fan_path_access)],
+    dependencies=[
+        Depends(require_local_test_endpoints),
+        Depends(require_fan_path_access),
+    ],
 )
 async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
     """Dev only — simulate a fan purchasing a pending PPV."""
@@ -5594,7 +5673,12 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
     # Get pending PPV check
     fan_row = await asyncio.to_thread(
         lambda: db.table("fans")
-        .select("pending_ppv_check, total_spent, active_session, ai_summary")
+        # sales_log must be selected: it used to be read from a row that never
+        # contained it, so the append below silently replaced the fan's entire
+        # sales history with one fabricated entry (SEC-005).
+        .select(
+            "pending_ppv_check, total_spent, active_session, ai_summary, sales_log"
+        )
         .eq("id", fan_id)
         .single()
         .execute()
@@ -5613,8 +5697,18 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
     summary = fan_data.get("ai_summary") or {}
 
     from datetime import datetime
-    # Get existing sales_log
-    sales_log = fan_data.get("sales_log") or []
+
+    # Append to the existing history rather than replacing it. A non-list value
+    # would otherwise be silently discarded, so refuse instead of destroying it.
+    existing_sales_log = fan_data.get("sales_log")
+    if existing_sales_log is None:
+        existing_sales_log = []
+    if not isinstance(existing_sales_log, list):
+        return {
+            "status": "error",
+            "message": "fan sales_log is not a list; refusing to overwrite it",
+        }
+    sales_log = [*existing_sales_log]
     sales_log.append({
         "date": datetime.utcnow().strftime("%d.%m.%Y"),
         "item": f"PPV media {media_id}",
@@ -5660,14 +5754,61 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
 
 @app.post(
     "/test/inject-message",
-    dependencies=[Depends(require_creator_fan_access)],
+    dependencies=[
+        Depends(require_local_test_endpoints),
+        Depends(require_creator_fan_access),
+    ],
 )
-async def test_inject_message(fan_id: str, creator_id: str, content: str) -> dict:
-    """Dev testing only — simulate a fan message without Fansly webhook."""
+async def test_inject_message(
+    fan_id: str,
+    creator_id: str,
+    content: str,
+    auto_mode: bool | None = None,
+) -> dict:
+    """Dev testing only — simulate a fan message without a Fansly webhook.
+
+    auto_mode used to be hardcoded True, so a helper call could trigger a real
+    Full Auto send to a real fan for a creator whose Auto is off (SEC-005). It
+    now resolves the creator's actual setting. An explicit auto_mode=false can
+    force a non-delivering injection; auto_mode=true is honoured only when the
+    creator really has Auto on, so the helper can never be the reason a message
+    is sent.
+    """
     from db.queries import save_message
+
+    creator_auto = False
+    try:
+        creator_row = await asyncio.to_thread(
+            lambda: get_supabase()
+            .table("creators")
+            .select("auto_mode")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
+        creator_auto = bool((creator_row.data or {}).get("auto_mode", False))
+    except Exception as exc:
+        # Fail closed: an unreadable creator row must not authorise a send.
+        print(f"[TEST INJECT] creator auto_mode unreadable creator={creator_id}: {exc}")
+        creator_auto = False
+
+    effective_auto = creator_auto if auto_mode is None else (creator_auto and auto_mode)
+
     await save_message(fan_id, creator_id, "fan", content, was_ai_suggested=False)
-    await process_incoming_fan_message(fan_id, creator_id, content, auto_mode=True, message_id=None)
-    return {"status": "ok", "fan_id": fan_id, "content": content}
+    await process_incoming_fan_message(
+        fan_id,
+        creator_id,
+        content,
+        auto_mode=effective_auto,
+        message_id=None,
+    )
+    return {
+        "status": "ok",
+        "fan_id": fan_id,
+        "content": content,
+        "auto_mode": effective_auto,
+        "creator_auto_mode": creator_auto,
+    }
 
 
 @app.post(
@@ -5998,7 +6139,15 @@ async def health_ready(response: Response, request: Request = None) -> dict:
 @app.get("/model-runtime-health")
 async def model_runtime_health() -> dict:
     """Expose cached provider-model availability without spending AI tokens."""
-    return current_model_availability()
+    from services.analyzer_telemetry import analyzer_health
+
+    return {
+        **current_model_availability(),
+        # REL-001 — degraded-analysis counts, so an analyzer incident is
+        # countable without reading logs.
+        "analyzer": analyzer_health(hours=1),
+        "analyzer_24h": analyzer_health(hours=24),
+    }
 
 
 from routes.fansly import fansly_router

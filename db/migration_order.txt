@@ -1,0 +1,42 @@
+# Deterministic migration order (DB-000).
+#
+# One filename per line, applied top to bottom after the base schema. Blank
+# lines and # comments are ignored. tests/test_schema_pipeline.py applies this
+# list to a fresh PostgreSQL and fails if any db/*.sql is missing from it, so a
+# new migration cannot be added without choosing where it runs.
+#
+# The order is not alphabetical, because three real dependencies exist:
+#   * full_auto_lifecycle_v1 adds creator_commercial_policies.ppv_payment_window_hours,
+#     which operator_ppv_concurrency_v1 then alters.
+#   * ppv_delivery_ledger_v1 creates ppv_deliveries, which
+#     operator_ppv_concurrency_v1 indexes.
+#   * tenant_isolation_v1 discovers every creator-owned table at run time, so it
+#     must be last or tables created by later migrations get no RLS policy.
+#
+# See db/MIGRATIONS.md.
+
+abandoned_offer_lifecycle_v1.sql
+full_auto_lifecycle_v1.sql
+ppv_delivery_ledger_v1.sql
+operator_ppv_concurrency_v1.sql
+adaptive_planning_v1.sql
+affordability_v1.sql
+agency_operability_v1.sql
+conversation_director_v1.sql
+fan_intelligence_v1.sql
+fan_lifecycle_v1.sql
+fansly_audience_sync_v1.sql
+fansly_lists_v1.sql
+inactivity_reengagement_v1.sql
+model_lab_v1.sql
+payment_pending_status_v1.sql
+price_learning_v1.sql
+vault_metadata_v2.sql
+summaries_security_invoker_v1.sql
+message_platform_identity_v1.sql
+# Depends on message_platform_identity_v1: the two together are what make
+# webhook redelivery harmless (REL-006).
+durable_ingestion_v1.sql
+
+# Always last: discovers creator-owned tables at run time.
+tenant_isolation_v1.sql

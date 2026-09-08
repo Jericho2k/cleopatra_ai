@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 import main
-from db import queries as db_queries
+from db.queries import MessageWriteResult
 
 SECRET = "test-webhook-secret"
 
@@ -51,7 +51,13 @@ def message_event(message_id="msg-1", content="hey there"):
 
 
 class Recorder:
-    """Captures everything the acceptance path writes."""
+    """Captures everything the acceptance path writes.
+
+    Mirrors the REL-002 upsert semantics of the real ``save_message_result``:
+    a first write for a given platform-message key inserts, and every
+    subsequent write for the same key resolves to the existing row with
+    ``inserted=False`` rather than creating a second one.
+    """
 
     def __init__(self):
         self.messages: dict[str, dict] = {}
@@ -60,15 +66,28 @@ class Recorder:
         self.enrich_calls = 0
         self.fail_persistence = False
 
-    async def save_message(self, fan_id, creator_id, role, content, **kwargs):
+    async def save_message_result(
+        self, fan_id, creator_id, role, content, **kwargs
+    ) -> MessageWriteResult:
         if self.fail_persistence:
             raise RuntimeError("supabase unavailable")
-        key = kwargs.get("fansly_message_id") or f"local:{len(self.messages)}"
+        fansly_message_id = kwargs.get("fansly_message_id")
+        if fansly_message_id is None:
+            row = {
+                "id": f"row-{len(self.messages)}",
+                "fan_id": fan_id,
+                "content": content,
+            }
+            self.messages[f"local:{len(self.messages)}"] = row
+            return MessageWriteResult(message_id=row["id"], inserted=True)
+        key = (creator_id, fansly_message_id)
         if key in self.messages:
-            return self.messages[key]["id"]
+            return MessageWriteResult(
+                message_id=self.messages[key]["id"], inserted=False
+            )
         row = {"id": f"row-{len(self.messages)}", "fan_id": fan_id, "content": content}
         self.messages[key] = row
-        return row["id"]
+        return MessageWriteResult(message_id=row["id"], inserted=True)
 
     async def schedule_action(self, **kwargs):
         key = kwargs["dedupe_key"]
@@ -117,7 +136,7 @@ def wired(monkeypatch):
         main, "get_fan",
         lambda *_a: _value(SimpleNamespace(id="fan-1", fansly_group_id="group-1")),
     )
-    monkeypatch.setattr(main, "save_message", recorder.save_message)
+    monkeypatch.setattr(main, "save_message_result", recorder.save_message_result)
     monkeypatch.setattr(main, "schedule_action", recorder.schedule_action)
     monkeypatch.setattr(main, "process_incoming_fan_message", recorder.pipeline)
     monkeypatch.setattr(main, "notify_scheduled_worker", lambda: None)
@@ -133,7 +152,7 @@ def test_webhook_acks_only_after_persisting_and_enqueuing(wired):
 
     assert response == {"status": "accepted"}
     # The message is durable.
-    assert "msg-1" in wired.messages
+    assert ("creator-1", "msg-1") in wired.messages
     # And exactly one processing obligation exists for it.
     assert list(wired.actions) == ["inbound-message:fan-1:msg-1"]
     action = wired.actions["inbound-message:fan-1:msg-1"]
@@ -160,11 +179,14 @@ def test_failed_persistence_returns_an_error_so_the_platform_retries(wired):
 
 def test_redelivery_produces_one_message_and_one_obligation(wired):
     request = message_event()
-    for _ in range(4):
-        assert asyncio.run(main.fansly_webhook(signed_request(request))) == {
-            "status": "accepted"
-        }
+    statuses = [
+        asyncio.run(main.fansly_webhook(signed_request(request)))["status"]
+        for _ in range(4)
+    ]
 
+    # First delivery inserts; every redelivery resolves to the same row and
+    # reports it rather than re-running the pipeline.
+    assert statuses == ["accepted", "duplicate", "duplicate", "duplicate"]
     assert len(wired.messages) == 1
     assert len(wired.actions) == 1
 
@@ -272,7 +294,7 @@ def test_acknowledgement_latency_is_dominated_by_signature_and_writes(monkeypatc
     reachable from this path at all, so the numbers below describe the SHAPE of
     the request: bounded writes, no inference.
     """
-    original_save = wired.save_message
+    original_save = wired.save_message_result
     original_schedule = wired.schedule_action
 
     async def slow_save(*a, **k):
@@ -283,7 +305,7 @@ def test_acknowledgement_latency_is_dominated_by_signature_and_writes(monkeypatc
         await asyncio.sleep(0.005)
         return await original_schedule(**k)
 
-    monkeypatch.setattr(main, "save_message", slow_save)
+    monkeypatch.setattr(main, "save_message_result", slow_save)
     monkeypatch.setattr(main, "schedule_action", slow_schedule)
 
     samples = []
@@ -305,87 +327,3 @@ def test_acknowledgement_latency_is_dominated_by_signature_and_writes(monkeypatc
     # would be an order of magnitude above this.
     assert p50 < 60
     assert p95 < 120
-
-
-def test_save_message_resolves_a_concurrent_unique_violation(monkeypatch):
-    """REL-006's dependency: dedupe is a DB guarantee, not a lucky read.
-
-    The scenario is two webhook deliveries of one platform message racing: both
-    read and see nothing, both insert, and the unique index rejects the loser.
-    The loser must resolve to the winner's row, because answering the platform
-    with a 5xx would provoke yet another redelivery.
-    """
-    calls = {"select": 0, "insert": 0}
-    committed: dict[str, str] = {}
-
-    class DB:
-        def table(self, _n):
-            return self
-
-        def select(self, *_a):
-            self._op = "select"
-            return self
-
-        def eq(self, *_a):
-            return self
-
-        def limit(self, *_a):
-            return self
-
-        def insert(self, _row):
-            self._op = "insert"
-            return self
-
-        def execute(self):
-            if self._op == "select":
-                calls["select"] += 1
-                # First read: the racing writer has not committed yet.
-                if calls["select"] == 1:
-                    return SimpleNamespace(data=[])
-                return SimpleNamespace(data=[{"id": committed["msg-1"]}])
-            calls["insert"] += 1
-            committed["msg-1"] = "winner-row"
-            raise RuntimeError(
-                "duplicate key value violates unique constraint "
-                '"messages_fansly_message_id_key"'
-            )
-
-    monkeypatch.setattr(db_queries, "get_supabase", lambda: DB())
-
-    result = asyncio.run(
-        db_queries.save_message(
-            "fan-1", "creator-1", "fan", "hi", fansly_message_id="msg-1"
-        )
-    )
-    assert result == "winner-row"
-    assert calls == {"select": 2, "insert": 1}
-
-
-def test_save_message_still_raises_on_a_real_failure(monkeypatch):
-    class DB:
-        def table(self, _n):
-            return self
-
-        def select(self, *_a):
-            return self
-
-        def eq(self, *_a):
-            return self
-
-        def limit(self, *_a):
-            return self
-
-        def insert(self, _row):
-            return self
-
-        def execute(self):
-            raise RuntimeError("connection refused by the database")
-
-    monkeypatch.setattr(db_queries, "get_supabase", lambda: DB())
-
-    with pytest.raises(RuntimeError):
-        asyncio.run(
-            db_queries.save_message(
-                "fan-1", "creator-1", "fan", "hi", fansly_message_id="msg-1"
-            )
-        )

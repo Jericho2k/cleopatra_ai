@@ -135,7 +135,8 @@ def test_member_pagination_follows_the_cursor_and_deduplicates():
         async with _client(handler) as client:
             return await fansly_lists.fetch_remote_members("acct-1", "1001", client=client)
 
-    assert asyncio.run(run()) == ["p-a", "p-b", "p-c"]
+    # fetch_remote_members reports whether the listing reached the end (SCALE-003).
+    assert asyncio.run(run()) == (["p-a", "p-b", "p-c"], True)
 
 
 def test_pagination_stops_rather_than_looping_on_a_repeating_cursor(monkeypatch):

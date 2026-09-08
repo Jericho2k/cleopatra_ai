@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 
 from core.supabase import get_supabase
@@ -228,18 +229,39 @@ async def get_conversation_history(fan_id: str, limit: int = 40) -> list[Message
     return await asyncio.to_thread(_get)
 
 
-# PostgREST surfaces a unique-constraint conflict as SQLSTATE 23505 / HTTP 409.
-# The Supabase client raises its own error type, so match on the codes rather
-# than on an exception class that would tie this module to the client version.
-_UNIQUE_VIOLATION_MARKERS = ("23505", "duplicate key value", "already exists")
+@dataclass
+class MessageWriteResult:
+    """What one ingestion attempt actually did.
+
+    REL-002 — callers that trigger the conversation pipeline need to know
+    whether THIS call created the row. Without it, a webhook redelivery and the
+    poller both "succeed", both see a message id, and both run the pipeline for
+    one fan message: two analyzer calls, two writer generations, and the fan's
+    message twice in the writer's history.
+    """
+
+    message_id: str | None
+    inserted: bool
 
 
-def _is_unique_violation(exc: BaseException) -> bool:
-    code = str(getattr(exc, "code", "") or "")
-    if code == "23505":
-        return True
-    text = str(exc).lower()
-    return any(marker in text for marker in _UNIQUE_VIOLATION_MARKERS)
+# The unique key created by db/message_platform_identity_v1.sql. Composite
+# rather than fansly_message_id alone: see that file for why a global key would
+# risk dropping a second creator's legitimately distinct message.
+_PLATFORM_IDENTITY_CONFLICT = "creator_id,fansly_message_id"
+
+# Postgres 42P10: ON CONFLICT names columns with no matching unique index. That
+# means the migration has not been applied yet, so the code falls back to the
+# old check-then-insert rather than failing the ingestion outright.
+_MISSING_CONFLICT_TARGET_MARKERS = (
+    "42P10",
+    "no unique or exclusion constraint",
+    "there is no unique or exclusion constraint",
+)
+
+
+def _is_missing_conflict_target(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(marker.lower() in text for marker in _MISSING_CONFLICT_TARGET_MARKERS)
 
 
 async def save_message(
@@ -256,35 +278,42 @@ async def save_message(
     Existing callers may ignore the return value. The passive intelligence layer uses
     it as evidence provenance for manually submitted fan messages.
     """
+    result = await save_message_result(
+        fan_id,
+        creator_id,
+        role,
+        content,
+        was_ai_suggested=was_ai_suggested,
+        fansly_message_id=fansly_message_id,
+        media_context=media_context,
+    )
+    return result.message_id
 
-    def _existing_id() -> str | None:
-        response = (
-            get_supabase().table("messages")
-            .select("id")
-            .eq("fan_id", fan_id)
-            .eq("creator_id", creator_id)
-            .eq("fansly_message_id", fansly_message_id)
-            .limit(1)
-            .execute()
-        )
-        data = response.data or []
-        if data and data[0].get("id") is not None:
-            return str(data[0]["id"])
-        return None
 
-    def _save() -> str | None:
-        if fansly_message_id is not None:
-            try:
-                found = _existing_id()
-                if found is not None:
-                    return found
-            except Exception as exc:
-                # Delivery already happened. A failed defensive read must not
-                # turn the response into an apparent send failure.
-                print(
-                    "[MESSAGE DEDUPE READ ERROR] "
-                    f"fan={fan_id} platform_message={fansly_message_id}: {exc}"
-                )
+async def save_message_result(
+    fan_id: str,
+    creator_id: str,
+    role: str,
+    content: str,
+    *,
+    was_ai_suggested: bool = False,
+    fansly_message_id: str | None = None,
+    media_context: dict | None = None,
+) -> MessageWriteResult:
+    """Persist a message idempotently and report whether this call inserted it.
+
+    REL-002 — this was a SELECT followed by a non-atomic INSERT. Two writers
+    (webhook redelivery, webhook racing the poller, two workers) could both read
+    "absent" and both insert, and nothing in version control guaranteed a unique
+    constraint would stop them.
+
+    Correctness now comes from the database: a single upsert against
+    (creator_id, fansly_message_id). The loser of a race gets inserted=False
+    rather than a second row, so the pipeline runs at most once per platform
+    message.
+    """
+
+    def _row() -> dict:
         row = {
             "fan_id": fan_id,
             "creator_id": creator_id,
@@ -296,30 +325,79 @@ async def save_message(
             row["fansly_message_id"] = fansly_message_id
         if media_context is not None:
             row["media_context"] = media_context
+        return row
+
+    def _existing_id() -> str | None:
         try:
-            response = get_supabase().table("messages").insert(row).execute()
-        except Exception as exc:
-            # The read above is advisory; the unique index on
-            # messages(fansly_message_id) is the actual guarantee (see
-            # db/durable_ingestion_v1.sql). Two concurrent webhook deliveries of
-            # the same platform message both pass the read and one of them loses
-            # the insert -- that loser must resolve to the surviving row, not
-            # report a failure, or the webhook would answer 5xx and provoke yet
-            # another redelivery.
-            if fansly_message_id is None or not _is_unique_violation(exc):
-                raise
-            found = _existing_id()
-            if found is None:
-                raise
-            print(
-                "[MESSAGE DEDUPE] concurrent insert resolved to existing row "
-                f"fan={fan_id} platform_message={fansly_message_id}"
+            existing = (
+                get_supabase().table("messages")
+                .select("id")
+                .eq("creator_id", creator_id)
+                .eq("fansly_message_id", fansly_message_id)
+                .limit(1)
+                .execute()
             )
-            return found
+            if existing.data and existing.data[0].get("id") is not None:
+                return str(existing.data[0]["id"])
+        except Exception as exc:
+            # The row exists — we just cannot name it. Returning None here would
+            # be read as "not saved" by callers, which is worse than a null id.
+            print(
+                "[MESSAGE IDENTITY READ ERROR] "
+                f"creator={creator_id} platform_message={fansly_message_id}: {exc}"
+            )
+        return None
+
+    def _legacy_check_then_insert() -> MessageWriteResult:
+        """Pre-migration fallback. Racy by nature; kept only so ingestion does
+        not stop working if the code ships before the unique index exists."""
+        existing = _existing_id()
+        if existing is not None:
+            return MessageWriteResult(message_id=existing, inserted=False)
+        response = get_supabase().table("messages").insert(_row()).execute()
+        data = response.data or []
+        message_id = str(data[0]["id"]) if data and data[0].get("id") else None
+        return MessageWriteResult(message_id=message_id, inserted=True)
+
+    def _save() -> MessageWriteResult:
+        # No platform identity: nothing to deduplicate against. Locally
+        # originated messages (an operator sending before the platform confirms)
+        # must each get their own row.
+        if fansly_message_id is None:
+            response = get_supabase().table("messages").insert(_row()).execute()
+            data = response.data or []
+            message_id = str(data[0]["id"]) if data and data[0].get("id") else None
+            return MessageWriteResult(message_id=message_id, inserted=True)
+
+        try:
+            response = (
+                get_supabase().table("messages")
+                .upsert(
+                    _row(),
+                    on_conflict=_PLATFORM_IDENTITY_CONFLICT,
+                    ignore_duplicates=True,
+                )
+                .execute()
+            )
+        except Exception as exc:
+            if _is_missing_conflict_target(exc):
+                print(
+                    "[MESSAGE IDENTITY] unique index missing — falling back to "
+                    "check-then-insert. Apply db/message_platform_identity_v1.sql "
+                    f"(creator={creator_id})"
+                )
+                return _legacy_check_then_insert()
+            raise
+
         data = response.data or []
         if data and data[0].get("id") is not None:
-            return str(data[0]["id"])
-        return None
+            # ignore_duplicates makes this DO NOTHING, so a returned row means
+            # this call is the one that inserted it.
+            return MessageWriteResult(message_id=str(data[0]["id"]), inserted=True)
+
+        # Conflict: someone else already has it. Resolve the id for callers that
+        # need provenance, but report inserted=False so the pipeline stays put.
+        return MessageWriteResult(message_id=_existing_id(), inserted=False)
 
     return await asyncio.to_thread(_save)
 

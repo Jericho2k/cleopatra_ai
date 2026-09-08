@@ -101,6 +101,8 @@ class _Query:
         self.in_filters: list[tuple[str, list[str]]] = []
         self.op = None
         self.payload = None
+        self.orders: list[tuple[str, bool]] = []
+        self._range: tuple[int, int] | None = None
 
     # -- builders
     def select(self, *_args, **_kwargs):
@@ -135,7 +137,18 @@ class _Query:
         self.in_filters.append((column, [str(v) for v in values]))
         return self
 
-    def limit(self, _value):
+    def limit(self, value):
+        self._range = (0, value - 1)
+        return self
+
+    def order(self, column, desc=False, **_kwargs):
+        # _load_state pages with a deterministic order (SCALE-003), so the fake
+        # has to honour ordering for those reads to come back correctly.
+        self.orders.append((column, desc))
+        return self
+
+    def range(self, start, end):
+        self._range = (start, end)
         return self
 
     # -- execution
@@ -151,7 +164,13 @@ class _Query:
     def execute(self):
         rows = self.db.tables.setdefault(self.table_name, [])
         if self.op == "select":
-            return _Result([dict(row) for row in rows if self._matches(row)])
+            selected = [dict(row) for row in rows if self._matches(row)]
+            for column, desc in reversed(self.orders):
+                selected.sort(key=lambda row: str(row.get(column) or ""), reverse=desc)
+            if self._range is not None:
+                start, end = self._range
+                selected = selected[start : end + 1]
+            return _Result(selected)
         if self.op == "insert":
             return _Result([self.db.insert(self.table_name, dict(self.payload))])
         if self.op == "upsert":
@@ -266,7 +285,8 @@ def run_sync(monkeypatch, *, lists, members, account_id="acct-1", creator_id="cr
         return list(lists)
 
     async def fake_fetch_members(_account_id, external_list_id, *, client):
-        return list(members.get(external_list_id, []))
+        # (members, listing_reached_the_end) — see SCALE-003.
+        return list(members.get(external_list_id, [])), True
 
     monkeypatch.setattr(fansly_lists, "fetch_remote_lists", fake_fetch_lists)
     monkeypatch.setattr(fansly_lists, "fetch_remote_members", fake_fetch_members)
