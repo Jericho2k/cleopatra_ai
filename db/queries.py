@@ -402,6 +402,25 @@ async def save_message_result(
     return await asyncio.to_thread(_save)
 
 
+async def update_message_media_context(message_id: str, media_context: dict) -> None:
+    """Attach resolved media locations to an already-persisted message.
+
+    Webhooks carry attachment IDs but not signed media URLs, and resolving them
+    costs a live API Fansly call. That call no longer runs inside the webhook
+    request, so the row is written first and enriched by the durable ingestion
+    worker moments later.
+    """
+    def _update():
+        (
+            get_supabase().table("messages")
+            .update({"media_context": media_context})
+            .eq("id", message_id)
+            .execute()
+        )
+
+    await asyncio.to_thread(_update)
+
+
 async def get_creator_fansly_account_id(creator_id: str) -> str | None:
     def _get():
         r = (

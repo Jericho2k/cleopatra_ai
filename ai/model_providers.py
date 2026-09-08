@@ -11,6 +11,8 @@ from typing import Any
 
 from ai import openrouter_routing
 from ai.model_migrations import resolve_supported_model
+from core.action_telemetry import record_count, record_stage
+from core.model_gate import MODEL_GATE
 from models.model_runtime import ModelResult, ModelTarget, ModelUsage
 
 # Providers that speak the OpenAI chat-completions wire format.
@@ -155,31 +157,43 @@ async def complete(
     ``session_id`` is the stable per-conversation affinity key. Providers that
     support sticky routing use it to keep consecutive turns on one upstream so
     prefix caching survives; providers that do not simply ignore it.
+
+    Every call passes through the global model gate (see ``core.model_gate``).
+    This is the single admission-control point for paid inference: writer,
+    analyzer, extractor, and every future caller of this function are bounded by
+    one limit rather than by whatever concurrency their caller happens to have.
+    ``latency_ms`` remains pure provider time — the wait for a slot is reported
+    separately so a slow provider is never confused with a saturated gate.
     """
 
-    started = time.perf_counter()
-    if target.provider == "anthropic":
-        result = await _complete_anthropic(
-            target,
-            system=system,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-    elif target.provider in OPENAI_COMPATIBLE_PROVIDERS:
-        result = await _complete_openai_compatible(
-            target,
-            system=system,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            session_id=session_id,
-            end_user_id=end_user_id,
-        )
-    else:
+    if target.provider not in OPENAI_COMPATIBLE_PROVIDERS and target.provider != "anthropic":
         raise ValueError(f"Unsupported model provider: {target.provider}")
 
-    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    async with MODEL_GATE.acquire(feature=target.provider) as gate_wait_ms:
+        record_stage("model_gate_wait_ms", gate_wait_ms)
+        record_count("model_calls")
+        started = time.perf_counter()
+        if target.provider == "anthropic":
+            result = await _complete_anthropic(
+                target,
+                system=system,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        else:
+            result = await _complete_openai_compatible(
+                target,
+                system=system,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                session_id=session_id,
+                end_user_id=end_user_id,
+            )
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+    record_stage("model_provider_ms", float(elapsed_ms))
     return ModelResult(
         text=result.text,
         target=result.target,
@@ -188,6 +202,7 @@ async def complete(
         raw_response_id=result.raw_response_id,
         upstream_provider=result.upstream_provider,
         reported_cost_usd=result.reported_cost_usd,
+        gate_wait_ms=int(gate_wait_ms),
     )
 
 

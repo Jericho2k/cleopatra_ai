@@ -156,7 +156,7 @@ def test_worker_dispatches_and_completes_durable_auto_reply(monkeypatch):
         scheduled_actions, "repair_followup_obligations", lambda: _async_value(0)
     )
     monkeypatch.setattr(
-        scheduled_actions, "claim_due_actions", lambda: _async_value([due])
+        scheduled_actions, "claim_due_actions", lambda **_: _async_value([due])
     )
     monkeypatch.setattr(
         scheduled_actions,

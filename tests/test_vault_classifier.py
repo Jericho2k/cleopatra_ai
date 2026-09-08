@@ -755,12 +755,53 @@ async def test_main_uses_local_classifier_without_anthropic(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_health_exposes_safe_vault_rollout_state(monkeypatch):
+    """The vault rollout keys survive alongside the operational health payload."""
+    from services import operational_health
+
     monkeypatch.setenv(
         "VAULT_SEMANTIC_BASE_URL",
         "https://semantic.example",
     )
-    assert await main.health() == {
-        "status": "ok",
-        "vault_classifier_version": main.VAULT_CLASSIFIER_VERSION,
-        "vault_semantics_configured": True,
-    }
+    operational_health.reset_cache()
+    monkeypatch.setattr(
+        operational_health,
+        "worker_health_snapshot",
+        lambda: {
+            "poll_seconds": 5,
+            "seconds_since_last_cycle": 1.0,
+            "cycles_completed": 3,
+            "last_error": None,
+        },
+    )
+    monkeypatch.setattr(
+        operational_health,
+        "probe_database",
+        lambda: _resolved({"reachable": True, "latency_ms": 3, "error": None}),
+    )
+    monkeypatch.setattr(
+        operational_health,
+        "probe_queue",
+        lambda: _resolved({
+            "available": True,
+            "pending": 0,
+            "processing": 0,
+            "failed": 0,
+            "pending_inbound_messages": 0,
+            "oldest_due_execute_at": None,
+            "oldest_due_action_type": None,
+            "oldest_pending_age_seconds": 0.0,
+            "error": None,
+        }),
+    )
+    try:
+        payload = await main.health()
+    finally:
+        operational_health.reset_cache()
+
+    assert payload["status"] == "ok"
+    assert payload["vault_classifier_version"] == main.VAULT_CLASSIFIER_VERSION
+    assert payload["vault_semantics_configured"] is True
+
+
+async def _resolved(value):
+    return value

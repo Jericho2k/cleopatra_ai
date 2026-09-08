@@ -157,9 +157,21 @@ def test_auto_mode_writes_are_backend_gated_by_approved_sets():
 
 
 def test_poller_persists_before_processing():
-    source = inspect.getsource(handle_new_fan_message)
-    assert source.index("await save_message(") < source.index(
-        "await process_incoming_fan_message("
+    """The poller still persists before anything can act on the message.
+
+    It now shares the webhook's durable acceptance path, so the ordering lives
+    in accept_inbound_message: the message row is written, then the processing
+    obligation, and only then can a worker run the pipeline.
+    """
+    from main import accept_inbound_message
+
+    poller_source = inspect.getsource(handle_new_fan_message)
+    assert "await accept_inbound_message(" in poller_source
+    assert "await process_incoming_fan_message(" not in poller_source
+
+    acceptance = inspect.getsource(accept_inbound_message)
+    assert acceptance.index("await save_message_result(") < acceptance.index(
+        "await schedule_action("
     )
 
 
