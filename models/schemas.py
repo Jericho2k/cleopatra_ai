@@ -133,14 +133,30 @@ class SuggestionRequest(BaseModel):
 
 
 class SuggestionResponse(BaseModel):
-    """Response: exactly 3 reply options."""
+    """Response: one to three reply options.
+
+    COST-001 — this used to require exactly three. Combined with the writer's
+    "must produce three survivors" rule it meant a turn that yielded one good
+    reply raised a ValidationError and returned a 500, so the operator saw an
+    error rather than the usable suggestion. One is a usable answer; the
+    dashboard already renders a variable-length list.
+
+    Zero is still rejected. Full Auto must fail closed rather than send filler,
+    and an empty list is a failure, not a response.
+    """
 
     suggestions: list[str]
     stage: StageType = StageType.WARMING_UP
+    # REL-001 — true when the situation analysis behind these suggestions was
+    # fabricated because the analyzer failed. Assisted still returns copy (an
+    # operator reads it before anything is sent), but it must not be presented
+    # as a normally analysed suggestion.
+    analysis_degraded: bool = False
+    analysis_degraded_reason: str = ""
 
     @field_validator("suggestions")
     @classmethod
-    def exactly_three(cls, v: list[str]) -> list[str]:
-        if len(v) != 3:
-            raise ValueError("suggestions must contain exactly 3 items")
+    def between_one_and_three(cls, v: list[str]) -> list[str]:
+        if not 1 <= len(v) <= 3:
+            raise ValueError("suggestions must contain between 1 and 3 items")
         return v

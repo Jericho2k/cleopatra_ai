@@ -16,7 +16,9 @@ class Settings(BaseSettings):
     UPSTASH_REDIS_URL: str
     UPSTASH_REDIS_TOKEN: str
     OPENAI_API_KEY: str
-    APP_ENV: str = "development"
+    # SEC-004: an absent APP_ENV must not select development. The empty
+    # default is resolved to production by core.environment.app_env().
+    APP_ENV: str = ""
     DASHBOARD_API_SECRET: str = ""
     WEBHOOK_SECRET: str = ""
 

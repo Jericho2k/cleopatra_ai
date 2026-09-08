@@ -68,7 +68,11 @@ from services.session_lifecycle import (
     mark_step_declined,
     mark_step_purchased,
 )
-from ai.situation_analyzer import analyze_situation
+from ai.situation_analyzer import (
+    analyze_situation,
+    analysis_is_degraded,
+    degraded_reason,
+)
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from db.queries import (
@@ -102,6 +106,15 @@ together_client = AsyncOpenAI(
     base_url="https://api.together.xyz/v1",
     api_key=get_settings().TOGETHER_API_KEY,
 )
+
+class AnalyzerDegradedError(RuntimeError):
+    """Full Auto refused to act on a fabricated analysis (REL-001).
+
+    Raised rather than returned so the durable scheduled action records it and
+    retries through the existing bounded backoff (max_attempts=8), instead of
+    completing as though a reply had been delivered.
+    """
+
 
 _pending_auto_replies: dict[str, asyncio.Task] = {}
 
@@ -293,6 +306,16 @@ async def get_suggestions(
         ctx_without_situation,
         telemetry_context={"creator_id": creator_id, "fan_id": fan_id},
     )
+    # REL-001 — Assisted keeps producing copy, because a human approves it before
+    # anything reaches the fan, but the operator must be told the analysis behind
+    # it was guessed rather than returned.
+    assisted_degraded = analysis_is_degraded(situation)
+    assisted_degraded_reason = degraded_reason(situation)
+    if assisted_degraded:
+        print(
+            f"[ASSISTED ANALYZER DEGRADED] fan={fan_id} creator={creator_id} "
+            f"reason={assisted_degraded_reason or 'unknown'}"
+        )
     if fan_intelligence:
         situation["learned_fan_intelligence"] = fan_intelligence
 
@@ -437,7 +460,12 @@ async def get_suggestions(
         spawn(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent), name="update_fan_memory")
         spawn(_update_fan_ai_summary(fan_id, conversation_history), name="update_fan_ai_summary")
 
-    return SuggestionResponse(suggestions=replies, stage=conversation_stage)
+    return SuggestionResponse(
+        suggestions=replies,
+        stage=conversation_stage,
+        analysis_degraded=assisted_degraded,
+        analysis_degraded_reason=assisted_degraded_reason,
+    )
 
 
 def _render_legend(legend: dict) -> str:
@@ -774,6 +802,35 @@ async def _debounced_auto_reply(
             ctx_without_situation,
             telemetry_context={"creator_id": creator_id, "fan_id": fan_id},
         )
+
+        # REL-001 — Full Auto fails closed on a degraded analysis.
+        #
+        # A fabricated analysis is uniformly neutral: purchase_signal "none",
+        # crisis_signal "none", resend_requested "false". Acting on it means a
+        # fan saying "I'll take the $50 one" is read as small talk, decline locks
+        # are set and cleared from guessed state, and a PPV may be resent. None
+        # of that is recoverable after the message leaves.
+        #
+        # The stop is placed before refresh_affordability_from_situation and
+        # refresh_price_learning: both WRITE commercial state derived from the
+        # situation, so running them would persist the guess even though nothing
+        # is sent.
+        if analysis_is_degraded(situation):
+            reason = degraded_reason(situation) or "unknown"
+            # The deterministic self-harm backstop still applies — a failed
+            # analyzer must not weaken crisis handling. _crisis_freezes_chat only
+            # fires on a positive signal, which in a degraded result can only
+            # have come from the regex in situation_analyzer.
+            if await _crisis_freezes_chat(creator_id, fan_id, situation):
+                return
+            print(
+                f"[AUTO ANALYZER DEGRADED] fan={fan_id} creator={creator_id} "
+                f"reason={reason} — sending nothing"
+            )
+            raise AnalyzerDegradedError(
+                f"situation analysis degraded ({reason}); Full Auto sent nothing"
+            )
+
         if fan_intelligence:
             situation["learned_fan_intelligence"] = fan_intelligence
         affordability = await refresh_affordability_from_situation(
@@ -1406,6 +1463,11 @@ async def _debounced_auto_reply(
                 )
 
     except asyncio.CancelledError:
+        raise
+    except AnalyzerDegradedError:
+        # REL-001 — propagate rather than swallow. The durable action's
+        # last_error should say the analyzer failed, not the generic "completed
+        # without a confirmed message" this handler would otherwise produce.
         raise
     except Exception as e:
         print(f"[DEBOUNCED AUTO REPLY ERROR] fan={fan_id} error={e}")
