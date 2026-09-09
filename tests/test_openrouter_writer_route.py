@@ -615,6 +615,14 @@ def test_generator_sends_a_stable_prefix_and_affinity_key(monkeypatch):
         )
     )
 
-    assert seen[0]["system"] == "STABLEVOLATILE"
+    # COST-002a — the generator hands the blocks down untouched. Flattening for
+    # OpenAI-compatible providers now happens in the transport, which is the
+    # only layer that knows whether the provider consumes blocks; asserting the
+    # joined string here would have re-pinned the defect the audit found.
+    assert seen[0]["system"] == [
+        {"type": "text", "text": "STABLE"},
+        {"type": "text", "text": "VOLATILE"},
+    ]
+    assert flatten_message_content(seen[0]["system"]) == "STABLEVOLATILE"
     assert seen[0]["session_id"] == writer_session_id("creator-1", "fan-1")
     assert seen[0]["end_user_id"] == writer_end_user_id("creator-1", "fan-1")

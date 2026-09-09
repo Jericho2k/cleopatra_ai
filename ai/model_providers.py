@@ -11,6 +11,7 @@ from typing import Any
 
 from ai import openrouter_routing
 from ai.model_migrations import resolve_supported_model
+from ai.prompt_blocks import flatten_message_content
 from core.action_telemetry import record_count, record_stage
 from core.model_gate import MODEL_GATE
 from models.model_runtime import ModelResult, ModelTarget, ModelUsage
@@ -145,7 +146,7 @@ def _openai_compatible_client(base_url: str, api_key: str, timeout_seconds: floa
 async def complete(
     target: ModelTarget,
     *,
-    system: str,
+    system: str | list[dict[str, Any]],
     messages: list[dict[str, str]],
     max_tokens: int,
     temperature: float | None = None,
@@ -153,6 +154,13 @@ async def complete(
     end_user_id: str | None = None,
 ) -> ModelResult:
     """Call a configured model endpoint and normalize text, usage, and latency.
+
+    ``system`` may be a plain string or the ordered content blocks
+    ``ai.prompt_blocks`` produces. Blocks reach Anthropic intact, so a
+    ``cache_control`` marker actually arrives at the provider (COST-002a);
+    OpenAI-compatible transports, which use implicit prefix caching, receive the
+    same prose joined into one string. Deciding that here rather than in the
+    caller is what stopped the marker being discarded before transport.
 
     ``session_id`` is the stable per-conversation affinity key. Providers that
     support sticky routing use it to keep consecutive turns on one upstream so
@@ -209,7 +217,7 @@ async def complete(
 async def _complete_anthropic(
     target: ModelTarget,
     *,
-    system: str,
+    system: str | list[dict[str, Any]],
     messages: list[dict[str, str]],
     max_tokens: int,
     temperature: float | None,
@@ -280,7 +288,7 @@ def _float_field(source: Any, name: str) -> float | None:
 async def _complete_openai_compatible(
     target: ModelTarget,
     *,
-    system: str,
+    system: str | list[dict[str, Any]],
     messages: list[dict[str, str]],
     max_tokens: int,
     temperature: float | None,
@@ -297,7 +305,7 @@ async def _complete_openai_compatible(
     )
 
     payload_messages = [
-        {"role": "system", "content": system},
+        {"role": "system", "content": flatten_message_content(system)},
         *messages,
     ]
 

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ai.model_providers import complete, get_runtime_target
+from ai.prompt_blocks import flatten_message_content
 from ai.session_affinity import writer_end_user_id, writer_session_id
 from models.model_runtime import ModelTarget, ModelTelemetryContext
 from models.schemas import Persona
@@ -221,32 +222,6 @@ def parse_reply_outcome(
     return ParseOutcome(reason=PARSE_ALL_REJECTED)
 
 
-def flatten_message_content(content: Any) -> str:
-    """Collapse a prompt message into the plain string the transport expects.
-
-    build_prompt emits the system message as ordered content blocks so the
-    stable prefix stays first and volatile additions stay last. Anthropic
-    consumes those blocks directly, but every OpenAI-compatible provider —
-    OpenRouter and Together included — wants a single string. Joining the block
-    text preserves that ordering, which is what keeps the cacheable prefix
-    byte-identical between turns.
-    """
-
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict):
-                text = block.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        return "".join(parts)
-    return str(content)
-
-
 def _same_model_target(left: ModelTarget, right: ModelTarget | None) -> bool:
     return bool(
         right
@@ -412,7 +387,11 @@ async def generate_replies(
     attempt_targets.append(fallback_target or primary_target)
 
     metadata = dict(telemetry_context or {})
-    system = flatten_message_content(prompt_messages[0]["content"])
+    # COST-002a — the system content is handed to the transport in whatever
+    # shape build_prompt produced. Flattening it here is what used to discard
+    # the cache_control marker before Anthropic ever saw it; the transport now
+    # decides, because only it knows whether the provider consumes blocks.
+    system = prompt_messages[0]["content"]
     messages = [
         {
             "role": "user",
