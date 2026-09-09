@@ -24,6 +24,7 @@ from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from core.action_telemetry import stage as action_stage
 from core.supabase import get_supabase
+from core.vault_gate import VAULT_GATE
 from core.webhooks import valid_hmac_sha256_signature
 from core.tenancy import (
     require_account_path_access,
@@ -139,7 +140,9 @@ from services.vault_metadata import (
 _processed_messages: set = set()
 _vault_sync_state: dict = {}
 _vault_sync_retry_after: dict[str, float] = {}
-_VAULT_SYNC_ACTIVE_STATUSES = {"running", "categorizing_new"}
+# "queued" is an active status: a creator waiting for a vault slot must not
+# be started a second time by the scheduler or an operator (VAULT-001).
+_VAULT_SYNC_ACTIVE_STATUSES = {"queued", "running", "categorizing_new"}
 _protected_video_download_gate = asyncio.Semaphore(1)
 _active_chat_binding_retry_after: dict[str, float] = {}
 _active_chat_binding_tasks: dict[str, asyncio.Task] = {}
@@ -2556,7 +2559,15 @@ async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
         cd = await _vault_cooldown_remaining(creator_id, "last_vault_sync_at")
         if not cd["allowed"]:
             return {"status": "cooldown", **cd}
-    _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": 0, "album": ""}
+    # Spawned immediately, but it waits for a creator-level slot before doing
+    # any work. The scheduler can therefore mark every due creator without
+    # starting every due creator (VAULT-001).
+    _vault_sync_state[creator_id] = {
+        "status": "queued",
+        "synced": 0,
+        "total": 0,
+        "album": "Waiting for a vault slot…",
+    }
     spawn(_run_vault_sync(creator_id), name="run_vault_sync")
     return {"status": "started"}
 
@@ -2596,6 +2607,21 @@ async def _run_vault_sync(creator_id: str) -> None:
     import httpx
 
     db = get_supabase()
+    async with VAULT_GATE.acquire(creator_id=creator_id, kind="vault_sync"):
+        _vault_sync_state[creator_id] = {
+            "status": "running",
+            "synced": 0,
+            "total": 0,
+            "album": "",
+        }
+        await _run_vault_sync_locked(creator_id, db)
+
+
+async def _run_vault_sync_locked(creator_id: str, db) -> None:
+    """The sync itself. Runs only while holding one creator-level vault slot."""
+
+    import httpx
+
     try:
         creator_row = await asyncio.to_thread(
             lambda: db.table("creators")
@@ -3570,6 +3596,14 @@ async def _video_frame_upgrade_media_ids(creator_id: str) -> list[str]:
 
 _categorize_state: dict = {}
 
+# VAULT-002 — how many classification results are persisted per round trip, and
+# how long a partial batch may wait. Small enough that completed work is never
+# held in memory for long and the operator's progress number stays live; large
+# enough that a 10,000-item vault is ~100 writes rather than 10,000. Internal
+# constants on purpose: an env var per batch size is configuration sprawl.
+_CLASSIFICATION_WRITE_BATCH = 100
+_CLASSIFICATION_FLUSH_SECONDS = 5.0
+
 
 @app.post(
     "/categorize-vault/{creator_id}",
@@ -3655,7 +3689,7 @@ async def categorize_vault(
         }
 
     _categorize_state[creator_id] = {
-        "status": "running",
+        "status": "queued",
         "mode": resolved_mode,
         "done": 0,
         "total": pending,
@@ -3663,7 +3697,7 @@ async def categorize_vault(
     }
     await _stamp_vault_op(creator_id, "last_categorize_at")
     spawn(
-        _run_vault_categorization(
+        _run_vault_categorization_job(
             creator_id,
             item_ids=upgrade_item_ids,
             mark_initial=resolved_mode == "initial",
@@ -3763,6 +3797,9 @@ async def vault_categorization_overview(creator_id: str) -> dict:
             creator_id,
             {"status": "idle", "synced": 0, "total": 0, "album": ""},
         ),
+        # Deployment-wide, so an operator can see that their creator is queued
+        # behind other creators rather than stalled (VAULT-001).
+        "vault_gate": VAULT_GATE.snapshot(),
         "uncategorized": await _count_uncategorized(creator_id),
         "stale_classifications": await _count_stale_classifications(creator_id),
         "stale_approved_classifications": len(stale_approved),
@@ -3848,6 +3885,32 @@ async def get_vault_media_urls(
             for media_id in media_ids
         }
     }
+
+
+async def _run_vault_categorization_job(
+    creator_id: str,
+    *,
+    item_ids: list[str] | None = None,
+    mark_initial: bool = False,
+    upgrade_legacy: bool = False,
+) -> None:
+    """An operator-started categorisation run, holding one creator-level slot.
+
+    The run started from inside ``_run_vault_sync`` deliberately does NOT come
+    through here: it already holds that sync's slot, and taking a second one
+    would deadlock the gate at a limit of 1 (VAULT-001).
+    """
+
+    async with VAULT_GATE.acquire(creator_id=creator_id, kind="vault_categorize"):
+        state = _categorize_state.get(creator_id)
+        if isinstance(state, dict):
+            state["status"] = "running"
+        await _run_vault_categorization(
+            creator_id,
+            item_ids=item_ids,
+            mark_initial=mark_initial,
+            upgrade_legacy=upgrade_legacy,
+        )
 
 
 async def _run_vault_categorization(
@@ -3960,89 +4023,177 @@ async def _run_vault_categorization(
             max_connections=max(batch_size * 2, 16),
             max_keepalive_connections=max(batch_size, 8),
         )
+
+        # ---- VAULT-002: worker pool instead of fixed-window batches ----
+        # This used to be `for i in range(0, total, batch_size)` with an
+        # asyncio.gather per slice. That gather is a barrier: a slice of 12
+        # finishes only when its slowest item finishes, so one video needing
+        # ffmpeg frame extraction (~35 s) held eleven idle slots against eleven
+        # images that each took about a second. A fixed number of workers
+        # pulling from a shared cursor uses the same concurrency budget without
+        # ever idling a slot behind someone else's video.
+        #
+        # The concurrency limit itself is unchanged and is still never exceeded:
+        # exactly `batch_size` workers exist, so at most `batch_size` items are
+        # in flight.
+        next_index = 0
+        completed = 0
+        abort_reason = ""
+        pending_writes: list[dict] = []
+        last_flush = time.monotonic()
+        write_lock = asyncio.Lock()
+        cursor_lock = asyncio.Lock()
+
+        async def flush_writes(*, force: bool = False) -> None:
+            """Persist accumulated classifications in one bounded round trip.
+
+            Each result used to be its own awaited UPDATE, so a 10,000-item
+            vault was 10,000 sequential round trips — several minutes of pure
+            database latency. Rows are batched instead, and the batch is small
+            enough that completed work is never held in memory for long: the
+            point is fewer writes, not one giant write at the end.
+            """
+
+            nonlocal pending_writes, last_flush, done
+            async with write_lock:
+                due = (
+                    force
+                    or len(pending_writes) >= _CLASSIFICATION_WRITE_BATCH
+                    or (
+                        pending_writes
+                        and time.monotonic() - last_flush >= _CLASSIFICATION_FLUSH_SECONDS
+                    )
+                )
+                if not due or not pending_writes:
+                    return
+                rows, pending_writes = pending_writes, []
+                last_flush = time.monotonic()
+                await retry_transient_db_operation(
+                    lambda batch=rows: asyncio.to_thread(
+                        lambda: db.table("creator_vault_media")
+                        .upsert(batch, on_conflict="id")
+                        .execute()
+                    ),
+                    label=f"save_vault_classifications:{len(rows)}",
+                )
+                # ``done`` stays "persisted", not "classified", so the operator's
+                # progress number never runs ahead of the database.
+                done += len(rows)
+
+        def report_progress() -> None:
+            elapsed = max(time.monotonic() - started_monotonic, 0.001)
+            rate = done / elapsed
+            remaining = max(total - done - errors, 0)
+            eta = round(remaining / rate) if rate > 0 else None
+            _categorize_state[creator_id].update({
+                "done": done,
+                "errors": errors,
+                "qwen_fallbacks": qwen_fallbacks,
+                "semantic_failures": semantic_failures,
+                "elapsed_seconds": round(elapsed),
+                "items_per_minute": round(rate * 60, 1),
+                "estimated_seconds_remaining": eta,
+            })
+
+        async def next_item() -> dict | None:
+            nonlocal next_index
+            async with cursor_lock:
+                if abort_reason or next_index >= total:
+                    return None
+                item = all_items[next_index]
+                next_index += 1
+                return item
+
+        async def worker(visual_client) -> None:
+            nonlocal completed, errors, provider_failures
+            nonlocal qwen_fallbacks, semantic_failures, abort_reason
+            while True:
+                item = await next_item()
+                if item is None:
+                    return
+                try:
+                    result = await _categorize_single_item_with_retry(
+                        item,
+                        allow_core_qwen_fallback=allow_core_qwen_fallback,
+                        visual_client=visual_client,
+                    )
+                except Exception as error:
+                    errors += 1
+                    if isinstance(error, VaultClassifierError):
+                        provider_failures += 1
+                        if provider_failures >= 3:
+                            # Unchanged abort rule: three provider failures stop
+                            # the run. Workers notice on their next pull, so
+                            # nothing new starts and in-flight items finish.
+                            abort_reason = (
+                                "Vault categorization stopped after three provider "
+                                f"failures: {error}"
+                            )
+                    continue
+
+                provider_details = (
+                    (result.get("classification_metadata") or {})
+                    .get("provider_details") or {}
+                )
+                if provider_details.get("qwen_status") == "ready":
+                    qwen_fallbacks += 1
+                if provider_details.get("semantic_status") == "fallback":
+                    semantic_failures += 1
+
+                # on_conflict targets the primary key, so this is an update of
+                # an existing row. creator_id and media_id travel with it so the
+                # row is fully identified and can never be written under another
+                # creator.
+                pending_writes.append({
+                    "id": result["id"],
+                    "creator_id": item["creator_id"],
+                    "media_id": item["media_id"],
+                    **_classification_update_payload(result),
+                })
+                completed += 1
+                await flush_writes()
+                report_progress()
+
+                # The self-hosted semantic service scales independently.
+                # Preserve the old provider throttle only for legacy
+                # configurations: one worker sleeping after each item reproduces
+                # the previous rate of batch_size items per 1.5 seconds.
+                if not semantic_enabled:
+                    await asyncio.sleep(1.5)
+
         async with httpx.AsyncClient(
             follow_redirects=True,
             limits=limits,
         ) as visual_client:
-            for i in range(0, total, batch_size):
-                batch = all_items[i:i + batch_size]
-                results = await asyncio.gather(
-                    *[
-                        _categorize_single_item_with_retry(
-                            item,
-                            allow_core_qwen_fallback=allow_core_qwen_fallback,
-                            visual_client=visual_client,
-                        )
-                        for item in batch
-                    ],
-                    return_exceptions=True,
+            try:
+                await asyncio.gather(
+                    *[worker(visual_client) for _ in range(batch_size)]
                 )
-                fatal_error = ""
-                for result in results:
-                    if isinstance(result, Exception):
-                        errors += 1
-                        if isinstance(result, VaultClassifierError):
-                            provider_failures += 1
-                            if provider_failures >= 3:
-                                fatal_error = (
-                                    "Vault categorization stopped after three provider "
-                                    f"failures: {result}"
-                                )
-                        continue
-                    provider_details = (
-                        (result.get("classification_metadata") or {})
-                        .get("provider_details") or {}
-                    )
-                    if provider_details.get("qwen_status") == "ready":
-                        qwen_fallbacks += 1
-                    if provider_details.get("semantic_status") == "fallback":
-                        semantic_failures += 1
-                    await retry_transient_db_operation(
-                        lambda r=result: asyncio.to_thread(
-                            lambda: db.table("creator_vault_media")
-                            .update(_classification_update_payload(r))
-                            .eq("id", r["id"])
-                            .execute()
-                        ),
-                        label=f"save_vault_classification:{result['id']}",
-                    )
-                    done += 1
-                if fatal_error:
-                    _categorize_state[creator_id].update({
-                        "status": "error",
-                        "done": done,
-                        "errors": errors,
-                        "error": fatal_error,
-                        "aborted_remaining": max(total - done - errors, 0),
-                    })
-                    print(
-                        f"[CATEGORIZE ABORTED] creator={creator_id} "
-                        f"done={done}/{total} errors={errors} reason={fatal_error}"
-                    )
-                    return
-                elapsed = max(time.monotonic() - started_monotonic, 0.001)
-                rate = done / elapsed
-                remaining = max(total - done - errors, 0)
-                eta = round(remaining / rate) if rate > 0 else None
-                _categorize_state[creator_id].update({
-                    "done": done,
-                    "errors": errors,
-                    "qwen_fallbacks": qwen_fallbacks,
-                    "semantic_failures": semantic_failures,
-                    "elapsed_seconds": round(elapsed),
-                    "items_per_minute": round(rate * 60, 1),
-                    "estimated_seconds_remaining": eta,
-                })
-                print(
-                    f"[CATEGORIZE] done={done}/{total} errors={errors} "
-                    f"rate={rate * 60:.1f}/min eta_s={eta} "
-                    f"qwen_fallbacks={qwen_fallbacks} "
-                    f"semantic_failures={semantic_failures}"
-                )
-                # The self-hosted semantic service scales independently. Preserve
-                # the old provider throttle only for legacy configurations.
-                if not semantic_enabled:
-                    await asyncio.sleep(1.5)
+            finally:
+                # Work that was already classified is persisted even when the
+                # run aborts, exactly as the per-item writes used to be.
+                await flush_writes(force=True)
+
+        report_progress()
+        print(
+            f"[CATEGORIZE] done={done}/{total} errors={errors} "
+            f"qwen_fallbacks={qwen_fallbacks} "
+            f"semantic_failures={semantic_failures}"
+        )
+
+        if abort_reason:
+            _categorize_state[creator_id].update({
+                "status": "error",
+                "done": done,
+                "errors": errors,
+                "error": abort_reason,
+                "aborted_remaining": max(total - done - errors, 0),
+            })
+            print(
+                f"[CATEGORIZE ABORTED] creator={creator_id} "
+                f"done={done}/{total} errors={errors} reason={abort_reason}"
+            )
+            return
 
         if mark_initial and errors == 0:
             await _stamp_vault_op(creator_id, "vault_initial_categorized_at")
