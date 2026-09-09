@@ -6,12 +6,15 @@ across chat sync, vault sync, PPV delivery, and purchase reconciliation.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import random
 import threading
 import time
 from collections import Counter, deque
-from typing import Any, Iterable
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Iterable
 from urllib.parse import urlparse
 
 import httpx
@@ -34,6 +37,111 @@ class ApiFanslyAccountAccessError(RuntimeError):
 
 class ApiFanslyProtocolError(RuntimeError):
     """The upstream response was successful HTTP but not the documented shape."""
+
+
+class ApiFanslyTransientError(RuntimeError):
+    """Upstream refused this request for a reason that is expected to pass.
+
+    Raised only when the server answered with a rate-limit or unavailability
+    status, which means the request was definitively *not* processed. That is a
+    different fact from an authentication failure (which will fail identically
+    until a human reconnects the account) and from a network timeout (where the
+    platform may have accepted the request and we cannot know).
+
+    Callers on an exactly-once path must treat a timeout as ambiguous even
+    though it is also "transient"; only this class states that nothing
+    happened upstream.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.retry_after_seconds = retry_after_seconds
+
+
+# Statuses where the server answered and told us it did not process the request.
+TRANSIENT_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+# ---------------------------------------------------------------------------
+# PERF-006 — one connection pool for the whole process.
+#
+# Every helper below used to fall back to ``httpx.AsyncClient()`` when no client
+# was injected, so a single ``list_chat_messages`` or ``send_message`` paid for
+# a fresh TCP connection and TLS handshake and then threw the pool away. The
+# client is now created once and reused, which is safe because nothing about it
+# is per-creator: authentication is a request header built by ``headers()`` from
+# one deployment-wide key, and httpx carries no cross-request state between
+# concurrent callers.
+#
+# ``follow_redirects`` stays False, exactly as the per-call clients had it, so a
+# redirect cannot carry the x-api-key header to another host. The two helpers
+# that legitimately follow redirects ask for it per request.
+# ---------------------------------------------------------------------------
+
+_SHARED_CLIENT_LOCK = threading.Lock()
+_shared_client: httpx.AsyncClient | None = None
+
+# Sized for the vault and chat reconciliation fan-out without letting one
+# process open an unbounded number of sockets against the provider.
+SHARED_CLIENT_LIMITS = httpx.Limits(
+    max_connections=64,
+    max_keepalive_connections=32,
+    keepalive_expiry=60.0,
+)
+
+
+def shared_client() -> httpx.AsyncClient:
+    """Return the process-wide pooled client, creating it on first use."""
+
+    global _shared_client
+    client = _shared_client
+    if client is not None and not client.is_closed:
+        return client
+    with _SHARED_CLIENT_LOCK:
+        if _shared_client is None or _shared_client.is_closed:
+            _shared_client = httpx.AsyncClient(
+                limits=SHARED_CLIENT_LIMITS,
+                follow_redirects=False,
+            )
+        return _shared_client
+
+
+def set_shared_client(client: httpx.AsyncClient | None) -> None:
+    """Install a client for tests, or clear it so the next call rebuilds one.
+
+    Does not close whatever was there: the caller owns anything it installed.
+    """
+
+    global _shared_client
+    with _SHARED_CLIENT_LOCK:
+        _shared_client = client
+
+
+async def close_shared_client() -> None:
+    """Close the pooled client. Called once from the application's shutdown."""
+
+    global _shared_client
+    with _SHARED_CLIENT_LOCK:
+        client = _shared_client
+        _shared_client = None
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
+@asynccontextmanager
+async def client_scope() -> AsyncIterator[httpx.AsyncClient]:
+    """Yield the shared client for a block that used to own a private one.
+
+    Deliberately does not close on exit — the pool outlives the request.
+    """
+
+    yield shared_client()
 
 
 def _record_usage(
@@ -163,6 +271,21 @@ def response_message(response: httpx.Response) -> str:
     return response.text[:200] or f"HTTP {response.status_code}"
 
 
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Read a Retry-After header, seconds form only."""
+
+    raw = str(response.headers.get("retry-after") or "").strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        # HTTP-date form. Honouring it needs a clock comparison we do not need
+        # here; the caller's own backoff is a safe substitute.
+        return None
+    return seconds if seconds >= 0 else None
+
+
 def raise_for_response(
     response: httpx.Response,
     *,
@@ -182,6 +305,17 @@ def raise_for_response(
         raise ApiFanslyAccountAccessError(
             f"API Fansly access denied{target} during {operation}: {message}. "
             "Reconnect this creator under the current APIFANSLY_API_KEY."
+        )
+    if response.status_code in TRANSIENT_STATUS_CODES:
+        # The server answered, so the request was definitively not processed.
+        # Distinguishing this from an invalid key matters: a rate limit clears
+        # by itself, while a disconnected account never does, and treating them
+        # alike is what freezes a fan for a passing 503.
+        raise ApiFanslyTransientError(
+            f"API Fansly {operation} is temporarily unavailable "
+            f"(HTTP {response.status_code}): {message}",
+            status_code=response.status_code,
+            retry_after_seconds=_retry_after_seconds(response),
         )
     try:
         response.raise_for_status()
@@ -457,6 +591,25 @@ def ppv_delivery_evidence(
     }
 
 
+# A read may be repeated freely; a write may not. Automatic retry is therefore
+# decided by the HTTP method, never by how transient the failure looked.
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD"})
+
+# Deliberately small. This exists to ride out a rate limit or a single bad
+# gateway, not to become a generic retry framework, and every attempt is a real
+# provider call that costs credits.
+MAX_READ_ATTEMPTS = 3
+_RETRY_BASE_SECONDS = 0.5
+_RETRY_MAX_SECONDS = 8.0
+
+
+def _retry_delay(attempt: int, advertised: float | None) -> float:
+    if advertised is not None:
+        return min(max(advertised, 0.0), _RETRY_MAX_SECONDS)
+    ceiling = min(_RETRY_BASE_SECONDS * (2 ** attempt), _RETRY_MAX_SECONDS)
+    return random.uniform(0.0, ceiling)
+
+
 async def request(
     method: str,
     path: str,
@@ -468,25 +621,65 @@ async def request(
     files: Any = None,
     timeout: float = 30,
     client: httpx.AsyncClient | None = None,
+    follow_redirects: bool | None = None,
+    retry_idempotent: bool = True,
 ) -> dict[str, Any]:
-    """Execute one API Fansly request with uniform errors and JSON validation."""
-    owns_client = client is None
-    active_client = client or httpx.AsyncClient()
-    try:
-        response = await active_client.request(
-            method,
-            url(path),
-            headers=headers(json_content=json is not None),
-            params=params,
-            json=json,
-            files=files,
-            timeout=timeout,
-        )
-        raise_for_response(
-            response,
-            operation=operation,
-            account_id=account_id,
-        )
+    """Execute one API Fansly request with uniform errors and JSON validation.
+
+    Uses the process-wide connection pool unless a client is injected, so a
+    single call no longer pays for its own TLS handshake (PERF-006).
+
+    A GET or HEAD is repeated after a transient refusal or a network failure,
+    because repeating a read cannot have a side effect. Every other method is
+    attempted exactly once and its error is raised to the caller, which is the
+    only layer that knows whether the platform may already have accepted the
+    write. Timeouts on a send are ambiguous by nature and must go through the
+    delivery journal, not through a retry here.
+    """
+
+    active_client = client if client is not None else shared_client()
+    upper_method = str(method or "").upper()
+    attempts = (
+        MAX_READ_ATTEMPTS
+        if retry_idempotent and upper_method in IDEMPOTENT_METHODS
+        else 1
+    )
+
+    for attempt in range(attempts):
+        try:
+            response = await active_client.request(
+                method,
+                url(path),
+                headers=headers(json_content=json is not None),
+                params=params,
+                json=json,
+                files=files,
+                timeout=timeout,
+                # None means "whatever this client was built with", so an
+                # injected client keeps its own redirect policy.
+                follow_redirects=(
+                    httpx.USE_CLIENT_DEFAULT
+                    if follow_redirects is None
+                    else follow_redirects
+                ),
+            )
+            raise_for_response(
+                response,
+                operation=operation,
+                account_id=account_id,
+            )
+        except (ApiFanslyTransientError, httpx.TransportError) as exc:
+            if attempt + 1 >= attempts:
+                raise
+            advertised = getattr(exc, "retry_after_seconds", None)
+            delay = _retry_delay(attempt, advertised)
+            print(
+                f"[APIFANSLY RETRY] operation={operation} "
+                f"attempt={attempt + 1}/{attempts} in {delay:.2f}s: {exc}"
+            )
+            await asyncio.sleep(delay)
+            continue
+
         try:
             payload = response.json()
         except Exception as exc:
@@ -498,9 +691,9 @@ async def request(
                 f"API Fansly {operation} returned a non-object response"
             )
         return payload
-    finally:
-        if owns_client:
-            await active_client.aclose()
+
+    # Unreachable: the loop either returns or re-raises on its last attempt.
+    raise ApiFanslyProtocolError(f"API Fansly {operation} produced no response")
 
 
 async def download_media(
@@ -517,30 +710,28 @@ async def download_media(
     if not is_fansly_cdn_url(cdn_url):
         raise ValueError("media download requires an HTTPS Fansly CDN URL")
 
-    owns_client = client is None
-    active_client = client or httpx.AsyncClient(follow_redirects=True)
-    try:
-        response = await active_client.post(
-            url("media/download"),
-            headers=headers(json_content=True),
-            json={"cdnUrl": cdn_url},
-            timeout=timeout,
+    active_client = client if client is not None else shared_client()
+    # No try/finally: the pool is process-wide and deliberately outlives this
+    # call, and an injected client belongs to whoever injected it.
+    response = await active_client.post(
+        url("media/download"),
+        headers=headers(json_content=True),
+        json={"cdnUrl": cdn_url},
+        timeout=timeout,
+        follow_redirects=True,
+    )
+    raise_for_response(response, operation="protected media download")
+    content_type = str(response.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        raise ApiFanslyProtocolError(
+            "API Fansly media download returned JSON instead of media: "
+            + response_message(response)
         )
-        raise_for_response(response, operation="protected media download")
-        content_type = str(response.headers.get("content-type") or "").lower()
-        if "application/json" in content_type:
-            raise ApiFanslyProtocolError(
-                "API Fansly media download returned JSON instead of media: "
-                + response_message(response)
-            )
-        if len(response.content) <= 1000:
-            raise ApiFanslyProtocolError(
-                "API Fansly media download returned an empty or truncated file"
-            )
-        return bytes(response.content)
-    finally:
-        if owns_client:
-            await active_client.aclose()
+    if len(response.content) <= 1000:
+        raise ApiFanslyProtocolError(
+            "API Fansly media download returned an empty or truncated file"
+        )
+    return bytes(response.content)
 
 
 async def send_message(

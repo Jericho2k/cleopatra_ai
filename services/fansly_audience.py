@@ -5,10 +5,14 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
 
 from core.supabase import get_supabase
-from services.apifansly import list_followers, list_subscribers, top_supporters
+from services.apifansly import (
+    client_scope as apifansly_client_scope,
+    list_followers,
+    list_subscribers,
+    top_supporters,
+)
 
 
 def _accounts_from_followers(response: Any) -> tuple[set[str], dict[str, dict]]:
@@ -62,7 +66,7 @@ async def sync_fansly_audience(
     follower_accounts: dict[str, dict] = {}
     subscriptions: dict[str, dict] = {}
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         cursor: str | None = None
         while True:
             response, cursor = await list_followers(

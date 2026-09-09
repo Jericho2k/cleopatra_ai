@@ -12,7 +12,6 @@ import re
 import time
 import uuid
 
-import httpx
 
 from ai.generator import generate_replies
 from ai.writer_router import select_writer_route
@@ -38,6 +37,7 @@ from services.ppv_delivery import create_ppv_approval_request
 from services.db_reliability import retry_transient_db_operation
 from services.apifansly import (
     headers as apifansly_headers,
+    shared_client as apifansly_shared_client,
     send_message as send_apifansly_message,
     sent_message_id,
     url as apifansly_url,
@@ -1224,14 +1224,17 @@ async def _debounced_auto_reply(
 
         if group_id and apifansly_account_id:
             try:
-                async with httpx.AsyncClient() as client:
-                    await client.post(
-                        apifansly_url(
-                            f"{apifansly_account_id}/chats/{str(group_id)}/typing"
-                        ),
-                        headers=apifansly_headers(),
-                        timeout=5,
-                    )
+                # PERF-006 — one pooled connection. This sits inside the
+                # human-like composition delay on the live reply path, so a
+                # per-call TLS handshake here was pure added latency before the
+                # fan sees anything.
+                await apifansly_shared_client().post(
+                    apifansly_url(
+                        f"{apifansly_account_id}/chats/{str(group_id)}/typing"
+                    ),
+                    headers=apifansly_headers(),
+                    timeout=5,
+                )
             except Exception:
                 pass
 

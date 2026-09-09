@@ -43,6 +43,7 @@ from core.pagination import fetch_all_rows
 from core.supabase import get_supabase
 from services.apifansly import (
     ApiFanslyAccountAccessError,
+    shared_client as apifansly_shared_client,
     list_account_list_members,
     list_account_lists,
 )
@@ -461,8 +462,7 @@ async def sync_fansly_lists(
     if not lists_sync_enabled():
         return {"status": "disabled"}
 
-    owns_client = client is None
-    active_client = client or httpx.AsyncClient()
+    active_client = client if client is not None else apifansly_shared_client()
     try:
         remote_lists = await fetch_remote_lists(account_id, client=active_client)
         remote_members: dict[str, list[str]] = {}
@@ -486,9 +486,6 @@ async def sync_fansly_lists(
     except Exception as exc:
         await asyncio.to_thread(_record_failure, creator_id, str(exc))
         raise
-    finally:
-        if owns_client:
-            await active_client.aclose()
 
     counters = await asyncio.to_thread(
         _reconcile,

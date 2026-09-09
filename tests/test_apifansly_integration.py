@@ -67,9 +67,9 @@ def test_account_access_error_requires_reconnect():
 def test_other_upstream_errors_preserve_http_status():
     request = httpx.Request("GET", f"{DEFAULT_BASE_URL}/account/chats")
     response = httpx.Response(
-        503,
+        400,
         request=request,
-        json={"message": "temporarily unavailable"},
+        json={"message": "malformed cursor"},
     )
 
     with pytest.raises(httpx.HTTPStatusError, match="chat synchronization"):

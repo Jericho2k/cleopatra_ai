@@ -25,7 +25,11 @@ from services.followup_lifecycle import (
     payment_expires_at,
     pending_reference,
 )
-from services.apifansly import request as apifansly_request, response_data
+from services.apifansly import (
+    ApiFanslyTransientError,
+    request as apifansly_request,
+    response_data,
+)
 from services.session_lifecycle import mark_step_declined
 from services.vault_operations import normalize_media_ids
 
@@ -254,11 +258,17 @@ async def _verification_unavailable(
     error: Exception,
 ) -> PPVReconcileResult:
     """Bound verification failures and stop automation when truth is unknown."""
-    status_code = (
-        error.response.status_code
-        if isinstance(error, httpx.HTTPStatusError) and error.response is not None
-        else None
-    )
+    # A transient API Fansly refusal now arrives as ApiFanslyTransientError
+    # rather than as a raw HTTPStatusError, so read the status from either.
+    # Without this the status would read as None and the diagnostic message
+    # would lose the code, though the permanent/transient verdict below is the
+    # same either way.
+    if isinstance(error, ApiFanslyTransientError):
+        status_code: int | None = error.status_code
+    elif isinstance(error, httpx.HTTPStatusError) and error.response is not None:
+        status_code = error.response.status_code
+    else:
+        status_code = None
     failures = int(pending.get("verification_failures") or 0) + 1
     message = f"purchase verification HTTP {status_code}" if status_code else type(error).__name__
     pending.update({

@@ -62,6 +62,8 @@ from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
     account_media_prices,
+    client_scope as apifansly_client_scope,
+    close_shared_client as close_apifansly_client,
     current_account as apifansly_current_account,
     download_media as apifansly_download_media,
     headers as apifansly_headers,
@@ -158,7 +160,7 @@ async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id:
     import httpx
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with apifansly_client_scope() as client:
             cursor = None
             for _ in range(5):  # check up to 5 pages
                 chats, accounts, cursor = await apifansly_list_chats(
@@ -1068,6 +1070,11 @@ async def lifespan(app: FastAPI):
     if model_availability_task:
         model_availability_task.cancel()
 
+    # PERF-006 — the API Fansly connection pool is process-wide, so shutdown is
+    # the only place that closes it. Sockets are released here rather than at
+    # the end of every individual call.
+    await close_apifansly_client()
+
 
 app = FastAPI(lifespan=lifespan)
 
@@ -1254,7 +1261,7 @@ async def connect_creator(req: ConnectCreatorRequest, request: Request) -> dict:
     )
     import httpx
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         response = await client.post(
             apifansly_url("connect"),
             headers=apifansly_headers(json_content=True),
@@ -1343,7 +1350,7 @@ async def connect_creator_2fa(req: Connect2FARequest, request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Missing dashboard user session")
     import httpx
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         response = await client.post(
             apifansly_url("verify-2fa"),
             headers=apifansly_headers(json_content=True),
@@ -1865,7 +1872,7 @@ async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
                 "retry_after_seconds": retry_after_seconds,
             }
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         result = await _sync_recent_fan_messages(
             creator_id=creator_id,
             fan_id=fan_id,
@@ -2000,7 +2007,7 @@ async def sync_chats(
             if row.get("platform_fan_id")
         }
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         all_chats = []
         account_lookup: dict[str, dict] = {}
         cursor = None
@@ -2213,7 +2220,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
 
     print(f"[LOAD HISTORY URL] apifansly_id={apifansly_id} group_id={group_id}")
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         while True:
             messages, account_media_batch, cursor = (
                 await apifansly_list_chat_messages(
@@ -2362,7 +2369,7 @@ async def mark_all_read(creator_id: str) -> dict:
     if not apifansly_id:
         return {"status": "error"}
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         await client.post(
             apifansly_url(f"{apifansly_id}/chats/mark-as-read"),
             headers=apifansly_headers(),
@@ -2418,7 +2425,7 @@ async def sync_vault(creator_id: str) -> dict:
     )
 
     apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         # Step 1: Get all albums
         albums = await apifansly_list_vault_albums(
             str(apifansly_id),
@@ -2565,7 +2572,7 @@ async def _run_vault_sync(creator_id: str) -> None:
         )
         existing_ids = await _vault_existing_media_ids(creator_id)
 
-        async with httpx.AsyncClient() as client:
+        async with apifansly_client_scope() as client:
             albums = await apifansly_list_vault_albums(
                 str(apifansly_id),
                 client=client,
@@ -2784,7 +2791,7 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
     filename = file.filename
     mimetype = file.content_type
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         upload_resp = await client.post(
             apifansly_url(f"{apifansly_id}/media/upload"),
             headers=apifansly_headers(),
@@ -4207,7 +4214,7 @@ async def recategorize_item(item_id: str) -> dict:
 async def get_media_url(account_id: str, content_id: str) -> dict:
     import httpx
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         response = await client.get(
             apifansly_url(f"{account_id}/media/{content_id}"),
             headers=apifansly_headers(),
