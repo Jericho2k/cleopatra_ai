@@ -738,8 +738,6 @@ async def _debounced_auto_reply(
         if getattr(fan_profile, "needs_human_review", False):
             print(f"[AUTO REPLY] fan={fan_id} is frozen for human review — skipping auto-reply")
             return
-        fan_tier = getattr(fan_profile, "spend_tier", "cold") or "cold"
-
         # Check for a pending tip and clear it atomically before building context
         pending_tip: dict | None = None
         try:

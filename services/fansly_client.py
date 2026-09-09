@@ -164,7 +164,7 @@ class FanslyClient:
 
                 return data["response"]
 
-            except (httpx.ConnectError, httpx.TimeoutException) as e:
+            except (httpx.ConnectError, httpx.TimeoutException):
                 if attempt == retries - 1:
                     raise
                 await asyncio.sleep(5 * (2 ** attempt))

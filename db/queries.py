@@ -516,7 +516,6 @@ async def get_ppv_offers(creator_id: str) -> list[dict]:
             description = row.get("ai_description", "")
             category = row.get("content_category", "")
             outfit = row.get("scene_outfit", "")
-            location = row.get("scene_location", "")
             price_min = row.get("price_min") or 15
             price_max = row.get("price_max") or 50
             # Use lower third of range as default — session planner will set actual price

@@ -10,7 +10,6 @@ from typing import Any
 from db.affordability_queries import get_affordability_events
 from db.pricing_policy_queries import get_effective_price_learning_policy
 from db.price_learning_queries import (
-    get_price_learning_policy,
     get_price_learning_profile,
     insert_price_learning_audit,
     save_price_learning_profile,

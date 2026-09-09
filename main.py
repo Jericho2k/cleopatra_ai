@@ -10,12 +10,11 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sse_starlette.sse import EventSourceResponse
 
 from ai.generator import generate_replies
 from ai.prompt_builder import build_prompt
@@ -161,7 +160,6 @@ _VAULT_ACCESS_DENIED_RETRY_SECONDS = max(
 
 async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id: str) -> str | None:
     """Find the group_id for a fan by scanning recent chats."""
-    import httpx
 
     try:
         async with apifansly_client_scope() as client:
@@ -1280,7 +1278,6 @@ async def connect_creator(req: ConnectCreatorRequest, request: Request) -> dict:
         f"[CONNECT] creator_id={req.creator_id or 'new'} "
         f"name={req.name} country={req.countryCode}"
     )
-    import httpx
 
     async with apifansly_client_scope() as client:
         response = await client.post(
@@ -1369,7 +1366,6 @@ async def connect_creator_2fa(req: Connect2FARequest, request: Request) -> dict:
     operator_id = dashboard_user_id(request) or req.user_id
     if not operator_id:
         raise HTTPException(status_code=401, detail="Missing dashboard user session")
-    import httpx
 
     async with apifansly_client_scope() as client:
         response = await client.post(
@@ -1823,7 +1819,6 @@ async def _sync_recent_fan_messages(
 )
 async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
     """Low-cost active-chat reconciliation for managed API Fansly accounts."""
-    import httpx
 
     db = get_supabase()
     async def _load_bindings():
@@ -1986,7 +1981,6 @@ async def sync_chats(
     incremental: bool = False,
     force: bool = False,
 ) -> dict:
-    import httpx
 
     db = get_supabase()
     creator_row = await asyncio.to_thread(
@@ -2245,7 +2239,6 @@ async def get_apifansly_usage() -> dict:
     dependencies=[Depends(require_creator_fan_access)],
 )
 async def load_fan_history(creator_id: str, fan_id: str) -> dict:
-    import httpx
 
     db = get_supabase()
 
@@ -2427,7 +2420,6 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
     dependencies=[Depends(require_creator_path_access)],
 )
 async def mark_all_read(creator_id: str) -> dict:
-    import httpx
 
     db = get_supabase()
     creator_row = await asyncio.to_thread(
@@ -2485,7 +2477,6 @@ def _vault_media_visual_urls(media: dict) -> tuple[str, str]:
     dependencies=[Depends(require_creator_path_access)],
 )
 async def sync_vault(creator_id: str) -> dict:
-    import httpx
 
     db = get_supabase()
     creator_row = await asyncio.to_thread(
@@ -2629,7 +2620,6 @@ async def _vault_existing_media_ids(creator_id: str) -> set[str]:
 
 
 async def _run_vault_sync(creator_id: str) -> None:
-    import httpx
 
     db = get_supabase()
     async with VAULT_GATE.acquire(creator_id=creator_id, kind="vault_sync"):
@@ -2645,7 +2635,6 @@ async def _run_vault_sync(creator_id: str) -> None:
 async def _run_vault_sync_locked(creator_id: str, db) -> None:
     """The sync itself. Runs only while holding one creator-level vault slot."""
 
-    import httpx
 
     try:
         creator_row = await asyncio.to_thread(
@@ -2860,7 +2849,6 @@ async def _run_vault_sync_locked(creator_id: str, db) -> None:
     dependencies=[Depends(require_creator_path_access)],
 )
 async def upload_vault_media(creator_id: str, request: Request) -> dict:
-    import httpx
 
     db = get_supabase()
     creator_row = await asyncio.to_thread(
@@ -4432,7 +4420,6 @@ async def recategorize_item(item_id: str) -> dict:
     dependencies=[Depends(require_account_path_access)],
 )
 async def get_media_url(account_id: str, content_id: str) -> dict:
-    import httpx
 
     async with apifansly_client_scope() as client:
         response = await client.get(
@@ -5931,7 +5918,6 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
 
     summary = fan_data.get("ai_summary") or {}
 
-    from datetime import datetime
 
     # Append to the existing history rather than replacing it. A non-list value
     # would otherwise be silently discarded, so refuse instead of destroying it.
