@@ -1993,19 +1993,39 @@ async def sync_chats(
         if not bool(claim.data):
             return {"status": "cooldown", "synced": 0, "new_chats": 0}
 
-    existing_platform_ids: set[str] = set()
-    if incremental:
-        existing = await asyncio.to_thread(
-            lambda: db.table("fans")
-            .select("platform_fan_id")
-            .eq("creator_id", creator_id)
-            .execute()
-        )
-        existing_platform_ids = {
-            str(row.get("platform_fan_id"))
-            for row in (existing.data or [])
-            if row.get("platform_fan_id")
-        }
+    # API-003 + FE-006 — one paginated read of the creator's fans, used for
+    # three things that each used to cost their own round trips:
+    #
+    #  * the complete set of known platform ids, so the incremental early-break
+    #    can actually trigger. This select had no .range(), so PostgREST capped
+    #    it at 1,000 rows and page_ids.issubset(...) was almost never true for a
+    #    creator past that. Those creators re-paginated the entire Fansly chat
+    #    list every reconcile pass, forever.
+    #
+    #  * the persisted display name and group binding, so an UPDATE is issued
+    #    only when a value actually changed. Every UPDATE is delivered to every
+    #    subscribed dashboard as a realtime event, so 2,000 unchanged chats used
+    #    to mean 2,000 writes and a 2,000-event burst every pass (FE-006).
+    #
+    #  * the fan's row id, replacing a per-chat get_fan() — which was a
+    #    select("*") pulling every JSONB column to read one uuid.
+    from core.pagination import fetch_all_rows_async
+
+    existing_fans = await fetch_all_rows_async(
+        lambda start, end: db.table("fans")
+        .select("id, platform_fan_id, fansly_group_id, display_name, avatar_url")
+        .eq("creator_id", creator_id)
+        # A unique total order: pages cannot drop or repeat a row.
+        .order("id")
+        .range(start, end)
+        .execute()
+    )
+    fans_by_platform_id: dict[str, dict] = {}
+    for row in existing_fans:
+        platform_id_value = str(row.get("platform_fan_id") or "")
+        if platform_id_value:
+            fans_by_platform_id[platform_id_value] = row
+    existing_platform_ids: set[str] = set(fans_by_platform_id)
 
     async with apifansly_client_scope() as client:
         all_chats = []
@@ -2059,6 +2079,7 @@ async def sync_chats(
                 break
 
         synced = 0
+        updated = 0
         new_chats = 0
         new_messages = 0
         for chat in all_chats:
@@ -2078,22 +2099,44 @@ async def sync_chats(
             if not platform_fan_id or not group_id:
                 continue
 
-            fan = await get_fan(creator_id, platform_fan_id)
-            is_new_chat = fan is None
-            if not fan:
-                fan = await create_fan(creator_id, platform_fan_id, fan_name)
+            known = fans_by_platform_id.get(platform_fan_id)
+            is_new_chat = known is None
+            if known is None:
+                created = await create_fan(creator_id, platform_fan_id, fan_name)
                 new_chats += 1
+                # create_fan writes the display name and nothing else, so the
+                # binding below is a genuine change for a new fan.
+                known = {
+                    "id": str(created.id),
+                    "platform_fan_id": platform_fan_id,
+                    "fansly_group_id": None,
+                    "display_name": fan_name,
+                    "avatar_url": None,
+                }
+                fans_by_platform_id[platform_fan_id] = known
 
-            update_payload = {
-                "fansly_group_id": group_id,
-                "display_name": fan_name,
-            }
-            if avatar_url:
+            fan_row_id = str(known["id"])
+
+            # Compare against what is already stored rather than writing
+            # unconditionally. The values are already in hand, so this costs no
+            # extra read.
+            update_payload: dict[str, str] = {}
+            if str(known.get("fansly_group_id") or "") != group_id:
+                update_payload["fansly_group_id"] = group_id
+            if str(known.get("display_name") or "") != fan_name:
+                update_payload["display_name"] = fan_name
+            if avatar_url and str(known.get("avatar_url") or "") != avatar_url:
                 update_payload["avatar_url"] = avatar_url
 
-            await asyncio.to_thread(
-                lambda fid=fan.id, p=update_payload: db.table("fans").update(p).eq("id", fid).execute()
-            )
+            if update_payload:
+                await asyncio.to_thread(
+                    lambda fid=fan_row_id, p=update_payload: db.table("fans")
+                    .update(p)
+                    .eq("id", fid)
+                    .execute()
+                )
+                known.update(update_payload)
+                updated += 1
             synced += 1
             platform_last_message_id = str(
                 chat.get("lastMessageId") or ""
@@ -2108,7 +2151,7 @@ async def sync_chats(
                 try:
                     recent = await _sync_recent_fan_messages(
                         creator_id=creator_id,
-                        fan_id=str(fan.id),
+                        fan_id=fan_row_id,
                         account_id=str(apifansly_id),
                         creator_platform_id=creator_platform_id,
                         group_id=group_id,
@@ -2126,7 +2169,7 @@ async def sync_chats(
                 except Exception as exc:
                     print(
                         f"[SYNC MESSAGES ERROR] creator={creator_id} "
-                        f"fan={fan.id} group={group_id}: {exc}"
+                        f"fan={fan_row_id} group={group_id}: {exc}"
                     )
 
         await _stamp_vault_op(creator_id, "last_chat_reconcile_at")
@@ -2156,12 +2199,13 @@ async def sync_chats(
         )
         print(
             f"[SYNC CHATS] incremental={incremental} total_chats={len(all_chats)} "
-            f"synced={synced} new={new_chats}"
+            f"synced={synced} updated={updated} new={new_chats}"
         )
         return {
             "status": "ok",
             "mode": "incremental" if incremental else "full",
             "synced": synced,
+            "updated": updated,
             "new_chats": new_chats,
             "new_messages": new_messages,
             "audience": audience_sync,

@@ -53,6 +53,7 @@ create table public.fans (
     creator_id uuid not null references public.creators(id) on delete cascade,
     platform_fan_id text null,
     display_name text null,
+    avatar_url text null,
     fansly_group_id text null,
     auto_mode boolean null,
     total_spent integer not null default 0,
