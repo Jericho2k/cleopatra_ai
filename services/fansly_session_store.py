@@ -7,13 +7,12 @@ Fires Telegram alerts when sessions die.
 """
 
 import logging
-import os
 import time
 from typing import Optional, Callable
 
 from cryptography.fernet import Fernet
 
-from .fansly_client import FanslyClient, SessionExpiredError
+from .fansly_client import FanslyClient
 
 logger = logging.getLogger(__name__)
 

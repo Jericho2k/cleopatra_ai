@@ -4,6 +4,7 @@ Pure string assembly only — no I/O, DB, or API calls.
 
 from datetime import datetime
 
+from ai.prompt_blocks import cacheable_system_blocks
 from ai.voice_calibration import render_voice_calibration
 from models.schemas import ConversationContext, StageType
 
@@ -691,20 +692,26 @@ WELCOME MESSAGE (your opening style):
             "This is what they paid for, deliver it fully."
         )
 
-    # Build the fan context block
+    # ---- Durable fan context first (COST-002c) ----
+    # These blocks split into two groups by what they actually depend on. The
+    # profile items below are appended to as facts are learned; they are the
+    # same text turn after turn. The group after the transcript is recomputed by
+    # the affordability model, the price learner, the director and the session
+    # planner on every single inbound message.
+    #
+    # They used to be assembled the other way round, so one recomputed price
+    # band truncated the shared prefix in front of the whole durable profile
+    # *and* the transcript, dropping reusable prefix from 71% to 49% whenever
+    # the intelligence flags were on (MEASURED, and reproduced by
+    # scripts/measure_prompt_cache.py). Wording is untouched — only the order
+    # moved — so the model sees the same facts, and the volatile group still
+    # sits ahead of stage, situation and the newest message.
     fan_context_parts = []
     if learned_intelligence_block:
+        # Append-only: a fact is added when one is learned and never rewritten
+        # between turns, so this belongs with the profile rather than with the
+        # values the analyzer recomputes.
         fan_context_parts.append(learned_intelligence_block)
-    if affordability_block:
-        fan_context_parts.append(affordability_block)
-    if price_learning_block:
-        fan_context_parts.append(price_learning_block)
-    if conversation_director_block:
-        fan_context_parts.append(conversation_director_block)
-    if session_strategy_block:
-        fan_context_parts.append(session_strategy_block)
-    if expression_guidance_block:
-        fan_context_parts.append(expression_guidance_block)
     if notes:
         fan_context_parts.append(f"Summary: {notes}")
     if member_note:
@@ -748,7 +755,36 @@ WELCOME MESSAGE (your opening style):
             f"total spend: ${total_spent_cents / 100:g}. {lifecycle_guidance}"
         )
 
+    # ---- Blocks recomputed on every single message ----
+    # Same wording, same blocks, moved behind the transcript so that one
+    # recomputed price band or director phase no longer truncates the shared
+    # prefix in front of the conversation history. Each carries its own header
+    # already, so they read identically wherever they sit, and they still
+    # precede stage, situation, the commercial decision and the newest message —
+    # everything that was already treated as volatile.
+    live_state_parts = []
+    if affordability_block:
+        live_state_parts.append(affordability_block)
+    if price_learning_block:
+        live_state_parts.append(price_learning_block)
+    if conversation_director_block:
+        live_state_parts.append(conversation_director_block)
+    if session_strategy_block:
+        live_state_parts.append(session_strategy_block)
+    if expression_guidance_block:
+        # Expression calibration is derived from the director and the session
+        # strategy. With neither configured it renders one constant paragraph
+        # for every turn of every conversation, so it belongs in front of the
+        # transcript; with either of them live it changes per message and
+        # belongs behind it. Placing it by what it actually depends on keeps the
+        # flags-off deployment — today's default — from losing prefix it had.
+        if conversation_director_block or session_strategy_block:
+            live_state_parts.append(expression_guidance_block)
+        else:
+            fan_context_parts.append(expression_guidance_block)
+
     fan_context = "\n".join(fan_context_parts)
+    live_state_block = "\n".join(live_state_parts)
 
     # The actual recent back-and-forth. Without this the model writes every reply
     # effectively blind to the conversation — working only from the analyzer's
@@ -779,6 +815,8 @@ WHAT YOU KNOW ABOUT THIS FAN:
 {fan_context if fan_context else "New fan — no profile yet. Focus on learning about them."}{missing_details_block}
 
 {transcript_block}
+
+{live_state_block}
 
 CONVERSATION STAGE: {stage.value}
 {stage_instruction}
@@ -1040,15 +1078,7 @@ Return ONLY a JSON array of 3 strings. No markdown.
     return [
         {
             "role": "system",
-            "content": [
-                {
-                    "type": "text",
-                    "text": stable_system,
-                    "cache_control": {"type": "ephemeral"},
-                },
-            ] + (
-                [{"type": "text", "text": volatile_system}] if volatile_system else []
-            ),
+            "content": cacheable_system_blocks(stable_system, volatile_system),
         },
         {"role": "user", "content": user_prompt},
     ]

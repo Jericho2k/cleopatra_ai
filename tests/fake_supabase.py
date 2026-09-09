@@ -88,6 +88,11 @@ class _FakeQuery:
         self._record.filters.append(("is", column, value))
         return self
 
+    @property
+    def not_(self):
+        """PostgREST's negation prefix: ``.not_.is_("col", "null")``."""
+        return _NegatedFilters(self)
+
     def order(self, column: str, desc: bool = False, **_kwargs):
         self._record.orders.append((column, desc))
         return self
@@ -140,6 +145,13 @@ class _FakeQuery:
                 rows = [row for row in rows if str(row.get(column)) in wanted]
             elif kind == "is" and value in (None, "null"):
                 rows = [row for row in rows if row.get(column) is None]
+            elif kind == "not.is" and value in (None, "null"):
+                rows = [row for row in rows if row.get(column) is not None]
+            elif kind == "not.eq":
+                rows = [row for row in rows if str(row.get(column)) != str(value)]
+            elif kind == "not.in":
+                unwanted = {str(item) for item in value}
+                rows = [row for row in rows if str(row.get(column)) not in unwanted]
         return rows
 
     def execute(self):
@@ -227,3 +239,27 @@ class _FakeQuery:
             }:
                 return False
         return True
+
+
+class _NegatedFilters:
+    """The object PostgREST's ``.not_`` prefix returns.
+
+    It only records the negation and hands the query builder straight back, so
+    ``.not_.is_(...)`` reads and chains exactly as it does against the real
+    client.
+    """
+
+    def __init__(self, query: "_FakeQuery"):  # noqa: UP037
+        self._query = query
+
+    def is_(self, column: str, value):
+        self._query._record.filters.append(("not.is", column, value))
+        return self._query
+
+    def eq(self, column: str, value):
+        self._query._record.filters.append(("not.eq", column, value))
+        return self._query
+
+    def in_(self, column: str, values):
+        self._query._record.filters.append(("not.in", column, list(values)))
+        return self._query

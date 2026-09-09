@@ -40,6 +40,15 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
+      # Ruff was already installed here and never run, so it enforced nothing.
+      # This is a deliberately narrow FATAL subset, not a style gate: syntax and
+      # runtime errors (E9), always-wrong comparisons and f-strings (F63, F7),
+      # undefined names (F82), and dead imports/redefinitions/locals (F401,
+      # F811, F841) — the last three because they are how a half-finished
+      # refactor hides. Formatting and the hundreds of style warnings in this
+      # codebase stay out of scope; widening this is its own piece of work.
+      - name: Ruff (fatal subset)
+        run: ruff check --select E9,F63,F7,F82,F401,F811,F841 .
       # Fail fast and unambiguously if the schema pipeline itself is broken,
       # before the rest of the suite muddies the output.
       - name: Schema pipeline (base schema + ordered migrations)

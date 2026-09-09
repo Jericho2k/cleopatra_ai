@@ -16,8 +16,11 @@ from services import apifansly, fansly_lists
 from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyProtocolError,
+    ApiFanslyTransientError,
+    MAX_READ_ATTEMPTS,
     list_account_list_members,
     list_account_lists,
+    send_message,
 )
 
 
@@ -199,15 +202,61 @@ def test_access_errors_reuse_the_shared_reconnect_exception(status):
 
 
 def test_server_errors_surface_rather_than_returning_an_empty_list():
+    """A 5xx must never be mistaken for "this account owns no lists".
+
+    It now arrives as ApiFanslyTransientError rather than a raw
+    HTTPStatusError, because the server told us it did not process the request
+    and that is a materially different fact from a rejected key. What matters
+    for list mirroring is unchanged: the failure surfaces, and a truncated or
+    empty result is never treated as authoritative.
+    """
+
+    attempts = 0
+
     def handler(request):
+        nonlocal attempts
+        attempts += 1
         return httpx.Response(500, json={"error": "boom"})
 
     async def run():
         async with _client(handler) as client:
             await list_account_lists("acct-1", client=client)
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(ApiFanslyTransientError) as exc:
         asyncio.run(run())
+
+    assert exc.value.status_code == 500
+    # Reads are idempotent, so a bounded retry happened before giving up.
+    assert attempts == MAX_READ_ATTEMPTS
+
+
+def test_a_rejected_write_is_never_retried():
+    """Exactly-once sends must not be repeated by the transport layer.
+
+    A retry here would be invisible to the delivery journal, so a 503 on a
+    message send has to reach the caller after exactly one attempt.
+    """
+
+    attempts = 0
+
+    def handler(request):
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503, json={"error": "busy"})
+
+    async def run():
+        async with _client(handler) as client:
+            await send_message(
+                "acct-1",
+                "group-1",
+                content="hi",
+                client=client,
+            )
+
+    with pytest.raises(ApiFanslyTransientError):
+        asyncio.run(run())
+
+    assert attempts == 1
 
 
 def test_a_missing_envelope_is_a_protocol_error_not_an_empty_result():

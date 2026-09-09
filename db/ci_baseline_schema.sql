@@ -53,6 +53,7 @@ create table public.fans (
     creator_id uuid not null references public.creators(id) on delete cascade,
     platform_fan_id text null,
     display_name text null,
+    avatar_url text null,
     fansly_group_id text null,
     auto_mode boolean null,
     total_spent integer not null default 0,
@@ -172,6 +173,10 @@ create table public.creator_vault_media (
     id uuid primary key default gen_random_uuid(),
     creator_id uuid not null references public.creators(id) on delete cascade,
     media_id text not null,
+    -- The vault browser groups by this and the album-summary function reads it.
+    -- Like fans.avatar_url, it exists only in the live project; the fixture
+    -- carries it so a migration that references it can be applied in CI.
+    album_title text null,
     created_at timestamptz not null default now()
 );
 

@@ -13,6 +13,7 @@ from db.queries import (
 )
 from services.db_reliability import retry_transient_db_operation
 from services.apifansly import (
+    ApiFanslyTransientError,
     delete_message as delete_apifansly_message,
     list_chat_messages,
     ppv_delivery_evidence,
@@ -225,6 +226,25 @@ async def send_locked_ppv(
             media_ids=exact_media_ids,
             price_dollars=price_dollars,
         )
+    except ApiFanslyTransientError as exc:
+        # The platform answered with a rate limit or an unavailability status,
+        # which means it did not process the send. Nothing is in the fan's chat,
+        # so the claim is released and the scheduled action retries on its own
+        # backoff. Freezing here — which is what used to happen, because every
+        # failure was one `except Exception` — took a fan out of automation for
+        # a 503 that cleared by itself, and needed an operator to undo.
+        #
+        # A timeout is deliberately NOT in this branch. It is indistinguishable
+        # from a send the platform accepted, so it still falls through to the
+        # freeze below and is resolved through the delivery journal.
+        await transition_delivery(reference, "failed", error=str(exc))
+        print(
+            f"[PPV SEND TRANSIENT] fan={fan_id} status={exc.status_code} "
+            "not freezing: the platform confirmed it did not process the send"
+        )
+        raise PPVDeliveryError(
+            f"platform temporarily unavailable for PPV delivery: {exc}"
+        ) from exc
     except Exception as exc:
         await transition_delivery(reference, "failed", error=str(exc))
         await freeze_fan_for_review(fan_id, "ppv_send_failed")

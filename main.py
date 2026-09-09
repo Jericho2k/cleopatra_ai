@@ -10,12 +10,11 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from sse_starlette.sse import EventSourceResponse
 
 from ai.generator import generate_replies
 from ai.prompt_builder import build_prompt
@@ -23,7 +22,9 @@ from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from core.action_telemetry import stage as action_stage
+from core.pagination import fetch_all_rows_async
 from core.supabase import get_supabase
+from core.vault_gate import VAULT_GATE
 from core.webhooks import valid_hmac_sha256_signature
 from core.tenancy import (
     require_account_path_access,
@@ -62,6 +63,8 @@ from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
     account_media_prices,
+    client_scope as apifansly_client_scope,
+    close_shared_client as close_apifansly_client,
     current_account as apifansly_current_account,
     download_media as apifansly_download_media,
     headers as apifansly_headers,
@@ -137,7 +140,9 @@ from services.vault_metadata import (
 _processed_messages: set = set()
 _vault_sync_state: dict = {}
 _vault_sync_retry_after: dict[str, float] = {}
-_VAULT_SYNC_ACTIVE_STATUSES = {"running", "categorizing_new"}
+# "queued" is an active status: a creator waiting for a vault slot must not
+# be started a second time by the scheduler or an operator (VAULT-001).
+_VAULT_SYNC_ACTIVE_STATUSES = {"queued", "running", "categorizing_new"}
 _protected_video_download_gate = asyncio.Semaphore(1)
 _active_chat_binding_retry_after: dict[str, float] = {}
 _active_chat_binding_tasks: dict[str, asyncio.Task] = {}
@@ -155,10 +160,9 @@ _VAULT_ACCESS_DENIED_RETRY_SECONDS = max(
 
 async def get_or_fetch_group_id(apifansly_id: str, platform_fan_id: str, fan_id: str) -> str | None:
     """Find the group_id for a fan by scanning recent chats."""
-    import httpx
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with apifansly_client_scope() as client:
             cursor = None
             for _ in range(5):  # check up to 5 pages
                 chats, accounts, cursor = await apifansly_list_chats(
@@ -979,25 +983,35 @@ async def chat_reconciliation_scheduler():
             import time
 
             db = get_supabase()
-            creators_result, auto_fans_result = await asyncio.gather(
-                asyncio.to_thread(
-                    lambda: db.table("creators")
-                    .select("id, apifansly_account_id, auto_mode")
-                    .not_.is_("apifansly_account_id", "null")
-                    .execute()
-                ),
-                asyncio.to_thread(
-                    lambda: db.table("fans")
-                    .select("creator_id")
-                    .eq("auto_mode", True)
-                    .execute()
-                ),
+            creators_result = await asyncio.to_thread(
+                lambda: db.table("creators")
+                .select("id, apifansly_account_id, auto_mode")
+                .not_.is_("apifansly_account_id", "null")
+                .execute()
             )
-            auto_fan_creators = {
-                str(row.get("creator_id") or "")
-                for row in (auto_fans_result.data or [])
-                if row.get("creator_id")
-            }
+
+            # This used to read every auto-mode fan in the DEPLOYMENT — no
+            # creator filter — and build a set of creator ids from it. PostgREST
+            # capped that globally at 1,000 rows, so once enough fans had auto
+            # mode on anywhere, creators whose fans fell past the cap were
+            # misread as having none and were dropped to the 30-minute idle
+            # reconcile interval instead of 10.
+            #
+            # The question is only ever "does this creator have at least one",
+            # so ask it that way. One bounded existence check, and only for a
+            # creator that is due and whose own auto_mode has not already
+            # answered it.
+            async def _has_auto_fan(creator_id: str) -> bool:
+                probe = await asyncio.to_thread(
+                    lambda cid=creator_id: db.table("fans")
+                    .select("id")
+                    .eq("creator_id", cid)
+                    .eq("auto_mode", True)
+                    .limit(1)
+                    .execute()
+                )
+                return bool(probe.data)
+
             now = time.monotonic()
             due: list[dict] = []
             active_creator_ids: set[str] = set()
@@ -1009,10 +1023,17 @@ async def chat_reconciliation_scheduler():
                 if now < _chat_reconcile_due_at.get(creator_id, 0):
                     continue
                 due.append(creator)
+                creator_auto_mode = bool(creator.get("auto_mode"))
                 _chat_reconcile_due_at[creator_id] = now + (
                     _chat_reconcile_interval_seconds(
-                        creator_auto_mode=bool(creator.get("auto_mode")),
-                        has_auto_fan=creator_id in auto_fan_creators,
+                        creator_auto_mode=creator_auto_mode,
+                        # Creator-level auto mode already selects the active
+                        # interval, so the probe is skipped entirely there.
+                        has_auto_fan=(
+                            False
+                            if creator_auto_mode
+                            else await _has_auto_fan(creator_id)
+                        ),
                     )
                 )
             for creator_id in list(_chat_reconcile_due_at):
@@ -1067,6 +1088,11 @@ async def lifespan(app: FastAPI):
         chat_reconcile_task.cancel()
     if model_availability_task:
         model_availability_task.cancel()
+
+    # PERF-006 — the API Fansly connection pool is process-wide, so shutdown is
+    # the only place that closes it. Sockets are released here rather than at
+    # the end of every individual call.
+    await close_apifansly_client()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1252,9 +1278,8 @@ async def connect_creator(req: ConnectCreatorRequest, request: Request) -> dict:
         f"[CONNECT] creator_id={req.creator_id or 'new'} "
         f"name={req.name} country={req.countryCode}"
     )
-    import httpx
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         response = await client.post(
             apifansly_url("connect"),
             headers=apifansly_headers(json_content=True),
@@ -1341,9 +1366,8 @@ async def connect_creator_2fa(req: Connect2FARequest, request: Request) -> dict:
     operator_id = dashboard_user_id(request) or req.user_id
     if not operator_id:
         raise HTTPException(status_code=401, detail="Missing dashboard user session")
-    import httpx
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         response = await client.post(
             apifansly_url("verify-2fa"),
             headers=apifansly_headers(json_content=True),
@@ -1795,7 +1819,6 @@ async def _sync_recent_fan_messages(
 )
 async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
     """Low-cost active-chat reconciliation for managed API Fansly accounts."""
-    import httpx
 
     db = get_supabase()
     async def _load_bindings():
@@ -1865,7 +1888,7 @@ async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
                 "retry_after_seconds": retry_after_seconds,
             }
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         result = await _sync_recent_fan_messages(
             creator_id=creator_id,
             fan_id=fan_id,
@@ -1958,7 +1981,6 @@ async def sync_chats(
     incremental: bool = False,
     force: bool = False,
 ) -> dict:
-    import httpx
 
     db = get_supabase()
     creator_row = await asyncio.to_thread(
@@ -1986,21 +2008,41 @@ async def sync_chats(
         if not bool(claim.data):
             return {"status": "cooldown", "synced": 0, "new_chats": 0}
 
-    existing_platform_ids: set[str] = set()
-    if incremental:
-        existing = await asyncio.to_thread(
-            lambda: db.table("fans")
-            .select("platform_fan_id")
-            .eq("creator_id", creator_id)
-            .execute()
-        )
-        existing_platform_ids = {
-            str(row.get("platform_fan_id"))
-            for row in (existing.data or [])
-            if row.get("platform_fan_id")
-        }
+    # API-003 + FE-006 — one paginated read of the creator's fans, used for
+    # three things that each used to cost their own round trips:
+    #
+    #  * the complete set of known platform ids, so the incremental early-break
+    #    can actually trigger. This select had no .range(), so PostgREST capped
+    #    it at 1,000 rows and page_ids.issubset(...) was almost never true for a
+    #    creator past that. Those creators re-paginated the entire Fansly chat
+    #    list every reconcile pass, forever.
+    #
+    #  * the persisted display name and group binding, so an UPDATE is issued
+    #    only when a value actually changed. Every UPDATE is delivered to every
+    #    subscribed dashboard as a realtime event, so 2,000 unchanged chats used
+    #    to mean 2,000 writes and a 2,000-event burst every pass (FE-006).
+    #
+    #  * the fan's row id, replacing a per-chat get_fan() — which was a
+    #    select("*") pulling every JSONB column to read one uuid.
+    from core.pagination import fetch_all_rows_async
 
-    async with httpx.AsyncClient() as client:
+    existing_fans = await fetch_all_rows_async(
+        lambda start, end: db.table("fans")
+        .select("id, platform_fan_id, fansly_group_id, display_name, avatar_url")
+        .eq("creator_id", creator_id)
+        # A unique total order: pages cannot drop or repeat a row.
+        .order("id")
+        .range(start, end)
+        .execute()
+    )
+    fans_by_platform_id: dict[str, dict] = {}
+    for row in existing_fans:
+        platform_id_value = str(row.get("platform_fan_id") or "")
+        if platform_id_value:
+            fans_by_platform_id[platform_id_value] = row
+    existing_platform_ids: set[str] = set(fans_by_platform_id)
+
+    async with apifansly_client_scope() as client:
         all_chats = []
         account_lookup: dict[str, dict] = {}
         cursor = None
@@ -2052,6 +2094,7 @@ async def sync_chats(
                 break
 
         synced = 0
+        updated = 0
         new_chats = 0
         new_messages = 0
         for chat in all_chats:
@@ -2071,22 +2114,44 @@ async def sync_chats(
             if not platform_fan_id or not group_id:
                 continue
 
-            fan = await get_fan(creator_id, platform_fan_id)
-            is_new_chat = fan is None
-            if not fan:
-                fan = await create_fan(creator_id, platform_fan_id, fan_name)
+            known = fans_by_platform_id.get(platform_fan_id)
+            is_new_chat = known is None
+            if known is None:
+                created = await create_fan(creator_id, platform_fan_id, fan_name)
                 new_chats += 1
+                # create_fan writes the display name and nothing else, so the
+                # binding below is a genuine change for a new fan.
+                known = {
+                    "id": str(created.id),
+                    "platform_fan_id": platform_fan_id,
+                    "fansly_group_id": None,
+                    "display_name": fan_name,
+                    "avatar_url": None,
+                }
+                fans_by_platform_id[platform_fan_id] = known
 
-            update_payload = {
-                "fansly_group_id": group_id,
-                "display_name": fan_name,
-            }
-            if avatar_url:
+            fan_row_id = str(known["id"])
+
+            # Compare against what is already stored rather than writing
+            # unconditionally. The values are already in hand, so this costs no
+            # extra read.
+            update_payload: dict[str, str] = {}
+            if str(known.get("fansly_group_id") or "") != group_id:
+                update_payload["fansly_group_id"] = group_id
+            if str(known.get("display_name") or "") != fan_name:
+                update_payload["display_name"] = fan_name
+            if avatar_url and str(known.get("avatar_url") or "") != avatar_url:
                 update_payload["avatar_url"] = avatar_url
 
-            await asyncio.to_thread(
-                lambda fid=fan.id, p=update_payload: db.table("fans").update(p).eq("id", fid).execute()
-            )
+            if update_payload:
+                await asyncio.to_thread(
+                    lambda fid=fan_row_id, p=update_payload: db.table("fans")
+                    .update(p)
+                    .eq("id", fid)
+                    .execute()
+                )
+                known.update(update_payload)
+                updated += 1
             synced += 1
             platform_last_message_id = str(
                 chat.get("lastMessageId") or ""
@@ -2101,7 +2166,7 @@ async def sync_chats(
                 try:
                     recent = await _sync_recent_fan_messages(
                         creator_id=creator_id,
-                        fan_id=str(fan.id),
+                        fan_id=fan_row_id,
                         account_id=str(apifansly_id),
                         creator_platform_id=creator_platform_id,
                         group_id=group_id,
@@ -2119,7 +2184,7 @@ async def sync_chats(
                 except Exception as exc:
                     print(
                         f"[SYNC MESSAGES ERROR] creator={creator_id} "
-                        f"fan={fan.id} group={group_id}: {exc}"
+                        f"fan={fan_row_id} group={group_id}: {exc}"
                     )
 
         await _stamp_vault_op(creator_id, "last_chat_reconcile_at")
@@ -2149,12 +2214,13 @@ async def sync_chats(
         )
         print(
             f"[SYNC CHATS] incremental={incremental} total_chats={len(all_chats)} "
-            f"synced={synced} new={new_chats}"
+            f"synced={synced} updated={updated} new={new_chats}"
         )
         return {
             "status": "ok",
             "mode": "incremental" if incremental else "full",
             "synced": synced,
+            "updated": updated,
             "new_chats": new_chats,
             "new_messages": new_messages,
             "audience": audience_sync,
@@ -2173,7 +2239,6 @@ async def get_apifansly_usage() -> dict:
     dependencies=[Depends(require_creator_fan_access)],
 )
 async def load_fan_history(creator_id: str, fan_id: str) -> dict:
-    import httpx
 
     db = get_supabase()
 
@@ -2199,13 +2264,20 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
     if not group_id or not apifansly_id:
         return {"status": "error", "message": "missing fan or creator info"}
 
-    existing = await asyncio.to_thread(
-        lambda: db.table("messages")
+    # Paginated: a truncated set makes history import re-attempt inserts the
+    # unique (creator_id, fansly_message_id) index then rejects, so a long
+    # conversation turned into a wave of failing writes on every load.
+    existing_rows = await fetch_all_rows_async(
+        lambda start, end: db.table("messages")
         .select("fansly_message_id")
         .eq("fan_id", fan_id)
+        .order("id")
+        .range(start, end)
         .execute()
     )
-    existing_ids = {r["fansly_message_id"] for r in (existing.data or []) if r.get("fansly_message_id")}
+    existing_ids = {
+        r["fansly_message_id"] for r in existing_rows if r.get("fansly_message_id")
+    }
 
     all_messages = []
     all_media = {}
@@ -2213,7 +2285,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
 
     print(f"[LOAD HISTORY URL] apifansly_id={apifansly_id} group_id={group_id}")
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         while True:
             messages, account_media_batch, cursor = (
                 await apifansly_list_chat_messages(
@@ -2348,7 +2420,6 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
     dependencies=[Depends(require_creator_path_access)],
 )
 async def mark_all_read(creator_id: str) -> dict:
-    import httpx
 
     db = get_supabase()
     creator_row = await asyncio.to_thread(
@@ -2362,7 +2433,7 @@ async def mark_all_read(creator_id: str) -> dict:
     if not apifansly_id:
         return {"status": "error"}
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         await client.post(
             apifansly_url(f"{apifansly_id}/chats/mark-as-read"),
             headers=apifansly_headers(),
@@ -2406,7 +2477,6 @@ def _vault_media_visual_urls(media: dict) -> tuple[str, str]:
     dependencies=[Depends(require_creator_path_access)],
 )
 async def sync_vault(creator_id: str) -> dict:
-    import httpx
 
     db = get_supabase()
     creator_row = await asyncio.to_thread(
@@ -2418,7 +2488,7 @@ async def sync_vault(creator_id: str) -> dict:
     )
 
     apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         # Step 1: Get all albums
         albums = await apifansly_list_vault_albums(
             str(apifansly_id),
@@ -2505,7 +2575,15 @@ async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
         cd = await _vault_cooldown_remaining(creator_id, "last_vault_sync_at")
         if not cd["allowed"]:
             return {"status": "cooldown", **cd}
-    _vault_sync_state[creator_id] = {"status": "running", "synced": 0, "total": 0, "album": ""}
+    # Spawned immediately, but it waits for a creator-level slot before doing
+    # any work. The scheduler can therefore mark every due creator without
+    # starting every due creator (VAULT-001).
+    _vault_sync_state[creator_id] = {
+        "status": "queued",
+        "synced": 0,
+        "total": 0,
+        "album": "Waiting for a vault slot…",
+    }
     spawn(_run_vault_sync(creator_id), name="run_vault_sync")
     return {"status": "started"}
 
@@ -2542,9 +2620,22 @@ async def _vault_existing_media_ids(creator_id: str) -> set[str]:
 
 
 async def _run_vault_sync(creator_id: str) -> None:
-    import httpx
 
     db = get_supabase()
+    async with VAULT_GATE.acquire(creator_id=creator_id, kind="vault_sync"):
+        _vault_sync_state[creator_id] = {
+            "status": "running",
+            "synced": 0,
+            "total": 0,
+            "album": "",
+        }
+        await _run_vault_sync_locked(creator_id, db)
+
+
+async def _run_vault_sync_locked(creator_id: str, db) -> None:
+    """The sync itself. Runs only while holding one creator-level vault slot."""
+
+
     try:
         creator_row = await asyncio.to_thread(
             lambda: db.table("creators")
@@ -2565,7 +2656,7 @@ async def _run_vault_sync(creator_id: str) -> None:
         )
         existing_ids = await _vault_existing_media_ids(creator_id)
 
-        async with httpx.AsyncClient() as client:
+        async with apifansly_client_scope() as client:
             albums = await apifansly_list_vault_albums(
                 str(apifansly_id),
                 client=client,
@@ -2758,7 +2849,6 @@ async def _run_vault_sync(creator_id: str) -> None:
     dependencies=[Depends(require_creator_path_access)],
 )
 async def upload_vault_media(creator_id: str, request: Request) -> dict:
-    import httpx
 
     db = get_supabase()
     creator_row = await asyncio.to_thread(
@@ -2784,7 +2874,7 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
     filename = file.filename
     mimetype = file.content_type
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         upload_resp = await client.post(
             apifansly_url(f"{apifansly_id}/media/upload"),
             headers=apifansly_headers(),
@@ -3519,6 +3609,14 @@ async def _video_frame_upgrade_media_ids(creator_id: str) -> list[str]:
 
 _categorize_state: dict = {}
 
+# VAULT-002 — how many classification results are persisted per round trip, and
+# how long a partial batch may wait. Small enough that completed work is never
+# held in memory for long and the operator's progress number stays live; large
+# enough that a 10,000-item vault is ~100 writes rather than 10,000. Internal
+# constants on purpose: an env var per batch size is configuration sprawl.
+_CLASSIFICATION_WRITE_BATCH = 100
+_CLASSIFICATION_FLUSH_SECONDS = 5.0
+
 
 @app.post(
     "/categorize-vault/{creator_id}",
@@ -3604,7 +3702,7 @@ async def categorize_vault(
         }
 
     _categorize_state[creator_id] = {
-        "status": "running",
+        "status": "queued",
         "mode": resolved_mode,
         "done": 0,
         "total": pending,
@@ -3612,7 +3710,7 @@ async def categorize_vault(
     }
     await _stamp_vault_op(creator_id, "last_categorize_at")
     spawn(
-        _run_vault_categorization(
+        _run_vault_categorization_job(
             creator_id,
             item_ids=upgrade_item_ids,
             mark_initial=resolved_mode == "initial",
@@ -3712,6 +3810,9 @@ async def vault_categorization_overview(creator_id: str) -> dict:
             creator_id,
             {"status": "idle", "synced": 0, "total": 0, "album": ""},
         ),
+        # Deployment-wide, so an operator can see that their creator is queued
+        # behind other creators rather than stalled (VAULT-001).
+        "vault_gate": VAULT_GATE.snapshot(),
         "uncategorized": await _count_uncategorized(creator_id),
         "stale_classifications": await _count_stale_classifications(creator_id),
         "stale_approved_classifications": len(stale_approved),
@@ -3797,6 +3898,32 @@ async def get_vault_media_urls(
             for media_id in media_ids
         }
     }
+
+
+async def _run_vault_categorization_job(
+    creator_id: str,
+    *,
+    item_ids: list[str] | None = None,
+    mark_initial: bool = False,
+    upgrade_legacy: bool = False,
+) -> None:
+    """An operator-started categorisation run, holding one creator-level slot.
+
+    The run started from inside ``_run_vault_sync`` deliberately does NOT come
+    through here: it already holds that sync's slot, and taking a second one
+    would deadlock the gate at a limit of 1 (VAULT-001).
+    """
+
+    async with VAULT_GATE.acquire(creator_id=creator_id, kind="vault_categorize"):
+        state = _categorize_state.get(creator_id)
+        if isinstance(state, dict):
+            state["status"] = "running"
+        await _run_vault_categorization(
+            creator_id,
+            item_ids=item_ids,
+            mark_initial=mark_initial,
+            upgrade_legacy=upgrade_legacy,
+        )
 
 
 async def _run_vault_categorization(
@@ -3909,89 +4036,177 @@ async def _run_vault_categorization(
             max_connections=max(batch_size * 2, 16),
             max_keepalive_connections=max(batch_size, 8),
         )
+
+        # ---- VAULT-002: worker pool instead of fixed-window batches ----
+        # This used to be `for i in range(0, total, batch_size)` with an
+        # asyncio.gather per slice. That gather is a barrier: a slice of 12
+        # finishes only when its slowest item finishes, so one video needing
+        # ffmpeg frame extraction (~35 s) held eleven idle slots against eleven
+        # images that each took about a second. A fixed number of workers
+        # pulling from a shared cursor uses the same concurrency budget without
+        # ever idling a slot behind someone else's video.
+        #
+        # The concurrency limit itself is unchanged and is still never exceeded:
+        # exactly `batch_size` workers exist, so at most `batch_size` items are
+        # in flight.
+        next_index = 0
+        completed = 0
+        abort_reason = ""
+        pending_writes: list[dict] = []
+        last_flush = time.monotonic()
+        write_lock = asyncio.Lock()
+        cursor_lock = asyncio.Lock()
+
+        async def flush_writes(*, force: bool = False) -> None:
+            """Persist accumulated classifications in one bounded round trip.
+
+            Each result used to be its own awaited UPDATE, so a 10,000-item
+            vault was 10,000 sequential round trips — several minutes of pure
+            database latency. Rows are batched instead, and the batch is small
+            enough that completed work is never held in memory for long: the
+            point is fewer writes, not one giant write at the end.
+            """
+
+            nonlocal pending_writes, last_flush, done
+            async with write_lock:
+                due = (
+                    force
+                    or len(pending_writes) >= _CLASSIFICATION_WRITE_BATCH
+                    or (
+                        pending_writes
+                        and time.monotonic() - last_flush >= _CLASSIFICATION_FLUSH_SECONDS
+                    )
+                )
+                if not due or not pending_writes:
+                    return
+                rows, pending_writes = pending_writes, []
+                last_flush = time.monotonic()
+                await retry_transient_db_operation(
+                    lambda batch=rows: asyncio.to_thread(
+                        lambda: db.table("creator_vault_media")
+                        .upsert(batch, on_conflict="id")
+                        .execute()
+                    ),
+                    label=f"save_vault_classifications:{len(rows)}",
+                )
+                # ``done`` stays "persisted", not "classified", so the operator's
+                # progress number never runs ahead of the database.
+                done += len(rows)
+
+        def report_progress() -> None:
+            elapsed = max(time.monotonic() - started_monotonic, 0.001)
+            rate = done / elapsed
+            remaining = max(total - done - errors, 0)
+            eta = round(remaining / rate) if rate > 0 else None
+            _categorize_state[creator_id].update({
+                "done": done,
+                "errors": errors,
+                "qwen_fallbacks": qwen_fallbacks,
+                "semantic_failures": semantic_failures,
+                "elapsed_seconds": round(elapsed),
+                "items_per_minute": round(rate * 60, 1),
+                "estimated_seconds_remaining": eta,
+            })
+
+        async def next_item() -> dict | None:
+            nonlocal next_index
+            async with cursor_lock:
+                if abort_reason or next_index >= total:
+                    return None
+                item = all_items[next_index]
+                next_index += 1
+                return item
+
+        async def worker(visual_client) -> None:
+            nonlocal completed, errors, provider_failures
+            nonlocal qwen_fallbacks, semantic_failures, abort_reason
+            while True:
+                item = await next_item()
+                if item is None:
+                    return
+                try:
+                    result = await _categorize_single_item_with_retry(
+                        item,
+                        allow_core_qwen_fallback=allow_core_qwen_fallback,
+                        visual_client=visual_client,
+                    )
+                except Exception as error:
+                    errors += 1
+                    if isinstance(error, VaultClassifierError):
+                        provider_failures += 1
+                        if provider_failures >= 3:
+                            # Unchanged abort rule: three provider failures stop
+                            # the run. Workers notice on their next pull, so
+                            # nothing new starts and in-flight items finish.
+                            abort_reason = (
+                                "Vault categorization stopped after three provider "
+                                f"failures: {error}"
+                            )
+                    continue
+
+                provider_details = (
+                    (result.get("classification_metadata") or {})
+                    .get("provider_details") or {}
+                )
+                if provider_details.get("qwen_status") == "ready":
+                    qwen_fallbacks += 1
+                if provider_details.get("semantic_status") == "fallback":
+                    semantic_failures += 1
+
+                # on_conflict targets the primary key, so this is an update of
+                # an existing row. creator_id and media_id travel with it so the
+                # row is fully identified and can never be written under another
+                # creator.
+                pending_writes.append({
+                    "id": result["id"],
+                    "creator_id": item["creator_id"],
+                    "media_id": item["media_id"],
+                    **_classification_update_payload(result),
+                })
+                completed += 1
+                await flush_writes()
+                report_progress()
+
+                # The self-hosted semantic service scales independently.
+                # Preserve the old provider throttle only for legacy
+                # configurations: one worker sleeping after each item reproduces
+                # the previous rate of batch_size items per 1.5 seconds.
+                if not semantic_enabled:
+                    await asyncio.sleep(1.5)
+
         async with httpx.AsyncClient(
             follow_redirects=True,
             limits=limits,
         ) as visual_client:
-            for i in range(0, total, batch_size):
-                batch = all_items[i:i + batch_size]
-                results = await asyncio.gather(
-                    *[
-                        _categorize_single_item_with_retry(
-                            item,
-                            allow_core_qwen_fallback=allow_core_qwen_fallback,
-                            visual_client=visual_client,
-                        )
-                        for item in batch
-                    ],
-                    return_exceptions=True,
+            try:
+                await asyncio.gather(
+                    *[worker(visual_client) for _ in range(batch_size)]
                 )
-                fatal_error = ""
-                for result in results:
-                    if isinstance(result, Exception):
-                        errors += 1
-                        if isinstance(result, VaultClassifierError):
-                            provider_failures += 1
-                            if provider_failures >= 3:
-                                fatal_error = (
-                                    "Vault categorization stopped after three provider "
-                                    f"failures: {result}"
-                                )
-                        continue
-                    provider_details = (
-                        (result.get("classification_metadata") or {})
-                        .get("provider_details") or {}
-                    )
-                    if provider_details.get("qwen_status") == "ready":
-                        qwen_fallbacks += 1
-                    if provider_details.get("semantic_status") == "fallback":
-                        semantic_failures += 1
-                    await retry_transient_db_operation(
-                        lambda r=result: asyncio.to_thread(
-                            lambda: db.table("creator_vault_media")
-                            .update(_classification_update_payload(r))
-                            .eq("id", r["id"])
-                            .execute()
-                        ),
-                        label=f"save_vault_classification:{result['id']}",
-                    )
-                    done += 1
-                if fatal_error:
-                    _categorize_state[creator_id].update({
-                        "status": "error",
-                        "done": done,
-                        "errors": errors,
-                        "error": fatal_error,
-                        "aborted_remaining": max(total - done - errors, 0),
-                    })
-                    print(
-                        f"[CATEGORIZE ABORTED] creator={creator_id} "
-                        f"done={done}/{total} errors={errors} reason={fatal_error}"
-                    )
-                    return
-                elapsed = max(time.monotonic() - started_monotonic, 0.001)
-                rate = done / elapsed
-                remaining = max(total - done - errors, 0)
-                eta = round(remaining / rate) if rate > 0 else None
-                _categorize_state[creator_id].update({
-                    "done": done,
-                    "errors": errors,
-                    "qwen_fallbacks": qwen_fallbacks,
-                    "semantic_failures": semantic_failures,
-                    "elapsed_seconds": round(elapsed),
-                    "items_per_minute": round(rate * 60, 1),
-                    "estimated_seconds_remaining": eta,
-                })
-                print(
-                    f"[CATEGORIZE] done={done}/{total} errors={errors} "
-                    f"rate={rate * 60:.1f}/min eta_s={eta} "
-                    f"qwen_fallbacks={qwen_fallbacks} "
-                    f"semantic_failures={semantic_failures}"
-                )
-                # The self-hosted semantic service scales independently. Preserve
-                # the old provider throttle only for legacy configurations.
-                if not semantic_enabled:
-                    await asyncio.sleep(1.5)
+            finally:
+                # Work that was already classified is persisted even when the
+                # run aborts, exactly as the per-item writes used to be.
+                await flush_writes(force=True)
+
+        report_progress()
+        print(
+            f"[CATEGORIZE] done={done}/{total} errors={errors} "
+            f"qwen_fallbacks={qwen_fallbacks} "
+            f"semantic_failures={semantic_failures}"
+        )
+
+        if abort_reason:
+            _categorize_state[creator_id].update({
+                "status": "error",
+                "done": done,
+                "errors": errors,
+                "error": abort_reason,
+                "aborted_remaining": max(total - done - errors, 0),
+            })
+            print(
+                f"[CATEGORIZE ABORTED] creator={creator_id} "
+                f"done={done}/{total} errors={errors} reason={abort_reason}"
+            )
+            return
 
         if mark_initial and errors == 0:
             await _stamp_vault_op(creator_id, "vault_initial_categorized_at")
@@ -4205,9 +4420,8 @@ async def recategorize_item(item_id: str) -> dict:
     dependencies=[Depends(require_account_path_access)],
 )
 async def get_media_url(account_id: str, content_id: str) -> dict:
-    import httpx
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         response = await client.get(
             apifansly_url(f"{account_id}/media/{content_id}"),
             headers=apifansly_headers(),
@@ -4649,10 +4863,18 @@ async def delete_creator(creator_id: str) -> dict:
         lambda cid=creator_id: db.table("ppv_offers").delete().eq("creator_id", cid).execute()
     )
 
-    fans = await asyncio.to_thread(
-        lambda cid=creator_id: db.table("fans").select("id").eq("creator_id", cid).execute()
+    # Paginated: deleting a creator has to reach every one of their fans. A
+    # truncated read left rows behind and the creator delete then failed on a
+    # foreign key, or worse, succeeded and orphaned them.
+    fan_rows = await fetch_all_rows_async(
+        lambda start, end: db.table("fans")
+        .select("id")
+        .eq("creator_id", creator_id)
+        .order("id")
+        .range(start, end)
+        .execute()
     )
-    fan_ids = [f["id"] for f in (fans.data or [])]
+    fan_ids = [f["id"] for f in fan_rows]
 
     for fan_id in fan_ids:
         await asyncio.to_thread(
@@ -5696,7 +5918,6 @@ async def simulate_ppv_purchase(fan_id: str, request: Request) -> dict:
 
     summary = fan_data.get("ai_summary") or {}
 
-    from datetime import datetime
 
     # Append to the existing history rather than replacing it. A non-list value
     # would otherwise be silently discarded, so refuse instead of destroying it.

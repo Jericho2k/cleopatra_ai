@@ -12,7 +12,6 @@ import re
 import time
 import uuid
 
-import httpx
 
 from ai.generator import generate_replies
 from ai.writer_router import select_writer_route
@@ -38,6 +37,7 @@ from services.ppv_delivery import create_ppv_approval_request
 from services.db_reliability import retry_transient_db_operation
 from services.apifansly import (
     headers as apifansly_headers,
+    shared_client as apifansly_shared_client,
     send_message as send_apifansly_message,
     sent_message_id,
     url as apifansly_url,
@@ -738,8 +738,6 @@ async def _debounced_auto_reply(
         if getattr(fan_profile, "needs_human_review", False):
             print(f"[AUTO REPLY] fan={fan_id} is frozen for human review — skipping auto-reply")
             return
-        fan_tier = getattr(fan_profile, "spend_tier", "cold") or "cold"
-
         # Check for a pending tip and clear it atomically before building context
         pending_tip: dict | None = None
         try:
@@ -1224,14 +1222,17 @@ async def _debounced_auto_reply(
 
         if group_id and apifansly_account_id:
             try:
-                async with httpx.AsyncClient() as client:
-                    await client.post(
-                        apifansly_url(
-                            f"{apifansly_account_id}/chats/{str(group_id)}/typing"
-                        ),
-                        headers=apifansly_headers(),
-                        timeout=5,
-                    )
+                # PERF-006 — one pooled connection. This sits inside the
+                # human-like composition delay on the live reply path, so a
+                # per-call TLS handshake here was pure added latency before the
+                # fan sees anything.
+                await apifansly_shared_client().post(
+                    apifansly_url(
+                        f"{apifansly_account_id}/chats/{str(group_id)}/typing"
+                    ),
+                    headers=apifansly_headers(),
+                    timeout=5,
+                )
             except Exception:
                 pass
 
@@ -1835,21 +1836,31 @@ async def sweep_stale_ppv_checks() -> None:
         from db.commercial_queries import ensure_action_pending
         from services.followup_lifecycle import pending_reference
 
-        rows = await asyncio.to_thread(
-            lambda: db.table("fans")
+        # Paginated: this sweep is the repair path for pending PPV
+        # reconciliation after a restart or a partial write. Rows past the
+        # 1,000-row cap were silently skipped every 15 minutes, so those fans'
+        # reconciliation actions were never rebuilt and their purchases went
+        # unverified. This read spans every creator, so the cap was global and
+        # easy to reach.
+        from core.pagination import fetch_all_rows_async
+
+        pending_rows = await fetch_all_rows_async(
+            lambda start, end: db.table("fans")
             .select("id, creator_id, pending_ppv_check, needs_human_review, review_reason")
             .not_.is_("pending_ppv_check", "null")
+            .order("id")
+            .range(start, end)
             .execute()
         )
 
-        if not rows.data:
+        if not pending_rows:
             return
 
         now = datetime.now(timezone.utc)
         cutoff = now - timedelta(minutes=5)
         stale = []
 
-        for row in rows.data:
+        for row in pending_rows:
             if row.get("needs_human_review"):
                 continue
             pending = row.get("pending_ppv_check") or {}

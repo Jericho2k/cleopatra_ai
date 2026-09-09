@@ -15,10 +15,10 @@ autonomous commercial decisions must check it with ``analysis_is_degraded``.
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from ai.model_providers import complete, get_runtime_target
+from ai.prompt_blocks import cacheable_system_blocks
 from models.model_runtime import ModelTelemetryContext
 from models.schemas import ConversationContext
 from services.analyzer_telemetry import record_analysis_outcome
@@ -41,26 +41,21 @@ def degraded_reason(situation: dict | None) -> str:
     return str((situation or {}).get("degraded_reason") or "")
 
 
-async def analyze_situation(
-    ctx: ConversationContext,
-    *,
-    telemetry_context: dict[str, Any] | None = None,
-) -> dict:
-    recent = ctx.conversation_history[-12:]
-    convo = "\n".join(
-        f"{'Fan' if message.role == 'fan' else 'Creator'}: {message.content}"
-        for message in recent
-    )
-
-    user_content = f"""You are analyzing an adult creator chat so another system can decide the correct business action.
-
-Conversation so far:
-{convo}
-
-Latest fan message: "{ctx.fan_message}"
+# COST-002b — the analyzer's instructions, output schema, interpretation rules
+# and safety rule are identical for every message of every conversation in the
+# deployment, but they used to sit *after* the transcript inside the user turn.
+# Nothing in front of them was stable, so a prefix cache could reuse only the
+# 12-token system line. They are unchanged in wording and now live in the system
+# block, which is the longest stable prefix this call has.
+#
+# The model therefore reads the rules before the conversation rather than after
+# it. That is the only behavioural difference, and it is the ordinary
+# instructions-then-input shape; the instructions themselves are byte-identical
+# to what they were.
+ANALYZER_SYSTEM = """You are analyzing an adult creator chat so another system can decide the correct business action.
 
 Return ONLY valid JSON with exactly these fields:
-{{
+{
   "fan_mood": "excited/bored/horny/lonely/curious/frustrated/romantic/testing/shy",
   "fan_intent": "brief description of what the latest message means",
   "conversation_energy": "rising/flat/dropping",
@@ -85,7 +80,7 @@ Return ONLY valid JSON with exactly these fields:
   "payday_confidence": 0.0,
   "budget_stated_usd": "number only if the fan explicitly says what he has available now, otherwise empty",
   "desired_experience": "the fan's concrete requested theme/action/location/outfit/body focus/format in a short natural phrase, or empty"
-}}
+}
 
 COMMERCIAL INTERPRETATION RULES:
 - Treat facts independently. A fan can select a cheaper offer now AND mention a future payday.
@@ -117,7 +112,39 @@ COMMERCIAL INTERPRETATION RULES:
 
 SAFETY:
 - Crisis is not sexual roughness or consensual roleplay. Flag self_harm for plausible self-directed harm language and harm_to_others only for real intent toward a real person.
-"""
+
+Return only the requested JSON object. Do not add commentary."""
+
+
+def build_analyzer_prompt(ctx: ConversationContext) -> tuple[str, str]:
+    """Return the analyzer's ``(system, user)`` pair for one turn.
+
+    The system half is deployment-wide constant; the user half carries only the
+    volatile conversation. Extracted so scripts/measure_prompt_cache.py can
+    render the exact prompt the provider sees without issuing a paid call.
+    """
+
+    recent = ctx.conversation_history[-12:]
+    convo = "\n".join(
+        f"{'Fan' if message.role == 'fan' else 'Creator'}: {message.content}"
+        for message in recent
+    )
+
+    user_content = (
+        f"Conversation so far:\n{convo}\n\n"
+        f'Latest fan message: "{ctx.fan_message}"'
+    )
+
+    return ANALYZER_SYSTEM, user_content
+
+
+async def analyze_situation(
+    ctx: ConversationContext,
+    *,
+    telemetry_context: dict[str, Any] | None = None,
+) -> dict:
+    recent = ctx.conversation_history[-12:]
+    system_content, user_content = build_analyzer_prompt(ctx)
 
     target = get_runtime_target("ANALYZER")
     metadata = telemetry_context or {}
@@ -135,7 +162,7 @@ SAFETY:
     try:
         response = await complete(
             target,
-            system="Return only the requested JSON object. Do not add commentary.",
+            system=cacheable_system_blocks(system_content),
             messages=[{"role": "user", "content": user_content}],
             max_tokens=650,
             temperature=0.0,

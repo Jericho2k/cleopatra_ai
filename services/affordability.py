@@ -20,7 +20,6 @@ from models.affordability import (
     AffordabilityAuthority,
     AffordabilityEvent,
     AffordabilityEventType,
-    AffordabilityState,
     apply_affordability_event,
 )
 from models.commercial import CommercialEvent, EventType

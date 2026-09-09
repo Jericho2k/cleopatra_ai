@@ -5,10 +5,15 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
 
 from core.supabase import get_supabase
-from services.apifansly import list_followers, list_subscribers, top_supporters
+from core.pagination import fetch_all_rows_async
+from services.apifansly import (
+    client_scope as apifansly_client_scope,
+    list_followers,
+    list_subscribers,
+    top_supporters,
+)
 
 
 def _accounts_from_followers(response: Any) -> tuple[set[str], dict[str, dict]]:
@@ -62,7 +67,7 @@ async def sync_fansly_audience(
     follower_accounts: dict[str, dict] = {}
     subscriptions: dict[str, dict] = {}
 
-    async with httpx.AsyncClient() as client:
+    async with apifansly_client_scope() as client:
         cursor: str | None = None
         while True:
             response, cursor = await list_followers(
@@ -114,15 +119,20 @@ async def sync_fansly_audience(
             supporter_spend[platform_fan_id] = int(row.get("totalGross") or 0)
 
     db = get_supabase()
-    existing_result = await asyncio.to_thread(
-        lambda: db.table("fans")
+    # Paginated: every fan past the 1,000-row cap silently stopped receiving
+    # follower/subscriber status and lifetime-spend updates, which are what the
+    # auto-audience policy filters on.
+    existing_rows = await fetch_all_rows_async(
+        lambda start, end: db.table("fans")
         .select("id, platform_fan_id, total_spent")
         .eq("creator_id", creator_id)
+        .order("id")
+        .range(start, end)
         .execute()
     )
     now = datetime.now(timezone.utc).isoformat()
     updated = 0
-    for fan in existing_result.data or []:
+    for fan in existing_rows:
         platform_fan_id = str(fan.get("platform_fan_id") or "")
         if not platform_fan_id:
             continue

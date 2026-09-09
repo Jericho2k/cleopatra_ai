@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.model_gate import MODEL_GATE
+from core.vault_gate import VAULT_GATE
 from services.model_availability import current_model_availability
 from workers.scheduled_actions import worker_health_snapshot
 
@@ -272,6 +273,10 @@ async def collect(*, use_cache: bool = True) -> dict:
     database, queue = await asyncio.gather(probe_database(), probe_queue())
     scheduler = worker_health_snapshot()
     model_gate = MODEL_GATE.snapshot()
+    # VAULT-001 — informational, never part of the verdict. A queue here is the
+    # gate working as designed: vault work waiting is exactly what stops it
+    # competing with chat, so it must not be reported as degraded.
+    vault_gate = VAULT_GATE.snapshot()
     availability = current_model_availability()
     model_summary = {
         "status": availability.get("status"),
@@ -301,6 +306,7 @@ async def collect(*, use_cache: bool = True) -> dict:
         "queue": queue,
         "scheduler": scheduler,
         "model": model_summary,
+        "vault": {"gate": vault_gate},
     }
     _cache["at"] = now
     _cache["value"] = document
