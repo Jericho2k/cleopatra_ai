@@ -37,6 +37,7 @@ message_platform_identity_v1.sql
 # Depends on message_platform_identity_v1: the two together are what make
 # webhook redelivery harmless (REL-006).
 durable_ingestion_v1.sql
+scheduled_action_claim_v1.sql
 
 # Always last: discovers creator-owned tables at run time.
 tenant_isolation_v1.sql

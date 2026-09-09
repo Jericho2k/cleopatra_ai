@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from core.pagination import fetch_all_rows
 from core.supabase import get_supabase
 from services.analyzer_telemetry import analyzer_health
 from db.commercial_queries import (
@@ -294,32 +295,44 @@ async def get_fan_full_auto_snapshot(fan_id: str) -> dict[str, Any]:
 async def get_creator_full_auto_health(creator_id: str) -> dict[str, Any]:
     def _load() -> tuple[list[dict], list[dict], list[dict], list[dict]]:
         db = get_supabase()
-        states = (
-            db.table("fan_commercial_states")
+        # All three are paginated. This is the surface an operator uses to find
+        # fans that need them — a frozen conversation, a failed action — so a
+        # silent 1,000-row truncation does not merely under-report a total, it
+        # hides the individual fan who is stuck. Each carries a unique total
+        # order so a page boundary cannot drop or repeat a row.
+        states = fetch_all_rows(
+            lambda start, end: db.table("fan_commercial_states")
             .select(
                 "fan_id, status, next_followup_at, next_followup_type, "
                 "last_abandoned_ppv_at, updated_at"
             )
             .eq("creator_id", creator_id)
+            .order("fan_id")
+            .range(start, end)
             .execute()
-        ).data or []
-        fans = (
-            db.table("fans")
+        )
+        fans = fetch_all_rows(
+            lambda start, end: db.table("fans")
             .select("id, display_name, auto_mode, needs_human_review, review_reason")
             .eq("creator_id", creator_id)
+            .order("id")
+            .range(start, end)
             .execute()
-        ).data or []
-        actions = (
-            db.table("scheduled_actions")
+        )
+        actions = fetch_all_rows(
+            lambda start, end: db.table("scheduled_actions")
             .select(
                 "id, fan_id, action_type, execute_at, status, attempts, "
                 "last_error, locked_at, payload"
             )
             .eq("creator_id", creator_id)
             .in_("status", ["PENDING", "PROCESSING", "FAILED"])
+            # execute_at keeps the operator-facing ordering; id makes it unique.
             .order("execute_at")
+            .order("id")
+            .range(start, end)
             .execute()
-        ).data or []
+        )
         recent = (
             db.table("scheduled_actions")
             .select("id, fan_id, action_type, execute_at, status, payload")

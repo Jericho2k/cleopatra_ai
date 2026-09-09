@@ -5,6 +5,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 
+from core.pagination import fetch_all_rows
 from core.supabase import get_supabase
 from models.schemas import ExchangeExample, Fan, Message, Persona
 from services.shoot_fingerprint import build_shoot_clusters, shoot_fingerprint
@@ -156,17 +157,29 @@ async def increment_fan_total_spent(fan_id: str, amount: int) -> None:
 
 
 async def get_sent_ppv(fan_id: str) -> list[dict]:
-    """Return list of PPV media already sent to this fan with purchase status."""
+    """Return list of PPV media already sent to this fan with purchase status.
+
+    Paginated because the result is used to decide what NOT to offer. A
+    truncated read here does not degrade a ranking — it makes Cleopatra re-offer
+    content the fan was already sent, which is a correctness failure the fan
+    sees. Ordered by (sent_at, id) because sent_at alone is not unique and a
+    non-unique order can drop or repeat a row across a page boundary.
+    """
+
     def _get():
-        r = get_supabase().table("messages") \
-            .select("media_context, sent_at") \
-            .eq("fan_id", fan_id) \
-            .eq("role", "creator") \
-            .not_.is_("media_context", "null") \
-            .order("sent_at", desc=False) \
+        rows = fetch_all_rows(
+            lambda start, end: get_supabase().table("messages")
+            .select("media_context, sent_at")
+            .eq("fan_id", fan_id)
+            .eq("role", "creator")
+            .not_.is_("media_context", "null")
+            .order("sent_at", desc=False)
+            .order("id", desc=False)
+            .range(start, end)
             .execute()
+        )
         sent = []
-        for row in (r.data or []):
+        for row in rows:
             mc = row.get("media_context") or {}
             ppv = mc.get("ppv")
             if ppv and ppv.get("media_id"):
@@ -190,10 +203,22 @@ async def get_sent_ppv(fan_id: str) -> list[dict]:
 async def mark_ppv_purchased(fan_id: str, media_id: str, sent_at: str | None = None) -> bool:
     def _mark() -> bool:
         db = get_supabase()
-        r = db.table("messages").select("id, media_context, sent_at") \
-            .eq("fan_id", fan_id).eq("role", "creator") \
-            .not_.is_("media_context", "null").order("sent_at", desc=True).execute()
-        for row in (r.data or []):
+        # Newest first, because a purchase almost always settles a recent PPV
+        # and the loop returns on the first match. Paginated anyway: an
+        # unmatched purchase past row 1,000 used to be silently unrecordable,
+        # which leaves the fan able to be re-offered what they just bought.
+        rows = fetch_all_rows(
+            lambda start, end: db.table("messages")
+            .select("id, media_context, sent_at")
+            .eq("fan_id", fan_id)
+            .eq("role", "creator")
+            .not_.is_("media_context", "null")
+            .order("sent_at", desc=True)
+            .order("id", desc=True)
+            .range(start, end)
+            .execute()
+        )
+        for row in rows:
             mc = row.get("media_context") or {}
             ppv = mc.get("ppv")
             if not ppv or str(ppv.get("media_id")) != str(media_id):

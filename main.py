@@ -23,6 +23,7 @@ from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from core.action_telemetry import stage as action_stage
+from core.pagination import fetch_all_rows_async
 from core.supabase import get_supabase
 from core.vault_gate import VAULT_GATE
 from core.webhooks import valid_hmac_sha256_signature
@@ -984,25 +985,35 @@ async def chat_reconciliation_scheduler():
             import time
 
             db = get_supabase()
-            creators_result, auto_fans_result = await asyncio.gather(
-                asyncio.to_thread(
-                    lambda: db.table("creators")
-                    .select("id, apifansly_account_id, auto_mode")
-                    .not_.is_("apifansly_account_id", "null")
-                    .execute()
-                ),
-                asyncio.to_thread(
-                    lambda: db.table("fans")
-                    .select("creator_id")
-                    .eq("auto_mode", True)
-                    .execute()
-                ),
+            creators_result = await asyncio.to_thread(
+                lambda: db.table("creators")
+                .select("id, apifansly_account_id, auto_mode")
+                .not_.is_("apifansly_account_id", "null")
+                .execute()
             )
-            auto_fan_creators = {
-                str(row.get("creator_id") or "")
-                for row in (auto_fans_result.data or [])
-                if row.get("creator_id")
-            }
+
+            # This used to read every auto-mode fan in the DEPLOYMENT — no
+            # creator filter — and build a set of creator ids from it. PostgREST
+            # capped that globally at 1,000 rows, so once enough fans had auto
+            # mode on anywhere, creators whose fans fell past the cap were
+            # misread as having none and were dropped to the 30-minute idle
+            # reconcile interval instead of 10.
+            #
+            # The question is only ever "does this creator have at least one",
+            # so ask it that way. One bounded existence check, and only for a
+            # creator that is due and whose own auto_mode has not already
+            # answered it.
+            async def _has_auto_fan(creator_id: str) -> bool:
+                probe = await asyncio.to_thread(
+                    lambda cid=creator_id: db.table("fans")
+                    .select("id")
+                    .eq("creator_id", cid)
+                    .eq("auto_mode", True)
+                    .limit(1)
+                    .execute()
+                )
+                return bool(probe.data)
+
             now = time.monotonic()
             due: list[dict] = []
             active_creator_ids: set[str] = set()
@@ -1014,10 +1025,17 @@ async def chat_reconciliation_scheduler():
                 if now < _chat_reconcile_due_at.get(creator_id, 0):
                     continue
                 due.append(creator)
+                creator_auto_mode = bool(creator.get("auto_mode"))
                 _chat_reconcile_due_at[creator_id] = now + (
                     _chat_reconcile_interval_seconds(
-                        creator_auto_mode=bool(creator.get("auto_mode")),
-                        has_auto_fan=creator_id in auto_fan_creators,
+                        creator_auto_mode=creator_auto_mode,
+                        # Creator-level auto mode already selects the active
+                        # interval, so the probe is skipped entirely there.
+                        has_auto_fan=(
+                            False
+                            if creator_auto_mode
+                            else await _has_auto_fan(creator_id)
+                        ),
                     )
                 )
             for creator_id in list(_chat_reconcile_due_at):
@@ -2253,13 +2271,20 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
     if not group_id or not apifansly_id:
         return {"status": "error", "message": "missing fan or creator info"}
 
-    existing = await asyncio.to_thread(
-        lambda: db.table("messages")
+    # Paginated: a truncated set makes history import re-attempt inserts the
+    # unique (creator_id, fansly_message_id) index then rejects, so a long
+    # conversation turned into a wave of failing writes on every load.
+    existing_rows = await fetch_all_rows_async(
+        lambda start, end: db.table("messages")
         .select("fansly_message_id")
         .eq("fan_id", fan_id)
+        .order("id")
+        .range(start, end)
         .execute()
     )
-    existing_ids = {r["fansly_message_id"] for r in (existing.data or []) if r.get("fansly_message_id")}
+    existing_ids = {
+        r["fansly_message_id"] for r in existing_rows if r.get("fansly_message_id")
+    }
 
     all_messages = []
     all_media = {}
@@ -4851,10 +4876,18 @@ async def delete_creator(creator_id: str) -> dict:
         lambda cid=creator_id: db.table("ppv_offers").delete().eq("creator_id", cid).execute()
     )
 
-    fans = await asyncio.to_thread(
-        lambda cid=creator_id: db.table("fans").select("id").eq("creator_id", cid).execute()
+    # Paginated: deleting a creator has to reach every one of their fans. A
+    # truncated read left rows behind and the creator delete then failed on a
+    # foreign key, or worse, succeeded and orphaned them.
+    fan_rows = await fetch_all_rows_async(
+        lambda start, end: db.table("fans")
+        .select("id")
+        .eq("creator_id", creator_id)
+        .order("id")
+        .range(start, end)
+        .execute()
     )
-    fan_ids = [f["id"] for f in (fans.data or [])]
+    fan_ids = [f["id"] for f in fan_rows]
 
     for fan_id in fan_ids:
         await asyncio.to_thread(

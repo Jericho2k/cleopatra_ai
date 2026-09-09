@@ -2,6 +2,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+from core.pagination import fetch_all_rows
 from core.supabase import get_supabase
 from models.commercial import CreatorPolicy, FanCommercialState, PackageOption
 from services.media_packages import build_offer_packages, usable_sets
@@ -174,14 +175,20 @@ async def get_offerable_packages(
             .execute()
         ).data or []
 
-        sent_rows = (
-            db.table("messages")
+        # Paginated: this set is the "never offer this again" list. Truncated at
+        # 1,000 creator messages it silently forgets older sends, and Cleopatra
+        # re-offers content the fan already received. Ordered by id, which is
+        # unique, so a page boundary cannot drop or repeat a row.
+        sent_rows = fetch_all_rows(
+            lambda start, end: db.table("messages")
             .select("media_context")
             .eq("fan_id", fan_id)
             .eq("role", "creator")
             .not_.is_("media_context", "null")
+            .order("id")
+            .range(start, end)
             .execute()
-        ).data or []
+        )
         sent_set_ids: set[str] = set()
         sent_media_ids: set[str] = set()
         for row in sent_rows:
@@ -340,7 +347,72 @@ async def cancel_action_by_dedupe_key(dedupe_key: str) -> None:
     await asyncio.to_thread(_cancel)
 
 
+# Set once per process when the atomic claim function turns out to be missing,
+# so a rolling deploy that reaches the new code before the migration falls back
+# once rather than paying a failed RPC on every poll.
+_ATOMIC_CLAIM_AVAILABLE = True
+
+
+def _looks_like_missing_function(error: Exception) -> bool:
+    """Whether this error means the RPC is not deployed yet.
+
+    Deliberately narrow. A genuine failure inside the function — a constraint
+    violation, a deadlock — must surface, not silently downgrade the claim path.
+    """
+
+    text = str(error).lower()
+    return (
+        "claim_due_actions" in text
+        and (
+            "could not find" in text
+            or "does not exist" in text
+            or "undefined function" in text
+            or "pgrst202" in text
+        )
+    )
+
+
 async def claim_due_actions(limit: int = 20, stale_minutes: int = 10) -> list[dict]:
+    """Take ownership of up to ``limit`` due and ``limit`` stale actions.
+
+    One atomic statement (see db/scheduled_action_claim_v1.sql) rather than two
+    selects plus a compare-and-swap UPDATE per row — 22 round trips for a batch
+    of 20. The database side is also strictly safer than the CAS it replaces:
+    FOR UPDATE SKIP LOCKED means two workers never select the same row, so the
+    race the CAS existed to lose is never entered.
+
+    The per-row CAS remains as the fallback for a deployment whose migration has
+    not been applied yet. It is exactly the previous implementation, and it is
+    correct on its own — this is a rollout affordance, not a weaker path.
+    """
+
+    global _ATOMIC_CLAIM_AVAILABLE
+
+    if _ATOMIC_CLAIM_AVAILABLE:
+        try:
+            response = await asyncio.to_thread(
+                lambda: get_supabase()
+                .rpc(
+                    "claim_due_actions",
+                    {"p_limit": int(limit), "p_stale_minutes": int(stale_minutes)},
+                )
+                .execute()
+            )
+            return list(response.data or [])
+        except Exception as error:
+            if not _looks_like_missing_function(error):
+                raise
+            _ATOMIC_CLAIM_AVAILABLE = False
+            print(
+                "[SCHEDULED ACTIONS] claim_due_actions() is not deployed; "
+                "falling back to per-row compare-and-swap. Apply "
+                "db/scheduled_action_claim_v1.sql."
+            )
+
+    return await _claim_due_actions_by_cas(limit, stale_minutes)
+
+
+async def _claim_due_actions_by_cas(limit: int, stale_minutes: int) -> list[dict]:
     now = datetime.now(timezone.utc)
     stale_before = (now - timedelta(minutes=stale_minutes)).isoformat()
 
