@@ -1113,6 +1113,16 @@ async def lifespan(app: FastAPI):
 
     print(f"[STARTUP] {describe_environment()}")
 
+    # Every Supabase call in this process runs on the event loop's default
+    # executor via asyncio.to_thread. Left unconfigured that pool is sized
+    # min(32, cpu_count + 4) — eight threads on a 4-vCPU container, shared by
+    # the worker, the schedulers and every inbound webhook. Make the ceiling
+    # explicit and visible rather than an accident of the container size.
+    from core import db_executor
+
+    db_executor.install(asyncio.get_running_loop())
+    print(f"[STARTUP] {db_executor.describe()}")
+
     supabase = get_supabase()
     session_store = SessionStore(
         supabase=supabase,
@@ -1150,6 +1160,10 @@ async def lifespan(app: FastAPI):
     # the only place that closes it. Sockets are released here rather than at
     # the end of every individual call.
     await close_apifansly_client()
+
+    # The database pool's threads are not daemons, so a lingering pool would
+    # keep the process alive after the event loop stops.
+    db_executor.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)

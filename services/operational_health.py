@@ -334,6 +334,12 @@ async def collect(*, use_cache: bool = True) -> dict:
         model_availability=availability,
     )
 
+    # The ceiling on concurrent Supabase calls for this whole process. A
+    # persistently non-zero `queued` is how an operator tells "the database
+    # thread pool is the bottleneck" from "the database is slow" — they look
+    # identical in latency alone.
+    from core import db_executor
+
     document = {
         "status": verdict["status"],
         "liveness": "ok",
@@ -349,6 +355,7 @@ async def collect(*, use_cache: bool = True) -> dict:
         "scheduler": scheduler,
         "model": model_summary,
         "vault": {"gate": vault_gate},
+        "db_executor": db_executor.snapshot(),
     }
     _cache["at"] = now
     _cache["value"] = document
