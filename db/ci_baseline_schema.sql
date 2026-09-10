@@ -45,6 +45,17 @@ create table public.creators (
     auto_mode boolean not null default false,
     auto_audience_policy jsonb null,
     persona jsonb null,
+    -- Settings edits these directly from the browser (app/settings/page.tsx),
+    -- so browser_least_privilege_v1 grants UPDATE on exactly this set and
+    -- nothing else. The fixture carries them or CI cannot test SEC-001's
+    -- column grants at all — the migration skips columns that do not exist.
+    sleep_hours_start integer null,
+    sleep_hours_end integer null,
+    caps_enabled boolean not null default false,
+    max_ppv_per_fan_per_day integer null,
+    max_spend_per_fan_per_day integer null,
+    crisis_policy text null,
+    whale_handoff_threshold integer null,
     created_at timestamptz not null default now()
 );
 
@@ -69,6 +80,15 @@ create table public.fans (
     notes text null,
     member_note text null,
     model_note text null,
+    -- The FAN DETAILS form in components/FanPanel.tsx reads and writes these.
+    -- They are the ONLY fan columns browser_least_privilege_v1 grants UPDATE
+    -- on; total_spent, spend_tier, sales_log and needs_human_review above are
+    -- deliberately backend-only, and the SEC-001 tests assert exactly that.
+    age text null,
+    payday text null,
+    hobbies text null,
+    relationship_status text null,
+    preferences jsonb null,
     last_active timestamptz null,
     created_at timestamptz not null default now()
 );
@@ -166,6 +186,16 @@ create table public.vault_sets (
     -- The pre-cents price column adaptive_planning_v1 backfills base/min/max
     -- from. Numeric dollars, per that migration's round(... * 100) conversion.
     suggested_price numeric null,
+    -- What app/scripts/page.tsx inserts and patches when an operator curates a
+    -- set by hand. Operator-owned content, so SEC-001 grants whole-row writes
+    -- here rather than a column list.
+    title text null,
+    media_ids jsonb not null default '[]'::jsonb,
+    preview_media_id text null,
+    status text null,
+    source text null,
+    description text null,
+    metadata_version integer null,
     created_at timestamptz not null default now()
 );
 
@@ -177,6 +207,23 @@ create table public.creator_vault_media (
     -- Like fans.avatar_url, it exists only in the live project; the fixture
     -- carries it so a migration that references it can be applied in CI.
     album_title text null,
+    -- The platform's record of what exists in the vault. app/vault/page.tsx
+    -- reads these; SEC-001 deliberately does NOT grant UPDATE on url or
+    -- fansly_media_id, because editing them locally would desynchronise the
+    -- mirror without changing anything on Fansly.
+    fansly_media_id text null,
+    url text null,
+    mimetype text null,
+    -- The classifier's output, which an operator MAY correct from the preview
+    -- panel. These are the granted columns.
+    content_category text null,
+    ai_description text null,
+    price_min integer null,
+    price_max integer null,
+    scene_location text null,
+    scene_outfit text null,
+    scene_lighting text null,
+    scene_id text null,
     created_at timestamptz not null default now()
 );
 

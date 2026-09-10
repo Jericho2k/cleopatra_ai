@@ -71,9 +71,28 @@ def test_migration_order_has_no_duplicates():
     assert len(order) == len(set(order))
 
 
-def test_tenant_isolation_runs_last():
-    """It discovers creator-owned objects at run time; anything after it is uncovered."""
-    assert migration_order()[-1] == "tenant_isolation_v1.sql"
+def test_tenant_isolation_and_least_privilege_run_last_as_a_pair():
+    """Both discover creator-owned objects at run time, and their order matters.
+
+    tenant_isolation_v1 must come after every migration that creates a
+    creator-owned table, or that table gets no policy at all.
+
+    browser_least_privilege_v1 must come immediately after tenant_isolation_v1,
+    because tenant_isolation_v1 DROPS every policy on each table it discovers
+    before creating its own FOR ALL policy. Anything that narrows those policies
+    has to run afterwards or it is silently undone — which is also why the two
+    have to be applied together to production, not one at a time (SEC-001).
+    """
+    order = migration_order()
+
+    assert order[-2:] == [
+        "tenant_isolation_v1.sql",
+        "browser_least_privilege_v1.sql",
+    ], (
+        "tenant_isolation_v1 and browser_least_privilege_v1 must be the last "
+        "two migrations, in that order: the first grants FOR ALL to "
+        "authenticated and the second narrows it (SEC-001)."
+    )
 
 
 @pytest.fixture(scope="module")

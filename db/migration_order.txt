@@ -52,5 +52,14 @@ vault_sync_interruption_v1.sql
 # operators pressing Refresh cannot race the same membership diff.
 fansly_lists_single_flight_v1.sql
 
-# Always last: discovers creator-owned tables at run time.
+# Always last, and always as a PAIR, in this order.
+#
+# tenant_isolation_v1 discovers creator-owned tables at run time and gives each
+# a FOR ALL policy, so it must run after every table exists.
+#
+# browser_least_privilege_v1 (SEC-001) then narrows those policies to the
+# operations the dashboard actually performs. Running tenant_isolation_v1 ALONE
+# silently restores FOR ALL, because it drops every policy on each table it
+# discovers before creating its own. Never run one without the other.
 tenant_isolation_v1.sql
+browser_least_privilege_v1.sql
