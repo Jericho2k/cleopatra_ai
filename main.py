@@ -1917,6 +1917,101 @@ def _fansly_lists_interval_hours() -> float:
         return float(_FANSLY_LISTS_DEFAULT_INTERVAL_HOURS)
 
 
+async def _claim_platform_purchase(
+    *,
+    creator_id: str,
+    platform_order_id: str,
+    fan_id: str | None = None,
+    event_type: str = "ppv.purchased",
+    account_media_id: str | None = None,
+    price_cents: int | None = None,
+) -> str:
+    """Win or lose the right to process one platform order (REL-003).
+
+    Returns 'claimed' to exactly one caller, 'duplicate' to every other
+    including a concurrent one, and 'no_identity' when the platform did not
+    supply an order id.
+
+    A deployment that has not yet applied db/purchase_identity_v1.sql has no
+    such function. That is reported as 'unavailable' rather than raising, so a
+    rolling deploy in either order keeps working: the caller falls back to the
+    pre-existing sales_log scan, which is what it did before this sprint.
+    """
+    db = get_supabase()
+    try:
+        result = await asyncio.to_thread(
+            lambda: db.rpc(
+                "claim_platform_purchase",
+                {
+                    "p_creator_id": creator_id,
+                    "p_platform_order_id": platform_order_id,
+                    "p_fan_id": fan_id,
+                    "p_event_type": event_type,
+                    "p_account_media_id": account_media_id,
+                    "p_price_cents": price_cents,
+                },
+            ).execute()
+        )
+    except Exception as exc:
+        print(
+            f"[PPV WEBHOOK] purchase ledger unavailable creator={creator_id} "
+            f"order={platform_order_id}: {exc}"
+        )
+        return "unavailable"
+    return str(result.data or "unavailable")
+
+
+async def _complete_platform_purchase(
+    creator_id: str,
+    platform_order_id: str,
+) -> None:
+    db = get_supabase()
+    try:
+        await asyncio.to_thread(
+            lambda: db.rpc(
+                "complete_platform_purchase",
+                {
+                    "p_creator_id": creator_id,
+                    "p_platform_order_id": platform_order_id,
+                },
+            ).execute()
+        )
+    except Exception as exc:
+        # The purchase itself is already recorded; this only marks the ledger
+        # row. Leaving it 'claimed' still deduplicates correctly.
+        print(
+            f"[PPV WEBHOOK] could not settle ledger creator={creator_id} "
+            f"order={platform_order_id}: {exc}"
+        )
+
+
+async def _release_platform_purchase(
+    creator_id: str,
+    platform_order_id: str,
+) -> None:
+    """Undo a claim that did not result in a recorded purchase.
+
+    Failing to release is the one way this design could lose a sale, so the
+    failure is logged loudly rather than swallowed silently.
+    """
+    db = get_supabase()
+    try:
+        await asyncio.to_thread(
+            lambda: db.rpc(
+                "release_platform_purchase",
+                {
+                    "p_creator_id": creator_id,
+                    "p_platform_order_id": platform_order_id,
+                },
+            ).execute()
+        )
+    except Exception as exc:
+        print(
+            f"[PPV WEBHOOK CLAIM STUCK] creator={creator_id} "
+            f"order={platform_order_id} action=manual_review: {exc}"
+        )
+
+
 async def _fansly_lists_sync_due(creator_id: str) -> bool:
     """Whether the mirrored lists are stale enough to refresh on this pass."""
     db = get_supabase()
@@ -4623,11 +4718,53 @@ async def fansly_webhook(request: Request) -> dict:
             return {"status": "fan_not_found"}
 
         fan_row = fans[0]
+
+        # REL-003 — platform order identity is decided by PostgreSQL, not by
+        # scanning a jsonb array in Python.
+        #
+        # The scan below still runs, but only AFTER the claim and only as a
+        # compatibility check: orders processed before this migration exist in
+        # sales_log and in no ledger, and must keep deduplicating. It is not the
+        # concurrency authority any more and cannot be — two concurrent
+        # deliveries both read a log without the order in it.
+        #
+        # The claim is taken before any work, so every path that returns without
+        # recording a purchase has to release it (see _release below). Otherwise
+        # a redelivery of a genuinely unprocessed order would be rejected as a
+        # duplicate and the sale would be lost.
+        purchase_claim = "no_identity"
+        if platform_order_id:
+            purchase_claim = await _claim_platform_purchase(
+                creator_id=creator_id,
+                platform_order_id=platform_order_id,
+                fan_id=str(fan_row["id"]),
+                account_media_id=account_media_id or None,
+                price_cents=price_cents or None,
+            )
+            if purchase_claim == "duplicate":
+                print(
+                    f"[PPV WEBHOOK] duplicate order={platform_order_id} "
+                    f"creator={creator_id}"
+                )
+                return {"status": "duplicate"}
+
+        async def _release() -> None:
+            """Give the order back so a later redelivery can still apply it."""
+            if purchase_claim == "claimed":
+                await _release_platform_purchase(creator_id, platform_order_id)
+
         if platform_order_id and any(
             str(entry.get("platform_order_id") or "") == platform_order_id
             for entry in (fan_row.get("sales_log") or [])
         ):
+            # Already in this fan's history from before the ledger existed.
+            # Settle the claim as processed rather than releasing it, so the
+            # ledger now carries the identity too and the scan stops being
+            # needed for this order.
+            if purchase_claim == "claimed":
+                await _complete_platform_purchase(creator_id, platform_order_id)
             return {"status": "duplicate"}
+
         delivery_result = await asyncio.to_thread(
             lambda: db.table("ppv_deliveries")
             .select(
@@ -4694,6 +4831,7 @@ async def fansly_webhook(request: Request) -> dict:
                     f"[PPV WEBHOOK] unmatched price fan={fan_row['id']} "
                     f"expected={expected_cents} actual={price_cents}"
                 )
+                await _release()
                 return {"status": "unmatched_ppv_purchase"}
 
         pending_media_ids = normalize_media_ids(
@@ -4708,6 +4846,7 @@ async def fansly_webhook(request: Request) -> dict:
                 f"[PPV WEBHOOK] unmatched media fan={fan_row['id']} "
                 f"expected={pending_media_ids} actual={account_media_id}"
             )
+            await _release()
             return {"status": "unmatched_ppv_purchase"}
 
         purchase_media_id = str(
@@ -4715,17 +4854,26 @@ async def fansly_webhook(request: Request) -> dict:
             or pending.get("media_id")
         )
         if not purchase_media_id:
+            await _release()
             return {"status": "invalid_ppv_purchase_event"}
 
         from services.suggestions import record_ppv_purchase
 
-        await record_ppv_purchase(
-            str(fan_row["id"]),
-            purchase_media_id,
-            (price_cents / 100.0) if price_cents else None,
-            pending_override=pending,
-            platform_order_id=platform_order_id or None,
-        )
+        try:
+            await record_ppv_purchase(
+                str(fan_row["id"]),
+                purchase_media_id,
+                (price_cents / 100.0) if price_cents else None,
+                pending_override=pending,
+                platform_order_id=platform_order_id or None,
+            )
+        except Exception:
+            # The downstream effects did not all land. Release so the platform's
+            # redelivery can retry rather than being told it is a duplicate.
+            await _release()
+            raise
+        if purchase_claim == "claimed":
+            await _complete_platform_purchase(creator_id, platform_order_id)
         print(
             f"[PPV WEBHOOK] confirmed fan={fan_row['id']} "
             f"media={purchase_media_id} cents={price_cents}"

@@ -42,6 +42,9 @@ vault_album_summary_v1.sql
 # API-001: adds fans.chat_last_message_id, the durable reconciliation
 # checkpoint that keeps a restart from cold-syncing every known chat.
 chat_sync_checkpoint_v1.sql
+# REL-003: platform_purchase_events, the relational identity that makes two
+# concurrent deliveries of one order resolve to a single purchase.
+purchase_identity_v1.sql
 
 # Always last: discovers creator-owned tables at run time.
 tenant_isolation_v1.sql
