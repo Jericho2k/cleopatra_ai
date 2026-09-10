@@ -39,6 +39,9 @@ message_platform_identity_v1.sql
 durable_ingestion_v1.sql
 scheduled_action_claim_v1.sql
 vault_album_summary_v1.sql
+# API-001: adds fans.chat_last_message_id, the durable reconciliation
+# checkpoint that keeps a restart from cold-syncing every known chat.
+chat_sync_checkpoint_v1.sql
 
 # Always last: discovers creator-owned tables at run time.
 tenant_isolation_v1.sql

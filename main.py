@@ -855,7 +855,6 @@ async def vault_autosync_scheduler():
 
 _chat_reconcile_denied_bindings: set[tuple[str, str]] = set()
 _chat_reconcile_due_at: dict[str, float] = {}
-_chat_last_message_ids: dict[tuple[str, str], str] = {}
 
 
 def _chat_reconcile_interval_seconds(
@@ -877,35 +876,41 @@ def _chat_reconcile_interval_seconds(
 
 
 def _chat_message_sync_needed(
-    creator_id: str,
-    group_id: str,
     platform_last_message_id: str,
+    stored_checkpoint: str,
     *,
     is_new_chat: bool,
+    group_binding_changed: bool,
 ) -> bool:
-    """Fetch messages only when the chat-list cursor changed.
+    """Fetch messages only when the chat's remote last-message marker moved.
 
-    The first observation after a process restart intentionally returns true,
-    providing a durable safety reconciliation without a new database column.
+    API-001. The checkpoint is `fans.chat_last_message_id`, written at the end
+    of the last successful reconciliation of this chat and read back from the
+    fans page sync_chats already loads. Because it is durable, a process restart
+    no longer turns every known conversation into a cold sync — which at 20
+    creators x ~2,000 chats was ~40,000 provider calls per deploy.
+
+    Every ambiguous case resolves toward reconciling. A call this returns False
+    for is one where the remote marker is byte-identical to the marker we stored
+    after successfully syncing that same chat, so suppressing it cannot lose a
+    message:
+
+      * new chat                  -> sync (nothing has ever been imported)
+      * rebound group             -> sync (the checkpoint belongs to the old
+                                     conversation and means nothing here)
+      * no checkpoint stored      -> sync (never synced, or pre-migration row)
+      * platform reports no marker-> sync (cannot prove nothing changed)
+      * marker differs            -> sync (including a deleted newest message,
+                                     which moves lastMessageId)
+      * marker identical          -> skip
     """
-    if is_new_chat:
+    if is_new_chat or group_binding_changed:
         return True
-    previous = _chat_last_message_ids.get((creator_id, group_id))
-    if previous is None:
+    if not stored_checkpoint:
         return True
-    return bool(
-        platform_last_message_id
-        and platform_last_message_id != previous
-    )
-
-
-def _remember_chat_message_id(
-    creator_id: str,
-    group_id: str,
-    message_id: str,
-) -> None:
-    if creator_id and group_id and message_id:
-        _chat_last_message_ids[(creator_id, group_id)] = message_id
+    if not platform_last_message_id:
+        return True
+    return platform_last_message_id != stored_checkpoint
 
 
 async def _reconcile_chat_creators_once(
@@ -1626,16 +1631,14 @@ async def _sync_recent_fan_messages(
         limit=10,
         client=client,
     )
-    newest = max(
-        messages,
-        key=lambda row: int(row.get("createdAt") or 0),
-        default={},
-    )
-    _remember_chat_message_id(
-        creator_id,
-        group_id,
-        str(newest.get("id") or ""),
-    )
+    # API-001 — the reconciliation checkpoint is NOT written here. It has to be
+    # the marker list_chats reports, because that is what the next pass compares
+    # against; the newest id on this page is a different value from a different
+    # endpoint and the two would never compare equal. sync_chats writes it after
+    # this call returns. Callers that reach this function outside a chat-list
+    # pass (an Auto reply reconciling its own fan) therefore leave the
+    # checkpoint alone, which costs at most one extra call on the next pass and
+    # can never suppress one.
     message_ids = [
         str(message.get("id"))
         for message in messages
@@ -2028,7 +2031,13 @@ async def sync_chats(
 
     existing_fans = await fetch_all_rows_async(
         lambda start, end: db.table("fans")
-        .select("id, platform_fan_id, fansly_group_id, display_name, avatar_url")
+        # chat_last_message_id is the API-001 reconciliation checkpoint. It is
+        # read here rather than in its own query precisely because this page
+        # already exists: the durable checkpoint costs no extra round trip.
+        .select(
+            "id, platform_fan_id, fansly_group_id, display_name, avatar_url, "
+            "chat_last_message_id"
+        )
         .eq("creator_id", creator_id)
         # A unique total order: pages cannot drop or repeat a row.
         .order("id")
@@ -2135,32 +2144,32 @@ async def sync_chats(
             # Compare against what is already stored rather than writing
             # unconditionally. The values are already in hand, so this costs no
             # extra read.
-            update_payload: dict[str, str] = {}
-            if str(known.get("fansly_group_id") or "") != group_id:
+            #
+            # API-001 — the write is deliberately deferred until after the
+            # message sync below, so the reconciliation checkpoint rides the
+            # SAME update statement as the binding/display corrections instead
+            # of adding a second one. Unchanged chats still issue no write at
+            # all, and a chat that did sync issues exactly one.
+            update_payload: dict[str, object] = {}
+            group_binding_changed = (
+                str(known.get("fansly_group_id") or "") != group_id
+            )
+            if group_binding_changed:
                 update_payload["fansly_group_id"] = group_id
             if str(known.get("display_name") or "") != fan_name:
                 update_payload["display_name"] = fan_name
             if avatar_url and str(known.get("avatar_url") or "") != avatar_url:
                 update_payload["avatar_url"] = avatar_url
 
-            if update_payload:
-                await asyncio.to_thread(
-                    lambda fid=fan_row_id, p=update_payload: db.table("fans")
-                    .update(p)
-                    .eq("id", fid)
-                    .execute()
-                )
-                known.update(update_payload)
-                updated += 1
             synced += 1
             platform_last_message_id = str(
                 chat.get("lastMessageId") or ""
             )
             should_sync_messages = _chat_message_sync_needed(
-                creator_id,
-                group_id,
                 platform_last_message_id,
+                str(known.get("chat_last_message_id") or ""),
                 is_new_chat=is_new_chat,
+                group_binding_changed=group_binding_changed,
             )
             if incremental and creator_platform_id and should_sync_messages:
                 try:
@@ -2174,11 +2183,21 @@ async def sync_chats(
                         client=client,
                     )
                     new_messages += int(recent.get("imported") or 0)
-                    _remember_chat_message_id(
-                        creator_id,
-                        group_id,
-                        platform_last_message_id,
-                    )
+                    # Only after the import actually succeeded. A checkpoint
+                    # written for a failed sync would suppress the retry.
+                    #
+                    # The stored marker is the one list_chats reported, not the
+                    # newest id on the fetched page: the next pass compares
+                    # against list_chats, so the two have to come from the same
+                    # source or they would never match and nothing would ever be
+                    # suppressed.
+                    if platform_last_message_id:
+                        update_payload["chat_last_message_id"] = (
+                            platform_last_message_id
+                        )
+                        update_payload["chat_last_synced_at"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
                 except ApiFanslyAccountAccessError:
                     raise
                 except Exception as exc:
@@ -2186,6 +2205,27 @@ async def sync_chats(
                         f"[SYNC MESSAGES ERROR] creator={creator_id} "
                         f"fan={fan_row_id} group={group_id}: {exc}"
                     )
+            elif group_binding_changed and known.get("chat_last_message_id"):
+                # Rebound to a different conversation without importing from it
+                # on this pass (a full sync does not read messages per chat).
+                # The old checkpoint describes the OLD chat, so leaving it would
+                # let a stale marker suppress the first sync of the new one.
+                #
+                # Guarded on there being a checkpoint to clear: a brand new fan
+                # has none, and writing null over null would add two fields to
+                # every new-fan update for no effect.
+                update_payload["chat_last_message_id"] = None
+                update_payload["chat_last_synced_at"] = None
+
+            if update_payload:
+                await asyncio.to_thread(
+                    lambda fid=fan_row_id, p=update_payload: db.table("fans")
+                    .update(p)
+                    .eq("id", fid)
+                    .execute()
+                )
+                known.update(update_payload)
+                updated += 1
 
         await _stamp_vault_op(creator_id, "last_chat_reconcile_at")
         audience_sync = None
