@@ -80,6 +80,48 @@ is expressed as `GRANT ... (column)`).
 `tests/test_browser_least_privilege.py` asserts no creator-owned table is left
 with a `FOR ALL` policy for `authenticated`.
 
+## Applying a migration to production
+
+There is no automatic runner and this sprint deliberately did not build one.
+The workflow is four steps, and the third is the one that was missing:
+
+1. **Write the migration.** Additive where possible, idempotent where practical,
+   listed in `migration_order.txt` (CI fails otherwise), and tested against a
+   real PostgreSQL by `tests/test_schema_pipeline.py`.
+2. **Apply it intentionally**, by hand, in the Supabase SQL editor, in the order
+   `migration_order.txt` gives. Never `ci_baseline_schema.sql` or
+   `ci_supabase_stubs.sql` — those are CI fixtures and applying them to
+   production would be destructive.
+3. **Verify by effect**:
+   ```
+   SUPABASE_DB_URL='postgresql://...' python scripts/production_preflight.py
+   ```
+   It is read-only. It reports PASS/FAIL per effect and names the file to apply
+   for anything missing. Exit status is non-zero if anything FAILED.
+4. **Deploy the code.** Every migration in this sprint degrades to the previous
+   behaviour when absent, so the order of steps 2 and 4 is not load-bearing —
+   but verifying before deploying means a missing migration is a report rather
+   than an incident.
+
+### Why verify-by-effect and not a migrations ledger
+
+A ledger table records what someone *told* it was applied. For a project whose
+base schema was created out of band and whose history was never tracked, the
+first thing a new ledger would have to do is assert something about the past
+that nobody can check. Marking the existing migrations "applied" because their
+files exist would be fabricating history, and marking them un-applied would be
+false too.
+
+Verify-by-effect has no such problem: an index that exists, exists. It is also
+strictly more useful, because it catches the case a ledger cannot — a migration
+recorded as applied whose effect was later dropped, renamed, or never committed
+because the transaction failed halfway.
+
+**If a ledger is introduced later**, it should record only migrations applied
+*from that point forward*, and the preflight should remain the authority on
+whether an effect is actually present. The two answer different questions:
+"was this run" and "is this true". Only the second one matters at 3am.
+
 ## Switching CI to the real base schema
 
 Once someone with production read access has run `scripts/dump_base_schema.sh`:
