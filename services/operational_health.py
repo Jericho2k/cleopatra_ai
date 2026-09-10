@@ -25,6 +25,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from core.action_failures import TERMINAL_PREFIX, terminal_code
 from core.model_gate import MODEL_GATE
 from core.vault_gate import VAULT_GATE
 from services.model_availability import current_model_availability
@@ -56,6 +57,13 @@ SCHEDULER_START_GRACE_SECONDS = 90
 
 def process_uptime_seconds() -> float:
     return time.monotonic() - _PROCESS_STARTED_AT
+
+
+# How many terminal failures are inspected per probe. The health document is
+# polled often and this is a diagnosis aid, not an accounting record: enough
+# rows to identify WHICH cause is blocking work, cheap enough to read every few
+# seconds.
+_TERMINAL_SAMPLE_LIMIT = 200
 
 
 def _env_int(name: str, default: int) -> int:
@@ -162,10 +170,25 @@ async def probe_queue() -> dict:
             .limit(1)
             .execute()
         )
+        # REL-005 — an operator needs to tell "the provider is having a bad ten
+        # minutes" apart from "twenty fans cannot send because a binding is
+        # permanently broken". Both show up as FAILED rows; only the second is
+        # someone's job to fix. Terminal failures carry a machine-readable code
+        # in last_error, so they can be counted per cause rather than in total.
+        blocked = (
+            db.table("scheduled_actions")
+            .select("action_type, last_error")
+            .eq("status", "FAILED")
+            .like("last_error", f"{TERMINAL_PREFIX}:%")
+            .order("id")
+            .limit(_TERMINAL_SAMPLE_LIMIT)
+            .execute()
+        ).data or []
         return {
             "counts": counts,
             "oldest": oldest[0] if oldest else None,
             "pending_inbound": int(getattr(inbound, "count", 0) or 0),
+            "blocked": blocked,
         }
 
     try:
@@ -185,6 +208,11 @@ async def probe_queue() -> dict:
         else 0.0
     )
     counts = raw["counts"]
+    blocked_by_reason: dict[str, int] = {}
+    for row in raw.get("blocked") or []:
+        code = terminal_code(row.get("last_error")) or "unknown"
+        blocked_by_reason[code] = blocked_by_reason.get(code, 0) + 1
+
     return {
         "available": True,
         "pending": counts.get("pending", 0),
@@ -194,6 +222,14 @@ async def probe_queue() -> dict:
         "oldest_due_execute_at": oldest_at.isoformat() if oldest_at else None,
         "oldest_due_action_type": str(oldest.get("action_type") or "") or None,
         "oldest_pending_age_seconds": age_seconds,
+        # Actions that will never run again without an operator changing
+        # something, counted by cause. Sampled, so it is a floor, not a census —
+        # the point is "which problem", not an exact total.
+        "blocked_actions": sum(blocked_by_reason.values()),
+        "blocked_by_reason": blocked_by_reason,
+        "blocked_sample_truncated": (
+            len(raw.get("blocked") or []) >= _TERMINAL_SAMPLE_LIMIT
+        ),
         "error": None,
     }
 
@@ -244,6 +280,12 @@ def evaluate(
         degraded.append(f"scheduler_stale_for_{int(since)}s")
     if scheduler.get("last_error"):
         degraded.append("scheduler_last_cycle_errored")
+
+    # Terminal failures are degraded rather than fatal: the deployment is
+    # working, some creator's configuration is not. Named per cause so the
+    # alert says what to fix.
+    for code, count in sorted((queue.get("blocked_by_reason") or {}).items()):
+        degraded.append(f"actions_blocked_{code}:{count}")
 
     limit = int(model_gate.get("limit") or 0)
     if limit and int(model_gate.get("waiting") or 0) >= limit:

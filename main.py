@@ -9,6 +9,7 @@ from core.tasks import spawn
 import json
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -22,6 +23,7 @@ from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from core.action_telemetry import stage as action_stage
+from core.bounded_state import BoundedIdSet, prune_expired
 from core.pagination import fetch_all_rows_async
 from core.supabase import get_supabase
 from core.vault_gate import VAULT_GATE
@@ -137,12 +139,30 @@ from services.vault_metadata import (
 )
 
 
-_processed_messages: set = set()
+# REL-004 — a bounded FIFO, not a set that empties itself.
+#
+# This used to be a plain set cleared wholesale at 1,000 entries, which meant
+# item 1,001 erased the previous 1,000 identities in one go and left the dedupe
+# window empty. A redelivery arriving in that window was processed twice.
+#
+# Only a cheap short-circuit in front of the database: message identity is
+# enforced by the unique index from REL-002, so losing this on restart costs a
+# little duplicate work and never correctness.
+_processed_messages = BoundedIdSet(
+    maxsize=max(100, int(os.getenv("PROCESSED_MESSAGE_CACHE_SIZE", "5000")))
+)
 _vault_sync_state: dict = {}
 _vault_sync_retry_after: dict[str, float] = {}
 # "queued" is an active status: a creator waiting for a vault slot must not
 # be started a second time by the scheduler or an operator (VAULT-001).
 _VAULT_SYNC_ACTIVE_STATUSES = {"queued", "running", "categorizing_new"}
+
+# VAULT-003 — a random identity for THIS process, minted once at import.
+#
+# Deliberately not a PID or a hostname: two containers can share a host and a
+# PID can be reused, and either collision would make a dead process's
+# interrupted run look like a live one. It is only ever compared for equality.
+_PROCESS_ID = uuid.uuid4().hex
 _protected_video_download_gate = asyncio.Semaphore(1)
 _active_chat_binding_retry_after: dict[str, float] = {}
 _active_chat_binding_tasks: dict[str, asyncio.Task] = {}
@@ -716,8 +736,6 @@ async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
     # Register in dedup set to prevent webhook double-processing this same message
     if message_id:
         _processed_messages.add(message_id)
-        if len(_processed_messages) > 1000:
-            _processed_messages.clear()
 
     print(
         f"[POLLER] New message model={account_id} fan={platform_fan_id} "
@@ -1044,6 +1062,40 @@ async def chat_reconciliation_scheduler():
             for creator_id in list(_chat_reconcile_due_at):
                 if creator_id not in active_creator_ids:
                     _chat_reconcile_due_at.pop(creator_id, None)
+
+            # REL-004 — retry maps are cleaned on work the process is already
+            # doing, rather than by a background task whose only job is a few
+            # dicts.
+            #
+            # _active_chat_binding_retry_after only ever had entries REMOVED on
+            # success, so a fan whose binding never resolved — deleted, or
+            # permanently unresolvable — stayed in it for the life of the
+            # process. Dropping entries whose backoff has already elapsed is
+            # both the cleanup and a no-op semantically: an expired deadline is
+            # exactly the state "no backoff applies", which is what an absent
+            # entry means. The map is therefore bounded by the number of fans in
+            # backoff AT ONCE rather than by the number ever seen.
+            loop_now = asyncio.get_running_loop().time()
+            expired_bindings = prune_expired(
+                _active_chat_binding_retry_after,
+                loop_now,
+                # A fan with an in-flight resolution task keeps its entry: there
+                # the entry is also what coalesces concurrent callers onto one
+                # scan, which outlives the backoff deadline.
+                protect=set(_active_chat_binding_tasks),
+            )
+            expired_vault = prune_expired(
+                _vault_sync_retry_after,
+                time.time(),
+                keep=active_creator_ids,
+            )
+            if expired_bindings or expired_vault:
+                print(
+                    f"[STATE PRUNE] chat_bindings={expired_bindings} "
+                    f"vault_backoff={expired_vault} "
+                    f"processed_messages={len(_processed_messages)}"
+                )
+
             if due:
                 await _reconcile_chat_creators_once(due)
         except Exception as exc:
@@ -2054,14 +2106,21 @@ async def _sync_fansly_lists_if_due(
     caller's own binding backoff still owns the retry cadence.
     """
     from services.apifansly import ApiFanslyAccountAccessError
-    from services.fansly_lists import lists_sync_enabled, sync_fansly_lists
+    from services.fansly_lists import (
+        lists_sync_enabled,
+        sync_fansly_lists_single_flight,
+    )
 
     if not lists_sync_enabled():
         return None
     try:
         if not force and not await _fansly_lists_sync_due(creator_id):
             return None
-        return await sync_fansly_lists(creator_id, account_id)
+        # Single-flight: the staleness check above answers "should this run",
+        # not "am I the one running it". A manual refresh landing at the same
+        # moment as this pass would otherwise reconcile the same membership
+        # twice, each seeing the other's half-applied state.
+        return await sync_fansly_lists_single_flight(creator_id, account_id)
     except ApiFanslyAccountAccessError as exc:
         print(f"[FANSLY LISTS ACCESS DENIED] creator={creator_id}: {exc}")
         return {"status": "access_denied", "detail": str(exc)}
@@ -2719,6 +2778,10 @@ async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
         "total": 0,
         "album": "Waiting for a vault slot…",
     }
+    # VAULT-003 — durable from the moment the obligation exists, not from the
+    # moment a slot frees up. A restart while queued is just as invisible to the
+    # operator as a restart while running.
+    await _mark_vault_run_started(creator_id)
     spawn(_run_vault_sync(creator_id), name="run_vault_sync")
     return {"status": "started"}
 
@@ -2728,8 +2791,13 @@ async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
     dependencies=[Depends(require_creator_path_access)],
 )
 async def sync_vault_status(creator_id: str) -> dict:
-    state = _vault_sync_state.get(creator_id, {"status": "idle", "synced": 0, "total": 0, "album": ""})
-    return state
+    state = _vault_sync_state.get(creator_id)
+    if state is not None:
+        return state
+    # No in-process state. Either nothing has been asked of this creator, or a
+    # run was cut off by a restart — which used to be reported identically, as
+    # "idle" (VAULT-003).
+    return await _durable_vault_sync_state(creator_id)
 
 
 async def _vault_existing_media_ids(creator_id: str) -> set[str]:
@@ -2757,14 +2825,21 @@ async def _vault_existing_media_ids(creator_id: str) -> set[str]:
 async def _run_vault_sync(creator_id: str) -> None:
 
     db = get_supabase()
-    async with VAULT_GATE.acquire(creator_id=creator_id, kind="vault_sync"):
-        _vault_sync_state[creator_id] = {
-            "status": "running",
-            "synced": 0,
-            "total": 0,
-            "album": "",
-        }
-        await _run_vault_sync_locked(creator_id, db)
+    try:
+        async with VAULT_GATE.acquire(creator_id=creator_id, kind="vault_sync"):
+            _vault_sync_state[creator_id] = {
+                "status": "running",
+                "synced": 0,
+                "total": 0,
+                "album": "",
+            }
+            await _run_vault_sync_locked(creator_id, db)
+    finally:
+        # VAULT-003 — released on every terminal path including cancellation,
+        # because a run that ended is 'idle' whether it succeeded or not. Only a
+        # run that never got here should look interrupted; leaving the marker
+        # behind would make a completed sync report interrupted forever.
+        await _mark_vault_run_finished(creator_id)
 
 
 async def _run_vault_sync_locked(creator_id: str, db) -> None:
@@ -3644,6 +3719,103 @@ async def _vault_cooldown_remaining(creator_id: str, column: str) -> dict:
         last_str,
         interval_hours=_VAULT_SYNC_INTERVAL_HOURS,
     )
+
+
+async def _mark_vault_run_started(creator_id: str) -> None:
+    """Claim the vault run for this process (VAULT-003).
+
+    Best effort by design. A deployment that has not applied
+    db/vault_sync_interruption_v1.sql yet has no such columns; the sync itself
+    is unaffected and only the interrupted/idle distinction is unavailable, so
+    this must never be the thing that stops a vault import.
+    """
+    db = get_supabase()
+    try:
+        await asyncio.to_thread(
+            lambda: db.table("creators")
+            .update({
+                "vault_sync_started_at": datetime.now(timezone.utc).isoformat(),
+                "vault_sync_finished_at": None,
+                "vault_sync_owner": _PROCESS_ID,
+            })
+            .eq("id", creator_id)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[VAULT STATE] could not mark start creator={creator_id}: {exc}")
+
+
+async def _mark_vault_run_finished(creator_id: str) -> None:
+    """Release the run. Called for success AND for failure.
+
+    A finished run is 'idle' whether it succeeded or errored — the error is
+    reported separately. What must not survive is the in-flight marker, or the
+    next process would report a completed run as interrupted forever.
+    """
+    db = get_supabase()
+    try:
+        await asyncio.to_thread(
+            lambda: db.table("creators")
+            .update({
+                "vault_sync_finished_at": datetime.now(timezone.utc).isoformat(),
+                "vault_sync_owner": None,
+            })
+            .eq("id", creator_id)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[VAULT STATE] could not mark finish creator={creator_id}: {exc}")
+
+
+async def _durable_vault_sync_state(creator_id: str) -> dict:
+    """What the database says about a run this process knows nothing about.
+
+    Only consulted when in-process state is empty, which after a restart is the
+    normal case rather than an error.
+    """
+    db = get_supabase()
+    try:
+        rows = (
+            await asyncio.to_thread(
+                lambda: db.table("creators")
+                .select(
+                    "vault_sync_started_at, vault_sync_finished_at, "
+                    "vault_sync_owner"
+                )
+                .eq("id", creator_id)
+                .limit(1)
+                .execute()
+            )
+        ).data or []
+    except Exception:
+        # The columns are missing (migration not applied) or the read failed.
+        # Fall back to the pre-existing answer rather than inventing a state.
+        return {"status": "idle", "synced": 0, "total": 0, "album": ""}
+
+    row = rows[0] if rows else {}
+    started = str(row.get("vault_sync_started_at") or "")
+    finished = str(row.get("vault_sync_finished_at") or "")
+    owner = str(row.get("vault_sync_owner") or "")
+
+    if started and not finished and owner and owner != _PROCESS_ID:
+        # A run began under a process that is no longer here. Recovery is
+        # already automatic — an interrupted sync never stamped
+        # last_vault_sync_at, so the cooldown never started and the scheduler
+        # will pick it up — so this is a description, not an alarm, and there is
+        # nothing for an operator to clear.
+        return {
+            "status": "interrupted",
+            "synced": 0,
+            "total": 0,
+            "album": "",
+            "interrupted_at": started,
+            "recoverable": True,
+            "detail": (
+                "A vault synchronisation was interrupted by a restart. "
+                "The next automatic or manual run resumes it."
+            ),
+        }
+    return {"status": "idle", "synced": 0, "total": 0, "album": ""}
 
 
 async def _stamp_vault_op(creator_id: str, column: str) -> None:
@@ -4590,8 +4762,6 @@ async def generate_suggestions_webhook(
     if message_id in _processed_messages:
         return {"status": "duplicate"}
     _processed_messages.add(message_id)
-    if len(_processed_messages) > 1000:
-        _processed_messages.clear()
 
     fan_id = record.get("fan_id")
     creator_id = record.get("creator_id")
@@ -5352,7 +5522,7 @@ async def sync_creator_fansly_lists(creator_id: str) -> dict:
     from services.fansly_lists import (
         lists_sync_enabled,
         read_lists_sync_state,
-        sync_fansly_lists,
+        sync_fansly_lists_single_flight,
     )
 
     if not lists_sync_enabled():
@@ -5379,7 +5549,12 @@ async def sync_creator_fansly_lists(creator_id: str) -> dict:
         )
 
     try:
-        result = await sync_fansly_lists(creator_id, account_id)
+        # Runs to completion before responding, so "synced" in the response
+        # means the reconciliation actually finished — not that a background
+        # task was created that a restart could discard. A second operator
+        # pressing Refresh gets status=already_syncing instead of a second
+        # concurrent reconciliation.
+        result = await sync_fansly_lists_single_flight(creator_id, account_id)
     except ApiFanslyAccountAccessError as exc:
         # Same reconnect semantics every other API Fansly access failure uses.
         raise HTTPException(status_code=409, detail=str(exc)) from exc

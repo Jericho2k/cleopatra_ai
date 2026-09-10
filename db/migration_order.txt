@@ -45,6 +45,12 @@ chat_sync_checkpoint_v1.sql
 # REL-003: platform_purchase_events, the relational identity that makes two
 # concurrent deliveries of one order resolve to a single purchase.
 purchase_identity_v1.sql
+# VAULT-003: lets a restarted process report an interrupted vault sync
+# as interrupted rather than idle.
+vault_sync_interruption_v1.sql
+# Per-creator single-flight claim for Fansly list reconciliation, so two
+# operators pressing Refresh cannot race the same membership diff.
+fansly_lists_single_flight_v1.sql
 
 # Always last: discovers creator-owned tables at run time.
 tenant_isolation_v1.sql

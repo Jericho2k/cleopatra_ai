@@ -490,6 +490,38 @@ async def fail_action(
     await asyncio.to_thread(_fail)
 
 
+async def fail_action_terminal(
+    action_id: str,
+    code: str,
+    detail: str,
+    attempts: int,
+) -> None:
+    """Fail an action once, with no further retries (REL-005).
+
+    For failures where retrying runs the same expensive pipeline to reach the
+    same answer — the creator is disconnected, there is no delivery route at
+    all. The eight-attempt budget exists to outlast a bad ten minutes at a
+    provider; spending it on a configuration problem costs eight analyzer and
+    writer runs and still cannot send.
+
+    last_error carries a machine-readable marker so the operator health surface
+    can tell a broken binding from a flaky provider without parsing prose.
+    """
+    from core.action_failures import TERMINAL_PREFIX
+
+    marker = f"{TERMINAL_PREFIX}:{code}: {detail}"[:500]
+
+    def _fail():
+        get_supabase().table("scheduled_actions").update({
+            "status": "FAILED",
+            "attempts": attempts + 1,
+            "last_error": marker,
+            "locked_at": None,
+        }).eq("id", action_id).eq("status", "PROCESSING").execute()
+
+    await asyncio.to_thread(_fail)
+
+
 async def reschedule_action(
     action_id: str,
     execute_at: datetime,

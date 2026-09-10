@@ -56,6 +56,15 @@ _MAX_MEMBER_PAGES = 200
 FANSLY_SOURCE = "fansly"
 LOCAL_SOURCE = "local"
 
+# How long a single-flight claim stays valid before another process may take it.
+# It has to comfortably exceed a legitimate large reconciliation — a creator
+# with thousands of fans across several lists — or a slow sync would be
+# reclaimed underneath itself and the race would be back. It also bounds how
+# long a crashed process can keep a creator from syncing.
+LISTS_SYNC_STALE_MINUTES = max(
+    1, int(os.getenv("FANSLY_LISTS_SYNC_STALE_MINUTES", "15"))
+)
+
 
 def lists_sync_enabled() -> bool:
     """Fansly list mirroring is opt-in until db/fansly_lists_v1.sql is applied.
@@ -503,6 +512,90 @@ async def sync_fansly_lists(
         f"skipped_removals={counters['skipped_removals']}"
     )
     return {"status": "degraded" if counters["degraded"] else "ok", **counters}
+
+
+async def _claim_lists_sync(creator_id: str) -> bool:
+    """Win the right to reconcile this creator's lists, or report that someone
+    else already has it.
+
+    A deployment without db/fansly_lists_single_flight_v1.sql has no such
+    function. That is treated as "claimed", which is exactly the pre-existing
+    behaviour: a rolling deploy must not be able to stop list synchronisation.
+    """
+    db = get_supabase()
+    try:
+        result = await asyncio.to_thread(
+            lambda: db.rpc(
+                "claim_fansly_lists_sync",
+                {
+                    "p_creator_id": creator_id,
+                    "p_stale_minutes": LISTS_SYNC_STALE_MINUTES,
+                },
+            ).execute()
+        )
+    except Exception as exc:
+        print(
+            f"[FANSLY LISTS] single-flight claim unavailable "
+            f"creator={creator_id}: {exc}"
+        )
+        return True
+    return bool(result.data)
+
+
+async def _release_lists_sync(creator_id: str) -> None:
+    """Release on success AND on failure.
+
+    A failed sync that stayed claimed would refuse a retry for the whole stale
+    window, turning one transient API error into fifteen minutes of no
+    synchronisation.
+    """
+    db = get_supabase()
+    try:
+        await asyncio.to_thread(
+            lambda: db.rpc(
+                "release_fansly_lists_sync",
+                {"p_creator_id": creator_id},
+            ).execute()
+        )
+    except Exception as exc:
+        # Not fatal: the claim is a timestamp, so it becomes reclaimable on its
+        # own once the stale window passes.
+        print(
+            f"[FANSLY LISTS] claim not released creator={creator_id}: {exc}"
+        )
+
+
+async def sync_fansly_lists_single_flight(
+    creator_id: str,
+    account_id: str,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """sync_fansly_lists, but only one at a time per creator.
+
+    Returns ``{"status": "already_syncing"}`` to a caller that lost the race,
+    rather than starting a second reconciliation of the same membership.
+
+    Deliberately not a global lock and not a new queue: different creators have
+    no shared state, and the durable work this would justify does not exist yet.
+    Callers that report completion to a human must call THIS, so "sync
+    completed" keeps meaning the reconciliation finished.
+    """
+    if not lists_sync_enabled():
+        return {"status": "disabled"}
+
+    if not await _claim_lists_sync(creator_id):
+        print(f"[FANSLY LISTS] already syncing creator={creator_id}")
+        return {"status": "already_syncing"}
+
+    try:
+        # Called with the same shape the callers used before this wrapper
+        # existed: an explicit client only when there is one to pass.
+        if client is not None:
+            return await sync_fansly_lists(creator_id, account_id, client=client)
+        return await sync_fansly_lists(creator_id, account_id)
+    finally:
+        await _release_lists_sync(creator_id)
 
 
 async def read_lists_sync_state(creator_id: str) -> dict[str, Any]:
