@@ -49,8 +49,17 @@ jobs:
       # codebase stay out of scope; widening this is its own piece of work.
       - name: Ruff (fatal subset)
         run: ruff check --select E9,F63,F7,F82,F401,F811,F841 .
+      # Cheapest possible check, and the one guarding the worst mistake in this
+      # repository's history: a CI-only fixture nearly being applied to the live
+      # Supabase project. Needs no database, so it runs before anything else.
+      - name: CI fixtures are not migrations
+        run: python scripts/production_preflight.py --env-only
       # Fail fast and unambiguously if the schema pipeline itself is broken,
       # before the rest of the suite muddies the output.
       - name: Schema pipeline (base schema + ordered migrations)
         run: pytest -q tests/test_schema_pipeline.py
+      # Every module must at least import. compileall catches a syntax error in
+      # a file no test happens to reach.
+      - name: Compile every module
+        run: python -m compileall -q . -x '(\.git|node_modules)'
       - run: pytest -q

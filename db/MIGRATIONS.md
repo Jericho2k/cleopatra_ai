@@ -26,6 +26,10 @@ could only ever test the additive migrations against nothing.
 | `db/migration_order.txt` | The deterministic order migrations are applied in. | n/a |
 | `db/*_v1.sql`, `db/*_v2.sql` | The additive migrations. Idempotent; safe to re-run. | Yes, in the order above |
 
+`scripts/production_preflight.py` verifies, read-only, that the effects of these
+migrations are actually present in a target database. Run it after applying
+anything, and before trusting a deployment. It never writes.
+
 `ci_baseline_schema.sql` is deliberately **not** named `000_base_schema.sql`. It
 was written from what the migrations and application code require, not dumped
 from production, and must never be mistaken for the real thing.
@@ -59,8 +63,64 @@ force it:
    (SEC-003), except that it is a view and the discovery loop only ever looked
    at base tables.
 
-**Re-run `tenant_isolation_v1` after adding any creator-owned table or view.**
-It is idempotent by design.
+**Re-run `tenant_isolation_v1` AND `browser_least_privilege_v1`, in that order,
+after adding any creator-owned table or view.** Both are idempotent by design.
+
+They are a pair and must never be applied singly. `tenant_isolation_v1` drops
+every policy on each table it discovers before creating its own
+`FOR ALL TO authenticated` policy, so running it alone silently reopens SEC-001:
+every creator-owned table becomes fully writable from the browser again.
+`browser_least_privilege_v1` then narrows those policies to the operations the
+dashboard actually performs, and revokes the broad Supabase grants that RLS
+alone cannot constrain (PostgreSQL has no per-column RLS, so column-level access
+is expressed as `GRANT ... (column)`).
+
+`tests/test_schema_pipeline.py` asserts they are the last two entries of
+`migration_order.txt`, in that order, and
+`tests/test_browser_least_privilege.py` asserts no creator-owned table is left
+with a `FOR ALL` policy for `authenticated`.
+
+## Applying a migration to production
+
+There is no automatic runner and this sprint deliberately did not build one.
+The workflow is four steps, and the third is the one that was missing:
+
+1. **Write the migration.** Additive where possible, idempotent where practical,
+   listed in `migration_order.txt` (CI fails otherwise), and tested against a
+   real PostgreSQL by `tests/test_schema_pipeline.py`.
+2. **Apply it intentionally**, by hand, in the Supabase SQL editor, in the order
+   `migration_order.txt` gives. Never `ci_baseline_schema.sql` or
+   `ci_supabase_stubs.sql` — those are CI fixtures and applying them to
+   production would be destructive.
+3. **Verify by effect**:
+   ```
+   SUPABASE_DB_URL='postgresql://...' python scripts/production_preflight.py
+   ```
+   It is read-only. It reports PASS/FAIL per effect and names the file to apply
+   for anything missing. Exit status is non-zero if anything FAILED.
+4. **Deploy the code.** Every migration in this sprint degrades to the previous
+   behaviour when absent, so the order of steps 2 and 4 is not load-bearing —
+   but verifying before deploying means a missing migration is a report rather
+   than an incident.
+
+### Why verify-by-effect and not a migrations ledger
+
+A ledger table records what someone *told* it was applied. For a project whose
+base schema was created out of band and whose history was never tracked, the
+first thing a new ledger would have to do is assert something about the past
+that nobody can check. Marking the existing migrations "applied" because their
+files exist would be fabricating history, and marking them un-applied would be
+false too.
+
+Verify-by-effect has no such problem: an index that exists, exists. It is also
+strictly more useful, because it catches the case a ledger cannot — a migration
+recorded as applied whose effect was later dropped, renamed, or never committed
+because the transaction failed halfway.
+
+**If a ledger is introduced later**, it should record only migrations applied
+*from that point forward*, and the preflight should remain the authority on
+whether an effect is actually present. The two answer different questions:
+"was this run" and "is this true". Only the second one matters at 3am.
 
 ## Switching CI to the real base schema
 

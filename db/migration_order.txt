@@ -39,6 +39,27 @@ message_platform_identity_v1.sql
 durable_ingestion_v1.sql
 scheduled_action_claim_v1.sql
 vault_album_summary_v1.sql
+# API-001: adds fans.chat_last_message_id, the durable reconciliation
+# checkpoint that keeps a restart from cold-syncing every known chat.
+chat_sync_checkpoint_v1.sql
+# REL-003: platform_purchase_events, the relational identity that makes two
+# concurrent deliveries of one order resolve to a single purchase.
+purchase_identity_v1.sql
+# VAULT-003: lets a restarted process report an interrupted vault sync
+# as interrupted rather than idle.
+vault_sync_interruption_v1.sql
+# Per-creator single-flight claim for Fansly list reconciliation, so two
+# operators pressing Refresh cannot race the same membership diff.
+fansly_lists_single_flight_v1.sql
 
-# Always last: discovers creator-owned tables at run time.
+# Always last, and always as a PAIR, in this order.
+#
+# tenant_isolation_v1 discovers creator-owned tables at run time and gives each
+# a FOR ALL policy, so it must run after every table exists.
+#
+# browser_least_privilege_v1 (SEC-001) then narrows those policies to the
+# operations the dashboard actually performs. Running tenant_isolation_v1 ALONE
+# silently restores FOR ALL, because it drops every policy on each table it
+# discovers before creating its own. Never run one without the other.
 tenant_isolation_v1.sql
+browser_least_privilege_v1.sql

@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from core.action_failures import PermanentActionFailure, WriterQualityFailure
 from core.action_telemetry import ActionTimings, action_scope, emit
 from db.commercial_queries import (
     action_needs_repair,
@@ -22,6 +23,7 @@ from db.commercial_queries import (
     claim_due_actions,
     complete_action,
     fail_action,
+    fail_action_terminal,
     get_action_states_by_dedupe_key,
     get_creator_policy,
     get_fan_state,
@@ -64,6 +66,12 @@ REPAIR_INTERVAL_SECONDS = 60
 # minutes leaves a wide margin for clock skew and a stalled cycle while removing
 # the every-obligation-every-minute scan.
 REPAIR_HORIZON_SECONDS = 300
+
+# REL-005 — a writer that produced nothing usable gets a small budget, not the
+# eight attempts a transient provider outage needs. The input has not changed
+# between attempts, so the later ones are not meaningfully more likely to
+# succeed; they just cost another analyzer and writer run each.
+WRITER_QUALITY_MAX_ATTEMPTS = 2
 
 # Actions whose whole purpose is bookkeeping or ingestion rather than sending a
 # proactive message; the proactive revalidation gate does not apply to them.
@@ -477,6 +485,19 @@ async def _run_inactivity_reengagement(action: dict) -> HandlerResult:
 async def _run_auto_reply(action: dict) -> HandlerResult:
     from services.suggestions import deliver_scheduled_auto_reply
 
+    # REL-005 — establish that a delivery route can exist BEFORE spending an
+    # analyzer and a writer run on producing a message for it.
+    #
+    # This is the whole point of the classification: an unconnected creator used
+    # to cost eight full pipelines to discover, once per queued fan. One cheap
+    # authoritative read replaces all of them.
+    #
+    # Only the creator half is checked here. The fan's group binding is
+    # deliberately NOT treated as permanent when absent: it is resolvable later
+    # by get_or_fetch_group_id, and calling a resolvable state permanent would
+    # silently drop a real reply.
+    await _require_delivery_route(action)
+
     sent = await deliver_scheduled_auto_reply(action)
     if not sent:
         from core.supabase import get_supabase
@@ -494,8 +515,55 @@ async def _run_auto_reply(action: dict) -> HandlerResult:
                 sent_message=False,
                 reason="durable Auto reply prepared a PPV approval",
             )
-        raise RuntimeError("Auto reply completed without a confirmed message")
+        # The pipeline ran and produced no confirmed message. Treated as a
+        # writer-quality failure rather than a transient one: the conversation
+        # state is unchanged, so a further six attempts would re-run the same
+        # generation against the same input.
+        raise WriterQualityFailure(
+            "no_confirmed_message",
+            "Auto reply completed without a confirmed message",
+        )
     return HandlerResult(sent_message=sent, reason="durable Auto reply processed")
+
+
+async def _require_delivery_route(action: dict) -> None:
+    """Fail terminally when the creator has no API Fansly connection at all.
+
+    Authoritative and cheap: one indexed read of the creator row. If the creator
+    is not connected there is no route to any fan, so every queued AUTO_REPLY
+    for them is in the same state and each would otherwise burn eight pipelines
+    discovering it.
+    """
+    from core.supabase import get_supabase
+
+    creator_id = str(action.get("creator_id") or "")
+    if not creator_id:
+        raise PermanentActionFailure(
+            "action_missing_creator",
+            "scheduled action carries no creator_id",
+        )
+
+    rows = (
+        await asyncio.to_thread(
+            lambda: get_supabase()
+            .table("creators")
+            .select("apifansly_account_id")
+            .eq("id", creator_id)
+            .limit(1)
+            .execute()
+        )
+    ).data or []
+
+    if not rows:
+        raise PermanentActionFailure(
+            "creator_missing",
+            f"creator {creator_id} no longer exists",
+        )
+    if not str(rows[0].get("apifansly_account_id") or "").strip():
+        raise PermanentActionFailure(
+            "creator_not_connected",
+            f"creator {creator_id} has no API Fansly account connected",
+        )
 
 
 async def _run_post_purchase_reaction(action: dict) -> HandlerResult:
@@ -788,7 +856,41 @@ async def _resolve_action(action: dict, *, sent_counter: list[int]) -> str:
         except asyncio.CancelledError:
             timings.outcome = "cancelled"
             raise
+        except PermanentActionFailure as exc:
+            # REL-005 — retrying this runs the analyzer and the writer again to
+            # reach the same answer. Fail once, visibly, with a code an operator
+            # can act on.
+            print(
+                f"[SCHEDULED TERMINAL] {action_type} fan={action.get('fan_id')} "
+                f"code={exc.code}: {exc.detail}"
+            )
+            await fail_action_terminal(
+                aid,
+                exc.code,
+                exc.detail,
+                action.get("attempts", 0),
+            )
+            timings.outcome = "failed_terminal"
+            return "failed_terminal"
+        except WriterQualityFailure as exc:
+            # The input has not changed, so the eighth attempt is no more likely
+            # to produce a usable candidate than the second. Worth one more try,
+            # not the full durable budget.
+            print(
+                f"[SCHEDULED WRITER FAILURE] {action_type} "
+                f"fan={action.get('fan_id')} code={exc.code}: {exc.detail}"
+            )
+            await fail_action(
+                aid,
+                f"writer_quality:{exc.code}: {exc.detail}",
+                action.get("attempts", 0),
+                max_attempts=WRITER_QUALITY_MAX_ATTEMPTS,
+            )
+            timings.outcome = "failed_writer_quality"
+            return "failed_writer_quality"
         except Exception as e:
+            # Unrecognised, therefore TRANSIENT. Guessing "permanent" here would
+            # silently drop a real message, which is the more expensive mistake.
             print(f"[SCHEDULED ERROR] {action_type} fan={action.get('fan_id')}: {e}")
             await fail_action(
                 aid,

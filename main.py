@@ -9,6 +9,7 @@ from core.tasks import spawn
 import json
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -22,6 +23,7 @@ from ai.situation_analyzer import analyze_situation
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from core.action_telemetry import stage as action_stage
+from core.bounded_state import BoundedIdSet, prune_expired
 from core.pagination import fetch_all_rows_async
 from core.supabase import get_supabase
 from core.vault_gate import VAULT_GATE
@@ -137,12 +139,30 @@ from services.vault_metadata import (
 )
 
 
-_processed_messages: set = set()
+# REL-004 — a bounded FIFO, not a set that empties itself.
+#
+# This used to be a plain set cleared wholesale at 1,000 entries, which meant
+# item 1,001 erased the previous 1,000 identities in one go and left the dedupe
+# window empty. A redelivery arriving in that window was processed twice.
+#
+# Only a cheap short-circuit in front of the database: message identity is
+# enforced by the unique index from REL-002, so losing this on restart costs a
+# little duplicate work and never correctness.
+_processed_messages = BoundedIdSet(
+    maxsize=max(100, int(os.getenv("PROCESSED_MESSAGE_CACHE_SIZE", "5000")))
+)
 _vault_sync_state: dict = {}
 _vault_sync_retry_after: dict[str, float] = {}
 # "queued" is an active status: a creator waiting for a vault slot must not
 # be started a second time by the scheduler or an operator (VAULT-001).
 _VAULT_SYNC_ACTIVE_STATUSES = {"queued", "running", "categorizing_new"}
+
+# VAULT-003 — a random identity for THIS process, minted once at import.
+#
+# Deliberately not a PID or a hostname: two containers can share a host and a
+# PID can be reused, and either collision would make a dead process's
+# interrupted run look like a live one. It is only ever compared for equality.
+_PROCESS_ID = uuid.uuid4().hex
 _protected_video_download_gate = asyncio.Semaphore(1)
 _active_chat_binding_retry_after: dict[str, float] = {}
 _active_chat_binding_tasks: dict[str, asyncio.Task] = {}
@@ -716,8 +736,6 @@ async def handle_new_fan_message(account_id: str, group_id: str, message: dict):
     # Register in dedup set to prevent webhook double-processing this same message
     if message_id:
         _processed_messages.add(message_id)
-        if len(_processed_messages) > 1000:
-            _processed_messages.clear()
 
     print(
         f"[POLLER] New message model={account_id} fan={platform_fan_id} "
@@ -855,7 +873,6 @@ async def vault_autosync_scheduler():
 
 _chat_reconcile_denied_bindings: set[tuple[str, str]] = set()
 _chat_reconcile_due_at: dict[str, float] = {}
-_chat_last_message_ids: dict[tuple[str, str], str] = {}
 
 
 def _chat_reconcile_interval_seconds(
@@ -877,35 +894,41 @@ def _chat_reconcile_interval_seconds(
 
 
 def _chat_message_sync_needed(
-    creator_id: str,
-    group_id: str,
     platform_last_message_id: str,
+    stored_checkpoint: str,
     *,
     is_new_chat: bool,
+    group_binding_changed: bool,
 ) -> bool:
-    """Fetch messages only when the chat-list cursor changed.
+    """Fetch messages only when the chat's remote last-message marker moved.
 
-    The first observation after a process restart intentionally returns true,
-    providing a durable safety reconciliation without a new database column.
+    API-001. The checkpoint is `fans.chat_last_message_id`, written at the end
+    of the last successful reconciliation of this chat and read back from the
+    fans page sync_chats already loads. Because it is durable, a process restart
+    no longer turns every known conversation into a cold sync — which at 20
+    creators x ~2,000 chats was ~40,000 provider calls per deploy.
+
+    Every ambiguous case resolves toward reconciling. A call this returns False
+    for is one where the remote marker is byte-identical to the marker we stored
+    after successfully syncing that same chat, so suppressing it cannot lose a
+    message:
+
+      * new chat                  -> sync (nothing has ever been imported)
+      * rebound group             -> sync (the checkpoint belongs to the old
+                                     conversation and means nothing here)
+      * no checkpoint stored      -> sync (never synced, or pre-migration row)
+      * platform reports no marker-> sync (cannot prove nothing changed)
+      * marker differs            -> sync (including a deleted newest message,
+                                     which moves lastMessageId)
+      * marker identical          -> skip
     """
-    if is_new_chat:
+    if is_new_chat or group_binding_changed:
         return True
-    previous = _chat_last_message_ids.get((creator_id, group_id))
-    if previous is None:
+    if not stored_checkpoint:
         return True
-    return bool(
-        platform_last_message_id
-        and platform_last_message_id != previous
-    )
-
-
-def _remember_chat_message_id(
-    creator_id: str,
-    group_id: str,
-    message_id: str,
-) -> None:
-    if creator_id and group_id and message_id:
-        _chat_last_message_ids[(creator_id, group_id)] = message_id
+    if not platform_last_message_id:
+        return True
+    return platform_last_message_id != stored_checkpoint
 
 
 async def _reconcile_chat_creators_once(
@@ -1039,6 +1062,40 @@ async def chat_reconciliation_scheduler():
             for creator_id in list(_chat_reconcile_due_at):
                 if creator_id not in active_creator_ids:
                     _chat_reconcile_due_at.pop(creator_id, None)
+
+            # REL-004 — retry maps are cleaned on work the process is already
+            # doing, rather than by a background task whose only job is a few
+            # dicts.
+            #
+            # _active_chat_binding_retry_after only ever had entries REMOVED on
+            # success, so a fan whose binding never resolved — deleted, or
+            # permanently unresolvable — stayed in it for the life of the
+            # process. Dropping entries whose backoff has already elapsed is
+            # both the cleanup and a no-op semantically: an expired deadline is
+            # exactly the state "no backoff applies", which is what an absent
+            # entry means. The map is therefore bounded by the number of fans in
+            # backoff AT ONCE rather than by the number ever seen.
+            loop_now = asyncio.get_running_loop().time()
+            expired_bindings = prune_expired(
+                _active_chat_binding_retry_after,
+                loop_now,
+                # A fan with an in-flight resolution task keeps its entry: there
+                # the entry is also what coalesces concurrent callers onto one
+                # scan, which outlives the backoff deadline.
+                protect=set(_active_chat_binding_tasks),
+            )
+            expired_vault = prune_expired(
+                _vault_sync_retry_after,
+                time.time(),
+                keep=active_creator_ids,
+            )
+            if expired_bindings or expired_vault:
+                print(
+                    f"[STATE PRUNE] chat_bindings={expired_bindings} "
+                    f"vault_backoff={expired_vault} "
+                    f"processed_messages={len(_processed_messages)}"
+                )
+
             if due:
                 await _reconcile_chat_creators_once(due)
         except Exception as exc:
@@ -1055,6 +1112,16 @@ async def lifespan(app: FastAPI):
     from core.environment import describe_environment
 
     print(f"[STARTUP] {describe_environment()}")
+
+    # Every Supabase call in this process runs on the event loop's default
+    # executor via asyncio.to_thread. Left unconfigured that pool is sized
+    # min(32, cpu_count + 4) — eight threads on a 4-vCPU container, shared by
+    # the worker, the schedulers and every inbound webhook. Make the ceiling
+    # explicit and visible rather than an accident of the container size.
+    from core import db_executor
+
+    db_executor.install(asyncio.get_running_loop())
+    print(f"[STARTUP] {db_executor.describe()}")
 
     supabase = get_supabase()
     session_store = SessionStore(
@@ -1093,6 +1160,10 @@ async def lifespan(app: FastAPI):
     # the only place that closes it. Sockets are released here rather than at
     # the end of every individual call.
     await close_apifansly_client()
+
+    # The database pool's threads are not daemons, so a lingering pool would
+    # keep the process alive after the event loop stops.
+    db_executor.shutdown()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -1626,16 +1697,14 @@ async def _sync_recent_fan_messages(
         limit=10,
         client=client,
     )
-    newest = max(
-        messages,
-        key=lambda row: int(row.get("createdAt") or 0),
-        default={},
-    )
-    _remember_chat_message_id(
-        creator_id,
-        group_id,
-        str(newest.get("id") or ""),
-    )
+    # API-001 — the reconciliation checkpoint is NOT written here. It has to be
+    # the marker list_chats reports, because that is what the next pass compares
+    # against; the newest id on this page is a different value from a different
+    # endpoint and the two would never compare equal. sync_chats writes it after
+    # this call returns. Callers that reach this function outside a chat-list
+    # pass (an Auto reply reconciling its own fan) therefore leave the
+    # checkpoint alone, which costs at most one extra call on the next pass and
+    # can never suppress one.
     message_ids = [
         str(message.get("id"))
         for message in messages
@@ -1914,6 +1983,101 @@ def _fansly_lists_interval_hours() -> float:
         return float(_FANSLY_LISTS_DEFAULT_INTERVAL_HOURS)
 
 
+async def _claim_platform_purchase(
+    *,
+    creator_id: str,
+    platform_order_id: str,
+    fan_id: str | None = None,
+    event_type: str = "ppv.purchased",
+    account_media_id: str | None = None,
+    price_cents: int | None = None,
+) -> str:
+    """Win or lose the right to process one platform order (REL-003).
+
+    Returns 'claimed' to exactly one caller, 'duplicate' to every other
+    including a concurrent one, and 'no_identity' when the platform did not
+    supply an order id.
+
+    A deployment that has not yet applied db/purchase_identity_v1.sql has no
+    such function. That is reported as 'unavailable' rather than raising, so a
+    rolling deploy in either order keeps working: the caller falls back to the
+    pre-existing sales_log scan, which is what it did before this sprint.
+    """
+    db = get_supabase()
+    try:
+        result = await asyncio.to_thread(
+            lambda: db.rpc(
+                "claim_platform_purchase",
+                {
+                    "p_creator_id": creator_id,
+                    "p_platform_order_id": platform_order_id,
+                    "p_fan_id": fan_id,
+                    "p_event_type": event_type,
+                    "p_account_media_id": account_media_id,
+                    "p_price_cents": price_cents,
+                },
+            ).execute()
+        )
+    except Exception as exc:
+        print(
+            f"[PPV WEBHOOK] purchase ledger unavailable creator={creator_id} "
+            f"order={platform_order_id}: {exc}"
+        )
+        return "unavailable"
+    return str(result.data or "unavailable")
+
+
+async def _complete_platform_purchase(
+    creator_id: str,
+    platform_order_id: str,
+) -> None:
+    db = get_supabase()
+    try:
+        await asyncio.to_thread(
+            lambda: db.rpc(
+                "complete_platform_purchase",
+                {
+                    "p_creator_id": creator_id,
+                    "p_platform_order_id": platform_order_id,
+                },
+            ).execute()
+        )
+    except Exception as exc:
+        # The purchase itself is already recorded; this only marks the ledger
+        # row. Leaving it 'claimed' still deduplicates correctly.
+        print(
+            f"[PPV WEBHOOK] could not settle ledger creator={creator_id} "
+            f"order={platform_order_id}: {exc}"
+        )
+
+
+async def _release_platform_purchase(
+    creator_id: str,
+    platform_order_id: str,
+) -> None:
+    """Undo a claim that did not result in a recorded purchase.
+
+    Failing to release is the one way this design could lose a sale, so the
+    failure is logged loudly rather than swallowed silently.
+    """
+    db = get_supabase()
+    try:
+        await asyncio.to_thread(
+            lambda: db.rpc(
+                "release_platform_purchase",
+                {
+                    "p_creator_id": creator_id,
+                    "p_platform_order_id": platform_order_id,
+                },
+            ).execute()
+        )
+    except Exception as exc:
+        print(
+            f"[PPV WEBHOOK CLAIM STUCK] creator={creator_id} "
+            f"order={platform_order_id} action=manual_review: {exc}"
+        )
+
+
 async def _fansly_lists_sync_due(creator_id: str) -> bool:
     """Whether the mirrored lists are stale enough to refresh on this pass."""
     db = get_supabase()
@@ -1956,14 +2120,21 @@ async def _sync_fansly_lists_if_due(
     caller's own binding backoff still owns the retry cadence.
     """
     from services.apifansly import ApiFanslyAccountAccessError
-    from services.fansly_lists import lists_sync_enabled, sync_fansly_lists
+    from services.fansly_lists import (
+        lists_sync_enabled,
+        sync_fansly_lists_single_flight,
+    )
 
     if not lists_sync_enabled():
         return None
     try:
         if not force and not await _fansly_lists_sync_due(creator_id):
             return None
-        return await sync_fansly_lists(creator_id, account_id)
+        # Single-flight: the staleness check above answers "should this run",
+        # not "am I the one running it". A manual refresh landing at the same
+        # moment as this pass would otherwise reconcile the same membership
+        # twice, each seeing the other's half-applied state.
+        return await sync_fansly_lists_single_flight(creator_id, account_id)
     except ApiFanslyAccountAccessError as exc:
         print(f"[FANSLY LISTS ACCESS DENIED] creator={creator_id}: {exc}")
         return {"status": "access_denied", "detail": str(exc)}
@@ -2028,7 +2199,13 @@ async def sync_chats(
 
     existing_fans = await fetch_all_rows_async(
         lambda start, end: db.table("fans")
-        .select("id, platform_fan_id, fansly_group_id, display_name, avatar_url")
+        # chat_last_message_id is the API-001 reconciliation checkpoint. It is
+        # read here rather than in its own query precisely because this page
+        # already exists: the durable checkpoint costs no extra round trip.
+        .select(
+            "id, platform_fan_id, fansly_group_id, display_name, avatar_url, "
+            "chat_last_message_id"
+        )
         .eq("creator_id", creator_id)
         # A unique total order: pages cannot drop or repeat a row.
         .order("id")
@@ -2135,32 +2312,32 @@ async def sync_chats(
             # Compare against what is already stored rather than writing
             # unconditionally. The values are already in hand, so this costs no
             # extra read.
-            update_payload: dict[str, str] = {}
-            if str(known.get("fansly_group_id") or "") != group_id:
+            #
+            # API-001 — the write is deliberately deferred until after the
+            # message sync below, so the reconciliation checkpoint rides the
+            # SAME update statement as the binding/display corrections instead
+            # of adding a second one. Unchanged chats still issue no write at
+            # all, and a chat that did sync issues exactly one.
+            update_payload: dict[str, object] = {}
+            group_binding_changed = (
+                str(known.get("fansly_group_id") or "") != group_id
+            )
+            if group_binding_changed:
                 update_payload["fansly_group_id"] = group_id
             if str(known.get("display_name") or "") != fan_name:
                 update_payload["display_name"] = fan_name
             if avatar_url and str(known.get("avatar_url") or "") != avatar_url:
                 update_payload["avatar_url"] = avatar_url
 
-            if update_payload:
-                await asyncio.to_thread(
-                    lambda fid=fan_row_id, p=update_payload: db.table("fans")
-                    .update(p)
-                    .eq("id", fid)
-                    .execute()
-                )
-                known.update(update_payload)
-                updated += 1
             synced += 1
             platform_last_message_id = str(
                 chat.get("lastMessageId") or ""
             )
             should_sync_messages = _chat_message_sync_needed(
-                creator_id,
-                group_id,
                 platform_last_message_id,
+                str(known.get("chat_last_message_id") or ""),
                 is_new_chat=is_new_chat,
+                group_binding_changed=group_binding_changed,
             )
             if incremental and creator_platform_id and should_sync_messages:
                 try:
@@ -2174,11 +2351,21 @@ async def sync_chats(
                         client=client,
                     )
                     new_messages += int(recent.get("imported") or 0)
-                    _remember_chat_message_id(
-                        creator_id,
-                        group_id,
-                        platform_last_message_id,
-                    )
+                    # Only after the import actually succeeded. A checkpoint
+                    # written for a failed sync would suppress the retry.
+                    #
+                    # The stored marker is the one list_chats reported, not the
+                    # newest id on the fetched page: the next pass compares
+                    # against list_chats, so the two have to come from the same
+                    # source or they would never match and nothing would ever be
+                    # suppressed.
+                    if platform_last_message_id:
+                        update_payload["chat_last_message_id"] = (
+                            platform_last_message_id
+                        )
+                        update_payload["chat_last_synced_at"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
                 except ApiFanslyAccountAccessError:
                     raise
                 except Exception as exc:
@@ -2186,6 +2373,27 @@ async def sync_chats(
                         f"[SYNC MESSAGES ERROR] creator={creator_id} "
                         f"fan={fan_row_id} group={group_id}: {exc}"
                     )
+            elif group_binding_changed and known.get("chat_last_message_id"):
+                # Rebound to a different conversation without importing from it
+                # on this pass (a full sync does not read messages per chat).
+                # The old checkpoint describes the OLD chat, so leaving it would
+                # let a stale marker suppress the first sync of the new one.
+                #
+                # Guarded on there being a checkpoint to clear: a brand new fan
+                # has none, and writing null over null would add two fields to
+                # every new-fan update for no effect.
+                update_payload["chat_last_message_id"] = None
+                update_payload["chat_last_synced_at"] = None
+
+            if update_payload:
+                await asyncio.to_thread(
+                    lambda fid=fan_row_id, p=update_payload: db.table("fans")
+                    .update(p)
+                    .eq("id", fid)
+                    .execute()
+                )
+                known.update(update_payload)
+                updated += 1
 
         await _stamp_vault_op(creator_id, "last_chat_reconcile_at")
         audience_sync = None
@@ -2584,6 +2792,10 @@ async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
         "total": 0,
         "album": "Waiting for a vault slot…",
     }
+    # VAULT-003 — durable from the moment the obligation exists, not from the
+    # moment a slot frees up. A restart while queued is just as invisible to the
+    # operator as a restart while running.
+    await _mark_vault_run_started(creator_id)
     spawn(_run_vault_sync(creator_id), name="run_vault_sync")
     return {"status": "started"}
 
@@ -2593,8 +2805,13 @@ async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
     dependencies=[Depends(require_creator_path_access)],
 )
 async def sync_vault_status(creator_id: str) -> dict:
-    state = _vault_sync_state.get(creator_id, {"status": "idle", "synced": 0, "total": 0, "album": ""})
-    return state
+    state = _vault_sync_state.get(creator_id)
+    if state is not None:
+        return state
+    # No in-process state. Either nothing has been asked of this creator, or a
+    # run was cut off by a restart — which used to be reported identically, as
+    # "idle" (VAULT-003).
+    return await _durable_vault_sync_state(creator_id)
 
 
 async def _vault_existing_media_ids(creator_id: str) -> set[str]:
@@ -2622,14 +2839,21 @@ async def _vault_existing_media_ids(creator_id: str) -> set[str]:
 async def _run_vault_sync(creator_id: str) -> None:
 
     db = get_supabase()
-    async with VAULT_GATE.acquire(creator_id=creator_id, kind="vault_sync"):
-        _vault_sync_state[creator_id] = {
-            "status": "running",
-            "synced": 0,
-            "total": 0,
-            "album": "",
-        }
-        await _run_vault_sync_locked(creator_id, db)
+    try:
+        async with VAULT_GATE.acquire(creator_id=creator_id, kind="vault_sync"):
+            _vault_sync_state[creator_id] = {
+                "status": "running",
+                "synced": 0,
+                "total": 0,
+                "album": "",
+            }
+            await _run_vault_sync_locked(creator_id, db)
+    finally:
+        # VAULT-003 — released on every terminal path including cancellation,
+        # because a run that ended is 'idle' whether it succeeded or not. Only a
+        # run that never got here should look interrupted; leaving the marker
+        # behind would make a completed sync report interrupted forever.
+        await _mark_vault_run_finished(creator_id)
 
 
 async def _run_vault_sync_locked(creator_id: str, db) -> None:
@@ -3509,6 +3733,103 @@ async def _vault_cooldown_remaining(creator_id: str, column: str) -> dict:
         last_str,
         interval_hours=_VAULT_SYNC_INTERVAL_HOURS,
     )
+
+
+async def _mark_vault_run_started(creator_id: str) -> None:
+    """Claim the vault run for this process (VAULT-003).
+
+    Best effort by design. A deployment that has not applied
+    db/vault_sync_interruption_v1.sql yet has no such columns; the sync itself
+    is unaffected and only the interrupted/idle distinction is unavailable, so
+    this must never be the thing that stops a vault import.
+    """
+    db = get_supabase()
+    try:
+        await asyncio.to_thread(
+            lambda: db.table("creators")
+            .update({
+                "vault_sync_started_at": datetime.now(timezone.utc).isoformat(),
+                "vault_sync_finished_at": None,
+                "vault_sync_owner": _PROCESS_ID,
+            })
+            .eq("id", creator_id)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[VAULT STATE] could not mark start creator={creator_id}: {exc}")
+
+
+async def _mark_vault_run_finished(creator_id: str) -> None:
+    """Release the run. Called for success AND for failure.
+
+    A finished run is 'idle' whether it succeeded or errored — the error is
+    reported separately. What must not survive is the in-flight marker, or the
+    next process would report a completed run as interrupted forever.
+    """
+    db = get_supabase()
+    try:
+        await asyncio.to_thread(
+            lambda: db.table("creators")
+            .update({
+                "vault_sync_finished_at": datetime.now(timezone.utc).isoformat(),
+                "vault_sync_owner": None,
+            })
+            .eq("id", creator_id)
+            .execute()
+        )
+    except Exception as exc:
+        print(f"[VAULT STATE] could not mark finish creator={creator_id}: {exc}")
+
+
+async def _durable_vault_sync_state(creator_id: str) -> dict:
+    """What the database says about a run this process knows nothing about.
+
+    Only consulted when in-process state is empty, which after a restart is the
+    normal case rather than an error.
+    """
+    db = get_supabase()
+    try:
+        rows = (
+            await asyncio.to_thread(
+                lambda: db.table("creators")
+                .select(
+                    "vault_sync_started_at, vault_sync_finished_at, "
+                    "vault_sync_owner"
+                )
+                .eq("id", creator_id)
+                .limit(1)
+                .execute()
+            )
+        ).data or []
+    except Exception:
+        # The columns are missing (migration not applied) or the read failed.
+        # Fall back to the pre-existing answer rather than inventing a state.
+        return {"status": "idle", "synced": 0, "total": 0, "album": ""}
+
+    row = rows[0] if rows else {}
+    started = str(row.get("vault_sync_started_at") or "")
+    finished = str(row.get("vault_sync_finished_at") or "")
+    owner = str(row.get("vault_sync_owner") or "")
+
+    if started and not finished and owner and owner != _PROCESS_ID:
+        # A run began under a process that is no longer here. Recovery is
+        # already automatic — an interrupted sync never stamped
+        # last_vault_sync_at, so the cooldown never started and the scheduler
+        # will pick it up — so this is a description, not an alarm, and there is
+        # nothing for an operator to clear.
+        return {
+            "status": "interrupted",
+            "synced": 0,
+            "total": 0,
+            "album": "",
+            "interrupted_at": started,
+            "recoverable": True,
+            "detail": (
+                "A vault synchronisation was interrupted by a restart. "
+                "The next automatic or manual run resumes it."
+            ),
+        }
+    return {"status": "idle", "synced": 0, "total": 0, "album": ""}
 
 
 async def _stamp_vault_op(creator_id: str, column: str) -> None:
@@ -4455,8 +4776,6 @@ async def generate_suggestions_webhook(
     if message_id in _processed_messages:
         return {"status": "duplicate"}
     _processed_messages.add(message_id)
-    if len(_processed_messages) > 1000:
-        _processed_messages.clear()
 
     fan_id = record.get("fan_id")
     creator_id = record.get("creator_id")
@@ -4583,11 +4902,53 @@ async def fansly_webhook(request: Request) -> dict:
             return {"status": "fan_not_found"}
 
         fan_row = fans[0]
+
+        # REL-003 — platform order identity is decided by PostgreSQL, not by
+        # scanning a jsonb array in Python.
+        #
+        # The scan below still runs, but only AFTER the claim and only as a
+        # compatibility check: orders processed before this migration exist in
+        # sales_log and in no ledger, and must keep deduplicating. It is not the
+        # concurrency authority any more and cannot be — two concurrent
+        # deliveries both read a log without the order in it.
+        #
+        # The claim is taken before any work, so every path that returns without
+        # recording a purchase has to release it (see _release below). Otherwise
+        # a redelivery of a genuinely unprocessed order would be rejected as a
+        # duplicate and the sale would be lost.
+        purchase_claim = "no_identity"
+        if platform_order_id:
+            purchase_claim = await _claim_platform_purchase(
+                creator_id=creator_id,
+                platform_order_id=platform_order_id,
+                fan_id=str(fan_row["id"]),
+                account_media_id=account_media_id or None,
+                price_cents=price_cents or None,
+            )
+            if purchase_claim == "duplicate":
+                print(
+                    f"[PPV WEBHOOK] duplicate order={platform_order_id} "
+                    f"creator={creator_id}"
+                )
+                return {"status": "duplicate"}
+
+        async def _release() -> None:
+            """Give the order back so a later redelivery can still apply it."""
+            if purchase_claim == "claimed":
+                await _release_platform_purchase(creator_id, platform_order_id)
+
         if platform_order_id and any(
             str(entry.get("platform_order_id") or "") == platform_order_id
             for entry in (fan_row.get("sales_log") or [])
         ):
+            # Already in this fan's history from before the ledger existed.
+            # Settle the claim as processed rather than releasing it, so the
+            # ledger now carries the identity too and the scan stops being
+            # needed for this order.
+            if purchase_claim == "claimed":
+                await _complete_platform_purchase(creator_id, platform_order_id)
             return {"status": "duplicate"}
+
         delivery_result = await asyncio.to_thread(
             lambda: db.table("ppv_deliveries")
             .select(
@@ -4654,6 +5015,7 @@ async def fansly_webhook(request: Request) -> dict:
                     f"[PPV WEBHOOK] unmatched price fan={fan_row['id']} "
                     f"expected={expected_cents} actual={price_cents}"
                 )
+                await _release()
                 return {"status": "unmatched_ppv_purchase"}
 
         pending_media_ids = normalize_media_ids(
@@ -4668,6 +5030,7 @@ async def fansly_webhook(request: Request) -> dict:
                 f"[PPV WEBHOOK] unmatched media fan={fan_row['id']} "
                 f"expected={pending_media_ids} actual={account_media_id}"
             )
+            await _release()
             return {"status": "unmatched_ppv_purchase"}
 
         purchase_media_id = str(
@@ -4675,17 +5038,26 @@ async def fansly_webhook(request: Request) -> dict:
             or pending.get("media_id")
         )
         if not purchase_media_id:
+            await _release()
             return {"status": "invalid_ppv_purchase_event"}
 
         from services.suggestions import record_ppv_purchase
 
-        await record_ppv_purchase(
-            str(fan_row["id"]),
-            purchase_media_id,
-            (price_cents / 100.0) if price_cents else None,
-            pending_override=pending,
-            platform_order_id=platform_order_id or None,
-        )
+        try:
+            await record_ppv_purchase(
+                str(fan_row["id"]),
+                purchase_media_id,
+                (price_cents / 100.0) if price_cents else None,
+                pending_override=pending,
+                platform_order_id=platform_order_id or None,
+            )
+        except Exception:
+            # The downstream effects did not all land. Release so the platform's
+            # redelivery can retry rather than being told it is a duplicate.
+            await _release()
+            raise
+        if purchase_claim == "claimed":
+            await _complete_platform_purchase(creator_id, platform_order_id)
         print(
             f"[PPV WEBHOOK] confirmed fan={fan_row['id']} "
             f"media={purchase_media_id} cents={price_cents}"
@@ -5164,7 +5536,7 @@ async def sync_creator_fansly_lists(creator_id: str) -> dict:
     from services.fansly_lists import (
         lists_sync_enabled,
         read_lists_sync_state,
-        sync_fansly_lists,
+        sync_fansly_lists_single_flight,
     )
 
     if not lists_sync_enabled():
@@ -5191,7 +5563,12 @@ async def sync_creator_fansly_lists(creator_id: str) -> dict:
         )
 
     try:
-        result = await sync_fansly_lists(creator_id, account_id)
+        # Runs to completion before responding, so "synced" in the response
+        # means the reconciliation actually finished — not that a background
+        # task was created that a restart could discard. A second operator
+        # pressing Refresh gets status=already_syncing instead of a second
+        # concurrent reconciliation.
+        result = await sync_fansly_lists_single_flight(creator_id, account_id)
     except ApiFanslyAccountAccessError as exc:
         # Same reconnect semantics every other API Fansly access failure uses.
         raise HTTPException(status_code=409, detail=str(exc)) from exc
