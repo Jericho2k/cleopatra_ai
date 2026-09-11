@@ -81,7 +81,7 @@ def test_fifty_generations_queue_behind_ten_slots(monkeypatch):
 
 
 def test_the_gate_covers_every_provider_route(monkeypatch):
-    """Kimi/OpenRouter, DeepSeek/Together and the analyzer share one budget."""
+    """Kimi/OpenRouter, the Together writer and the analyzer share one budget."""
     monkeypatch.setenv("MODEL_MAX_CONCURRENCY", "3")
     probe = Probe(delay=0.02)
     anthropic_probe = Probe(delay=0.02)

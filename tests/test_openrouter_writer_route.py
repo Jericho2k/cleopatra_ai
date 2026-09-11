@@ -1,7 +1,7 @@
 """Regression tests for the OpenRouter Kimi K2.6 ordinary writer route.
 
 Covers routing, provider pinning, cache affinity, usage accounting, failure
-visibility, and that none of it disturbed the DeepSeek commercial route.
+visibility, and that none of it disturbed the Together commercial route.
 """
 
 from __future__ import annotations
@@ -114,34 +114,34 @@ def test_generic_chat_runtime_supports_openrouter(monkeypatch):
     assert target.api_key_env == "OPENROUTER_API_KEY"
 
 
-# --- 9: DeepSeek commercial routing is untouched ------------------------------
+# --- 9: Together commercial routing is untouched ------------------------------
 
 
-def test_commercial_complex_route_still_uses_together_deepseek():
+def test_commercial_complex_route_still_uses_together_serverless():
     decision = select_writer_route(
         _ctx(commercial_decision={"action": "PRESENT_SESSION_OPTIONS"})
     )
 
     assert decision.route == WriterRoute.COMMERCIAL_COMPLEX
     assert decision.primary_target.provider == "together"
-    assert decision.primary_target.model == "deepseek-ai/DeepSeek-V4-Pro"
+    assert decision.primary_target.model == "Qwen/Qwen3.7-Plus"
     assert decision.fallback_target is None
 
 
-def test_safety_sensitive_route_still_uses_together_deepseek():
+def test_safety_sensitive_route_still_uses_together_serverless():
     decision = select_writer_route(_ctx(situation={"crisis_signal": "self_harm"}))
 
     assert decision.route == WriterRoute.SAFETY_SENSITIVE
     assert decision.primary_target.provider == "together"
-    assert decision.primary_target.model == "deepseek-ai/DeepSeek-V4-Pro"
+    assert decision.primary_target.model == "Qwen/Qwen3.7-Plus"
 
 
-def test_ordinary_route_falls_back_to_deepseek_not_another_openrouter_provider():
+def test_ordinary_route_falls_back_to_together_not_another_openrouter_provider():
     decision = select_writer_route(_ctx())
 
     assert decision.fallback_target is not None
     assert decision.fallback_target.provider == "together"
-    assert decision.fallback_target.model == "deepseek-ai/DeepSeek-V4-Pro"
+    assert decision.fallback_target.model == "Qwen/Qwen3.7-Plus"
 
 
 # --- 4: the Kimi route carries the intended pinned provider controls ---------
@@ -324,9 +324,9 @@ def test_together_requests_carry_no_openrouter_fields(monkeypatch):
     asyncio.run(
         complete(
             ModelTarget(
-                name="together:deepseek-ai/DeepSeek-V4-Pro",
+                name="together:Qwen/Qwen3.7-Plus",
                 provider="together",
-                model="deepseek-ai/DeepSeek-V4-Pro",
+                model="Qwen/Qwen3.7-Plus",
                 base_url="https://api.together.xyz/v1",
                 api_key_env="TOGETHER_API_KEY",
             ),
@@ -519,21 +519,21 @@ def test_openrouter_failure_is_recorded_and_never_silently_reprovidered(monkeypa
             telemetry_context={"creator_id": "creator-1", "fan_id": "fan-1"},
             target_override=_openrouter_target(),
             fallback_target_override=ModelTarget(
-                name="together:deepseek-ai/DeepSeek-V4-Pro",
+                name="together:Qwen/Qwen3.7-Plus",
                 provider="together",
-                model="deepseek-ai/DeepSeek-V4-Pro",
+                model="Qwen/Qwen3.7-Plus",
                 base_url="https://api.together.xyz/v1",
                 api_key_env="TOGETHER_API_KEY",
             ),
         )
     )
 
-    # Two Kimi attempts, then Cleopatra's explicit DeepSeek fallback. Never a
+    # Two Kimi attempts, then Cleopatra's explicit Together fallback. Never a
     # different OpenRouter upstream.
     assert attempts == [
         "openrouter:moonshotai/kimi-k2.6",
         "openrouter:moonshotai/kimi-k2.6",
-        "together:deepseek-ai/DeepSeek-V4-Pro",
+        "together:Qwen/Qwen3.7-Plus",
     ]
     assert [provider for provider, _ in failures] == ["openrouter", "openrouter"]
     assert all("data policy" in error for _, error in failures)

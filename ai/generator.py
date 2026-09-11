@@ -222,6 +222,38 @@ def parse_reply_outcome(
     return ParseOutcome(reason=PARSE_ALL_REJECTED)
 
 
+def _log_unsuccessful_generation(
+    *,
+    attempt: int,
+    target: ModelTarget,
+    outcome: str,
+    text: str,
+    output_tokens: int,
+) -> None:
+    """Report a generation that came back HTTP-successful but unusable.
+
+    Before this existed, an attempt whose parse outcome was ``unparseable`` —
+    which is what an empty ``message.content`` produces — advanced to the next
+    model in total silence. A reasoning-enabled writer that spent its whole
+    completion budget on hidden reasoning therefore looked, in Railway, exactly
+    like an attempt that never happened; the only visible line was the LAST
+    model's transport error. That is the failure this line makes obvious.
+
+    Deliberately content-free. Only the shape of the answer is logged: which
+    attempt, which provider and model, why it was unusable, whether the message
+    body was empty at all, and how many output tokens were billed for it. No fan
+    message, no prompt, and no model output ever reaches the log.
+    """
+    # A logging helper on an error path must never be the thing that raises.
+    body = str(text or "")
+    print(
+        f"[GENERATOR] attempt={attempt} provider={target.provider} "
+        f"model={target.model} outcome={outcome} "
+        f"content_empty={str(not body.strip()).lower()} "
+        f"output_tokens={output_tokens}"
+    )
+
+
 def _same_model_target(left: ModelTarget, right: ModelTarget | None) -> bool:
     return bool(
         right
@@ -468,6 +500,13 @@ async def generate_replies(
                     f"[GENERATOR ERROR] attempt {attempt + 1} "
                     f"model={attempt_target.model} parse_error={parse_error}"
                 )
+                _log_unsuccessful_generation(
+                    attempt=attempt + 1,
+                    target=attempt_target,
+                    outcome="parse_error",
+                    text=result.text,
+                    output_tokens=result.usage.output_tokens,
+                )
                 continue
 
             await record_model_result(
@@ -485,6 +524,14 @@ async def generate_replies(
                         f"primary={primary_target.model} fallback={attempt_target.model}"
                     )
                 return replies
+
+            _log_unsuccessful_generation(
+                attempt=attempt + 1,
+                target=attempt_target,
+                outcome=parse_reason,
+                text=result.text,
+                output_tokens=result.usage.output_tokens,
+            )
 
             if parse_reason == PARSE_ALL_REJECTED:
                 # Retire this model for this turn. A different, explicitly

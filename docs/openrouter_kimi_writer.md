@@ -21,15 +21,49 @@ only ever applied to Together. It was not loosened.
 
 ```
 ordinary conversation      -> openrouter / moonshotai/kimi-k2.6  (pinned upstream)
-commercially complex turn  -> together   / deepseek-ai/DeepSeek-V4-Pro
-safety-sensitive turn      -> together   / deepseek-ai/DeepSeek-V4-Pro
+commercially complex turn  -> together   / Qwen/Qwen3.7-Plus
+safety-sensitive turn      -> together   / Qwen/Qwen3.7-Plus
 ```
 
-The DeepSeek routes are untouched by this change and deliberately stay on a
-different provider, so an OpenRouter incident cannot take the commercial writer
-down with it. `ai/generator.py` still runs the bounded plan of two primary
-attempts followed by one explicit fallback attempt: for an ordinary turn that is
-Kimi, Kimi, DeepSeek.
+The Together routes deliberately stay on a different provider, so an OpenRouter
+incident cannot take the commercial writer down with it. `ai/generator.py` still
+runs the bounded plan of two primary attempts followed by one explicit fallback
+attempt: for an ordinary turn that is Kimi, Kimi, Qwen3.7-Plus.
+
+> **2026-09 correction.** The complex/fallback route was
+> `deepseek-ai/DeepSeek-V4-Pro`. Together answers that handle with a live 400 for
+> this account — *"Unable to access non-serverless model
+> deepseek-ai/DeepSeek-V4-Pro. Please create and start a dedicated endpoint."* —
+> so the fallback had never worked, and an ordinary turn whose two Kimi attempts
+> failed ended with no reply at all. `Qwen/Qwen3.7-Plus` is serverless on Together
+> and callable with the same `TOGETHER_API_KEY`.
+
+## Reasoning must be off on both writer targets
+
+Both catalog entries set `"reasoning_enabled": false`, and
+`ai/model_providers.py` forwards it as `reasoning: {"enabled": false}`.
+
+This is a correctness requirement, not tuning. Kimi K2.6 reasons by default. With
+reasoning on it spends the completion budget on hidden reasoning and returns
+`message.content = null`; the writer parses that as unparseable output and moves
+on. The result is a total, silent writer failure on an HTTP 200: nothing is sent,
+nothing is retried usefully, and the only Railway line is whatever the last model
+in the ladder happened to say.
+
+The writer never needs chain-of-thought. It needs the final JSON array of chat
+replies.
+
+Verify a route before trusting it — this spends real credits and CI never runs
+it:
+
+```
+OPENROUTER_API_KEY=... python scripts/openrouter_smoke.py
+TOGETHER_API_KEY=...   python scripts/openrouter_smoke.py --route complex
+```
+
+The smoke fails non-zero on empty content, on output that does not parse into
+usable replies, and on an upstream other than the pinned one. A transport
+success is not a pass.
 
 ## Provider pinning (fail closed)
 
@@ -49,7 +83,7 @@ Every OpenRouter request carries a `provider` object:
 * `allow_fallbacks: false` — if Inceptron is unavailable, OpenRouter returns the
   upstream error rather than silently switching provider. That error is
   recorded in telemetry and in the runtime health state, and Cleopatra's own
-  explicit DeepSeek fallback then covers the turn. A random OpenRouter provider
+  explicit Together fallback then covers the turn. A random OpenRouter provider
   would change writing style, price, and cache locality with no signal at all.
 * `data_collection: "deny"` — OpenRouter routes only to providers that do not
   collect user data, and errors explicitly if the pinned provider does not
@@ -184,9 +218,15 @@ OPENROUTER_DATA_COLLECTION=deny
 Unchanged (must stay set):
 
 ```
-TOGETHER_API_KEY=<key>            # DeepSeek complex/fallback route
+TOGETHER_API_KEY=<key>            # complex/fallback route
 WRITER_COMPLEX_PROVIDER=together
-WRITER_COMPLEX_MODEL=deepseek-ai/DeepSeek-V4-Pro
+```
+
+Changed (2026-09), and this one must be edited by hand in Railway if it is set
+there — an explicit variable overrides the code default:
+
+```
+WRITER_COMPLEX_MODEL=Qwen/Qwen3.7-Plus
 ```
 
 Optional: `OPENROUTER_ZDR`, `OPENROUTER_BASE_URL`.

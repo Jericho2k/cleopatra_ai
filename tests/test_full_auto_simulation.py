@@ -843,3 +843,226 @@ def test_real_fan_auto_is_blocked_when_the_connector_is_disabled(world, spy, mon
     _run(scenario())
     assert _creator_rows(db) == []
     assert spy.requests == []
+
+
+# --- the simulated turn is processed once, by the simulator -----------------
+
+
+def test_simulated_fan_message_is_marked_as_an_owner_simulation_event(world, spy):
+    """The marker the database webhook keys off, written where the row is.
+
+    Without it the INSERT also reached POST /generate-suggestions and the
+    ordinary inbound pipeline ran a second time for one simulated turn.
+    """
+    from core.simulation import is_simulation_message
+
+    db, _ = world
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hii", fast=True
+        )
+    )
+
+    rows = [r for r in _fan_rows(db) if r["content"] == "hii"]
+    assert len(rows) == 1
+    assert is_simulation_message(rows[0]["media_context"]) is True
+
+
+def test_one_simulated_inbound_runs_full_auto_exactly_once(world, spy, monkeypatch):
+    """Every analysis and planning stage runs once, not twice.
+
+    This is the duplicate-processing bug stated as a count. The double pass used
+    to run situation analysis, the commercial orchestrator, price learning and
+    the conversation director twice for a single simulated fan turn.
+    """
+    monkeypatch.setenv("COMMERCIAL_LAYER_ENABLED", "true")
+    db, calls = world
+    orchestrated: list[dict] = []
+    priced: list[dict] = []
+
+    async def fake_orchestrate(**kwargs):
+        orchestrated.append(kwargs)
+        from models.commercial import ActionType
+
+        return SimpleNamespace(
+            action=ActionType.CONTINUE_NORMAL_CHAT,
+            selected_package_set_ids=None,
+            session_budget_cents=None,
+            model_dump=lambda mode=None: {"action": "CONTINUE_NORMAL_CHAT"},
+        )
+
+    async def fake_refresh_price_learning(**kwargs):
+        priced.append(kwargs)
+        return {"mode": "learning"}
+
+    monkeypatch.setattr(suggestions, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(suggestions, "refresh_price_learning", fake_refresh_price_learning)
+    monkeypatch.setattr(suggestions, "_within_daily_caps", lambda *_a, **_k: _value((True, "")))
+
+    result = _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hii", fast=True
+        )
+    )
+
+    assert len(_fan_rows(db)) == 3, "exactly one new fan message"
+    assert len(calls["analyzer"]) == 1, "situation analysis must run once"
+    assert len(orchestrated) == 1, "no duplicate commercial mutation"
+    # Price learning is refreshed twice WITHIN one turn by design — once before
+    # the analysis and once after it writes commercial state. Two is therefore
+    # the single-pass count here; the doubled turn this test exists to catch
+    # showed four.
+    assert len(priced) == 2, "price learning must run once per pass, not twice"
+    assert len(calls["director"]) == 1, "the conversation director must run once"
+    assert len(calls["route"]) == 1
+    assert len(calls["writer"]) == 1, "one Full Auto generation, not two"
+    assert result["outcome"] == "replied"
+    assert spy.requests == [], "zero API Fansly requests"
+
+
+def test_simulator_never_runs_assisted_generation(world, spy, monkeypatch):
+    """Auto and Assisted are different pipelines. Only Auto may run here."""
+    db, calls = world
+    assisted: list[tuple] = []
+
+    async def forbidden(*args, **kwargs):
+        assisted.append((args, kwargs))
+        raise AssertionError("the simulator must never run Assisted generation")
+
+    monkeypatch.setattr(suggestions, "get_suggestions", forbidden, raising=False)
+    monkeypatch.setattr(
+        suggestions, "process_incoming_fan_message", forbidden, raising=False
+    )
+
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hii", fast=True
+        )
+    )
+
+    assert assisted == []
+    assert len(calls["writer"]) == 1
+    assert all(
+        call["telemetry_context"]["feature"] == "auto_reply"
+        for call in calls["writer"]
+    )
+
+
+# --- a writer failure is not a decision ------------------------------------
+
+
+def test_writer_failure_reports_outcome_writer_failed(world, spy, monkeypatch):
+    """generate_replies fails closed with an empty list. That is a broken
+    deployment, and the simulator must never present it as Full Auto choosing
+    to stay quiet."""
+    db, calls = world
+
+    async def writer_fails(prompt, persona, **kwargs):
+        calls["writer"].append({"prompt": prompt, **kwargs})
+        return []
+
+    monkeypatch.setattr(suggestions, "generate_replies", writer_fails)
+
+    result = _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hii", fast=True
+        )
+    )
+
+    assert result["outcome"] == "writer_failed"
+    assert result["creator_messages"] == []
+    assert result["analysis_degraded"] is False
+    assert len(calls["writer"]) == 1, "the writer was reached and failed there"
+    assert spy.requests == []
+
+
+def test_intentional_no_send_is_distinct_from_writer_failure(world, spy, monkeypatch):
+    """A turn that stops before the writer is a real Full Auto decision."""
+    db, calls = world
+
+    monkeypatch.setattr(
+        suggestions,
+        "get_fan_by_id",
+        lambda _f: _value(
+            Fan(
+                id="fan-test",
+                display_name="Jostar",
+                platform_fan_id="test_jostar",
+                fansly_group_id="stale-group-99",
+                needs_human_review=True,
+            )
+        ),
+    )
+    monkeypatch.setattr(suggestions, "_crisis_freezes_chat", lambda *_a, **_k: _value(True))
+
+    result = _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hii", fast=True
+        )
+    )
+
+    assert result["outcome"] == "no_send"
+    assert result["creator_messages"] == []
+    assert calls["writer"] == [], "a no-send decision never reaches the writer"
+
+
+def test_degraded_analysis_outranks_every_other_outcome(world, spy, monkeypatch):
+    """The fail-closed analyzer keeps its own name rather than collapsing into
+    the generic no-send."""
+    db, calls = world
+
+    async def degraded(_ctx, telemetry_context=None):
+        return {"analysis_degraded": True, "degraded_reason": "provider_down"}
+
+    monkeypatch.setattr(suggestions, "analyze_situation", degraded)
+    monkeypatch.setattr(suggestions, "analysis_is_degraded", lambda _s: True)
+    monkeypatch.setattr(suggestions, "degraded_reason", lambda _s: "provider_down")
+
+    result = _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    assert result["outcome"] == "analyzer_degraded"
+    assert result["analysis_degraded"] is True
+
+
+def test_a_successful_turn_reports_replied(world, spy):
+    result = _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    assert result["outcome"] == "replied"
+    assert len(result["creator_messages"]) == 2
+
+
+def test_live_inbound_path_is_unaffected_by_the_outcome_sink(world, spy, monkeypatch):
+    """Every non-simulator caller passes no sink and behaves exactly as before."""
+    db, calls = world
+
+    async def writer_fails(prompt, persona, **kwargs):
+        calls["writer"].append({"prompt": prompt, **kwargs})
+        return []
+
+    monkeypatch.setattr(suggestions, "generate_replies", writer_fails)
+
+    async def scenario():
+        task = asyncio.create_task(
+            suggestions._debounced_auto_reply(
+                "fan-test",
+                "creator-1",
+                skip_debounce=True,
+                skip_availability=True,
+                skip_human_delays=True,
+            )
+        )
+        suggestions._pending_auto_replies["fan-test"] = task
+        await task
+
+    _run(scenario())
+
+    assert _creator_rows(db) == []
+    assert spy.requests == []

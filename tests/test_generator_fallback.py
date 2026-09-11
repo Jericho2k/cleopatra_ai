@@ -15,9 +15,9 @@ def _target(name: str, model: str) -> ModelTarget:
     )
 
 
-def test_generator_uses_deepseek_after_two_invalid_kimi_outputs(monkeypatch):
+def test_generator_uses_fallback_after_two_invalid_kimi_outputs(monkeypatch):
     kimi = _target("Kimi", "moonshotai/Kimi-K3")
-    deepseek = _target("DeepSeek", "deepseek-ai/DeepSeek-V4-Pro")
+    complex_writer = _target("Qwen3.7 Plus", "Qwen/Qwen3.7-Plus")
     calls: list[str] = []
     telemetry = []
 
@@ -25,7 +25,7 @@ def test_generator_uses_deepseek_after_two_invalid_kimi_outputs(monkeypatch):
         calls.append(target.model)
         text = (
             '["one", "two", "three"]'
-            if target.model == deepseek.model
+            if target.model == complex_writer.model
             else "not json"
         )
         return ModelResult(
@@ -58,11 +58,11 @@ def test_generator_uses_deepseek_after_two_invalid_kimi_outputs(monkeypatch):
                 "writer_route_reason": "ordinary_conversation",
             },
             target_override=kimi,
-            fallback_target_override=deepseek,
+            fallback_target_override=complex_writer,
         )
     )
 
     assert replies == ["one", "two", "three"]
-    assert calls == [kimi.model, kimi.model, deepseek.model]
+    assert calls == [kimi.model, kimi.model, complex_writer.model]
     assert telemetry[-1]["writer_fallback_used"] is True
     assert telemetry[-1]["writer_attempt_role"] == "fallback"

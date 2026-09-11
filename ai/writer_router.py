@@ -1,7 +1,7 @@
 """Deterministic production writer routing for Cleopatra.
 
 Kimi K2.6 through OpenRouter, pinned to one upstream provider, handles ordinary
-conversation. DeepSeek on Together handles commercially complex, high-value,
+conversation. Qwen3.7-Plus on Together handles commercially complex, high-value,
 session-active, and safety-sensitive turns. The router never asks a model to
 decide which business action should happen; it only chooses the writer that
 expresses the already-known context.
@@ -32,10 +32,18 @@ from models.model_runtime import ModelTarget
 DEFAULT_WRITER_PROVIDER = "openrouter"
 DEFAULT_WRITER_MODEL = "moonshotai/kimi-k2.6"
 
-# Commercially complex and safety-sensitive turns. Unchanged by the OpenRouter
-# migration and deliberately not routed through OpenRouter.
+# Commercially complex and safety-sensitive turns. Deliberately not routed
+# through OpenRouter, so an OpenRouter incident cannot take both writers down.
+#
+# Was deepseek-ai/DeepSeek-V4-Pro. Together rejects that handle for this account
+# with a live 400 — "Unable to access non-serverless model ... Please create and
+# start a dedicated endpoint" — so it was not a fallback at all: every ordinary
+# turn whose Kimi attempts failed ended with no reply. Qwen3.7-Plus is serverless
+# on Together, reachable with the same TOGETHER_API_KEY, and carries
+# reasoning_enabled=false in the catalog so it returns the writer's JSON array
+# rather than chain-of-thought.
 COMPLEX_WRITER_PROVIDER = "together"
-COMPLEX_WRITER_MODEL = "deepseek-ai/DeepSeek-V4-Pro"
+COMPLEX_WRITER_MODEL = "Qwen/Qwen3.7-Plus"
 
 
 class WriterRoute(str, Enum):

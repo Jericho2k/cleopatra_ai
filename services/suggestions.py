@@ -36,6 +36,7 @@ from services.human_delivery import build_availability_delay, build_delivery_sch
 from services.ppv_delivery import create_ppv_approval_request
 from services.db_reliability import retry_transient_db_operation
 from core.apifansly_gate import apifansly_enabled, simulation_scope
+from core.simulation import simulation_message_marker
 from services.apifansly import (
     headers as apifansly_headers,
     shared_client as apifansly_shared_client,
@@ -109,6 +110,20 @@ together_client = AsyncOpenAI(
     base_url="https://api.together.xyz/v1",
     api_key=get_settings().TOGETHER_API_KEY,
 )
+
+# What one Full Auto turn actually did. A turn that sends nothing is not one
+# event but three, and reporting them as one is how a total writer failure came
+# to be displayed as "Full Auto decided to send nothing this turn".
+#
+# These are the machine-readable names; they are produced by the real Auto path
+# and are not a parallel engine. ``replied`` and ``no_send`` are observable from
+# outside (a creator message exists, or it does not); ``analyzer_degraded`` and
+# ``writer_failed`` are not, so the pipeline reports them explicitly.
+AUTO_OUTCOME_REPLIED = "replied"
+AUTO_OUTCOME_NO_SEND = "no_send"
+AUTO_OUTCOME_ANALYZER_DEGRADED = "analyzer_degraded"
+AUTO_OUTCOME_WRITER_FAILED = "writer_failed"
+
 
 class AnalyzerDegradedError(RuntimeError):
     """Full Auto refused to act on a fabricated analysis (REL-001).
@@ -678,6 +693,7 @@ async def _debounced_auto_reply(
     skip_availability: bool = False,
     skip_human_delays: bool = False,
     expected_trigger_at: str | None = None,
+    outcome_sink: dict[str, str] | None = None,
 ) -> None:
     """Wait for fan to finish typing, then generate and send one reply.
 
@@ -687,6 +703,19 @@ async def _debounced_auto_reply(
     session planning, conversation director, writer routing, multipart selection
     — runs exactly as it does in production. The staleness checks those pauses
     also perform are kept; only their duration is removed.
+
+    ``outcome_sink`` is an optional mapping the caller owns, into which this
+    function records WHY the turn produced nothing when the reason is not
+    visible from the outside. Only the owner-only simulator passes one; the
+    durable AUTO_REPLY worker and every other caller pass nothing and behave
+    exactly as before.
+
+    It exists because "no creator message" is three different events — the turn
+    deliberately said nothing, the analyzer failed closed, or the writer stack
+    failed — and the simulator was reporting all three as a decision. This is
+    deliberately a sink rather than a return value: the many early returns in
+    this function all mean "no send", and only the writer branch needs to say
+    something more specific.
     """
     try:
         # Short jittered debounce catches rapid multi-message bursts. A separate
@@ -1190,6 +1219,17 @@ async def _debounced_auto_reply(
             )
 
         if not replies:
+            # generate_replies fails closed: an empty list is never "the writer
+            # chose silence", it is every configured attempt having failed or
+            # produced unusable output. A no-send decision is taken well before
+            # this point and never reaches the writer at all.
+            print(
+                f"[AUTO REPLY] writer produced no usable reply fan={fan_id} "
+                f"primary={route.primary_target.model} "
+                f"fallback={(route.fallback_target.model if route.fallback_target else 'none')}"
+            )
+            if outcome_sink is not None:
+                outcome_sink["outcome"] = AUTO_OUTCOME_WRITER_FAILED
             return
 
         reply = replies[0]
@@ -2181,7 +2221,19 @@ async def run_simulated_inbound(
     transport refuses every API Fansly request made by this task or by anything
     it spawns, so "zero remote calls" holds even for a code path nobody audited.
     """
-    fan_message_id = await save_message(fan_id, creator_id, "fan", message)
+    # Marked as an owner simulation event so the production Supabase database
+    # webhook on messages INSERT — which POSTs /generate-suggestions — ignores
+    # this row. Without the marker one simulated turn ran the ordinary inbound
+    # pipeline as well as the Full Auto turn below, doubling situation analysis,
+    # commercial state changes, price learning and the conversation director.
+    # The simulator is the sole processor of its own event.
+    fan_message_id = await save_message(
+        fan_id,
+        creator_id,
+        "fan",
+        message,
+        media_context=simulation_message_marker(),
+    )
 
     history_before = await get_conversation_history(fan_id)
     creator_ids_before = {row["id"] for row in await _recent_creator_message_rows(fan_id)}
@@ -2206,6 +2258,11 @@ async def run_simulated_inbound(
         # Identical to deliver_scheduled_auto_reply's invocation: register the
         # task in the pending slot so the pipeline's own staleness checks see a
         # current owner, then await it.
+        #
+        # The real Auto path reports into this mapping. It is created here and
+        # handed down rather than returned, because a task's context is copied
+        # on creation: a value the task sets would not travel back to us.
+        auto_outcome: dict[str, str] = {}
         task = asyncio.create_task(
             _debounced_auto_reply(
                 fan_id,
@@ -2213,6 +2270,7 @@ async def run_simulated_inbound(
                 skip_debounce=True,
                 skip_availability=True,
                 skip_human_delays=bool(fast),
+                outcome_sink=auto_outcome,
             )
         )
         _pending_auto_replies[fan_id] = task
@@ -2232,6 +2290,19 @@ async def run_simulated_inbound(
         for row in await _recent_creator_message_rows(fan_id)
         if row["id"] not in creator_ids_before
     ]
+
+    # Reported, not inferred. A turn that sent nothing because the writer stack
+    # failed is a broken deployment; a turn that sent nothing because Full Auto
+    # decided to is the product working. The simulator must never present the
+    # first as the second.
+    if creator_messages:
+        outcome = AUTO_OUTCOME_REPLIED
+    elif analyzer_degraded:
+        outcome = AUTO_OUTCOME_ANALYZER_DEGRADED
+    else:
+        outcome = auto_outcome.get("outcome", AUTO_OUTCOME_NO_SEND)
+
+    print(f"[SIMULATION] turn complete fan={fan_id} outcome={outcome}")
     return {
         "status": "ok",
         "simulation": True,
@@ -2239,4 +2310,5 @@ async def run_simulated_inbound(
         "fan_message_id": fan_message_id,
         "creator_messages": creator_messages,
         "analysis_degraded": analyzer_degraded,
+        "outcome": outcome,
     }
