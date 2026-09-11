@@ -28,6 +28,7 @@ from typing import Any
 from core.action_failures import TERMINAL_PREFIX, terminal_code
 from core.model_gate import MODEL_GATE
 from core.vault_gate import VAULT_GATE
+from services.db_reliability import retry_transient_db_operation
 from services.model_availability import current_model_availability
 from workers.scheduled_actions import worker_health_snapshot
 
@@ -36,6 +37,21 @@ from workers.scheduled_actions import worker_health_snapshot
 _CACHE_SECONDS = 5.0
 _DB_PROBE_TIMEOUT_SECONDS = 1.5
 _QUEUE_PROBE_TIMEOUT_SECONDS = 2.5
+
+# One repeat, and only for a transport failure. PostgREST connections get
+# recycled; a probe that happened to be in flight when one was terminated used
+# to publish database_unreachable and put "Cleopatra cannot reach its database"
+# in front of an operator whose database was fine. A single retry tells that
+# apart from an outage, because an outage fails both times.
+#
+# Deliberately NOT retried: a timeout. A database too slow to answer a
+# one-row select in 1.5s is a real signal, and repeating it would double the
+# health endpoint's latency in exactly the situation where it must stay fast.
+#
+# Deliberately NOT resetting the transport either (reset_after_attempt=None).
+# Health is the thing that observes an outage; it must not be the thing that
+# churns the client during one.
+_PROBE_ATTEMPTS = 2
 
 DEFAULT_QUEUE_MAX_AGE_SECONDS = 900
 DEFAULT_QUEUE_MAX_DEPTH = 500
@@ -113,9 +129,19 @@ async def probe_database() -> dict:
             .execute()
         )
 
-    try:
+    async def _attempt() -> None:
         await asyncio.wait_for(
             asyncio.to_thread(_ping), timeout=_DB_PROBE_TIMEOUT_SECONDS
+        )
+
+    try:
+        await retry_transient_db_operation(
+            _attempt,
+            label="health.database",
+            attempts=_PROBE_ATTEMPTS,
+            delay_seconds=0.05,
+            log_prefix="HEALTH DB",
+            reset_after_attempt=None,
         )
     except (asyncio.TimeoutError, TimeoutError):
         return {
@@ -191,9 +217,19 @@ async def probe_queue() -> dict:
             "blocked": blocked,
         }
 
-    try:
-        raw = await asyncio.wait_for(
+    async def _attempt() -> dict:
+        return await asyncio.wait_for(
             asyncio.to_thread(_read), timeout=_QUEUE_PROBE_TIMEOUT_SECONDS
+        )
+
+    try:
+        raw = await retry_transient_db_operation(
+            _attempt,
+            label="health.queue",
+            attempts=_PROBE_ATTEMPTS,
+            delay_seconds=0.05,
+            log_prefix="HEALTH QUEUE",
+            reset_after_attempt=None,
         )
     except (asyncio.TimeoutError, TimeoutError):
         return {"available": False, "error": "timeout"}
@@ -339,6 +375,7 @@ async def collect(*, use_cache: bool = True) -> dict:
     # thread pool is the bottleneck" from "the database is slow" — they look
     # identical in latency alone.
     from core import db_executor
+    from core import supabase as supabase_transport
 
     document = {
         "status": verdict["status"],
@@ -356,6 +393,11 @@ async def collect(*, use_cache: bool = True) -> dict:
         "model": model_summary,
         "vault": {"gate": vault_gate},
         "db_executor": db_executor.snapshot(),
+        # Which transport the PostgREST calls are actually running on, and how
+        # many times it has been rebuilt. A rising generation is the signal that
+        # transport resets are happening at all; http2 says whether this
+        # deployment is exposed to the multiplexed-GOAWAY failure mode.
+        "db_transport": supabase_transport.snapshot(),
     }
     _cache["at"] = now
     _cache["value"] = document

@@ -1844,13 +1844,23 @@ async def sweep_stale_ppv_checks() -> None:
         # easy to reach.
         from core.pagination import fetch_all_rows_async
 
-        pending_rows = await fetch_all_rows_async(
-            lambda start, end: db.table("fans")
-            .select("id, creator_id, pending_ppv_check, needs_human_review, review_reason")
-            .not_.is_("pending_ppv_check", "null")
-            .order("id")
-            .range(start, end)
-            .execute()
+        # Paged select, so a repeat is free. A PostgREST connection recycle
+        # part-way through the paging used to abort the whole sweep with
+        # [PPV SWEEP FATAL] and leave every stale reconciliation unrepaired
+        # until the next 15-minute pass.
+        pending_rows = await retry_transient_db_operation(
+            lambda: fetch_all_rows_async(
+                lambda start, end: db.table("fans")
+                .select(
+                    "id, creator_id, pending_ppv_check, needs_human_review, "
+                    "review_reason"
+                )
+                .not_.is_("pending_ppv_check", "null")
+                .order("id")
+                .range(start, end)
+                .execute()
+            ),
+            label="ppv_sweep.pending_rows",
         )
 
         if not pending_rows:

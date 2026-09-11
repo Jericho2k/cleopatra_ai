@@ -25,7 +25,11 @@ from ai.stage_classifier import classify_stage
 from core.action_telemetry import stage as action_stage
 from core.bounded_state import BoundedIdSet, prune_expired
 from core.pagination import fetch_all_rows_async
-from core.supabase import get_supabase
+from core.supabase import (
+    close_supabase_client,
+    describe as supabase_transport_description,
+    get_supabase,
+)
 from core.vault_gate import VAULT_GATE
 from core.webhooks import valid_hmac_sha256_signature
 from core.tenancy import (
@@ -60,7 +64,7 @@ from models.schemas import (
     SuggestionResponse,
 )
 from services.fan_intelligence import learn_from_fan_message
-from services.db_reliability import retry_transient_db_operation
+from services.db_reliability import retry_db_read, retry_transient_db_operation
 from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
@@ -844,11 +848,14 @@ async def vault_autosync_scheduler():
         try:
             print("[CRON] Vault auto-sync pass...")
             db = get_supabase()
-            creators = await asyncio.to_thread(
+            # The read that opens the cycle. Losing it to a connection recycle
+            # used to cost the whole hourly pass.
+            creators = await retry_db_read(
                 lambda: db.table("creators")
                 .select("id, last_vault_sync_at")
                 .not_.is_("apifansly_account_id", "null")
-                .execute()
+                .execute(),
+                label="vault_autosync.creators",
             )
             for c in (creators.data or []):
                 cid = str(c["id"])
@@ -1006,11 +1013,12 @@ async def chat_reconciliation_scheduler():
             import time
 
             db = get_supabase()
-            creators_result = await asyncio.to_thread(
+            creators_result = await retry_db_read(
                 lambda: db.table("creators")
                 .select("id, apifansly_account_id, auto_mode")
                 .not_.is_("apifansly_account_id", "null")
-                .execute()
+                .execute(),
+                label="chat_reconcile.creators",
             )
 
             # This used to read every auto-mode fan in the DEPLOYMENT — no
@@ -1121,6 +1129,9 @@ async def lifespan(app: FastAPI):
     from core import db_executor
 
     db_executor.install(asyncio.get_running_loop())
+    # The Supabase transport is a deployment-wide decision (HTTP/2 off, pool
+    # size, timeouts) that used to be invisible defaults inside supabase-py.
+    print(f"[BOOT] {supabase_transport_description()}")
     print(f"[STARTUP] {db_executor.describe()}")
 
     supabase = get_supabase()
@@ -1160,6 +1171,10 @@ async def lifespan(app: FastAPI):
     # the only place that closes it. Sockets are released here rather than at
     # the end of every individual call.
     await close_apifansly_client()
+
+    # Same reasoning for the PostgREST pool: process-wide, so shutdown is the
+    # only place that releases its sockets.
+    close_supabase_client()
 
     # The database pool's threads are not daemons, so a lingering pool would
     # keep the process alive after the event loop stops.
@@ -5278,21 +5293,28 @@ async def get_my_creators(request: Request, user_id: str | None = None) -> dict:
     if not operator_id:
         raise HTTPException(status_code=401, detail="Missing dashboard user session")
     db = get_supabase()
-    links = await asyncio.to_thread(
+    # Both of these are selects, so a lost connection costs nothing but a
+    # repeat. Before this they were bare to_thread calls: one PostgREST
+    # connection recycle mid-request and the dashboard got a 500 and told the
+    # operator the database was gone, when the next connection would have
+    # answered immediately.
+    links = await retry_db_read(
         lambda: db.table("chatter_creators")
         .select("creator_id")
         .eq("chatter_id", operator_id)
-        .execute()
+        .execute(),
+        label="my_creators.links",
     )
     creator_ids = [r["creator_id"] for r in (links.data or [])]
     if not creator_ids:
         return {"creators": []}
 
-    creators = await asyncio.to_thread(
+    creators = await retry_db_read(
         lambda: db.table("creators")
         .select("id, platform_username, fansly_account_id, apifansly_account_id, persona, auto_mode")
         .in_("id", creator_ids)
-        .execute()
+        .execute(),
+        label="my_creators.creators",
     )
     return {"creators": creators.data or []}
 
