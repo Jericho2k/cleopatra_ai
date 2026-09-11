@@ -6484,37 +6484,58 @@ async def simulation_creators(request: Request) -> dict:
     Scoped by the caller's ordinary creator assignments, then filtered to
     ``test_`` fans, so the simulator's pickers cannot enumerate real fans.
     """
-    from core.simulation import TEST_FAN_PREFIX, not_found, require_simulation_user
+    from core.simulation import TEST_FAN_PREFIX, require_simulation_user
 
     await require_simulation_user(request)
     allowed = await _creator_ids_for_user_cached(request)
     if not allowed:
         return {"creators": []}
 
-    def _load() -> tuple[list[dict], list[dict]]:
-        db = get_supabase()
-        creators = (
-            db.table("creators")
-            .select("id, name")
-            .in_("id", sorted(allowed))
-            .execute()
-        ).data or []
-        fans = (
-            db.table("fans")
-            .select("id, display_name, creator_id, platform_fan_id")
-            .in_("creator_id", sorted(allowed))
-            .like("platform_fan_id", f"{TEST_FAN_PREFIX}%")
-            .order("display_name")
-            .limit(500)
-            .execute()
-        ).data or []
-        return creators, fans
-
+    db = get_supabase()
+    ids = sorted(allowed)
     try:
-        creators, fans = await asyncio.to_thread(_load)
+        # Both are selects, so a lost PostgREST connection costs nothing but a
+        # repeat. Bare to_thread calls here meant one connection recycle
+        # mid-request turned into an error the dashboard renders as "you have
+        # no creators", which is indistinguishable from the real empty case.
+        creators_result, fans_result = await asyncio.gather(
+            retry_db_read(
+                # The creator display field is platform_username. `name` exists
+                # in db/ci_baseline_schema.sql but NOT in production, so
+                # selecting it returned PostgREST 42703 and this route 404'd
+                # while /simulation-capabilities answered 200. The CI fixture is
+                # a test fixture, not the authoritative production schema.
+                lambda: db.table("creators")
+                .select("id, platform_username")
+                .in_("id", ids)
+                .execute(),
+                label="simulation.creators",
+            ),
+            retry_db_read(
+                lambda: db.table("fans")
+                .select("id, display_name, creator_id, platform_fan_id")
+                .in_("creator_id", ids)
+                .like("platform_fan_id", f"{TEST_FAN_PREFIX}%")
+                .order("display_name")
+                .limit(500)
+                .execute(),
+                label="simulation.test_fans",
+            ),
+        )
     except Exception as exc:
         print(f"[SIMULATION] creator listing failed: {exc}")
-        raise not_found() from exc
+        # 503, not 404. Authorization already passed above, so this caller is a
+        # verified allowlisted owner and a distinguishable error tells them
+        # nothing they may not know. A 404 here would be read as an empty
+        # creator list, which is a lie about the data rather than a report of a
+        # failed read.
+        raise HTTPException(
+            status_code=503,
+            detail="Could not read creators for simulation. Please retry.",
+        ) from exc
+
+    creators = creators_result.data or []
+    fans = fans_result.data or []
 
     by_creator: dict[str, list[dict]] = {}
     for fan in fans:
@@ -6532,7 +6553,9 @@ async def simulation_creators(request: Request) -> dict:
         "creators": [
             {
                 "id": str(creator.get("id")),
-                "name": creator.get("name") or str(creator.get("id")),
+                # The API contract stays "name" — the dashboard type is
+                # unchanged. Only the column it is read from is corrected.
+                "name": creator.get("platform_username") or str(creator.get("id")),
                 "test_fans": by_creator.get(str(creator.get("id")), []),
             }
             for creator in creators

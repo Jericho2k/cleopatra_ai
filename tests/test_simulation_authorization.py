@@ -313,46 +313,195 @@ def test_non_allowlisted_user_is_rejected_on_every_mutation(client, path, payloa
     assert response.status_code == 404
 
 
+# --- creator listing, and the production columns it may read ----------------
+#
+# db/ci_baseline_schema.sql is a TEST FIXTURE, not the authoritative production
+# schema. It carries ``creators.name``; the production table does not. Selecting
+# it returned PostgREST 42703 and made GET /simulation/creators 404 in
+# production while /simulation-capabilities answered 200. The fakes below model
+# production, not the fixture, so the same mistake fails here first.
+
+
+# Exactly what a production creators row exposes to this route. ``name`` is
+# deliberately absent: the display field is platform_username, as /my-creators
+# has always used.
+PRODUCTION_CREATOR_COLUMNS = {"id", "platform_username"}
+
+
+class PostgrestUndefinedColumn(Exception):
+    """What PostgREST actually raises for a column that does not exist."""
+
+    def __init__(self, table: str, column: str) -> None:
+        super().__init__(
+            {"message": f"column {table}.{column} does not exist", "code": "42703"}
+        )
+
+
+class _Query:
+    """One query against one table, so concurrent reads cannot share state."""
+
+    def __init__(self, listing: "_Listing", name: str) -> None:
+        self.listing = listing
+        self.name = name
+        self.columns: list[str] = []
+
+    def select(self, columns="*", **_k):
+        self.columns = [c.strip() for c in str(columns).split(",") if c.strip()]
+        if self.name == "creators":
+            self.listing.creator_columns.update(self.columns)
+            for column in self.columns:
+                if column not in PRODUCTION_CREATOR_COLUMNS:
+                    raise PostgrestUndefinedColumn("creators", column)
+        return self
+
+    def in_(self, *_a, **_k):
+        return self
+
+    def like(self, *_a, **_k):
+        self.listing.filtered = True
+        return self
+
+    def order(self, *_a, **_k):
+        return self
+
+    def limit(self, *_a, **_k):
+        return self
+
+    def execute(self):
+        if self.name == "creators":
+            return SimpleNamespace(
+                data=[{"id": "creator-1", "platform_username": "Sophia"}]
+            )
+        return SimpleNamespace(
+            data=[
+                FANS["fan-test"],
+                # A real fan smuggled past the database filter must still be
+                # dropped by the Python-side boundary.
+                FANS["fan-real"],
+            ]
+        )
+
+
+class _Listing:
+    """A creators/fans database that only has production's columns."""
+
+    def __init__(self) -> None:
+        self.creator_columns: set[str] = set()
+        self.filtered = False
+
+    def table(self, name):
+        # A fresh query per call: the route reads creators and fans
+        # concurrently, so a shared mutable builder would let one read's table
+        # name clobber the other's.
+        return _Query(self, name)
+
+
 def test_creator_listing_is_owner_only_and_test_fans_only(client, monkeypatch):
     assert client.get("/simulation/creators", headers=_headers(AGENCY)).status_code == 404
 
-    class _Listing:
-        def table(self, name):
-            self.name = name
-            return self
-
-        def select(self, *_a, **_k):
-            return self
-
-        def in_(self, *_a, **_k):
-            return self
-
-        def like(self, *_a, **_k):
-            self.filtered = True
-            return self
-
-        def order(self, *_a, **_k):
-            return self
-
-        def limit(self, *_a, **_k):
-            return self
-
-        def execute(self):
-            if self.name == "creators":
-                return SimpleNamespace(data=[{"id": "creator-1", "name": "Sophia"}])
-            return SimpleNamespace(
-                data=[
-                    FANS["fan-test"],
-                    # A real fan smuggled past the database filter must still be
-                    # dropped by the Python-side boundary.
-                    FANS["fan-real"],
-                ]
-            )
-
-    monkeypatch.setattr(main, "get_supabase", _Listing)
-    body = client.get("/simulation/creators", headers=_headers(OWNER)).json()
+    listing = _Listing()
+    monkeypatch.setattr(main, "get_supabase", lambda: listing)
+    response = client.get("/simulation/creators", headers=_headers(OWNER))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # The API contract is unchanged: the dashboard still receives "name",
+    # regardless of which column it is read from.
     assert body["creators"][0]["name"] == "Sophia"
     assert [fan["id"] for fan in body["creators"][0]["test_fans"]] == ["fan-test"]
+
+
+def test_creator_listing_never_queries_the_fixture_only_name_column(client, monkeypatch):
+    """Regression guard for the 42703 production outage.
+
+    The fake raises the real PostgREST error for any creators column that does
+    not exist in production, so reintroducing ``creators.name`` fails here
+    instead of on Railway.
+    """
+    listing = _Listing()
+    monkeypatch.setattr(main, "get_supabase", lambda: listing)
+    response = client.get("/simulation/creators", headers=_headers(OWNER))
+
+    assert response.status_code == 200, response.text
+    assert "name" not in listing.creator_columns
+    assert listing.creator_columns == {"id", "platform_username"}
+
+
+def test_creator_listing_falls_back_to_the_id_when_username_is_null(client, monkeypatch):
+    """platform_username is nullable, so the picker must still have a label."""
+
+    class _Nameless(_Listing):
+        def table(self, name):
+            query = _Query(self, name)
+            if name == "creators":
+                query.execute = lambda: SimpleNamespace(
+                    data=[{"id": "creator-1", "platform_username": None}]
+                )
+            return query
+
+    listing = _Nameless()
+    monkeypatch.setattr(main, "get_supabase", lambda: listing)
+    body = client.get("/simulation/creators", headers=_headers(OWNER)).json()
+    assert body["creators"][0]["name"] == "creator-1"
+
+
+def test_creator_listing_retries_a_transient_read_instead_of_returning_empty(
+    client, monkeypatch
+):
+    """A PostgREST connection recycle must not read as "you have no creators"."""
+    from httpx import ConnectError
+
+    attempts = {"creators": 0}
+
+    class _Flaky(_Listing):
+        def table(self, name):
+            query = _Query(self, name)
+            if name == "creators":
+                original = query.execute
+
+                def flaky():
+                    attempts["creators"] += 1
+                    if attempts["creators"] == 1:
+                        raise ConnectError("server disconnected")
+                    return original()
+
+                query.execute = flaky
+            return query
+
+    listing = _Flaky()
+    monkeypatch.setattr(main, "get_supabase", lambda: listing)
+    response = client.get("/simulation/creators", headers=_headers(OWNER))
+
+    assert response.status_code == 200, response.text
+    assert attempts["creators"] >= 2, "the read must be retried, not abandoned"
+    assert response.json()["creators"][0]["name"] == "Sophia"
+
+
+def test_creator_listing_reports_a_failed_read_rather_than_an_empty_list(
+    client, monkeypatch
+):
+    """When retries are exhausted, say the read failed.
+
+    Authorization has already passed at this point, so a distinguishable status
+    tells a verified owner nothing they may not know — and a 404 here would be
+    a claim about the DATA (no creators) rather than a report of a failed read.
+    """
+    from httpx import ConnectError
+
+    class _Broken(_Listing):
+        def table(self, name):
+            query = _Query(self, name)
+            if name == "creators":
+                query.execute = lambda: (_ for _ in ()).throw(
+                    ConnectError("server disconnected")
+                )
+            return query
+
+    listing = _Broken()
+    monkeypatch.setattr(main, "get_supabase", lambda: listing)
+    response = client.get("/simulation/creators", headers=_headers(OWNER))
+
+    assert response.status_code == 503
+    assert response.json() != {"creators": []}
 
 
 # --- 30: the simulator is not blocked by the connector switch ---------------
