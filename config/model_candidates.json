@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-09-07",
+  "updated_at": "2026-09-11",
   "notes": [
     "Pricing is a snapshot and must be reviewed before production decisions.",
     "adult_policy describes provider eligibility, not raw model capability.",
@@ -37,10 +37,11 @@
       "timeout_seconds": 90,
       "metadata": {
         "role": "ordinary conversational writer",
+        "reasoning_enabled": false,
         "openrouter_providers": [
           "Inceptron"
         ],
-        "note": "Pinned upstream. OPENROUTER_PROVIDERS overrides this list without a deploy. Cache-read pricing is an unverified snapshot; the reported usage.cost is authoritative."
+        "note": "Pinned upstream. OPENROUTER_PROVIDERS overrides this list without a deploy. reasoning_enabled=false is REQUIRED: K2.6 reasons by default and spends the completion budget on hidden reasoning, returning message.content=null, which the writer sees as unparseable output. Cache-read pricing is an unverified snapshot; the reported usage.cost is authoritative."
       }
     },
     {
@@ -67,7 +68,12 @@
       "adult_policy": "unverified",
       "enabled": true,
       "stream": true,
-      "timeout_seconds": 90
+      "timeout_seconds": 90,
+      "metadata": {
+        "role": "commercially complex, high-value and safety-sensitive writer",
+        "reasoning_enabled": false,
+        "note": "Serverless on Together and callable with the ordinary TOGETHER_API_KEY. Replaced deepseek-ai/DeepSeek-V4-Pro, which this account cannot reach without a dedicated endpoint. reasoning_enabled=false for the same reason as the Kimi entry: the writer needs the final JSON array, not chain-of-thought."
+      }
     },
     {
       "name": "Together Kimi K3",
@@ -96,11 +102,12 @@
       "output_per_million": 3.48,
       "cache_read_per_million": 0.2,
       "adult_policy": "unverified",
-      "enabled": true,
+      "enabled": false,
       "stream": true,
       "timeout_seconds": 90,
       "metadata": {
-        "reasoning_enabled": false
+        "reasoning_enabled": false,
+        "unavailable": "Together returns 400 'Unable to access non-serverless model deepseek-ai/DeepSeek-V4-Pro. Please create and start a dedicated endpoint.' for this account. Disabled so evaluations do not select it. Re-enable only after a dedicated endpoint exists."
       }
     },
     {

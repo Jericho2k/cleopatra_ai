@@ -74,7 +74,7 @@ legitimately slow action still cannot be reclaimed and run twice.
 
 The gate lives at `ai.model_providers.complete` — the single function every
 paid generation goes through — so it covers the Kimi/OpenRouter writer, the
-DeepSeek/Together commercial route, the analyzer, and the background extractor
+Together commercial route, the analyzer, and the background extractor
 with one budget. Wrapping `generate_replies` alone would have left the analyzer
 unbounded, which is the specific mistake this placement avoids.
 
@@ -90,7 +90,7 @@ together.
 - `MODEL_MAX_CONCURRENCY` is an **application policy**. It is deliberately not
   derived from the OpenAI SDK's `max_connections`, which is a transport ceiling.
 
-Routing is untouched: the OpenRouter provider pin, the explicit DeepSeek
+Routing is untouched: the OpenRouter provider pin, the explicit Together
 fallback route, and session affinity for prefix caching all behave exactly as
 before. The gate sits above routing, not inside it.
 

@@ -32,6 +32,7 @@ and cannot learn that another tenant's creator or fan exists.
 """
 from __future__ import annotations
 
+import json
 import os
 
 from fastapi import HTTPException, Request, status
@@ -109,3 +110,56 @@ async def require_simulation_user(request: Request) -> str:
 def is_simulatable_fan(platform_fan_id: object) -> bool:
     """Requirement 6 — the server-side test-fan boundary."""
     return str(platform_fan_id or "").startswith(TEST_FAN_PREFIX)
+
+
+# ---------------------------------------------------------------------------
+# The simulator's event marker
+# ---------------------------------------------------------------------------
+#
+# The simulator persists its fan message with an ordinary INSERT, which is
+# exactly what the production Supabase database webhook on ``messages`` fires
+# on. That webhook POSTs /generate-suggestions, so one simulated fan turn used
+# to run the whole ordinary inbound pipeline — situation analysis, commercial
+# state, price learning, the conversation director — a second time, alongside
+# the Full Auto turn the simulator itself drives. The simulator's results were
+# therefore measuring two overlapping passes, not one.
+#
+# The row is marked instead of being recognised by shape. Nothing here keys off
+# the ``test_`` platform-fan prefix: that prefix says a fan is *simulatable*,
+# not that a particular message came from the simulator, and an operator typing
+# into a test fan's real chat must still be processed normally. An explicit
+# marker on the event is the only thing that means "the simulator already owns
+# this one".
+#
+# ``media_context`` is existing JSON metadata on ``messages``, so no migration
+# is involved.
+
+SIMULATION_SOURCE = "owner_auto_simulator"
+
+
+def simulation_message_marker() -> dict:
+    """The ``media_context`` the simulator stamps on the fan message it writes."""
+    return {"simulation": True, "simulation_source": SIMULATION_SOURCE}
+
+
+def is_simulation_message(media_context: object) -> bool:
+    """Whether one message row was written by the owner-only simulator.
+
+    Accepts whatever the Supabase webhook happens to deliver for a ``jsonb``
+    column — a decoded mapping or the raw JSON text — because a transport detail
+    must not decide whether a simulated turn is processed twice.
+
+    Fails closed in the direction that matters: anything it cannot positively
+    identify as a simulator event is an ordinary production message and is
+    processed normally.
+    """
+    if isinstance(media_context, str):
+        try:
+            media_context = json.loads(media_context)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(media_context, dict):
+        return False
+    if media_context.get("simulation") is not True:
+        return False
+    return str(media_context.get("simulation_source") or "") == SIMULATION_SOURCE

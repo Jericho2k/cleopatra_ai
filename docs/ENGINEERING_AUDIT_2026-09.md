@@ -439,7 +439,7 @@ idempotent and reasonably ordered by convention (`agency_operability` → `ppv_d
 | Call site | Target env prefix | Default | Runs on | Telemetry? |
 |---|---|---|---|---|
 | `ai/situation_analyzer.py::analyze_situation` | `ANALYZER_*` | `anthropic:claude-haiku-4-5-20251001` | **every message** | ✅ |
-| `ai/generator.py::generate_replies` | writer router | `openrouter:moonshotai/kimi-k2.6` → `together:deepseek-ai/DeepSeek-V4-Pro` | **every message** | ✅ |
+| `ai/generator.py::generate_replies` | writer router | `openrouter:moonshotai/kimi-k2.6` → `together:Qwen/Qwen3.7-Plus` | **every message** | ✅ |
 | `services/fan_intelligence.py` extractor | `EXTRACTOR_*` | `together:openai/gpt-oss-120b` | every message (flag-gated) | ✅ |
 | `services/suggestions.py::_update_fan_memory` | **hardcoded** | `together:meta-llama/Llama-3.3-70B-Instruct-Turbo` | every 10th fan message | ❌ **none** |
 | `services/suggestions.py::_update_fan_ai_summary` | **hardcoded** | `together:meta-llama/Llama-3.3-70B-Instruct-Turbo` | every 10th fan message | ❌ **none** |
@@ -496,7 +496,7 @@ cache_control survives to transport? False
 caching is therefore completely inert** — `cache_read_input_tokens` will always be 0
 for any Anthropic target. Since `.env.example` documents `ANALYZER_PROVIDER=anthropic`
 and the analyzer runs on every single message, this is an ongoing, silent cost.
-For the OpenAI-compatible path (OpenRouter/Kimi, Together/DeepSeek) the flattening
+For the OpenAI-compatible path (OpenRouter/Kimi, Together/Qwen) the flattening
 is *correct and necessary* — those providers use implicit prefix caching — so the fix
 is to keep the blocks for Anthropic only, not to remove the flattening.
 

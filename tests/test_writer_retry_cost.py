@@ -42,7 +42,7 @@ def _target(name: str, model: str) -> ModelTarget:
 
 
 KIMI = _target("Kimi", "moonshotai/Kimi-K3")
-DEEPSEEK = _target("DeepSeek", "deepseek-ai/DeepSeek-V4-Pro")
+COMPLEX_WRITER = _target("Qwen3.7 Plus", "Qwen/Qwen3.7-Plus")
 
 
 class _FakeError(Exception):
@@ -95,7 +95,7 @@ def harness(monkeypatch):
     return state
 
 
-def _run(harness, *, primary=KIMI, fallback=DEEPSEEK):
+def _run(harness, *, primary=KIMI, fallback=COMPLEX_WRITER):
     return asyncio.run(
         generator.generate_replies(
             [
@@ -178,7 +178,7 @@ def test_validation_failure_does_not_retry_the_same_model(harness):
 
     assert replies == ["come closer"]
     # Kimi once, then straight to the explicitly configured fallback model.
-    assert harness["calls"] == [KIMI.model, DEEPSEEK.model]
+    assert harness["calls"] == [KIMI.model, COMPLEX_WRITER.model]
     assert harness["sleeps"] == [], "validation failure must not sleep"
 
 
@@ -198,7 +198,7 @@ def test_unparseable_output_still_retries_the_same_model_then_falls_back(harness
     replies = _run(harness)
 
     assert replies == ["come closer"]
-    assert harness["calls"] == [KIMI.model, KIMI.model, DEEPSEEK.model]
+    assert harness["calls"] == [KIMI.model, KIMI.model, COMPLEX_WRITER.model]
     assert harness["sleeps"] == [], "a parse failure is not a throttling signal"
 
 
@@ -215,7 +215,7 @@ def test_429_backs_off_before_retrying(harness):
     replies = _run(harness)
 
     assert replies == ["come closer"]
-    assert harness["calls"] == [KIMI.model, KIMI.model, DEEPSEEK.model]
+    assert harness["calls"] == [KIMI.model, KIMI.model, COMPLEX_WRITER.model]
     assert len(harness["sleeps"]) == 2, "a 429 must not be retried immediately"
     # Exponential from _BACKOFF_BASE_SECONDS, capped; jitter pinned to the top.
     assert harness["sleeps"] == [0.5, 1.0]
@@ -289,14 +289,14 @@ def test_only_the_explicit_fallback_target_is_ever_used(harness):
 
     _run(harness)
 
-    assert set(harness["calls"]) <= {KIMI.model, DEEPSEEK.model}
+    assert set(harness["calls"]) <= {KIMI.model, COMPLEX_WRITER.model}
 
 
 def test_complex_route_without_a_fallback_never_switches_model(harness):
-    """DeepSeek-only routes must stay DeepSeek-only across every retry."""
+    """Complex-writer-only routes must stay on that model across every retry."""
     harness["responses"] = [_FakeError(500), _FakeError(500), _FakeError(500)]
 
-    _run(harness, primary=DEEPSEEK, fallback=None)
+    _run(harness, primary=COMPLEX_WRITER, fallback=None)
 
-    assert set(harness["calls"]) == {DEEPSEEK.model}
+    assert set(harness["calls"]) == {COMPLEX_WRITER.model}
     assert len(harness["calls"]) == 3

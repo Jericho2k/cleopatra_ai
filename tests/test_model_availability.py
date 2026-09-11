@@ -58,7 +58,7 @@ class Client:
 def _default_client(**overrides):
     catalogs = {
         OPENROUTER_URL: ["moonshotai/kimi-k2.6"],
-        TOGETHER_URL: ["deepseek-ai/DeepSeek-V4-Pro"],
+        TOGETHER_URL: ["Qwen/Qwen3.7-Plus"],
     }
     catalogs.update(overrides)
     return Client(catalogs)
@@ -152,7 +152,7 @@ def test_together_only_configuration_still_works(monkeypatch):
     monkeypatch.setenv("WRITER_DEFAULT_PROVIDER", "together")
     monkeypatch.setenv("WRITER_DEFAULT_MODEL", "moonshotai/Kimi-K3")
     client = Client(
-        {TOGETHER_URL: ["moonshotai/Kimi-K3", "deepseek-ai/DeepSeek-V4-Pro"]}
+        {TOGETHER_URL: ["moonshotai/Kimi-K3", "Qwen/Qwen3.7-Plus"]}
     )
 
     result = asyncio.run(refresh_model_availability(client=client, now=NOW))
@@ -176,7 +176,7 @@ def test_repeated_live_primary_failures_surface_even_when_catalog_is_healthy():
 
     record_model_transport_failure("moonshotai/kimi-k2.6", "502 upstream error")
     record_model_transport_failure("moonshotai/kimi-k2.6", "502 upstream error")
-    record_model_transport_success("deepseek-ai/DeepSeek-V4-Pro")
+    record_model_transport_success("Qwen/Qwen3.7-Plus")
 
     result = current_model_availability()
 

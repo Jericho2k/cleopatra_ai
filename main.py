@@ -70,6 +70,7 @@ from core.apifansly_gate import (
     apifansly_enabled,
     describe_apifansly,
 )
+from core.simulation import is_simulation_message
 from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
@@ -4877,6 +4878,21 @@ async def generate_suggestions_webhook(
     record = payload.record
     message_id = record.get("id")
     message_content = record.get("content")
+
+    # The owner-only simulator persists its fan message with an ordinary INSERT,
+    # which fires this same database webhook. It then drives the real Full Auto
+    # turn itself, so processing the row here as well ran situation analysis,
+    # commercial state, price learning and the conversation director twice for
+    # one simulated turn — and made every simulator reading invalid.
+    #
+    # Nothing is skipped by shape: only a row the simulator explicitly marked is
+    # ignored, so an ordinary production fan message — including one typed into
+    # a test fan's chat by hand — is processed exactly as before. The response is
+    # a 2xx so Supabase treats the delivery as handled rather than retrying it.
+    if is_simulation_message(record.get("media_context")):
+        print(f"[WEBHOOK] message_id={message_id} owner simulation event — simulator owns this turn")
+        return {"status": "skipped - owner simulation"}
+
     print(f"[WEBHOOK] message_id={message_id} role={record.get('role')} content={message_content[:30]}")
     if record.get("role") != "fan":
         return {"status": "skipped"}
