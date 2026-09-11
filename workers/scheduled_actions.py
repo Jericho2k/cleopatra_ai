@@ -77,6 +77,63 @@ WRITER_QUALITY_MAX_ATTEMPTS = 2
 # proactive message; the proactive revalidation gate does not apply to them.
 NON_PROACTIVE_ACTIONS = {"PPV_RECONCILE", "OFFER_EXPIRY", "PROCESS_INBOUND_MESSAGE"}
 
+# Actions whose whole purpose is putting a message in front of a fan on the
+# remote platform. While APIFANSLY_ENABLED=false these are postponed rather than
+# run: the analyzer and writer would spend real model budget producing copy that
+# has nowhere to go, and a failure per action would show up as a blocked-action
+# health counter for what is a deliberate configuration choice.
+#
+# PPV_RECONCILE and OFFER_EXPIRY are absent on purpose. Both do useful local work
+# with the connector off — reconciliation defers or expires a pending offer
+# locally, and expiry is pure state.
+REMOTE_DELIVERY_ACTIONS = {
+    "AUTO_REPLY",
+    "POST_PURCHASE_REACTION",
+    "PAYDAY_REENGAGEMENT",
+    "POST_SESSION_FOLLOWUP",
+    "ABANDONED_PPV_FOLLOWUP",
+    "ABANDONED_OFFER_FOLLOWUP",
+    "INACTIVITY_REENGAGEMENT",
+    "PROCESS_INBOUND_MESSAGE",
+}
+
+# How long a postponed delivery action waits before it is reconsidered. Long
+# enough that a disabled connector costs one cheap read per action per half
+# hour; short enough that re-enabling the connector drains the backlog promptly
+# without a redeploy.
+CONNECTOR_DISABLED_RETRY_MINUTES = 30
+
+
+async def _connector_blocks_delivery(action: dict) -> bool:
+    """Whether this action needs the remote platform while it is switched off.
+
+    A ``test_`` fan is explicitly exempt: its delivery is local persistence and
+    never touched the provider even when the connector was on, so a disabled
+    connector must not stop it. That exemption is what keeps the owner-only
+    simulator and the existing local test paths working offline.
+    """
+    from core.apifansly_gate import apifansly_enabled
+    from core.supabase import get_supabase
+
+    if apifansly_enabled():
+        return False
+    fan_id = str(action.get("fan_id") or "")
+    if not fan_id:
+        return True
+    rows = (
+        await asyncio.to_thread(
+            lambda: get_supabase()
+            .table("fans")
+            .select("platform_fan_id")
+            .eq("id", fan_id)
+            .limit(1)
+            .execute()
+        )
+    ).data or []
+    if not rows:
+        return True
+    return not str(rows[0].get("platform_fan_id") or "").startswith("test_")
+
 
 def _env_int(name: str, default: int, *, low: int, high: int) -> int:
     raw = os.getenv(name, "").strip()
@@ -785,6 +842,14 @@ async def _resolve_action(action: dict, *, sent_counter: list[int]) -> str:
                 )
                 timings.outcome = "no_handler"
                 return "no_handler"
+
+            if action_type in REMOTE_DELIVERY_ACTIONS and await _connector_blocks_delivery(action):
+                retry_at = datetime.now(timezone.utc) + timedelta(
+                    minutes=CONNECTOR_DISABLED_RETRY_MINUTES
+                )
+                await reschedule_action(aid, retry_at)
+                timings.outcome = "postponed"
+                return "postponed"
 
             if action_type not in NON_PROACTIVE_ACTIONS:
                 started = time.perf_counter()

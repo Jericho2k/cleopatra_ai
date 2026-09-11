@@ -19,6 +19,21 @@ from urllib.parse import urlparse
 
 import httpx
 
+from core.apifansly_gate import (
+    # Redundant aliases mark these as deliberate re-exports: callers import
+    # every API Fansly concept from this module, and the names are not used
+    # inside it.
+    ApiFanslyDisabledError as ApiFanslyDisabledError,
+    apifansly_enabled as apifansly_enabled,
+    require_apifansly_available,
+    simulation_active as simulation_active,
+)
+
+
+# ``ApiFanslyDisabledError``, ``apifansly_enabled`` and ``simulation_active``
+# are imported above rather than redefined, so callers keep importing every API
+# Fansly concept from this one module as the docstring promises, while the
+# switch itself has a single definition in core/apifansly_gate.py.
 
 DEFAULT_BASE_URL = "https://v1.apifansly.com/api/fansly"
 _USAGE_WINDOW_SECONDS = 24 * 60 * 60
@@ -234,6 +249,19 @@ def url(path: str = "") -> str:
 
 
 def headers(*, json_content: bool = False) -> dict[str, str]:
+    """Build the authenticated request headers, refusing when the connector is off.
+
+    Six call sites across main.py and services/suggestions.py drive httpx
+    directly instead of going through ``request()`` (connect, verify-2fa,
+    mark-as-read, media upload + its status poll, the vault media URL lookup and
+    the typing indicator). Every one of them builds its auth header here,
+    because no API Fansly request is possible without ``x-api-key``.
+
+    Enforcing the switch here therefore covers the raw call sites as well as the
+    helpers, and makes "zero remote calls while disabled or simulating" a
+    property of the transport rather than a list of patched callers.
+    """
+    require_apifansly_available("API Fansly request")
     result = {"x-api-key": api_key()}
     if json_content:
         result["Content-Type"] = "application/json"
@@ -637,6 +665,11 @@ async def request(
     delivery journal, not through a retry here.
     """
 
+    # Stated explicitly as well as in headers(): the refusal names the operation
+    # that was blocked, which headers() cannot know, and it happens before a
+    # connection is taken from the pool.
+    require_apifansly_available(f"API Fansly {operation}")
+
     active_client = client if client is not None else shared_client()
     upper_method = str(method or "").upper()
     attempts = (
@@ -707,6 +740,7 @@ async def download_media(
     Unlike the regular API helpers, this endpoint returns binary content rather
     than the usual JSON envelope.
     """
+    require_apifansly_available("API Fansly protected media download")
     if not is_fansly_cdn_url(cdn_url):
         raise ValueError("media download requires an HTTPS Fansly CDN URL")
 

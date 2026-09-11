@@ -145,13 +145,24 @@ def test_inbound_media_lookup_uses_variants_and_preserves_type_metadata():
 
 
 def test_auto_mode_writes_are_backend_gated_by_approved_sets():
+    from main import _auto_locked_detail
+
     creator_source = inspect.getsource(update_creator_auto_mode)
     fan_source = inspect.getsource(update_fan_auto_mode)
     processing_source = inspect.getsource(process_incoming_fan_message)
     assert "_creator_auto_availability" in creator_source
     assert "_creator_auto_availability" in fan_source
-    assert "Auto mode is locked until at least one vault set is approved." in (
-        creator_source + fan_source
+    # The rejection message now comes from one helper shared by both handlers,
+    # because a second reason (a disabled API Fansly connector) can also lock
+    # Auto and must not be reported as a missing set. The approved-sets wording
+    # is asserted through the helper so the gate is still proven end to end.
+    assert "_auto_locked_detail(availability)" in creator_source
+    assert "_auto_locked_detail(availability)" in fan_source
+    assert _auto_locked_detail({"auto_available": False, "approved_sets": 0}) == (
+        "Auto mode is locked until at least one vault set is approved."
+    )
+    assert "connector" in _auto_locked_detail(
+        {"auto_available": False, "approved_sets": 3, "reason": "connector_disabled"}
     )
     assert "no_approved_sets" in processing_source
 

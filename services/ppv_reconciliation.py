@@ -25,6 +25,7 @@ from services.followup_lifecycle import (
     payment_expires_at,
     pending_reference,
 )
+from core.apifansly_gate import apifansly_enabled
 from services.apifansly import (
     ApiFanslyTransientError,
     request as apifansly_request,
@@ -473,7 +474,23 @@ async def reconcile_pending_ppv(
     if platform_fan_id.startswith("test_"):
         # Local test delivery has no platform transaction to query. Manual
         # purchase simulation may still confirm it before deterministic expiry.
+        # This is also what makes a simulated PPV's reconcile action provably
+        # local: the branch returns before any transport call is reachable.
         amount = None
+    elif not apifansly_enabled():
+        # Intentionally offline. The transport would refuse the earnings call
+        # anyway; answering here keeps a disabled connector out of the
+        # verification-failure counter, so it can never escalate a deliberate
+        # configuration choice into freezing a fan for human review.
+        return PPVReconcileResult(
+            PPVReconcileDisposition.PENDING,
+            "API Fansly connector disabled; purchase verification deferred",
+            retry_at=next_reconcile_at(
+                now,
+                expires_at=expires_at,
+                recheck_minutes=policy.ppv_recheck_minutes,
+            ),
+        )
     else:
         try:
             amount = await _fetch_purchase_amount(

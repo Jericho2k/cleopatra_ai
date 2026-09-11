@@ -35,6 +35,7 @@ from core.action_telemetry import record_stage, stage as action_stage
 from services.human_delivery import build_availability_delay, build_delivery_schedule
 from services.ppv_delivery import create_ppv_approval_request
 from services.db_reliability import retry_transient_db_operation
+from core.apifansly_gate import apifansly_enabled, simulation_scope
 from services.apifansly import (
     headers as apifansly_headers,
     shared_client as apifansly_shared_client,
@@ -675,9 +676,18 @@ async def _debounced_auto_reply(
     *,
     skip_debounce: bool = False,
     skip_availability: bool = False,
+    skip_human_delays: bool = False,
     expected_trigger_at: str | None = None,
 ) -> None:
-    """Wait for fan to finish typing, then generate and send one reply."""
+    """Wait for fan to finish typing, then generate and send one reply.
+
+    ``skip_human_delays`` removes the composition and inter-part pauses. It is
+    used only by the owner-only simulator, where the wait is the one thing that
+    is NOT interesting: everything else — analyzer, commercial orchestrator,
+    session planning, conversation director, writer routing, multipart selection
+    — runs exactly as it does in production. The staleness checks those pauses
+    also perform are kept; only their duration is removed.
+    """
     try:
         # Short jittered debounce catches rapid multi-message bursts. A separate
         # length-aware delay is applied after generation to simulate reading/typing.
@@ -733,6 +743,19 @@ async def _debounced_auto_reply(
         )
         if not fan_profile:
             return
+
+        # The local-test boundary is established HERE, not at delivery time.
+        #
+        # It used to be computed just before the send, which left four paths
+        # above it able to reach the provider for a test fan: the chat-list
+        # lookup that resolves a missing group id, the typing indicator, the PPV
+        # resend branch (which returns before the delivery block is ever
+        # reached), and the eager purchase verification spawned on a "bought"
+        # signal. Each is now gated on this flag.
+        local_test_delivery = _is_local_test_fan(
+            getattr(fan_profile, "platform_fan_id", None)
+        )
+
         # Frozen for human review (e.g. prior crisis under 'freeze' policy): auto-mode
         # stays out until a human clears the flag in the dashboard.
         if getattr(fan_profile, "needs_human_review", False):
@@ -953,7 +976,12 @@ async def _debounced_auto_reply(
             )
             apifansly_id_resend = (creator_data.data or {}).get("apifansly_account_id")
 
-            if pending and group_id_resend and apifansly_id_resend:
+            if pending and local_test_delivery:
+                # This branch returns before the delivery block below, so
+                # without this guard a test fan could send a REAL PPV. The
+                # simulated equivalent is to let normal generation proceed.
+                print(f"[AUTO TEST DELIVERY] fan={fan_id} ppv_resend=skipped")
+            elif pending and group_id_resend and apifansly_id_resend:
                 media_id_resend = pending.get("media_id")
                 media_ids_resend = (
                     pending.get("media_ids")
@@ -1002,7 +1030,19 @@ async def _debounced_auto_reply(
                     print(f"[AFFORDABILITY] decline price record failed fan={fan_id}: {exc}")
             if pending and purchase_signal == "bought":
                 print(f"[PPV SIGNAL] fan={fan_id} bought pending={pending}")
-                spawn(_verify_ppv_purchase(fan_id, creator_id, pending), name="verify_ppv_purchase")
+                if local_test_delivery:
+                    # A simulated PPV has no platform transaction to verify.
+                    # Reconciliation for a test fan is resolved locally by the
+                    # durable PPV_RECONCILE action (and by the owner's explicit
+                    # simulate-purchase control), so eagerly spawning a remote
+                    # verification here would be the one remote call a simulated
+                    # turn could still make.
+                    print(f"[AUTO TEST DELIVERY] fan={fan_id} remote_verification=skipped")
+                else:
+                    spawn(
+                        _verify_ppv_purchase(fan_id, creator_id, pending),
+                        name="verify_ppv_purchase",
+                    )
 
         if commercial_enabled and decision is not None:
             if decision.action in {ActionType.PAUSE_NO_BUDGET, ActionType.PAUSE_UNTIL_PAYDAY}:
@@ -1188,13 +1228,33 @@ async def _debounced_auto_reply(
         group_id = (fan_row.data or {}).get("fansly_group_id")
         platform_fan_id = (fan_row.data or {}).get("platform_fan_id")
         apifansly_account_id = (creator_row.data or {}).get("apifansly_account_id")
-        local_test_delivery = _is_local_test_fan(platform_fan_id)
+        # Re-read from the row for the delivery decision, but the fan cannot
+        # have changed identity mid-turn; both must agree.
+        local_test_delivery = local_test_delivery or _is_local_test_fan(platform_fan_id)
 
-        # If no group_id yet, try to find it from chats list
-        if not group_id and apifansly_account_id and platform_fan_id:
+        # If no group_id yet, try to find it from chats list. A test fan has no
+        # remote chat to find, and this call lists chats against the provider.
+        if (
+            not group_id
+            and apifansly_account_id
+            and platform_fan_id
+            and not local_test_delivery
+        ):
             from main import get_or_fetch_group_id
 
             group_id = await get_or_fetch_group_id(apifansly_account_id, str(platform_fan_id), fan_id)
+
+        async def _pause(seconds: float, *, phase: str) -> bool:
+            """Apply one human-like pause, or skip its duration in simulation.
+
+            Still consults the pending-task slot, so a simulated turn is
+            abandoned for the same reason a live one is.
+            """
+            return await _sleep_while_current(
+                fan_id,
+                0.0 if skip_human_delays else seconds,
+                phase=phase,
+            )
 
         parts = [p.strip() for p in reply.split("|") if p.strip()]
         timing = build_delivery_schedule(
@@ -1213,14 +1273,16 @@ async def _debounced_auto_reply(
         )
 
         # Do not advertise typing while the simulated creator is unavailable.
-        if not skip_availability and not await _sleep_while_current(
-            fan_id,
+        if not skip_availability and not await _pause(
             timing.availability_delay_seconds,
             phase="availability",
         ):
             return
 
-        if group_id and apifansly_account_id:
+        # A test fan may still carry a stale fansly_group_id, so the local-test
+        # flag — not the presence of a binding — decides whether we advertise
+        # typing to the platform.
+        if group_id and apifansly_account_id and not local_test_delivery:
             try:
                 # PERF-006 — one pooled connection. This sits inside the
                 # human-like composition delay on the live reply path, so a
@@ -1236,8 +1298,8 @@ async def _debounced_auto_reply(
             except Exception:
                 pass
 
-        if not await _sleep_while_current(
-            fan_id, timing.composition_delay_seconds, phase="before_part_1"
+        if not await _pause(
+            timing.composition_delay_seconds, phase="before_part_1"
         ):
             return
 
@@ -1245,9 +1307,7 @@ async def _debounced_auto_reply(
         for i, part in enumerate(parts):
             if i > 0:
                 inter_delay = timing.inter_part_delays_seconds[i - 1]
-                if not await _sleep_while_current(
-                    fan_id, inter_delay, phase=f"before_part_{i + 1}"
-                ):
+                if not await _pause(inter_delay, phase=f"before_part_{i + 1}"):
                     return
 
             ppv_match = re.search(r"\[PPV:([^:]+):(\d+(?:\.\d+)?)\]", part)
@@ -1323,7 +1383,15 @@ async def _debounced_auto_reply(
 
             # Platform acceptance is authoritative. Never create a local sent
             # message or PAYMENT_PENDING state for a delivery that failed.
-            if (not group_id or not apifansly_account_id) and not local_test_delivery:
+            #
+            # A disabled connector is the same fact as a missing binding here:
+            # there is no route. The worker already postpones these actions, so
+            # this is the backstop for any other caller.
+            if (
+                not group_id
+                or not apifansly_account_id
+                or not apifansly_enabled()
+            ) and not local_test_delivery:
                 print(f"[AUTO DELIVERY ERROR] fan={fan_id}: no live delivery route")
                 if ppv_match:
                     await freeze_fan_for_review(fan_id, "ppv_delivery_route_missing")
@@ -2034,3 +2102,141 @@ async def deliver_scheduled_auto_reply(action: dict) -> bool:
 def _should_update_memory(conversation_history: list[Message]) -> bool:
     count = len([m for m in conversation_history if m.role == "fan"])
     return count > 0 and count % 10 == 0
+
+
+# ---------------------------------------------------------------------------
+# Owner-only local Full Auto simulation
+# ---------------------------------------------------------------------------
+#
+# The point of this function is what it does NOT contain. There is no second
+# prompt, no simplified engine, no alternate model routing and no commercial
+# bypass. It persists the fan's message the same way an inbound platform message
+# is persisted, then awaits the same ``_debounced_auto_reply`` the durable
+# AUTO_REPLY worker awaits, with the same arguments the worker passes plus a
+# flag that removes the deliberate human-like pauses.
+#
+# Everything the simulated turn reads — full conversation history including rows
+# inserted by hand in SQL, fan profile, fan intelligence, buyer lifecycle,
+# affordability, price learning, creator persona, creator legend, PPV offers and
+# history, the active session, the situation analyzer, conversation stage, the
+# commercial orchestrator, session planning, the conversation director, writer
+# routing, the OpenRouter/Kimi fallback ladder and the fail-closed analyzer
+# behaviour — is loaded by that one function, unchanged.
+#
+# Only two things are simulated: delivery transport (the ``test_`` fan branch
+# persists locally instead of calling the platform) and waiting.
+
+
+async def _recent_creator_message_rows(fan_id: str) -> list[dict]:
+    """Creator messages for this fan, newest-window first, in production order.
+
+    ``get_conversation_history`` returns ``Message`` objects, which carry no row
+    id, so the simulator diffs the table directly. Identifying the turn's output
+    by id rather than by timestamp keeps multipart replies — which share a
+    second — ordered and complete.
+    """
+
+    def _load() -> list[dict]:
+        result = (
+            get_supabase().table("messages")
+            .select("id, role, content, sent_at, media_context")
+            .eq("fan_id", fan_id)
+            .eq("role", "creator")
+            .order("sent_at", desc=True)
+            .limit(40)
+            .execute()
+        )
+        rows = list(reversed(result.data or []))
+        return [
+            {
+                "id": str(row.get("id")),
+                "role": "creator",
+                "content": row.get("content"),
+                "sent_at": row.get("sent_at"),
+                "media_context": row.get("media_context"),
+            }
+            for row in rows
+            if row.get("id")
+        ]
+
+    return await asyncio.to_thread(_load)
+
+
+async def run_simulated_inbound(
+    *,
+    fan_id: str,
+    creator_id: str,
+    message: str,
+    fast: bool = True,
+) -> dict:
+    """Persist one fan message and run the real Full Auto turn it triggers.
+
+    Returns the fan message id and every creator message the turn produced, in
+    production order. Raises nothing that the caller needs to translate: an
+    analyzer that fails closed, or a turn that decides to send nothing, is a
+    real Full Auto outcome and is reported as such.
+
+    The whole turn runs inside ``simulation_scope()``. That is not belt and
+    braces for the ``test_`` fan branches above — it is the hard invariant. The
+    transport refuses every API Fansly request made by this task or by anything
+    it spawns, so "zero remote calls" holds even for a code path nobody audited.
+    """
+    fan_message_id = await save_message(fan_id, creator_id, "fan", message)
+
+    history_before = await get_conversation_history(fan_id)
+    creator_ids_before = {row["id"] for row in await _recent_creator_message_rows(fan_id)}
+
+    with simulation_scope():
+        # Fan intelligence learning is part of the real inbound pipeline, so the
+        # simulated turn runs it too. Awaited rather than spawned, so the
+        # simulation scope is still active while it runs and the caller's
+        # response reflects a settled turn.
+        try:
+            await learn_from_fan_message(
+                creator_id=creator_id,
+                fan_id=fan_id,
+                fan_message=message,
+                source_message_id=fan_message_id,
+                conversation_history=history_before,
+            )
+        except Exception as exc:
+            # Extraction is an enrichment, never a reason to lose the turn.
+            print(f"[SIMULATION] fan_intelligence failed fan={fan_id}: {exc}")
+
+        # Identical to deliver_scheduled_auto_reply's invocation: register the
+        # task in the pending slot so the pipeline's own staleness checks see a
+        # current owner, then await it.
+        task = asyncio.create_task(
+            _debounced_auto_reply(
+                fan_id,
+                creator_id,
+                skip_debounce=True,
+                skip_availability=True,
+                skip_human_delays=bool(fast),
+            )
+        )
+        _pending_auto_replies[fan_id] = task
+        analyzer_degraded = False
+        try:
+            await task
+        except AnalyzerDegradedError as exc:
+            # Fail-closed analyzer behaviour is exactly what the simulator is
+            # for observing. Report it instead of raising a 500.
+            analyzer_degraded = True
+            print(f"[SIMULATION] analyzer degraded fan={fan_id}: {exc}")
+        except asyncio.CancelledError:
+            raise
+
+    creator_messages = [
+        row
+        for row in await _recent_creator_message_rows(fan_id)
+        if row["id"] not in creator_ids_before
+    ]
+    return {
+        "status": "ok",
+        "simulation": True,
+        "fast": bool(fast),
+        "fan_message_id": fan_message_id,
+        "creator_messages": creator_messages,
+        "analysis_degraded": analyzer_degraded,
+    }

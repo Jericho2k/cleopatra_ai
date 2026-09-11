@@ -65,6 +65,11 @@ from models.schemas import (
 )
 from services.fan_intelligence import learn_from_fan_message
 from services.db_reliability import retry_db_read, retry_transient_db_operation
+from core.apifansly_gate import (
+    REASON_DISABLED,
+    apifansly_enabled,
+    describe_apifansly,
+)
 from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
@@ -810,6 +815,9 @@ async def ppv_sweep_scheduler():
     while True:
         await asyncio.sleep(15 * 60)
         try:
+            # The sweep itself only repairs durable rows; the provider call it
+            # can lead to is refused by the transport and handled as an
+            # unavailable verification, so it is safe to keep running.
             print("[CRON] Running PPV sweep...")
             from services.suggestions import sweep_stale_ppv_checks
 
@@ -846,6 +854,11 @@ async def vault_autosync_scheduler():
     """
     while True:
         try:
+            if not apifansly_enabled():
+                # Intentionally offline. The startup line already said so, and a
+                # per-cycle message every hour would be noise, not information.
+                await asyncio.sleep(_VAULT_AUTOSYNC_CHECK_SECONDS)
+                continue
             print("[CRON] Vault auto-sync pass...")
             db = get_supabase()
             # The read that opens the cycle. Losing it to a connection recycle
@@ -1009,6 +1022,12 @@ async def chat_reconciliation_scheduler():
         except ValueError:
             tick_minutes = 5
         await asyncio.sleep(min(max(tick_minutes, 1), 10) * 60)
+        if not apifansly_enabled():
+            # Every branch below exists to make provider calls. Skipping the
+            # tick entirely is what keeps the logs clean: the alternative is one
+            # 402 per creator per cycle, which is exactly the noise this switch
+            # was added to remove.
+            continue
         try:
             import time
 
@@ -1120,6 +1139,9 @@ async def lifespan(app: FastAPI):
     from core.environment import describe_environment
 
     print(f"[STARTUP] {describe_environment()}")
+    # One line, once. Everything downstream suppresses its own work silently,
+    # so this is the only place the disabled connector is announced.
+    print(describe_apifansly())
 
     # Every Supabase call in this process runs on the event loop's default
     # executor via asyncio.to_thread. Left unconfigured that pool is sized
@@ -1265,6 +1287,54 @@ app.add_middleware(
 
 
 
+# --- Intentional connector disablement -------------------------------------
+#
+# An endpoint whose real purpose is remote platform delivery or a fresh remote
+# fetch cannot pretend to succeed while APIFANSLY_ENABLED=false. It answers 503
+# with a stable machine-readable reason instead.
+#
+# The body keeps ``detail`` as a human-readable STRING because the dashboard
+# already surfaces ``body.detail`` directly in error toasts; a dict there would
+# render as "[object Object]". The machine-readable code travels alongside it in
+# ``reason``, so both audiences are served without changing any existing
+# response shape.
+
+
+class ConnectorDisabled(Exception):
+    """Raised by the route guard below; rendered by the handler beneath it."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+@app.exception_handler(ConnectorDisabled)
+async def _connector_disabled_handler(_request: Request, exc: ConnectorDisabled):
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "connector_disabled",
+            "reason": REASON_DISABLED,
+            "detail": exc.detail,
+        },
+    )
+
+
+def require_apifansly_connector() -> None:
+    """Route dependency for actions that genuinely need the remote platform.
+
+    Used only where success would otherwise be a lie — a live send, or a fetch
+    whose whole purpose is fresh remote data. Read-only local endpoints keep
+    working, because the product stays usable while Fansly is switched off.
+    """
+    if not apifansly_enabled():
+        raise ConnectorDisabled(
+            "The API Fansly connector is disabled for this deployment, so "
+            "nothing was sent or fetched. Set APIFANSLY_ENABLED=true to "
+            "restore live platform access."
+        )
+
+
 @app.post("/suggestions", response_model=SuggestionResponse)
 async def suggestions(req: SuggestionRequest, request: Request) -> SuggestionResponse:
     await require_creator_fan_access(request, req.creator_id, req.fan_id)
@@ -1304,7 +1374,7 @@ async def regenerate_suggestions(
     return result
 
 
-@app.post("/reply")
+@app.post("/reply", dependencies=[Depends(require_apifansly_connector)])
 async def save_reply(req: ReplyRequest, request: Request) -> dict:
     await require_creator_fan_access(request, req.creator_id, req.fan_id)
 
@@ -1353,7 +1423,10 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
     return {"status": "ok", "message_id": message_id}
 
 
-@app.post("/connect-creator")
+@app.post(
+    "/connect-creator",
+    dependencies=[Depends(require_apifansly_connector)],
+)
 async def connect_creator(req: ConnectCreatorRequest, request: Request) -> dict:
     if req.creator_id:
         await require_creator_access(request, req.creator_id)
@@ -1445,7 +1518,10 @@ async def connect_creator(req: ConnectCreatorRequest, request: Request) -> dict:
         }
 
 
-@app.post("/connect-creator-2fa")
+@app.post(
+    "/connect-creator-2fa",
+    dependencies=[Depends(require_apifansly_connector)],
+)
 async def connect_creator_2fa(req: Connect2FARequest, request: Request) -> dict:
     if req.creator_id:
         await require_creator_access(request, req.creator_id)
@@ -1904,6 +1980,21 @@ async def _sync_recent_fan_messages(
 async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
     """Low-cost active-chat reconciliation for managed API Fansly accounts."""
 
+    if not apifansly_enabled():
+        # The dashboard polls this on every conversation open, on tab focus and
+        # every 15 minutes. With the connector intentionally off it must not
+        # become a recurring failure: answer with the same counter keys the
+        # success path returns, so app/page.tsx computes changed == 0 and simply
+        # waits out its normal safety interval.
+        return {
+            "status": "skipped",
+            "reason": REASON_DISABLED,
+            "imported": 0,
+            "inbound": 0,
+            "media_updated": 0,
+            "identity_reconciled": 0,
+        }
+
     db = get_supabase()
     async def _load_bindings():
         return await asyncio.gather(
@@ -2142,6 +2233,10 @@ async def _sync_fansly_lists_if_due(
 
     if not lists_sync_enabled():
         return None
+    if not apifansly_enabled():
+        # Every call this makes is remote. Reported the same way the feature's
+        # own flag is, so the caller's status handling is unchanged.
+        return {"status": "skipped", "reason": REASON_DISABLED}
     try:
         if not force and not await _fansly_lists_sync_due(creator_id):
             return None
@@ -2160,7 +2255,7 @@ async def _sync_fansly_lists_if_due(
 
 @app.post(
     "/sync-chats/{creator_id}",
-    dependencies=[Depends(require_creator_path_access)],
+    dependencies=[Depends(require_creator_path_access), Depends(require_apifansly_connector)],
 )
 async def sync_chats(
     creator_id: str,
@@ -2459,7 +2554,7 @@ async def get_apifansly_usage() -> dict:
 
 @app.post(
     "/load-history/{creator_id}/{fan_id}",
-    dependencies=[Depends(require_creator_fan_access)],
+    dependencies=[Depends(require_creator_fan_access), Depends(require_apifansly_connector)],
 )
 async def load_fan_history(creator_id: str, fan_id: str) -> dict:
 
@@ -2640,7 +2735,7 @@ async def load_fan_history(creator_id: str, fan_id: str) -> dict:
 
 @app.post(
     "/mark-all-read/{creator_id}",
-    dependencies=[Depends(require_creator_path_access)],
+    dependencies=[Depends(require_creator_path_access), Depends(require_apifansly_connector)],
 )
 async def mark_all_read(creator_id: str) -> dict:
 
@@ -2697,7 +2792,7 @@ def _vault_media_visual_urls(media: dict) -> tuple[str, str]:
 
 @app.post(
     "/sync-vault/{creator_id}",
-    dependencies=[Depends(require_creator_path_access)],
+    dependencies=[Depends(require_creator_path_access), Depends(require_apifansly_connector)],
 )
 async def sync_vault(creator_id: str) -> dict:
 
@@ -2778,7 +2873,7 @@ async def sync_vault(creator_id: str) -> dict:
 
 @app.post(
     "/sync-vault-start/{creator_id}",
-    dependencies=[Depends(require_creator_path_access)],
+    dependencies=[Depends(require_creator_path_access), Depends(require_apifansly_connector)],
 )
 async def sync_vault_start(creator_id: str, force: bool = False) -> dict:
     if _vault_sync_state.get(creator_id, {}).get("status") in _VAULT_SYNC_ACTIVE_STATUSES:
@@ -3085,7 +3180,7 @@ async def _run_vault_sync_locked(creator_id: str, db) -> None:
 
 @app.post(
     "/upload-vault-media/{creator_id}",
-    dependencies=[Depends(require_creator_path_access)],
+    dependencies=[Depends(require_creator_path_access), Depends(require_apifansly_connector)],
 )
 async def upload_vault_media(creator_id: str, request: Request) -> dict:
 
@@ -4753,7 +4848,7 @@ async def recategorize_item(item_id: str) -> dict:
 
 @app.get(
     "/media/{account_id}/{content_id}",
-    dependencies=[Depends(require_account_path_access)],
+    dependencies=[Depends(require_account_path_access), Depends(require_apifansly_connector)],
 )
 async def get_media_url(account_id: str, content_id: str) -> dict:
 
@@ -5092,6 +5187,8 @@ async def fansly_webhook(request: Request) -> dict:
     if event == "subscriptions.new":
         if not creator or not api_account_id:
             return {"status": "creator_not_found"}
+        if not apifansly_enabled():
+            return {"status": "skipped", "reason": REASON_DISABLED}
         from services.fansly_audience import sync_fansly_audience
 
         spawn(
@@ -5337,7 +5434,27 @@ async def _creator_auto_availability(creator_id: str) -> dict:
         .execute()
     )
     count = int(result.count or 0)
+    if not apifansly_enabled():
+        # Real Full Auto has nowhere to deliver, so it is not available for real
+        # fans no matter how many sets are approved. Assisted generation is
+        # untouched, and the owner-only simulator is an explicit exception that
+        # never routes through this check.
+        return {
+            "auto_available": False,
+            "approved_sets": count,
+            "reason": "connector_disabled",
+        }
     return {"auto_available": count > 0, "approved_sets": count}
+
+
+def _auto_locked_detail(availability: dict) -> str:
+    """Say which of the two reasons locked Auto, rather than always blaming sets."""
+    if availability.get("reason") == "connector_disabled":
+        return (
+            "Auto mode is unavailable because the API Fansly connector is "
+            "disabled for this deployment."
+        )
+    return "Auto mode is locked until at least one vault set is approved."
 
 
 @app.get(
@@ -5360,10 +5477,7 @@ async def update_creator_auto_mode(
 ) -> dict:
     availability = await _creator_auto_availability(creator_id)
     if request.enabled and not availability["auto_available"]:
-        raise HTTPException(
-            status_code=409,
-            detail="Auto mode is locked until at least one vault set is approved.",
-        )
+        raise HTTPException(status_code=409, detail=_auto_locked_detail(availability))
     await asyncio.to_thread(
         lambda: get_supabase().table("creators")
         .update({"auto_mode": request.enabled})
@@ -5398,10 +5512,7 @@ async def update_fan_auto_mode(
         raise HTTPException(status_code=404, detail="Fan not found.")
     availability = await _creator_auto_availability(creator_id)
     if request.auto_mode is True and not availability["auto_available"]:
-        raise HTTPException(
-            status_code=409,
-            detail="Auto mode is locked until at least one vault set is approved.",
-        )
+        raise HTTPException(status_code=409, detail=_auto_locked_detail(availability))
     await asyncio.to_thread(
         lambda: db.table("fans")
         .update({"auto_mode": request.auto_mode})
@@ -5545,7 +5656,7 @@ async def read_fansly_lists(creator_id: str) -> dict:
 
 @app.post(
     "/creator/{creator_id}/sync-fansly-lists",
-    dependencies=[Depends(require_creator_path_access)],
+    dependencies=[Depends(require_creator_path_access), Depends(require_apifansly_connector)],
 )
 async def sync_creator_fansly_lists(creator_id: str) -> dict:
     """Explicit operator-triggered refresh of the creator's Fansly lists.
@@ -5854,6 +5965,21 @@ async def read_fansly_integration_health(creator_id: str) -> dict:
         "connected": bool(account_id),
         "stored_fansly_account_id": bool(creator.get("fansly_account_id")),
     }
+    if not apifansly_enabled():
+        # Deliberately offline. Reported as its own state, and without spending
+        # a provider call to rediscover what configuration already tells us.
+        # "disabled" is not "access_denied": nothing needs reconnecting.
+        return {
+            **common,
+            "configured": True,
+            "accessible": False,
+            "status": "connector_disabled",
+            "requires_reconnect": False,
+            "detail": (
+                "The API Fansly connector is intentionally disabled "
+                "(APIFANSLY_ENABLED=false)."
+            ),
+        }
     if not account_id:
         return {
             **common,
@@ -6042,7 +6168,7 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
 
 @app.post(
     "/fan/{fan_id}/operator-ppv",
-    dependencies=[Depends(require_creator_fan_access)],
+    dependencies=[Depends(require_creator_fan_access), Depends(require_apifansly_connector)],
 )
 async def send_operator_ppv(
     fan_id: str,
@@ -6263,6 +6389,252 @@ async def enrich_fan_endpoint(fan_id: str) -> dict:
         return {"status": "error", "message": "fan not found"}
     await _enrich_fan_profile(fan_id, creator_id, platform_fan_id)
     return {"status": "ok"}
+
+
+# --- Owner-only Full Auto simulator ----------------------------------------
+#
+# Private to allowlisted Supabase accounts. Every route below is invisible and
+# inaccessible to ordinary agency tenants, and every rejection is the same 404
+# the tenancy layer uses, so a caller cannot probe which condition it failed or
+# learn that another tenant's creator or fan exists.
+#
+# The frontend hides the simulator using GET /simulation-capabilities, but that
+# is convenience only: nothing below trusts the client.
+
+
+class SimulateInboundRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=4000)
+    fast: bool = True
+
+
+class SimulateDeclineRequest(BaseModel):
+    reason: str = "simulated_decline"
+
+
+async def _creator_ids_for_user_cached(request: Request) -> set[str]:
+    """The caller's assigned creator ids, reusing the tenancy layer's cache.
+
+    Goes through core.tenancy rather than re-querying chatter_creators here, so
+    the simulator can never see a different set of creators than every other
+    route in the application.
+    """
+    from core.tenancy import _creator_ids_for_user
+
+    cached = getattr(request.state, "allowed_creator_ids", None)
+    if cached is None:
+        cached = await _creator_ids_for_user(str(dashboard_user_id(request) or ""))
+        request.state.allowed_creator_ids = cached
+    return set(cached)
+
+
+async def _require_simulatable_fan(
+    request: Request,
+    creator_id: str,
+    fan_id: str,
+) -> dict:
+    """All six simulation preconditions, in order, with one shared rejection.
+
+    1-3 (flag, authenticated user, allowlist) come from core.simulation;
+    4 and 5 reuse the ordinary tenancy helper, so the simulator is subject to
+    exactly the same tenancy model as every other creator route rather than a
+    parallel one; 6 is the ``test_`` platform-fan boundary, enforced here on
+    every simulation mutation so knowing a real fan's UUID is never enough.
+    """
+    from core.simulation import is_simulatable_fan, not_found, require_simulation_user
+
+    await require_simulation_user(request)
+    await require_creator_fan_access(request, creator_id, fan_id)
+
+    row = await asyncio.to_thread(
+        lambda: get_supabase()
+        .table("fans")
+        .select("id, creator_id, platform_fan_id, display_name")
+        .eq("id", fan_id)
+        .eq("creator_id", creator_id)
+        .limit(1)
+        .execute()
+    )
+    rows = row.data or []
+    if not rows:
+        raise not_found()
+    fan = rows[0]
+    if not is_simulatable_fan(fan.get("platform_fan_id")):
+        # A real Fansly fan must never become eligible. Same 404 as everything
+        # else: the caller learns nothing about why.
+        raise not_found()
+    return fan
+
+
+@app.get("/simulation-capabilities")
+async def simulation_capabilities(request: Request) -> dict:
+    """What privileged local tooling this authenticated account may use.
+
+    Returns a boolean and nothing else. It never exposes the allowlist, the
+    environment variables, any user id, or why another user is not allowed.
+    """
+    from core.simulation import request_may_simulate
+
+    return {"auto_simulation": bool(request_may_simulate(request))}
+
+
+@app.get("/simulation/creators")
+async def simulation_creators(request: Request) -> dict:
+    """Creators the caller may simulate against, each with its test fans only.
+
+    Scoped by the caller's ordinary creator assignments, then filtered to
+    ``test_`` fans, so the simulator's pickers cannot enumerate real fans.
+    """
+    from core.simulation import TEST_FAN_PREFIX, not_found, require_simulation_user
+
+    await require_simulation_user(request)
+    allowed = await _creator_ids_for_user_cached(request)
+    if not allowed:
+        return {"creators": []}
+
+    def _load() -> tuple[list[dict], list[dict]]:
+        db = get_supabase()
+        creators = (
+            db.table("creators")
+            .select("id, name")
+            .in_("id", sorted(allowed))
+            .execute()
+        ).data or []
+        fans = (
+            db.table("fans")
+            .select("id, display_name, creator_id, platform_fan_id")
+            .in_("creator_id", sorted(allowed))
+            .like("platform_fan_id", f"{TEST_FAN_PREFIX}%")
+            .order("display_name")
+            .limit(500)
+            .execute()
+        ).data or []
+        return creators, fans
+
+    try:
+        creators, fans = await asyncio.to_thread(_load)
+    except Exception as exc:
+        print(f"[SIMULATION] creator listing failed: {exc}")
+        raise not_found() from exc
+
+    by_creator: dict[str, list[dict]] = {}
+    for fan in fans:
+        # Defence in depth: the LIKE above is a database filter, and this is the
+        # same boundary applied in Python so a driver quirk cannot widen it.
+        if not str(fan.get("platform_fan_id") or "").startswith(TEST_FAN_PREFIX):
+            continue
+        by_creator.setdefault(str(fan.get("creator_id")), []).append(
+            {
+                "id": str(fan.get("id")),
+                "display_name": fan.get("display_name") or str(fan.get("id")),
+            }
+        )
+    return {
+        "creators": [
+            {
+                "id": str(creator.get("id")),
+                "name": creator.get("name") or str(creator.get("id")),
+                "test_fans": by_creator.get(str(creator.get("id")), []),
+            }
+            for creator in creators
+        ]
+    }
+
+
+@app.post("/creator/{creator_id}/fan/{fan_id}/simulate-inbound")
+async def simulate_inbound(
+    creator_id: str,
+    fan_id: str,
+    body: SimulateInboundRequest,
+    request: Request,
+) -> dict:
+    """Persist one fan message and run the REAL Full Auto turn it triggers.
+
+    Deliberately unaffected by APIFANSLY_ENABLED: the whole point is that this
+    works while the connector is off, because it never touches it.
+    """
+    from services.suggestions import run_simulated_inbound
+
+    fan = await _require_simulatable_fan(request, creator_id, fan_id)
+    print(
+        f"[SIMULATION] inbound creator={creator_id} fan={fan_id} "
+        f"platform_fan={fan.get('platform_fan_id')} fast={body.fast}"
+    )
+    return await run_simulated_inbound(
+        fan_id=fan_id,
+        creator_id=creator_id,
+        message=body.message,
+        fast=body.fast,
+    )
+
+
+@app.post("/creator/{creator_id}/fan/{fan_id}/simulate-purchase")
+async def simulate_purchase(creator_id: str, fan_id: str, request: Request) -> dict:
+    """Confirm the pending simulated PPV through the real purchase transition.
+
+    Reuses record_ppv_purchase rather than reimplementing the state machine, so
+    the lifecycle, affordability, price-learning and session effects a real
+    purchase produces are the ones observed here.
+    """
+    from services.suggestions import record_ppv_purchase
+
+    await _require_simulatable_fan(request, creator_id, fan_id)
+    pending = (
+        await asyncio.to_thread(
+            lambda: get_supabase()
+            .table("fans")
+            .select("pending_ppv_check")
+            .eq("id", fan_id)
+            .single()
+            .execute()
+        )
+    ).data or {}
+    check = pending.get("pending_ppv_check") or {}
+    media_id = str(check.get("media_id") or "")
+    if not media_id:
+        return {"status": "no_pending_ppv", "simulation": True}
+    await record_ppv_purchase(
+        fan_id,
+        media_id,
+        float(check.get("price") or 0),
+        pending_override=check,
+    )
+    return {
+        "status": "ok",
+        "simulation": True,
+        "media_id": media_id,
+        "amount": float(check.get("price") or 0),
+    }
+
+
+@app.post("/creator/{creator_id}/fan/{fan_id}/simulate-decline")
+async def simulate_decline(
+    creator_id: str,
+    fan_id: str,
+    body: SimulateDeclineRequest,
+    request: Request,
+) -> dict:
+    """Decline the pending simulated PPV through the real decline transition."""
+    from db.queries import get_fan_session, save_fan_session, set_fan_decline_lock
+    from services.session_lifecycle import mark_step_declined
+
+    await _require_simulatable_fan(request, creator_id, fan_id)
+    pending = (
+        await asyncio.to_thread(
+            lambda: get_supabase()
+            .table("fans")
+            .select("pending_ppv_check")
+            .eq("id", fan_id)
+            .single()
+            .execute()
+        )
+    ).data or {}
+    check = pending.get("pending_ppv_check") or {}
+    await set_fan_decline_lock(fan_id, check.get("price"))
+    session = await get_fan_session(fan_id)
+    if session and session.get("awaiting_purchase_index") is not None:
+        session = mark_step_declined(session, reason=body.reason, pause=True)
+        await save_fan_session(fan_id, session)
+    return {"status": "ok", "simulation": True, "session": session}
 
 
 async def require_local_test_endpoints() -> None:

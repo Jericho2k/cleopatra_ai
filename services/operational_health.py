@@ -377,9 +377,18 @@ async def collect(*, use_cache: bool = True) -> dict:
     from core import db_executor
     from core import supabase as supabase_transport
 
+    # Intentional connector disablement is configuration, never a fault. It is
+    # reported here so an operator can see it, and it is deliberately absent
+    # from evaluate(): it must not appear in degraded_reasons or fatal_reasons,
+    # and must never influence /health/ready.
+    from core.apifansly_gate import apifansly_enabled
+
     document = {
         "status": verdict["status"],
         "liveness": "ok",
+        "integrations": {
+            "apifansly": "enabled" if apifansly_enabled() else "disabled",
+        },
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "degraded_reasons": verdict["degraded_reasons"],
         "fatal_reasons": verdict["fatal_reasons"],
