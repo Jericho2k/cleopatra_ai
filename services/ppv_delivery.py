@@ -5,6 +5,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import uuid
 
+from core.simulation_catalog import contains_simulation_media
 from core.supabase import get_supabase
 from db.commercial_queries import get_creator_policy
 from db.queries import (
@@ -129,6 +130,16 @@ async def send_locked_ppv(
         raise PPVDeliveryError("at least one media item is required")
     if int(price_cents) <= 0:
         raise PPVDeliveryError("price must be greater than zero")
+    # The last barrier for the owner-only simulation catalog. Mirrored test
+    # media carries a rewritten ``sim:`` id that is not a platform media id, so
+    # a delivery built from one is refused here rather than being handed to the
+    # platform. Planning already excludes these rows; this is what makes "never
+    # eligible for real delivery" a property of the delivery path itself and not
+    # a promise made by every caller.
+    if contains_simulation_media(exact_media_ids):
+        raise PPVDeliveryError(
+            "simulation-only test media can never be delivered to a real fan"
+        )
 
     db = get_supabase()
     fan_row = await asyncio.to_thread(

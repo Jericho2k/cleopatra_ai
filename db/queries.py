@@ -290,6 +290,27 @@ def _is_missing_conflict_target(error: Exception) -> bool:
     return any(marker.lower() in text for marker in _MISSING_CONFLICT_TARGET_MARKERS)
 
 
+# Whether this process has observed the platform-identity index to be missing.
+#
+# The fallback below keeps ingestion working without it, which is exactly why a
+# log line alone was not enough: the deployment looked fine while running on a
+# racy check-then-insert that the migration exists to remove. Health publishes
+# this, so "apply db/message_platform_identity_v1.sql" is a visible operator
+# task rather than a line somebody has to notice in Railway.
+_message_identity_index_missing = False
+
+
+def message_identity_index_missing() -> bool:
+    """True once ingestion has had to fall back to check-then-insert."""
+    return _message_identity_index_missing
+
+
+def reset_message_identity_index_state() -> None:
+    """Test-support only."""
+    global _message_identity_index_missing
+    _message_identity_index_missing = False
+
+
 async def save_message(
     fan_id: str,
     creator_id: str,
@@ -407,6 +428,8 @@ async def save_message_result(
             )
         except Exception as exc:
             if _is_missing_conflict_target(exc):
+                global _message_identity_index_missing
+                _message_identity_index_missing = True
                 print(
                     "[MESSAGE IDENTITY] unique index missing — falling back to "
                     "check-then-insert. Apply db/message_platform_identity_v1.sql "

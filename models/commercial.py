@@ -239,4 +239,21 @@ class CommercialDecision(BaseModel):
     max_messages: int | None = None
     conversation_continuation: Literal["required", "optional", "none"] = "optional"
 
+    # Authoritative media capabilities for this turn. The writer is TOLD what
+    # exists; it never infers it from a tag, a title or the fan's request.
+    # ``authorized`` is what this decision itself authorises, ``available`` what
+    # the current offer set could still contain, ``vault`` what exists in
+    # approved unsent inventory at all.
+    authorized_asset_types: list[str] = Field(default_factory=list)
+    available_package_asset_types: list[str] = Field(default_factory=list)
+    vault_asset_types: list[str] = Field(default_factory=list)
+
+    # Set when the fan explicitly asked for a media type that is not available.
+    # A deterministic pivot, never a stall and never a fabricated promise.
+    unavailable_asset_type_requested: str | None = None
+
+    # Set when the exact package the fan accepted can no longer be delivered and
+    # a replacement is being presented instead of silently substituted.
+    replacement_for_unavailable: bool = False
+
     reason: str = ""

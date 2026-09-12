@@ -10,6 +10,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
+from core.simulation_catalog import exclude_simulation_only, run_live_catalog_query
 from core.supabase import get_supabase
 from db.commercial_queries import get_creator_policy, get_fan_state
 from db.queries import get_fan_by_id, get_sent_ppv, save_fan_session
@@ -199,17 +200,24 @@ async def plan_session_for_fan(
 
 async def _load_approved_sets(creator_id: str) -> list[dict[str, Any]]:
     def _get() -> list[dict[str, Any]]:
-        response = (
-            get_supabase().table("vault_sets")
-            .select(
-                "id, title, description, location, outfit, explicit_min, explicit_max, "
-                "media_ids, preview_media_id, suggested_price, tags, base_price_cents, "
-                "min_price_cents, max_price_cents, dynamic_pricing_enabled"
+        def _build(apply_filter: bool):
+            query = (
+                get_supabase().table("vault_sets")
+                .select(
+                    "id, title, description, location, outfit, explicit_min, explicit_max, "
+                    "media_ids, preview_media_id, suggested_price, tags, base_price_cents, "
+                    "min_price_cents, max_price_cents, dynamic_pricing_enabled"
+                )
+                .eq("creator_id", creator_id)
+                .eq("status", "approved")
             )
-            .eq("creator_id", creator_id)
-            .eq("status", "approved")
-            .execute()
-        )
+            # Owner-only mirrored test content is real inventory to the
+            # simulator and invisible to everything else.
+            if apply_filter:
+                query = exclude_simulation_only(query)
+            return query.execute()
+
+        response = run_live_catalog_query(_build, label="session_planner.approved_sets")
         return response.data or []
 
     return await asyncio.to_thread(_get)

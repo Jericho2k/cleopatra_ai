@@ -7,6 +7,7 @@ from datetime import datetime
 from ai.prompt_blocks import cacheable_system_blocks
 from ai.voice_calibration import render_voice_calibration
 from services.session_lifecycle import session_progress
+from models.money import customer_dollars, customer_dollars_or_none
 from models.schemas import ConversationContext, StageType
 
 
@@ -83,9 +84,8 @@ def _render_fan_intelligence(intelligence: dict) -> str:
             continue
         value = fact.get("value")
         if key in money_keys:
-            try:
-                rendered = f"${int(value) / 100:g}"
-            except (TypeError, ValueError):
+            rendered = customer_dollars(value, default="")
+            if not rendered:
                 continue
         else:
             rendered = _display_fact_value(value)
@@ -127,11 +127,7 @@ def _render_affordability(affordability: dict) -> str:
     if not affordability:
         return ""
 
-    def money(value) -> str | None:
-        try:
-            return f"${int(value) / 100:g}" if value is not None else None
-        except (TypeError, ValueError):
-            return None
+    money = customer_dollars_or_none
 
     lines: list[str] = []
     status = str(affordability.get("status") or "UNKNOWN")
@@ -192,11 +188,7 @@ def _render_price_learning(price_learning: dict) -> str:
     if not price_learning:
         return ""
 
-    def money(value) -> str | None:
-        try:
-            return f"${int(value) / 100:g}" if value is not None else None
-        except (TypeError, ValueError):
-            return None
+    money = customer_dollars_or_none
 
     mode = str(price_learning.get("mode") or "DISCOVERY")
     confidence = str(price_learning.get("confidence") or "NONE")
@@ -352,12 +344,43 @@ def _render_session_strategy(session_strategy: dict) -> str:
         lines.append(f"maximum message bubbles: {session_strategy['max_messages']}")
     prices = [int(value) for value in session_strategy.get("approved_offer_prices_cents") or []]
     if prices:
-        lines.append("approved offer prices only: " + ", ".join(f"${value / 100:g}" for value in prices))
+        lines.append(
+            "approved offer prices only: "
+            + ", ".join(customer_dollars(value) for value in prices)
+        )
     lines.extend([
         "This is execution guidance, not permission to change the commercial decision.",
         "Never invent an offer, price, discount, content set, or promise.",
     ])
     return "ADAPTIVE SESSION STRATEGY (internal):\n- " + "\n- ".join(lines)
+
+def _render_media_inventory(media_inventory: dict) -> str:
+    """State the turn's approved media capabilities. Never inferred, always given.
+
+    The record comes from services/inventory_authority.py, which builds it from
+    the same approved rows the planner used. Rendering it here is what stops the
+    writer promising a clip for a creator whose vault is photo sets.
+    """
+    if not media_inventory:
+        return ""
+    from services.inventory_authority import MediaInventory, render_inventory_block
+
+    return render_inventory_block(
+        MediaInventory(
+            authorized_asset_types=tuple(
+                media_inventory.get("authorized_asset_types") or ()
+            ),
+            available_package_asset_types=tuple(
+                media_inventory.get("available_package_asset_types") or ()
+            ),
+            vault_asset_types=tuple(media_inventory.get("vault_asset_types") or ()),
+            next_step_asset_type=media_inventory.get("next_step_asset_type"),
+            video_requested=bool(media_inventory.get("video_requested")),
+            known=bool(media_inventory.get("known", True)),
+            reason_codes=tuple(media_inventory.get("reason_codes") or ()),
+        )
+    )
+
 
 def _render_message_shape(message_shape: dict) -> str:
     """Tell the writer the bubble count this turn was assigned.
@@ -479,6 +502,8 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     session_strategy_block = _render_session_strategy(session_strategy)
     message_shape = getattr(ctx, "message_shape", None) or {}
     message_shape_block = _render_message_shape(message_shape)
+    media_inventory = getattr(ctx, "media_inventory", None) or {}
+    media_inventory_block = _render_media_inventory(media_inventory)
     session_choreography_block = _render_session_choreography(
         session_progress(ctx.active_session)
     )
@@ -859,7 +884,7 @@ WELCOME MESSAGE (your opening style):
         }.get(buyer_stage, "Use the supplied buyer stage as context, not as a script.")
         fan_context_parts.append(
             f"Buyer lifecycle: {buyer_stage} | confirmed purchases: {purchase_count} | "
-            f"total spend: ${total_spent_cents / 100:g}. {lifecycle_guidance}"
+            f"total spend: {customer_dollars(total_spent_cents)}. {lifecycle_guidance}"
         )
 
     # ---- Blocks recomputed on every single message ----
@@ -870,6 +895,11 @@ WELCOME MESSAGE (your opening style):
     # precede stage, situation, the commercial decision and the newest message —
     # everything that was already treated as volatile.
     live_state_parts = []
+    # First, and before any commercial guidance: what actually exists. The
+    # writer must never be left to infer inventory from a tag, a title or the
+    # fan's own request.
+    if media_inventory_block:
+        live_state_parts.append(media_inventory_block)
     if affordability_block:
         live_state_parts.append(affordability_block)
     if price_learning_block:
@@ -1091,7 +1121,7 @@ Return ONLY a JSON array of 3 strings. No markdown.
                     legal_description = str(
                         option.get("legal_description") or option.get("experience") or ""
                     ).strip()
-                    item = f"{index}) {label}: ${cents / 100:g}"
+                    item = f"{index}) {label}: {customer_dollars(cents)}"
                     if legal_description:
                         item += f" — approved experience: {legal_description}"
                     rendered.append(item)
@@ -1109,7 +1139,8 @@ Return ONLY a JSON array of 3 strings. No markdown.
                     "Some of these prices buy a multi-part private session, not a "
                     "single drop: "
                     + "; ".join(
-                        f"{option.get('label') or 'session'} = ${int(option.get('price_cents') or 0) / 100:g} "
+                        f"{option.get('label') or 'session'} = "
+                        f"{customer_dollars(option.get('price_cents') or 0)} "
                         f"total for {int(option.get('step_count') or 1)} parts"
                         for option in multi_step
                     )

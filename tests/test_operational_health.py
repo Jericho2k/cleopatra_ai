@@ -91,11 +91,17 @@ def test_healthy_deployment_reports_ok(monkeypatch):
 
 
 def test_unreachable_database_is_fatal_and_visible(monkeypatch):
+    """A probe result with no confirmation record still fails closed.
+
+    The reason string is now ``database_unavailable`` — the confirmed-outage
+    name — because a confirmed outage is the only thing that reaches fatal once
+    the hysteresis ladder is in play (tests/test_db_health_hysteresis.py).
+    """
     wire(monkeypatch, db={"reachable": False, "latency_ms": 1500, "error": "timeout"})
     document = run(operational_health.collect(use_cache=False))
 
     assert document["status"] == "unhealthy"
-    assert any("database_unreachable" in r for r in document["fatal_reasons"])
+    assert any("database_unavailable" in r for r in document["fatal_reasons"])
 
 
 def test_unavailable_model_provider_is_degraded_never_fatal(monkeypatch):

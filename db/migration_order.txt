@@ -51,6 +51,10 @@ vault_sync_interruption_v1.sql
 # Per-creator single-flight claim for Fansly list reconciliation, so two
 # operators pressing Refresh cannot race the same membership diff.
 fansly_lists_single_flight_v1.sql
+# Owner-only simulation catalog: additive simulation_only / provenance columns
+# that live planning filters on and that make a mirrored test row impossible to
+# deliver. Must precede tenant_isolation_v1, which discovers tables at run time.
+simulation_catalog_v1.sql
 
 # Always last, and always as a PAIR, in this order.
 #
