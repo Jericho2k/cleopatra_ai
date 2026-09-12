@@ -6,6 +6,7 @@ from datetime import datetime
 
 from ai.prompt_blocks import cacheable_system_blocks
 from ai.voice_calibration import render_voice_calibration
+from services.session_lifecycle import session_progress
 from models.schemas import ConversationContext, StageType
 
 
@@ -14,6 +15,7 @@ The fan already knows that the creator sells digital adult content. Sexual inter
 All intimacy, services, and content stay digital and on-platform. Never suggest, promise, or agree to an in-person meeting, date, physical service, private meetup, phone number exchange, or moving the conversation elsewhere.
 Use the supplied recent conversation as authoritative continuity. Do not assume this is the first message unless the history is actually empty. When context is missing, respond naturally without inventing a prior promise, relationship, backstory, unavailable content, or real-world plan.
 The supplied commercial decision and active session are authoritative when present. Express them naturally in the creator's voice; never independently change whether to sell, which media to send, or what price to use.
+Paid content is attached directly to a chat message on this platform and unlocks in place. There is no link involved in sending it, so never offer, promise, or refer to "the link", "a link", clicking, or opening a link when you mean your own photos or videos. Say you will send it, that you are sending it, or that it is right there. (An unrelated link the fan himself brings up is ordinary conversation and is not covered by this rule.)
 """
 
 
@@ -357,6 +359,106 @@ def _render_session_strategy(session_strategy: dict) -> str:
     ])
     return "ADAPTIVE SESSION STRATEGY (internal):\n- " + "\n- ".join(lines)
 
+def _render_message_shape(message_shape: dict) -> str:
+    """Tell the writer the bubble count this turn was assigned.
+
+    The count is decided deterministically outside the model, because asking a
+    model to "vary" produces one rhythm it then repeats forever. Auto enforces
+    it after generation by merging, never by splitting, so a shape the writer
+    disagrees with costs naturalness only at the seams.
+    """
+    if not message_shape:
+        return ""
+    target = int(message_shape.get("target_bubbles") or 1)
+    if target <= 1:
+        body = (
+            "Write this reply as ONE message. No \" | \" separator. One bubble may be "
+            "a little longer than usual when the thought needs it; do not pad it, and "
+            "do not split one thought in half."
+        )
+    else:
+        body = (
+            f"Write this reply as {target} message bubbles separated by \" | \". "
+            "Each bubble must be able to stand on its own as a sent text. Never split "
+            "one sentence across bubbles to reach the count; if the reply is genuinely "
+            "one thought, send fewer."
+        )
+    return (
+        "MESSAGE SHAPE FOR THIS TURN (overrides any earlier guidance about how "
+        "many bubbles to use, for every option):\n" + body
+    )
+
+
+def _render_session_choreography(progress: dict) -> str:
+    """Describe the paid session as one experience the writer is mid-way through."""
+    if not progress:
+        return ""
+    lines: list[str] = [
+        f"session progress: step {progress.get('purchased_steps', 0)} of "
+        f"{progress.get('total_steps', 0)} purchased",
+    ]
+    purchased = progress.get("just_purchased") or {}
+    upcoming = progress.get("next_step") or {}
+    continuity = progress.get("continuity") or {}
+
+    if purchased:
+        lines.append(
+            "he just unlocked: "
+            + _describe_step(purchased)
+            + ". React to THIS specific piece, not to content in general. Do not "
+            "invent what is in it beyond the approved description above."
+        )
+    if progress.get("awaiting_purchase"):
+        lines.append(
+            "a step is locked and unconfirmed: do not imply he opened, saw, or "
+            "enjoyed it, and do not send anything else."
+        )
+    if upcoming:
+        lines.append("next planned step: " + _describe_step(upcoming))
+        if continuity.get("same_scene") or continuity.get("same_location"):
+            lines.append(
+                "it is the same scene continuing, so keep the moment alive rather "
+                "than starting a new topic."
+            )
+        if continuity.get("escalates"):
+            lines.append("it goes further than what he just got.")
+        if continuity.get("changes_asset_type"):
+            lines.append(
+                f"it changes format to a {upcoming.get('asset_type') or 'piece'}."
+            )
+        if progress.get("cooldown_active"):
+            lines.append(
+                "OBJECTIVE THIS TURN: stay in the moment with him and bridge toward "
+                "that next piece so it feels like one experience. Imply there is more "
+                "coming without pitching it, naming its price, or promising anything "
+                "outside the plan. Do not send media this turn and do not ask 'want "
+                "more?' — the session already knows what comes next."
+            )
+    elif purchased:
+        lines.append(
+            "nothing further is planned: close the experience warmly instead of "
+            "hinting at more."
+        )
+    return "PAID SESSION CHOREOGRAPHY (internal, authoritative):\n- " + "\n- ".join(lines)
+
+
+def _describe_step(step: dict) -> str:
+    parts: list[str] = []
+    asset = str(step.get("asset_type") or "").replace("_", " ").strip()
+    count = int(step.get("media_count") or 0)
+    if asset == "video":
+        parts.append("a video")
+    elif count:
+        parts.append(f"a {count}-piece photo set")
+    elif asset:
+        parts.append(f"a {asset}")
+    for key in ("scene_key", "location", "outfit"):
+        value = str(step.get(key) or "").strip()
+        if value and value.lower() not in {item.lower() for item in parts}:
+            parts.append(value)
+    return ", ".join(parts) or "the planned step"
+
+
 def build_prompt(ctx: ConversationContext) -> list[dict]:
     fan = ctx.fan_profile
     stage = ctx.conversation_stage
@@ -375,6 +477,11 @@ def build_prompt(ctx: ConversationContext) -> list[dict]:
     )
     session_strategy = getattr(ctx, "session_strategy", None) or {}
     session_strategy_block = _render_session_strategy(session_strategy)
+    message_shape = getattr(ctx, "message_shape", None) or {}
+    message_shape_block = _render_message_shape(message_shape)
+    session_choreography_block = _render_session_choreography(
+        session_progress(ctx.active_session)
+    )
     expression_guidance_block = _render_expression_guidance(
         conversation_director,
         session_strategy,
@@ -771,6 +878,8 @@ WELCOME MESSAGE (your opening style):
         live_state_parts.append(conversation_director_block)
     if session_strategy_block:
         live_state_parts.append(session_strategy_block)
+    if session_choreography_block:
+        live_state_parts.append(session_choreography_block)
     if expression_guidance_block:
         # Expression calibration is derived from the director and the session
         # strategy. With neither configured it renders one constant paragraph
@@ -856,6 +965,8 @@ For all three options:
 - Never mirror a compliment back. Never use stop words (baby, babe, daddy, mommy).
 - Use his name sparingly, not automatically.
 
+{message_shape_block}
+
 Return ONLY a JSON array of 3 strings. No markdown.
 ["reply 1", "reply 2", "reply 3"]"""
 
@@ -882,14 +993,21 @@ Return ONLY a JSON array of 3 strings. No markdown.
             messages_left = active_session.get("cooldown_messages_remaining", 2)
             user_prompt += (
                 f"\n\nPOST-PPV COOLDOWN ({messages_left} exchanges remaining): "
-                "Fan just received content. DO NOT push the next item yet. "
-                "React to their energy, be playful, build micro-rapport. Let THEM escalate first."
+                "Do NOT send the next item yet and do NOT include a [PPV:...] tag. "
+                "React to what he actually just unlocked, stay in the scene, and keep "
+                "the tension going."
             )
             if remaining:
+                # The session already knows what comes next. Waiting to be asked
+                # for more is what makes a planned experience read as a vending
+                # machine; see PAID SESSION CHOREOGRAPHY above for the exact
+                # approved next step.
                 user_prompt += (
-                    " The session is NOT over — you have more saved for him. Without pitching anything, "
-                    "make it clear tonight isn't finished (you're just getting started, don't finish yet, "
-                    "the best part is still coming). Keep him in the scene."
+                    " The session is not over and the next piece is already planned. "
+                    "Bridge toward it naturally using the approved scene details you "
+                    "were given, so it feels like one continuous experience. Do not "
+                    "ask him whether he wants more, do not name a price, and do not "
+                    "promise anything the plan does not contain."
                 )
         # Force send if session planned and fan has sent 3+ messages since qualification.
         # NEVER while selling is paused (he told us he can't afford it) — that's how a
@@ -921,11 +1039,14 @@ Return ONLY a JSON array of 3 strings. No markdown.
             next_transition = next_item.get("transition", "")
             user_prompt += "\n\nACTIVE SEXTING SESSION - follow this plan:\n"
             user_prompt += f"Next content to send: [{next_media_id}] {next_description}\n"
-            user_prompt += f"Suggested price: ${next_price}\n"
+            user_prompt += f"Approved price for this step: ${float(next_price):g}\n"
             user_prompt += f'Transition line: "{next_transition}"\n'
             user_prompt += f"Items remaining in session: {len(remaining)}\n"
             user_prompt += f"Use the transition line naturally, then send the PPV with [PPV:{next_media_id}:{next_price}]\n"
-            user_prompt += f"IMPORTANT: The price is ${next_price} — do not mention any other price.\n"
+            user_prompt += (
+                f"IMPORTANT: The price is ${float(next_price):g} — do not mention any "
+                "other price, and never offer a link for it.\n"
+            )
             user_prompt += "After sending, continue the intimate conversation - do not immediately push the next item."
 
     # ---- COMMERCIAL DECISION (authoritative) --------------------------------
@@ -941,6 +1062,20 @@ Return ONLY a JSON array of 3 strings. No markdown.
         ]
         if decision.get("must_not_send_media"):
             lines.append("Do NOT send media and do NOT include a [PPV:...] tag.")
+        if act in {
+            "PRESENT_SESSION_OPTIONS",
+            "END_TEASER_AND_OFFER",
+            "CREATE_PAID_SESSION",
+            "SEND_NEXT_PPV_STEP",
+            "RESUME_PREVIOUS_OFFER",
+        }:
+            lines.append(
+                "DELIVERY LANGUAGE: your content is attached to the message itself "
+                "and unlocks in this chat. There is no link. Never write \"want the "
+                "link\", \"here's the link\", \"click the link\", or \"I'll send you a "
+                "link\". Write \"want me to send it\", \"want it\", \"sending it now\", "
+                "or \"it's right there\"."
+            )
         if not decision.get("may_be_explicit", False):
             lines.append("Keep this response non-explicit.")
         else:
@@ -964,6 +1099,24 @@ Return ONLY a JSON array of 3 strings. No markdown.
                     rendered.append(f"{index}) ${option}")
 
             exact_options = "; ".join(rendered)
+            multi_step = [
+                option
+                for option in options
+                if isinstance(option, dict) and int(option.get("step_count") or 1) > 1
+            ]
+            if multi_step:
+                lines.append(
+                    "Some of these prices buy a multi-part private session, not a "
+                    "single drop: "
+                    + "; ".join(
+                        f"{option.get('label') or 'session'} = ${int(option.get('price_cents') or 0) / 100:g} "
+                        f"total for {int(option.get('step_count') or 1)} parts"
+                        for option in multi_step
+                    )
+                    + ". Present the total honestly as a session in parts. Never "
+                    "describe it as a fixed number of photos unless that is exactly "
+                    "what one part is."
+                )
             if act == "CREATE_PAID_SESSION":
                 lines.append(
                     "EXACT SELECTED OPTION: " + exact_options + ". "

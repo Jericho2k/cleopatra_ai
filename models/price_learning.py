@@ -14,6 +14,11 @@ from typing import Any, Iterable
 
 from pydantic import BaseModel, Field
 
+from models.content_pricing import (
+    DEFAULT_PRICE_STEP_CENTS,
+    human_price_cents,
+)
+
 
 class PriceRecommendationMode(str, Enum):
     NO_OFFER = "NO_OFFER"
@@ -39,6 +44,17 @@ class PriceLearningPolicy(BaseModel):
     range_width_bps: int = Field(default=2_000, ge=0, le=7_500)
     price_step_cents: int = Field(default=500, ge=1)
     evidence_lookback_days: int = Field(default=365, ge=1, le=3650)
+
+    # --- Price probing ---------------------------------------------------
+    # Where inside an approved content range a fan with no evidence is probed.
+    # 2,500 bps on a $15-$80 set is roughly $31, not a flat global $25.
+    cold_start_probe_bps: int = Field(default=2_500, ge=0, le=10_000)
+    # Confirmed purchases before effortless-buyer uplift is applied on top of
+    # the ordinary step-up.
+    effortless_purchase_streak: int = Field(default=2, ge=1, le=20)
+    # The customer-facing price grid. $5 by default; an agency that genuinely
+    # wants cent-level pricing sets this explicitly.
+    customer_price_step_cents: int = Field(default=DEFAULT_PRICE_STEP_CENTS, ge=1)
 
 
 class PriceLearningProfile(BaseModel):
@@ -245,7 +261,10 @@ def derive_price_learning_profile(
             "event_counts": counts,
             "current_explicit_cap_cents": current_cap,
             "highest_confirmed_purchase_cents": max(purchases) if purchases else None,
+            "demonstrated_willingness_cents": max(purchases) if purchases else None,
+            "confirmed_purchase_count": len(purchases),
             "latest_soft_resistance_cents": resistance[-1] if resistance else None,
+            "soft_resistance_count": len(resistance),
         },
         reason_codes=reasons,
         updated_at=current,
@@ -413,3 +432,143 @@ def _as_utc(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Price probing
+#
+# Six things the agency treats as different, and which must never collapse into
+# one "budget" number:
+#
+#   content floor / ceiling      what the content itself is allowed to cost
+#   fan probe price              where inside that band we test this fan now
+#   demonstrated willingness     a confirmed purchase at X proves >= X, forever
+#   explicit current ceiling     "I only have $25 today" — a hard cap, this session
+#   soft resistance              a declined offer — steps the probe down, nothing more
+#   selected offer               an accepted package price — exact and authoritative
+# ---------------------------------------------------------------------------
+
+
+class PriceProbe(BaseModel):
+    """One deterministic probe price inside one approved content range."""
+
+    price_cents: int
+    content_floor_cents: int
+    content_ceiling_cents: int
+    demonstrated_willingness_cents: int | None = None
+    explicit_ceiling_cents: int | None = None
+    soft_resistance_cents: int | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+
+
+def probe_price_cents(
+    content_floor_cents: int,
+    content_ceiling_cents: int,
+    *,
+    price_learning: dict[str, Any] | None = None,
+    policy: PriceLearningPolicy | None = None,
+    hard_ceiling_cents: int | None = None,
+) -> PriceProbe | None:
+    """Choose where inside an approved content range to price this fan.
+
+    Returns ``None`` when no approved price is sellable right now — an explicit
+    current ceiling below the content floor, or a suppressed offer. Refusing to
+    offer is a valid outcome; discounting below approved value is not.
+    """
+    policy = policy or PriceLearningPolicy()
+    context = price_learning or {}
+    summary = context.get("evidence_summary") or {}
+    mode = str(context.get("mode") or "").upper()
+
+    low = max(0, int(content_floor_cents))
+    high = max(low, int(content_ceiling_cents))
+    if high <= 0:
+        return None
+
+    demonstrated = _money(summary.get("demonstrated_willingness_cents")) or _money(
+        summary.get("highest_confirmed_purchase_cents")
+    )
+    resistance = _money(summary.get("latest_soft_resistance_cents"))
+    explicit_cap = _money(summary.get("current_explicit_cap_cents"))
+    evidence_target = _money(context.get("recommended_target_cents"))
+    purchases = max(
+        int(context.get("confirmed_purchase_count") or 0),
+        int(summary.get("confirmed_purchase_count") or 0),
+    )
+    reasons: list[str] = []
+
+    if mode == "NO_OFFER":
+        return None
+
+    caps = [value for value in (explicit_cap, _money(hard_ceiling_cents)) if value is not None]
+    ceiling = min([high, *caps]) if caps else high
+    if caps:
+        reasons.append("explicit_current_ceiling_respected")
+    if ceiling < low:
+        # He cannot afford this content at its approved value. Offering it
+        # below that value is not a decision price learning is allowed to make.
+        return None
+
+    # The cold-start anchor is a position inside the CONTENT range, not inside
+    # whatever an explicit ceiling has left of it. A fan who says he has $25
+    # should then be offered $25 worth of approved content, not the floor.
+    span = high - low
+    probe = low + (span * max(0, policy.cold_start_probe_bps)) // 10_000
+    reasons.append("content_range_cold_start_anchor")
+
+    if mode == "EXACT" and evidence_target is not None:
+        probe = evidence_target
+        reasons.append("selected_offer_is_authoritative")
+    elif evidence_target is not None and mode == "RANGE":
+        if evidence_target > probe:
+            probe = evidence_target
+            reasons.append("fan_evidence_raises_probe")
+
+    if demonstrated:
+        # A purchase at X proves willingness to pay at least X. It is a floor on
+        # what we probe next for comparable content, never a permanent maximum.
+        proven = min(ceiling, max(low, demonstrated))
+        if proven > probe:
+            probe = proven
+            reasons.append("demonstrated_willingness_floor")
+        stepped = min(
+            ceiling,
+            demonstrated * (10_000 + max(0, policy.max_step_up_bps)) // 10_000,
+        )
+        if stepped > probe:
+            probe = stepped
+            reasons.append("progressive_upward_probe")
+        if purchases >= policy.effortless_purchase_streak and not resistance:
+            uplifted = min(
+                ceiling,
+                probe * (10_000 + max(0, policy.repeat_buyer_uplift_bps)) // 10_000,
+            )
+            if uplifted > probe:
+                probe = uplifted
+                reasons.append("effortless_repeat_buyer_uplift")
+
+    if resistance:
+        # Soft resistance steps the probe down. It never becomes a stored
+        # ceiling and it never erases proven willingness to pay.
+        protected = min(ceiling, max(low, demonstrated or low))
+        softened = max(protected, resistance - max(1, policy.customer_price_step_cents))
+        if softened < probe:
+            probe = softened
+        reasons.append("soft_resistance_steps_probe_down")
+
+    probe = max(low, min(ceiling, probe))
+    price = human_price_cents(
+        probe,
+        low,
+        ceiling,
+        step_cents=policy.customer_price_step_cents,
+    )
+    return PriceProbe(
+        price_cents=price,
+        content_floor_cents=low,
+        content_ceiling_cents=high,
+        demonstrated_willingness_cents=demonstrated,
+        explicit_ceiling_cents=min(caps) if caps else None,
+        soft_resistance_cents=resistance,
+        reason_codes=reasons,
+    )

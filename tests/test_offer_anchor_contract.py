@@ -69,7 +69,10 @@ def test_current_experience_outranks_soft_initial_target():
 
     assert len(packages) == 1
     assert packages[0].set_ids == ["shower-premium"]
-    assert packages[0].price_cents == 4500
+    # The soft package target is $25; the shower set's approved range is
+    # $45-$70. The request wins on content, and the content wins on price.
+    assert 4500 <= packages[0].price_cents <= 7000
+    assert packages[0].price_cents % 500 == 0
     assert "shower" in (packages[0].experience or "").lower()
 
 

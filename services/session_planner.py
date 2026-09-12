@@ -14,10 +14,14 @@ from core.supabase import get_supabase
 from db.commercial_queries import get_creator_policy, get_fan_state
 from db.queries import get_fan_by_id, get_sent_ppv, save_fan_session
 from models.commercial import FanStatus
+from db.pricing_policy_queries import get_effective_price_learning_policy
 from services.media_packages import (
-    allocate_budget,
+    allocate_step_pricing,
     choose_sequence,
-    explicitness,
+    choose_video_finale,
+    is_video_row,
+    order_steps_for_progression,
+    split_media_types,
     usable_sets,
 )
 
@@ -83,26 +87,54 @@ async def plan_session_for_fan(
         preferred = list(confirmed_kinks or [])
         if not preferred and fan and getattr(fan, "ai_summary", None):
             preferred = list((fan.ai_summary or {}).get("kinks") or [])
+        photo_rows, video_rows = split_media_types(sellable)
         sequence = choose_sequence(
-            sellable,
+            photo_rows or sellable,
             target_cents=budget_cents,
             min_steps=policy.session_min_steps,
             max_steps=policy.session_max_steps,
             preferred_tags=preferred,
         )
+        # A generic session opens on lower-friction photo content and escalates
+        # into a clip; it does not burn the best video as the opener.
+        if sequence and video_rows and len(sequence) < policy.session_max_steps:
+            finale = choose_video_finale(
+                sequence,
+                video_rows,
+                preferred_tags=preferred,
+                excluded_set_ids={str(row.get("id")) for row in sequence},
+            )
+            if finale:
+                sequence = [*sequence, finale]
 
     if not sequence:
         return {"status": "no_coherent_sequence", "session": None}
 
-    # Always escalate within the already-coherent selected sequence.
-    sequence = sorted(sequence, key=lambda row: (explicitness(row), str(row.get("id"))))
-    allocations = allocate_budget(budget_cents, sequence)
+    # Always escalate within the already-coherent selected sequence: softer
+    # photos first, the clip last.
+    sequence = order_steps_for_progression(sequence)
+    pricing_policy = await get_effective_price_learning_policy(creator_id)
+    allocations = allocate_step_pricing(
+        budget_cents,
+        sequence,
+        step_cents=pricing_policy.customer_price_step_cents,
+    )
+    if allocations is None:
+        # The sold total cannot be split across these steps without breaking a
+        # step's approved bounds or inventing a fractional price. Fail closed:
+        # a session must never be delivered at prices nobody approved.
+        print(
+            f"[SESSION] no valid allocation fan={fan_id} "
+            f"budget=${budget_cents / 100:.2f} steps={len(sequence)}"
+        )
+        return {"status": "no_valid_allocation", "session": None}
     plan: list[dict[str, Any]] = []
     for index, (row, cents) in enumerate(zip(sequence, allocations, strict=True)):
         media_ids = [str(value) for value in (row.get("media_ids") or []) if value]
-        is_individual_video = "individual_video" in (row.get("tags") or [])
+        is_individual_video = is_video_row(row)
         plan.append({
             "step_number": index + 1,
+            "step_count": len(sequence),
             "media_ids": media_ids,
             "media_id": media_ids[0],  # compatibility with current executor
             "price": round(cents / 100, 2),

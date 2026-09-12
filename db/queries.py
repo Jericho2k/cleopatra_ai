@@ -7,6 +7,7 @@ from datetime import datetime
 
 from core.pagination import fetch_all_rows
 from core.supabase import get_supabase
+from models.content_pricing import category_range_for_items
 from models.schemas import ExchangeExample, Fan, Message, Persona
 from services.shoot_fingerprint import build_shoot_clusters, shoot_fingerprint
 from services.vault_metadata import VAULT_CLASSIFIER_VERSION, build_set_description
@@ -749,7 +750,24 @@ def propose_sets(vault_items, max_per_set=6, min_per_set=3, min_level=2):
             for colour in palette[:4]:
                 if colour not in tags:
                     tags.append(colour)
+            # Carry the approved commercial range forward. Without this a set
+            # reaches vault_sets with nothing but suggested_price, and the
+            # commercial layer has to re-derive its bounds from the category
+            # tag at read time.
+            approved_range = category_range_for_items(chunk)
+            bounds: dict[str, int] = {}
+            if approved_range:
+                minimum_cents, maximum_cents = approved_range
+                base_cents = max(
+                    minimum_cents, min(maximum_cents, int(round(price * 100)))
+                )
+                bounds = {
+                    "base_price_cents": base_cents,
+                    "min_price_cents": minimum_cents,
+                    "max_price_cents": maximum_cents,
+                }
             sets.append({
+                **bounds,
                 "title": title[:80],
                 "description": build_set_description(chunk),
                 "location": loc or None,
@@ -798,8 +816,11 @@ def propose_video_ppvs(vault_items, min_level=2):
         ):
             continue
 
-        minimum = max(1, round(float(item.get("price_min") or 15)))
-        maximum = max(minimum, round(float(item.get("price_max") or minimum)))
+        fallback_range = category_range_for_items([item])
+        default_minimum = (fallback_range[0] / 100) if fallback_range else 15
+        default_maximum = (fallback_range[1] / 100) if fallback_range else default_minimum
+        minimum = max(1, round(float(item.get("price_min") or default_minimum)))
+        maximum = max(minimum, round(float(item.get("price_max") or default_maximum)))
         suggested = int(round(((minimum + maximum) / 2) / 5) * 5)
         suggested = max(minimum, min(maximum, suggested))
         location = str(item.get("scene_location") or "").replace("_", " ").strip()

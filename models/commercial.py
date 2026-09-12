@@ -80,6 +80,26 @@ class PackageOption(BaseModel):
     experience: str | None = None
     legal_description: str | None = None
 
+    # How the offer is actually structured, so the writer can describe it
+    # honestly. A price presented for "3 photos" must not be delivered as two
+    # locked steps without the fan having been told it is a multi-part session.
+    step_count: int = 1
+    media_count: int = 0
+    asset_types: list[str] = Field(default_factory=list)
+
+    # Provenance of the price. Approved content bounds first, fan probe second.
+    content_floor_cents: int | None = None
+    content_ceiling_cents: int | None = None
+    price_reason_codes: list[str] = Field(default_factory=list)
+
+    @property
+    def is_multi_step(self) -> bool:
+        return self.step_count > 1
+
+    @property
+    def includes_video(self) -> bool:
+        return "video" in self.asset_types
+
 
 class CreatorPolicy(BaseModel):
     """Per-creator commercial policy. The agency's dials."""

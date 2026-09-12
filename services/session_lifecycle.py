@@ -229,3 +229,111 @@ def _find_step_index(
         if set_id and str(item.get("set_id")) == str(set_id):
             return index
     return None
+
+
+def next_step(session: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The next planned step that has not been sent yet, if any."""
+    normalized = normalize_session(session)
+    if not normalized or normalized.get("status") != "active":
+        return None
+    plan = normalized.get("plan") or []
+    index = int(normalized.get("current_index", 0) or 0)
+    for item in plan[max(0, index):]:
+        if not item.get("sent"):
+            return item
+    return None
+
+
+def last_purchased_step(session: dict[str, Any] | None) -> dict[str, Any] | None:
+    normalized = normalize_session(session)
+    if not normalized:
+        return None
+    purchased = [item for item in (normalized.get("plan") or []) if item.get("purchased")]
+    return purchased[-1] if purchased else None
+
+
+def session_progress(session: dict[str, Any] | None) -> dict[str, Any]:
+    """Writer-safe choreography context for an active paid session.
+
+    A paid session is one experience, not a queue of unrelated transactions.
+    After a purchase the writer needs to know exactly what he just unlocked,
+    whether anything comes next, and how the next piece relates to it — scene,
+    outfit, asset type, whether it escalates — so it can bridge honestly instead
+    of waiting to be asked for more.
+
+    Everything here is copied from the approved plan. Nothing is inferred about
+    what is *inside* the media, and this never authorizes a send: purchase
+    gating still decides that.
+    """
+    normalized = normalize_session(session)
+    if not normalized:
+        return {}
+    plan = normalized.get("plan") or []
+    if not plan:
+        return {}
+
+    purchased = last_purchased_step(normalized)
+    upcoming = next_step(normalized)
+    purchased_count = len([item for item in plan if item.get("purchased")])
+
+    context: dict[str, Any] = {
+        "status": normalized.get("status"),
+        "payment_state": normalized.get("payment_state"),
+        "total_steps": len(plan),
+        "purchased_steps": purchased_count,
+        "awaiting_purchase": has_pending_purchase(normalized),
+        "cooldown_active": is_cooldown_active(normalized),
+        "cooldown_messages_remaining": int(
+            normalized.get("cooldown_messages_remaining", 0) or 0
+        ),
+        "has_next_step": bool(upcoming),
+        "session_total_cents": int(normalized.get("total_budget_cents", 0) or 0),
+    }
+    if purchased:
+        context["just_purchased"] = _writer_safe_step(purchased)
+    if upcoming:
+        context["next_step"] = _writer_safe_step(upcoming)
+    if purchased and upcoming:
+        context["continuity"] = {
+            "same_location": _same(purchased.get("location"), upcoming.get("location")),
+            "same_outfit": _same(purchased.get("outfit"), upcoming.get("outfit")),
+            "same_scene": _same(purchased.get("scene_key"), upcoming.get("scene_key")),
+            "escalates": _level(upcoming) > _level(purchased),
+            "changes_asset_type": (
+                str(purchased.get("asset_type") or "") != str(upcoming.get("asset_type") or "")
+            ),
+        }
+    return context
+
+
+def _writer_safe_step(step: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "step_number": step.get("step_number"),
+        "asset_type": step.get("asset_type"),
+        "scene_key": step.get("scene_key"),
+        "location": step.get("location"),
+        "outfit": step.get("outfit"),
+        "description": step.get("description"),
+        "media_count": len(step.get("media_ids") or []),
+        "price_cents": int(step.get("price_cents") or 0)
+        or int(round(float(step.get("price") or 0) * 100)),
+        "explicit_min": step.get("explicit_min"),
+        "explicit_max": step.get("explicit_max"),
+        "purchased": bool(step.get("purchased")),
+        "sent": bool(step.get("sent")),
+    }
+
+
+def _same(left: Any, right: Any) -> bool:
+    return bool(left) and str(left).strip().lower() == str(right or "").strip().lower()
+
+
+def _level(step: dict[str, Any]) -> float:
+    values = [step.get("explicit_min"), step.get("explicit_max")]
+    parsed = []
+    for value in values:
+        try:
+            parsed.append(float(value))
+        except (TypeError, ValueError):
+            pass
+    return sum(parsed) / len(parsed) if parsed else 0.0
