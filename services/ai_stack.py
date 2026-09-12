@@ -36,6 +36,10 @@ from core.simulation import is_simulatable_fan
 from core.supabase import get_supabase
 
 
+# Sentinel for "the caller did not say what this fan's platform id is", which is
+# different from "the fan has none". Only the first means we have to go and look.
+_UNKNOWN = object()
+
 SOURCE_SIMULATION_FAN = "simulation_fan"
 SOURCE_CREATOR = "creator"
 SOURCE_ENVIRONMENT = "environment"
@@ -52,6 +56,13 @@ class ProfileResolution:
 
     def to_dict(self) -> dict:
         return {"ai_stack_profile": self.profile_id, "ai_stack_source": self.source}
+
+
+def _may_have_fan_override(platform_fan_id: object) -> bool:
+    """Whether a fan-level override could possibly apply, without reading."""
+    if platform_fan_id is _UNKNOWN:
+        return True
+    return is_simulatable_fan(platform_fan_id)
 
 
 def _cache_ttl_seconds() -> float:
@@ -159,9 +170,17 @@ async def resolve_ai_stack(
     *,
     creator_id: str | None,
     fan_id: str | None = None,
+    platform_fan_id: object = _UNKNOWN,
 ) -> ProfileResolution:
-    """The effective profile for one turn."""
-    if fan_id:
+    """The effective profile for one turn.
+
+    ``platform_fan_id`` is an optimisation, not a second boundary. A caller that
+    has already loaded the fan can pass it so a real fan costs no read at all:
+    the fan-level override exists only for the simulator, so there is nothing to
+    look up for a fan that is not a ``test_`` fan. Omitting it is always safe —
+    the read path checks the prefix itself either way.
+    """
+    if fan_id and _may_have_fan_override(platform_fan_id):
         fan_override = await simulation_fan_profile_override(str(fan_id))
         if fan_override:
             return ProfileResolution(fan_override, SOURCE_SIMULATION_FAN)

@@ -374,7 +374,11 @@ async def get_suggestions(
     # Which AI brain answers this turn. Resolved once, before the first model
     # call, so every stage of this turn — analyzer, writer, extractor — and the
     # metadata persisted with the reply all name the same profile.
-    stack = await resolve_ai_stack(creator_id=creator_id, fan_id=fan_id)
+    stack = await resolve_ai_stack(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        platform_fan_id=getattr(fan_profile, "platform_fan_id", None),
+    )
     log_effective_stack(
         stack, creator_id=creator_id, fan_id=fan_id, feature="assisted_reply"
     )
@@ -1156,7 +1160,11 @@ async def _debounced_auto_reply(
         # be the same profile, and so must the metadata persisted with the
         # reply. A simulation fan's own override wins here, which is what lets
         # two test fans under one creator be compared turn for turn.
-        stack = await resolve_ai_stack(creator_id=creator_id, fan_id=fan_id)
+        stack = await resolve_ai_stack(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            platform_fan_id=getattr(fan_profile, "platform_fan_id", None),
+        )
         log_effective_stack(
             stack, creator_id=creator_id, fan_id=fan_id, feature="full_auto"
         )

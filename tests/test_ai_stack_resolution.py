@@ -217,3 +217,62 @@ def test_a_simulation_fan_write_cannot_change_how_a_real_fan_is_answered(db):
     asyncio.run(set_simulation_fan_profile_override("fan-real", "cleo_legacy_v1"))
 
     assert _resolve(creator_id="creator-plain", fan_id="fan-real").profile_id == "cleo_v2"
+
+
+# --- the read a real fan never has to pay for -------------------------------
+
+
+def test_a_known_real_fan_costs_no_override_read(db, monkeypatch):
+    """A fan-level override exists only for the simulator, so for a fan the
+    caller already knows is real there is nothing to look up. This is an
+    optimisation on the reply path, not a second boundary."""
+    reads: list[str] = []
+    original = ai_stack._read_override
+
+    async def counting(table, row_id, extra_columns=""):
+        reads.append(table)
+        return await original(table, row_id, extra_columns)
+
+    monkeypatch.setattr(ai_stack, "_read_override", counting)
+
+    result = _resolve(
+        creator_id="creator-legacy",
+        fan_id="fan-real",
+        platform_fan_id="884422113355",
+    )
+
+    assert reads == ["creators"]
+    assert result.profile_id == "cleo_legacy_v1"
+
+
+def test_a_known_test_fan_still_gets_its_override(db, monkeypatch):
+    result = _resolve(
+        creator_id="creator-v2",
+        fan_id="fan-test-legacy",
+        platform_fan_id="test_a1",
+    )
+
+    assert result.profile_id == "cleo_legacy_v1"
+    assert result.source == SOURCE_SIMULATION_FAN
+
+
+def test_omitting_the_platform_id_is_always_safe(db):
+    """The read path checks the prefix itself, so a caller that does not know
+    loses nothing but the saved read."""
+    told = _resolve(
+        creator_id="creator-v2", fan_id="fan-test-legacy", platform_fan_id="test_a1"
+    )
+    untold = _resolve(creator_id="creator-v2", fan_id="fan-test-legacy")
+
+    assert told.profile_id == untold.profile_id == "cleo_legacy_v1"
+
+
+def test_a_lying_platform_id_cannot_grant_an_override(db):
+    """Claiming a real fan is a test fan does not help: the read re-checks the
+    prefix against the row, not against what the caller said."""
+    result = _resolve(
+        creator_id="creator-plain", fan_id="fan-real", platform_fan_id="test_pretend"
+    )
+
+    assert result.profile_id == "cleo_v2"
+    assert result.source == SOURCE_ENVIRONMENT
