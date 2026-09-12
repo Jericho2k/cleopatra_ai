@@ -6594,6 +6594,46 @@ async def simulation_capabilities(request: Request) -> dict:
     return {"auto_simulation": bool(request_may_simulate(request))}
 
 
+def _read_simulation_test_fans(db, creator_ids: list[str]):
+    """Read this creator's test fans, tolerating a missing ai_stack_profile column.
+
+    ``ai_stack_profile`` is the per-test-fan AI Stack override, which is what
+    lets two test fans under one creator be compared turn for turn. It arrives
+    with db/ai_stack_profile_v1.sql.
+
+    Until that migration is applied, PostgREST answers an unknown column with
+    42703 and fails the WHOLE read — which is exactly how this endpoint went
+    down before (#31), on a different column. So the select is retried without
+    it. A backend that ships ahead of its migration keeps listing test fans; it
+    simply reports no per-fan override yet, which is true by construction.
+    """
+    from core.simulation import TEST_FAN_PREFIX
+
+    def _query(columns: str):
+        return (
+            db.table("fans")
+            .select(columns)
+            .in_("creator_id", creator_ids)
+            .like("platform_fan_id", f"{TEST_FAN_PREFIX}%")
+            .order("display_name")
+            .limit(500)
+            .execute()
+        )
+
+    try:
+        return _query("id, display_name, creator_id, platform_fan_id, ai_stack_profile")
+    except Exception as exc:
+        text = str(exc).lower()
+        if "ai_stack_profile" not in text:
+            raise
+        print(
+            "[SIMULATION] ai_stack_profile column missing — apply "
+            "db/ai_stack_profile_v1.sql. Listing test fans without per-fan "
+            "AI stack overrides."
+        )
+        return _query("id, display_name, creator_id, platform_fan_id")
+
+
 @app.get("/simulation/creators")
 async def simulation_creators(request: Request) -> dict:
     """Creators the caller may simulate against, each with its test fans only.
@@ -6629,13 +6669,7 @@ async def simulation_creators(request: Request) -> dict:
                 label="simulation.creators",
             ),
             retry_db_read(
-                lambda: db.table("fans")
-                .select("id, display_name, creator_id, platform_fan_id")
-                .in_("creator_id", ids)
-                .like("platform_fan_id", f"{TEST_FAN_PREFIX}%")
-                .order("display_name")
-                .limit(500)
-                .execute(),
+                lambda: _read_simulation_test_fans(db, ids),
                 label="simulation.test_fans",
             ),
         )
@@ -6664,6 +6698,8 @@ async def simulation_creators(request: Request) -> dict:
             {
                 "id": str(fan.get("id")),
                 "display_name": fan.get("display_name") or str(fan.get("id")),
+                "platform_fan_id": fan.get("platform_fan_id"),
+                "ai_stack_profile": fan.get("ai_stack_profile"),
             }
         )
     return {
@@ -7025,6 +7061,41 @@ async def update_simulation_fan_ai_stack(
         print(f"[AI STACK] simulation override write failed fan={fan_id}: {exc}")
         raise not_found() from exc
     return {"status": "ok", "fan_id": fan_id, "ai_stack_profile": stored}
+
+
+@app.get("/content-price-ranges")
+async def read_content_price_ranges(request: Request) -> dict:
+    """The agency's approved commercial price range per content category.
+
+    Read-only, and the same table models/content_pricing.py prices every offer
+    from. The Sets UI needs it for two honest things: to name where a set's
+    allowed range came from ("nude_photo default"), and to restore that default
+    after an operator has customised one.
+
+    Authenticated by the application's own middleware (deployment key plus the
+    signed-in Supabase session) but deliberately not creator-scoped: this is
+    deployment configuration rather than anyone's data — the same numbers for
+    every tenant, containing nothing about any creator, fan or sale.
+    """
+    from models.content_pricing import VAULT_CATEGORIES
+
+    # Referenced so the signature stays honest about needing an authenticated
+    # request; the middleware has already rejected an unauthenticated one.
+    _ = dashboard_user_id(request)
+    return {
+        "categories": [
+            {
+                "category": name,
+                "label": value["label"],
+                "min_dollars": int(value["min"]),
+                "max_dollars": int(value["max"]),
+                # A free/teaser/unclear category is NOT an approved commercial
+                # range and must never be presented as one.
+                "priced": int(value["max"]) > 0,
+            }
+            for name, value in sorted(VAULT_CATEGORIES.items())
+        ]
+    }
 
 
 # --- Agency pricing strategy ------------------------------------------------

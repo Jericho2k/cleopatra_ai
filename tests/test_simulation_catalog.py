@@ -493,3 +493,120 @@ def test_the_migration_is_additive_and_ordered():
     lines = [line.strip() for line in order.splitlines() if line.strip() and not line.startswith("#")]
     assert "simulation_catalog_v1.sql" in lines
     assert lines.index("simulation_catalog_v1.sql") < lines.index("tenant_isolation_v1.sql")
+
+
+# ---------------------------------------------------------------------------
+# 8. Previewing mirrored media without making it deliverable
+# ---------------------------------------------------------------------------
+#
+# A mirrored row deliberately carries no url and no platform media id, so the
+# simulator could plan a PPV against realistic content but not render it — and a
+# grey box where the fan sees a locked photo makes the workspace useless for the
+# one judgement it exists for.
+#
+# The preview resolves through PROVENANCE and writes nothing. These tests pin
+# both halves: that it renders, and that rendering it changes nothing about what
+# can be delivered.
+
+
+def test_mirrored_media_can_be_previewed_through_its_provenance(db):
+    from services.simulation_catalog import resolve_simulation_media_previews
+
+    run(mirror_creator_catalog(source_creator_id=SOURCE, target_creator_id=TARGET))
+    mirrored_id = simulation_media_id(SOURCE, "fansly-media-1")
+
+    resolved = run(
+        resolve_simulation_media_previews(
+            creator_id=TARGET, media_ids=[mirrored_id]
+        )
+    )
+
+    assert resolved[mirrored_id]["url"] == "https://cdn.example/real-1.jpg"
+    assert resolved[mirrored_id]["mimetype"] == "image/jpeg"
+    # Labelled, so an operator can see this pixel came from another creator's
+    # vault and is a preview rather than this creator's content.
+    assert resolved[mirrored_id]["source"] == "simulation_mirror"
+
+
+def test_previewing_writes_nothing_at_all(db):
+    from services.simulation_catalog import resolve_simulation_media_previews
+
+    run(mirror_creator_catalog(source_creator_id=SOURCE, target_creator_id=TARGET))
+    before = [dict(row) for row in db.tables["creator_vault_media"]]
+
+    run(
+        resolve_simulation_media_previews(
+            creator_id=TARGET,
+            media_ids=[simulation_media_id(SOURCE, "fansly-media-1")],
+        )
+    )
+
+    assert [dict(row) for row in db.tables["creator_vault_media"]] == before
+
+
+def test_a_previewed_row_is_still_not_deliverable(db):
+    """The property the whole design turns on: preview access and live delivery
+    authority stay separate."""
+    from services.simulation_catalog import resolve_simulation_media_previews
+
+    run(mirror_creator_catalog(source_creator_id=SOURCE, target_creator_id=TARGET))
+    mirrored_id = simulation_media_id(SOURCE, "fansly-media-1")
+
+    run(resolve_simulation_media_previews(creator_id=TARGET, media_ids=[mirrored_id]))
+
+    mirrored = [
+        row
+        for row in db.tables["creator_vault_media"]
+        if row.get("media_id") == mirrored_id
+    ][0]
+    # No platform identity was granted to the simulation creator by rendering it.
+    assert mirrored.get("fansly_media_id") is None
+    assert mirrored.get("url") is None
+    assert mirrored["simulation_only"] is True
+    # And the id is still refused by every delivery path.
+    assert is_simulation_media_id(mirrored_id) is True
+    assert contains_simulation_media([mirrored_id]) is True
+
+
+def test_an_ordinary_media_id_is_not_resolved_by_the_preview_endpoint(db):
+    """It answers about mirrored test content only. A real id resolves to nulls
+    here and goes through the ordinary vault route instead."""
+    from services.simulation_catalog import resolve_simulation_media_previews
+
+    resolved = run(
+        resolve_simulation_media_previews(
+            creator_id=TARGET, media_ids=["fansly-media-1"]
+        )
+    )
+
+    assert resolved["fansly-media-1"] == {
+        "url": None,
+        "thumbnail_url": None,
+        "mimetype": None,
+        "source": None,
+    }
+
+
+def test_a_sim_id_belonging_to_another_creator_resolves_to_nothing(db):
+    """Provenance is read from THIS creator's mirrored row. Knowing the shape of
+    a sim: id is not enough to read another creator's vault."""
+    from services.simulation_catalog import resolve_simulation_media_previews
+
+    run(mirror_creator_catalog(source_creator_id=SOURCE, target_creator_id=TARGET))
+    mirrored_id = simulation_media_id(SOURCE, "fansly-media-1")
+
+    resolved = run(
+        resolve_simulation_media_previews(
+            creator_id=SOURCE, media_ids=[mirrored_id]
+        )
+    )
+
+    assert resolved[mirrored_id]["url"] is None
+
+
+def test_an_empty_request_costs_nothing(db):
+    from services.simulation_catalog import resolve_simulation_media_previews
+
+    assert run(
+        resolve_simulation_media_previews(creator_id=TARGET, media_ids=[])
+    ) == {}

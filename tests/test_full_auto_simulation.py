@@ -1512,3 +1512,83 @@ def test_the_opening_strategy_reaches_the_writer_prompt(world, spy, monkeypatch)
     assert "ADAPTIVE SESSION STRATEGY" in text
     assert "next action: CONTINUE_CHAT" in text
     assert "respond specifically to what he said" in text
+
+
+# --- which AI stack wrote this message --------------------------------------
+#
+# Every creator message the pipeline writes carries the profile that produced
+# it, inside the existing media_context jsonb. Without it, "which brain wrote
+# this?" is unanswerable from the row months later, which is the whole point of
+# running two profiles side by side.
+
+
+def test_a_generated_creator_message_records_the_effective_profile(
+    world, spy, two_bubble_turn, monkeypatch
+):
+    monkeypatch.setenv("AI_STACK_PROFILE", "cleo_v2")
+    monkeypatch.setenv("AI_STACK_CACHE_SECONDS", "0")
+    from services.ai_stack import clear_ai_stack_cache
+
+    clear_ai_stack_cache()
+    db, _ = world
+
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    creator_rows = _creator_rows(db)
+    assert creator_rows
+    for row in creator_rows:
+        marker = (row.get("media_context") or {}).get("ai_stack")
+        assert marker is not None, "every creator message names the stack that wrote it"
+        assert marker["profile"] == "cleo_v2"
+        # Enough to debug a bad reply without a telemetry join.
+        assert marker["route"]
+        assert marker["model"]
+
+
+def test_the_marker_travels_alongside_a_ppv_rather_than_replacing_it():
+    """The PPV payload is what delivery and purchase reconciliation read. The
+    stack marker is additive metadata and must never displace it."""
+    from services.suggestions import _with_ai_stack, message_ai_stack_metadata
+
+    ppv_context = {"ppv": {"media_ids": ["111"], "price": 25, "price_cents": 2500}}
+    marker = message_ai_stack_metadata(
+        SimpleNamespace(
+            route=SimpleNamespace(value="commercial_complex"),
+            prompt_version="writer_v2",
+            primary_target=SimpleNamespace(provider="openrouter", model="kimi"),
+        ),
+        profile_id="cleo_v2",
+    )
+
+    merged = _with_ai_stack(ppv_context, marker)
+
+    assert merged["ppv"] == ppv_context["ppv"]
+    assert merged["ai_stack"]["profile"] == "cleo_v2"
+    assert merged["ai_stack"]["route"] == "commercial_complex"
+
+
+def test_a_plain_message_with_no_other_metadata_still_records_the_stack():
+    from services.suggestions import _with_ai_stack, message_ai_stack_metadata
+
+    merged = _with_ai_stack(None, message_ai_stack_metadata(None, profile_id="cleo_legacy_v1"))
+
+    assert merged == {"ai_stack": {"profile": "cleo_legacy_v1"}}
+
+
+def test_the_simulator_marker_and_the_stack_marker_coexist():
+    """A simulated fan message carries the simulator's ownership marker; a
+    creator message carries the stack marker. Neither may shadow the other."""
+    from core.simulation import is_simulation_message, simulation_message_marker
+    from services.suggestions import _with_ai_stack, message_ai_stack_metadata
+
+    merged = _with_ai_stack(
+        simulation_message_marker(),
+        message_ai_stack_metadata(None, profile_id="cleo_v2"),
+    )
+
+    assert is_simulation_message(merged) is True
+    assert merged["ai_stack"]["profile"] == "cleo_v2"
