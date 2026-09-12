@@ -52,20 +52,59 @@ FANS = {
 }
 
 
+# Two tenants' creators. creator-2 belongs to OTHER_TENANT and is the stand-in
+# for an agency-owned creator the platform owner may mirror FROM but must never
+# gain ordinary access to.
+CREATORS = {
+    "creator-1": {"id": "creator-1", "platform_username": "sophia"},
+    "creator-2": {"id": "creator-2", "platform_username": "eliz"},
+}
+
+
 class _Fans:
-    """Minimal fans table honouring the .eq() filters the route applies."""
+    """Minimal creators/fans tables honouring the filters the routes apply.
+
+    Table-aware rather than fans-only: the mirror route checks that a source
+    creator exists, and the simulator creator listing reads both tables, so a
+    fake that answered every table with fan rows would let a broken
+    authorization check pass by accident.
+    """
 
     def __init__(self) -> None:
-        self.rows = list(FANS.values())
+        self._tables = {
+            "fans": list(FANS.values()),
+            "creators": list(CREATORS.values()),
+        }
+        self.rows: list[dict] = []
 
-    def table(self, _name):
-        return self
+    def table(self, name):
+        # A fresh view per call, so filters from one query never leak into the
+        # next — the previous single-instance version accumulated them.
+        clone = _Fans.__new__(_Fans)
+        clone._tables = self._tables
+        clone.rows = list(self._tables.get(name, []))
+        return clone
 
     def select(self, *_a, **_k):
         return self
 
     def eq(self, column, value):
         self.rows = [r for r in self.rows if str(r.get(column)) == str(value)]
+        return self
+
+    def in_(self, column, values):
+        allowed = {str(v) for v in values}
+        self.rows = [r for r in self.rows if str(r.get(column)) in allowed]
+        return self
+
+    def like(self, column, pattern):
+        prefix = pattern.rstrip("%")
+        self.rows = [
+            r for r in self.rows if str(r.get(column) or "").startswith(prefix)
+        ]
+        return self
+
+    def order(self, *_a, **_k):
         return self
 
     def limit(self, *_a, **_k):
@@ -615,11 +654,74 @@ def test_the_mirror_is_off_when_the_feature_switch_is_off(client, mirror_spy, mo
     assert mirror_spy == []
 
 
-def test_the_owner_cannot_mirror_a_creator_they_are_not_assigned(client, mirror_spy):
-    """Owner-only does not mean owner-of-everything: ordinary tenancy still
-    decides which creators are in reach."""
-    assert _mirror(client, OWNER, source="creator-2").status_code == 404
+def test_the_owner_cannot_mirror_INTO_a_creator_they_are_not_assigned(client, mirror_spy):
+    """The written-to side keeps ordinary tenancy. Owner-only does not mean
+    owner-of-everything: mirrored rows land in the target's catalog, so the
+    caller must be someone who ordinarily holds it."""
     assert _mirror(client, OWNER, target="creator-2").status_code == 404
+    assert mirror_spy == []
+
+
+def test_the_owner_may_mirror_FROM_a_creator_they_are_not_assigned(client, mirror_spy):
+    """The read-from side is owner-gated but deliberately not tenancy-gated.
+
+    This is the whole point of the feature: building a realistic test catalog
+    from a real, agency-owned creator's vault without assigning the platform
+    owner to that agency's creator — which would hand over its chats, fans and
+    revenue in order to copy some scene metadata.
+    """
+    response = _mirror(client, OWNER, source="creator-2", target="creator-1")
+
+    assert response.status_code == 200
+    assert mirror_spy == [("mirror", "creator-2", "creator-1")]
+
+
+def test_reading_a_source_does_not_make_it_simulatable(client, mirror_spy):
+    """Appearing as a mirror source grants nothing else.
+
+    creator-2 belongs to another tenant. The owner may copy its vault metadata,
+    and must still be unable to chat as it, read its fans, or see it in the
+    simulator's own creator list.
+    """
+    _mirror(client, OWNER, source="creator-2", target="creator-1")
+
+    # Not in the simulator selector.
+    listed = client.get("/simulation/creators", headers=_headers(OWNER)).json()
+    assert [row["id"] for row in listed["creators"]] == ["creator-1"]
+    # Still cannot simulate against its fans.
+    assert _simulate(client, OWNER, creator="creator-2", fan="fan-other").status_code == 404
+
+
+def test_an_agency_account_cannot_list_mirror_sources(client):
+    """The cross-tenant listing must not even be discoverable by an agency."""
+    response = client.get("/simulation/catalog/sources", headers=_headers(AGENCY))
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Resource not found"}
+
+
+def test_the_source_listing_is_off_when_the_feature_switch_is_off(client, monkeypatch):
+    monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "false")
+
+    assert client.get("/simulation/catalog/sources", headers=_headers(OWNER)).status_code == 404
+
+
+def test_an_agency_account_cannot_invoke_a_cross_tenant_mirror(client, mirror_spy):
+    """The loosened source rule is owner-only. An agency naming another
+    tenant's creator as a source gets the same 404 as everything else, and no
+    mirror runs."""
+    assert _mirror(client, AGENCY, source="creator-2", target="creator-1").status_code == 404
+    assert _mirror(client, AGENCY, source="creator-1", target="creator-2").status_code == 404
+    assert mirror_spy == []
+
+
+def test_an_agency_cannot_use_a_cross_tenant_source_to_reach_its_own_target(
+    client, mirror_spy
+):
+    """AGENCY legitimately holds creator-1, so the target check passes for it.
+    The owner allowlist is what stops the mirror, not tenancy — which is the
+    condition this feature now leans on for the source side."""
+    assert _mirror(client, AGENCY, source="creator-2", target="creator-1").status_code == 404
     assert mirror_spy == []
 
 

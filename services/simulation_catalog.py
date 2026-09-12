@@ -53,7 +53,11 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from core.simulation_catalog import simulation_media_id
+from core.simulation_catalog import (
+    exclude_simulation_only,
+    run_live_catalog_query,
+    simulation_media_id,
+)
 from core.supabase import get_supabase
 
 # Columns copied verbatim from a source media row. Deliberately explicit: a
@@ -465,3 +469,190 @@ async def resolve_simulation_media_previews(
                 "source": "simulation_mirror",
             }
     return resolved
+
+
+# ---------------------------------------------------------------------------
+# Owner-only mirror SOURCE discovery
+# ---------------------------------------------------------------------------
+#
+# The mirror exists so the platform owner can build a realistic test catalog on
+# their own simulation creator from a real creator's vault. That real creator is
+# typically AGENCY-OWNED and deliberately NOT assigned to the owner's dashboard
+# user — granting ordinary tenancy over it just to copy metadata would hand the
+# owner that agency's chats, fans and revenue, which is far more access than the
+# job needs.
+#
+# So source discovery is its own thing, and it is deliberately NOT the simulator
+# creator list:
+#
+#   /simulation/creators          WHO the owner may simulate AS. Tenancy-scoped.
+#                                 Unchanged by this function.
+#   /simulation/catalog/sources   WHOSE vault may be COPIED FROM. Owner-gated,
+#                                 cross-tenant, read-only, and metadata only.
+#
+# Appearing in this list grants nothing. It does not put a creator in the
+# simulator selector, does not create an assignment, and does not widen any
+# other route: the only thing it enables is being named as the SOURCE of a
+# mirror, whose target must still be a creator the caller ordinarily holds.
+#
+# The columns returned are the minimum the picker needs — id, display name, and
+# whether there is usable content — and deliberately exclude everything about
+# the account itself (no platform account id, no session state, no settings).
+
+
+# What the picker is told about each candidate source. Anything not on this list
+# is not read, so a future column cannot start leaking across tenants because
+# somebody widened a select.
+_SOURCE_COLUMNS = ("id", "platform_username")
+
+
+@dataclass(frozen=True)
+class MirrorSource:
+    creator_id: str
+    name: str
+    approved_sets: int
+    media_items: int
+
+    @property
+    def usable(self) -> bool:
+        """Whether mirroring this creator would produce a catalog worth testing.
+
+        A vault with no approved sets can be mirrored, but the simulator would
+        plan against nothing, so the picker says so rather than letting the
+        owner discover it after the fact.
+        """
+        return self.approved_sets > 0 and self.media_items > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "creator_id": self.creator_id,
+            "name": self.name,
+            "approved_sets": self.approved_sets,
+            "media_items": self.media_items,
+            "usable": self.usable,
+        }
+
+
+def _row_count(response: Any) -> int:
+    """Total matching rows from a PostgREST response.
+
+    The queries below pair ``count="exact"`` with ``limit(1)``, so ``count`` is
+    the whole match while ``data`` is one row. Reading ``data`` instead would
+    report every non-empty vault as having exactly one item. The length fallback
+    is only for a transport that returned no count at all.
+    """
+    exact = getattr(response, "count", None)
+    if isinstance(exact, int) and exact >= 0:
+        return exact
+    return len(getattr(response, "data", None) or [])
+
+
+async def list_mirror_source_creators() -> list[MirrorSource]:
+    """Every creator whose vault may be mirrored, with its content counts.
+
+    Cross-tenant by design and by necessity — see the note above. Authorization
+    is the caller's job and lives in the route: this function must only ever be
+    reached through the platform-owner simulator allowlist.
+
+    Counts describe REAL content. Mirrored rows are excluded, so a creator that
+    is itself a simulation target does not advertise somebody else's catalog
+    back as if it were its own.
+    """
+
+    def _run() -> list[MirrorSource]:
+        db = get_supabase()
+        creators = (
+            db.table("creators")
+            .select(", ".join(_SOURCE_COLUMNS))
+            .order("platform_username")
+            .limit(500)
+            .execute()
+        ).data or []
+
+        sources: list[MirrorSource] = []
+        for creator in creators:
+            creator_id = str(creator.get("id") or "").strip()
+            if not creator_id:
+                continue
+
+            def _sets(apply_filter: bool, _id: str = creator_id) -> Any:
+                query = (
+                    db.table("vault_sets")
+                    .select("id", count="exact")
+                    .eq("creator_id", _id)
+                    .eq("status", "approved")
+                )
+                if apply_filter:
+                    query = exclude_simulation_only(query)
+                # count + limit(1): PostgREST reports the total in a header and
+                # sends one row, so counting a 10,000-item vault does not drag
+                # 10,000 ids across the wire for a picker that shows a number.
+                return query.limit(1).execute()
+
+            def _media(apply_filter: bool, _id: str = creator_id) -> Any:
+                query = (
+                    db.table("creator_vault_media")
+                    .select("id", count="exact")
+                    .eq("creator_id", _id)
+                )
+                if apply_filter:
+                    query = exclude_simulation_only(query)
+                return query.limit(1).execute()
+
+            approved_sets = _row_count(
+                run_live_catalog_query(
+                    _sets,
+                    label="simulation.mirror_sources.sets",
+                    include_simulation=False,
+                )
+            )
+            media_items = _row_count(
+                run_live_catalog_query(
+                    _media,
+                    label="simulation.mirror_sources.media",
+                    include_simulation=False,
+                )
+            )
+            sources.append(
+                MirrorSource(
+                    creator_id=creator_id,
+                    name=str(creator.get("platform_username") or creator_id),
+                    approved_sets=approved_sets,
+                    media_items=media_items,
+                )
+            )
+        return sources
+
+    return await asyncio.to_thread(_run)
+
+
+async def mirror_source_exists(creator_id: str) -> bool:
+    """Whether a creator id names a real creator.
+
+    Used by the mirror route so a mistyped source id is reported as such rather
+    than silently mirroring an empty vault and looking like a working no-op.
+    Only ever called after the owner allowlist has passed, and it reveals one
+    boolean about a creator the caller may already enumerate.
+    """
+    key = str(creator_id or "").strip()
+    if not key:
+        return False
+
+    def _run() -> bool:
+        rows = (
+            get_supabase().table("creators")
+            .select("id")
+            .eq("id", key)
+            .limit(1)
+            .execute()
+        ).data or []
+        return bool(rows)
+
+    try:
+        return await asyncio.to_thread(_run)
+    except Exception as exc:
+        print(f"[SIMULATION CATALOG] source existence check failed {key}: {exc}")
+        # Fail open into the mirror itself, which is scoped to the target and
+        # cannot damage a source that does not exist. A transient read failure
+        # must not be reported to the owner as "no such creator".
+        return True

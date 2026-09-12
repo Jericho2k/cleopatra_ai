@@ -6748,19 +6748,88 @@ async def _require_simulation_catalog_access(
     source_creator_id: str,
     target_creator_id: str,
 ) -> None:
-    """Owner-only, and only over creators this caller is already assigned.
+    """Owner-only, with deliberately different rules for source and target.
 
-    The simulator allowlist decides WHO may mirror; ordinary tenancy decides
-    WHICH creators. Both, in that order, and the same 404 for either failure —
-    an agency account must not be able to discover that this feature exists,
-    let alone learn another tenant's creator ids by probing it.
+    The two sides of a mirror are not the same kind of thing, and requiring the
+    same authorization for both was the bug this asymmetry fixes.
+
+    TARGET — written to. Ordinary creator tenancy applies, unchanged: mirrored
+    rows are inserted into this creator's catalog, so the caller must be
+    someone who ordinarily holds it. This is the simulation creator (Sophia).
+
+    SOURCE — read from, metadata only, never modified. Owner-gated but NOT
+    tenancy-gated, because the whole point is to build a realistic test catalog
+    from a real, AGENCY-OWNED creator's vault (Eliz). Requiring ordinary tenancy
+    on the source would mean assigning the platform owner to that agency's
+    creator, which hands over its chats, fans and revenue in order to copy some
+    scene metadata — far more access than the job needs, and permanent.
+
+    What the looser source rule does NOT grant, and why that is safe:
+
+    * no write of any kind reaches the source (``mirror_creator_catalog`` and
+      ``delete_creator_catalog_mirror`` scope every statement to the target,
+      and deletions additionally require ``simulation_only = true`` plus a
+      matching ``source_creator_id``);
+    * the source does not become simulatable — ``/simulation/creators`` is
+      untouched and still tenancy-scoped, so the owner cannot chat as it;
+    * no other route widens. This is the only place a cross-tenant creator id
+      is accepted, and only in the source position;
+    * mirrored rows stay ``simulation_only`` with rewritten ``sim:`` ids, so
+      the source's platform media ids never become deliverable under the
+      target.
+
+    The allowlist still decides WHO, and every rejection is the same 404 the
+    rest of the simulator uses, so an agency account cannot discover that this
+    capability exists or probe for creator ids with it.
     """
     from core.simulation import not_found, require_simulation_user
+    from services.simulation_catalog import mirror_source_exists
 
     await require_simulation_user(request)
+
     allowed = await _creator_ids_for_user_cached(request)
-    if str(source_creator_id) not in allowed or str(target_creator_id) not in allowed:
+    if str(target_creator_id) not in allowed:
+        # The written-to side. Unchanged, and the reason an owner still cannot
+        # mirror INTO a creator they do not hold.
         raise not_found()
+
+    if not await mirror_source_exists(str(source_creator_id)):
+        # Only reachable by an authenticated allowlisted owner, who may already
+        # enumerate every creator through the source listing, so naming a
+        # mistyped id costs nothing and saves a confusing empty mirror.
+        raise not_found()
+
+
+@app.get("/simulation/catalog/sources")
+async def list_simulation_catalog_sources(request: Request) -> dict:
+    """Creators whose vault may be COPIED FROM. Owner only, cross-tenant.
+
+    Deliberately separate from ``/simulation/creators``, which answers a
+    different question — who the owner may simulate AS — and stays
+    tenancy-scoped. A creator appearing here gains nothing: it does not enter
+    the simulator selector, it creates no assignment, and the only thing it
+    enables is being named as the SOURCE of a mirror whose target the caller
+    must ordinarily hold.
+
+    Returns the minimum the picker needs: id, display name, and whether there is
+    real approved content worth mirroring. Nothing about the account itself.
+    """
+    from core.simulation import require_simulation_user
+    from services.simulation_catalog import list_mirror_source_creators
+
+    await require_simulation_user(request)
+    try:
+        sources = await list_mirror_source_creators()
+    except Exception as exc:
+        print(f"[SIMULATION CATALOG] source listing failed: {exc}")
+        # 503, not 404: authorization already passed, so this caller is a
+        # verified owner and an empty list would be a lie about the data rather
+        # than a report of a failed read.
+        raise HTTPException(
+            status_code=503,
+            detail="Could not read mirror sources. Please retry.",
+        ) from exc
+    return {"sources": [source.to_dict() for source in sources]}
 
 
 @app.post("/simulation/catalog/mirror")
