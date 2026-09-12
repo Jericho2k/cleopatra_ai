@@ -5,7 +5,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ai import prompt_builder
+from ai.writer_style import WRITER_V1, response_instructions
 from models.commercial import (
     ActionType,
     CommercialEvent,
@@ -294,8 +294,6 @@ def test_prompt_has_narrow_anti_witty_and_bounded_knowledge_rules():
     # The writer voice moved into ai/writer_style.py, keyed by prompt version.
     # Asserted against the rendered frozen version rather than build_prompt's
     # source, which is what the writer is actually handed.
-    from ai.writer_style import WRITER_V1, response_instructions
-
     source = response_instructions(WRITER_V1)
     assert "Do not try to land a clever line" in source
     assert "ordinary young woman with uneven knowledge" in source
