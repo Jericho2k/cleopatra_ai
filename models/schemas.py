@@ -128,6 +128,13 @@ class ConversationContext(BaseModel):
     # (services/inventory_authority.py). The writer is told; it never infers.
     media_inventory: dict = Field(default_factory=dict)
 
+    # Which AI Stack Profile is answering this turn, and which writer voice it
+    # selects (ai/stack_profiles.py, ai/writer_style.py). Resolved once per turn
+    # and carried here so the writer, the telemetry and the persisted message
+    # metadata cannot disagree about which brain produced the reply.
+    ai_stack_profile: str = "cleo_legacy_v1"
+    writer_prompt_version: str = "writer_v1"
+
 
 class SuggestionRequest(BaseModel):
     """Request body for the suggestion API."""

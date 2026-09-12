@@ -22,11 +22,12 @@ import httpx
 
 from ai import openrouter_routing
 from ai.model_migrations import resolve_supported_model
-from ai.writer_router import (
-    COMPLEX_WRITER_MODEL,
-    COMPLEX_WRITER_PROVIDER,
-    DEFAULT_WRITER_MODEL,
-    DEFAULT_WRITER_PROVIDER,
+from ai.stack_profiles import (
+    STAGE_WRITER_COMMERCIAL,
+    STAGE_WRITER_DEFAULT,
+    STAGE_WRITER_SAFETY,
+    environment_profile_id,
+    get_profile,
 )
 
 _DEFAULT_CHECK_SECONDS = 6 * 60 * 60
@@ -51,32 +52,43 @@ _runtime_attempts: dict[str, dict[str, Any]] = {}
 
 
 def configured_writer_models() -> list[dict[str, str]]:
-    """Return the ordinary writer and its complex-turn/fallback target."""
-    default_provider = os.getenv(
-        "WRITER_DEFAULT_PROVIDER", DEFAULT_WRITER_PROVIDER
-    ).strip().lower()
-    complex_provider = os.getenv(
-        "WRITER_COMPLEX_PROVIDER", COMPLEX_WRITER_PROVIDER
-    ).strip().lower()
-    configured = [
-        {
-            "role": "ordinary_writer",
-            "provider": default_provider,
-            "model": resolve_supported_model(
-                default_provider,
-                os.getenv("WRITER_DEFAULT_MODEL", DEFAULT_WRITER_MODEL),
-            ),
-        },
-        {
-            "role": "complex_writer_and_fallback",
-            "provider": complex_provider,
-            "model": resolve_supported_model(
-                complex_provider,
-                os.getenv("WRITER_COMPLEX_MODEL", COMPLEX_WRITER_MODEL),
-            ),
-        },
-    ]
-    return [row for row in configured if row["model"]]
+    """Every writer target the deployment's AI Stack Profile can route a turn to.
+
+    The profile is ``AI_STACK_PROFILE`` — the deployment-wide default. A
+    per-creator override is deliberately NOT enumerated here: this is a
+    background check with no creator in scope, and widening it to the union of
+    every registered profile would report a perfectly healthy Together-only
+    deployment as degraded merely because a profile nobody selected names an
+    OpenRouter model. The owner inspects an overridden creator's stack in the
+    AI Stack admin view, which resolves it exactly.
+
+    All three writer routes are checked, plus each one's fallback, because a
+    fallback that cannot be reached is not a fallback. Duplicates collapse: the
+    two profiles that ship name two or three distinct models between them.
+    """
+    profile = get_profile(environment_profile_id())
+    seen: set[tuple[str, str]] = set()
+    configured: list[dict[str, str]] = []
+    for stage_name, role in (
+        (STAGE_WRITER_DEFAULT, "ordinary_writer"),
+        (STAGE_WRITER_COMMERCIAL, "commercial_writer"),
+        (STAGE_WRITER_SAFETY, "safety_writer"),
+    ):
+        spec = profile.stages.get(stage_name)
+        if spec is None:
+            continue
+        pairs = [spec.resolved_primary()]
+        fallback = spec.resolved_fallback()
+        if fallback is not None:
+            pairs.append(fallback)
+        for provider, model in pairs:
+            provider = str(provider or "").strip().lower()
+            model = resolve_supported_model(provider, model)
+            if not model or (provider, model) in seen:
+                continue
+            seen.add((provider, model))
+            configured.append({"role": role, "provider": provider, "model": model})
+    return configured
 
 
 def current_model_availability() -> dict[str, Any]:

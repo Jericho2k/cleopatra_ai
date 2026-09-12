@@ -320,3 +320,36 @@ catalog filter retries once without it and logs
 first. The mirror endpoints will not work until the migration is applied, which
 is correct: with no columns there can be no mirrored rows, and therefore nothing
 for live planning to exclude.
+
+## Applying `ai_stack_profile_v1.sql` (AI Stack Profile selection)
+
+Purely additive: one nullable `text` column on `creators`, one on `fans`, and
+two `NOT VALID` check constraints naming the known profile identifiers. It
+creates no table, drops nothing, and moves no data. `NULL` everywhere means
+"no override", which is exactly the pre-migration behaviour.
+
+```bash
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/ai_stack_profile_v1.sql
+```
+
+Verify:
+
+```sql
+select table_name, column_name, is_nullable
+  from information_schema.columns
+ where table_schema = 'public'
+   and column_name = 'ai_stack_profile'
+ order by table_name;
+```
+
+Expected — one row for `creators` and one for `fans`, both `YES` (nullable).
+
+The backend tolerates this migration being absent: `services/ai_stack.py`
+recognises the PostgREST 42703 "column does not exist" answer and resolves the
+profile from `AI_STACK_PROFILE` alone. A deployment that ships ahead of its
+migration keeps answering fans; it simply has no per-creator override to honour
+yet.
+
+`fans.ai_stack_profile` is read **only** for fans whose `platform_fan_id` starts
+with `test_`. A value on a real fan row has no effect, because the read path
+re-checks the prefix rather than trusting the column.

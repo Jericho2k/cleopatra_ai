@@ -238,7 +238,7 @@ def world(monkeypatch):
         "sleeps": [],
     }
 
-    async def fake_analyze(ctx, telemetry_context=None):
+    async def fake_analyze(ctx, telemetry_context=None, **_kwargs):
         calls["analyzer"].append(ctx)
         return {
             "purchase_signal": "none",
@@ -251,13 +251,15 @@ def world(monkeypatch):
         calls["writer"].append({"prompt": prompt, **kwargs})
         return ["hey | what are you doing?"]
 
-    def fake_route(ctx):
+    def fake_route(ctx, **kwargs):
         calls["route"].append(ctx)
         return SimpleNamespace(
             route=SimpleNamespace(value="primary"),
             reason="test",
-            primary_target=SimpleNamespace(model="test-writer"),
+            primary_target=SimpleNamespace(model="test-writer", provider="test"),
             fallback_target=None,
+            prompt_version="writer_v1",
+            ai_stack_profile=str(kwargs.get("profile_id") or "cleo_legacy_v1"),
             telemetry_metadata=lambda: {},
         )
 
@@ -442,7 +444,7 @@ def test_analyzer_fail_closed_behaviour_is_preserved(world, spy, monkeypatch):
     """A degraded analysis sends nothing — the real Full Auto safety rule."""
     db, calls = world
 
-    async def degraded(_ctx, telemetry_context=None):
+    async def degraded(_ctx, telemetry_context=None, **_kwargs):
         return {"analysis_degraded": True, "degraded_reason": "provider_down"}
 
     monkeypatch.setattr(suggestions, "analyze_situation", degraded)
@@ -574,7 +576,7 @@ def test_resend_request_does_not_send_a_real_ppv(world, spy, monkeypatch, two_bu
             "reference": "ref-1",
         }
 
-    async def resend_requested(_ctx, telemetry_context=None):
+    async def resend_requested(_ctx, telemetry_context=None, **_kwargs):
         return {
             "purchase_signal": "none",
             "crisis_signal": "none",
@@ -679,7 +681,7 @@ def test_no_remote_reconciliation_is_triggered_after_a_simulated_ppv(
     db, _ = ppv_world
     verified: list[tuple] = []
 
-    async def bought(_ctx, telemetry_context=None):
+    async def bought(_ctx, telemetry_context=None, **_kwargs):
         return {
             "purchase_signal": "bought",
             "crisis_signal": "none",
@@ -1030,7 +1032,7 @@ def test_degraded_analysis_outranks_every_other_outcome(world, spy, monkeypatch)
     the generic no-send."""
     db, calls = world
 
-    async def degraded(_ctx, telemetry_context=None):
+    async def degraded(_ctx, telemetry_context=None, **_kwargs):
         return {"analysis_degraded": True, "degraded_reason": "provider_down"}
 
     monkeypatch.setattr(suggestions, "analyze_situation", degraded)
@@ -1510,3 +1512,83 @@ def test_the_opening_strategy_reaches_the_writer_prompt(world, spy, monkeypatch)
     assert "ADAPTIVE SESSION STRATEGY" in text
     assert "next action: CONTINUE_CHAT" in text
     assert "respond specifically to what he said" in text
+
+
+# --- which AI stack wrote this message --------------------------------------
+#
+# Every creator message the pipeline writes carries the profile that produced
+# it, inside the existing media_context jsonb. Without it, "which brain wrote
+# this?" is unanswerable from the row months later, which is the whole point of
+# running two profiles side by side.
+
+
+def test_a_generated_creator_message_records_the_effective_profile(
+    world, spy, two_bubble_turn, monkeypatch
+):
+    monkeypatch.setenv("AI_STACK_PROFILE", "cleo_v2")
+    monkeypatch.setenv("AI_STACK_CACHE_SECONDS", "0")
+    from services.ai_stack import clear_ai_stack_cache
+
+    clear_ai_stack_cache()
+    db, _ = world
+
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    creator_rows = _creator_rows(db)
+    assert creator_rows
+    for row in creator_rows:
+        marker = (row.get("media_context") or {}).get("ai_stack")
+        assert marker is not None, "every creator message names the stack that wrote it"
+        assert marker["profile"] == "cleo_v2"
+        # Enough to debug a bad reply without a telemetry join.
+        assert marker["route"]
+        assert marker["model"]
+
+
+def test_the_marker_travels_alongside_a_ppv_rather_than_replacing_it():
+    """The PPV payload is what delivery and purchase reconciliation read. The
+    stack marker is additive metadata and must never displace it."""
+    from services.suggestions import _with_ai_stack, message_ai_stack_metadata
+
+    ppv_context = {"ppv": {"media_ids": ["111"], "price": 25, "price_cents": 2500}}
+    marker = message_ai_stack_metadata(
+        SimpleNamespace(
+            route=SimpleNamespace(value="commercial_complex"),
+            prompt_version="writer_v2",
+            primary_target=SimpleNamespace(provider="openrouter", model="kimi"),
+        ),
+        profile_id="cleo_v2",
+    )
+
+    merged = _with_ai_stack(ppv_context, marker)
+
+    assert merged["ppv"] == ppv_context["ppv"]
+    assert merged["ai_stack"]["profile"] == "cleo_v2"
+    assert merged["ai_stack"]["route"] == "commercial_complex"
+
+
+def test_a_plain_message_with_no_other_metadata_still_records_the_stack():
+    from services.suggestions import _with_ai_stack, message_ai_stack_metadata
+
+    merged = _with_ai_stack(None, message_ai_stack_metadata(None, profile_id="cleo_legacy_v1"))
+
+    assert merged == {"ai_stack": {"profile": "cleo_legacy_v1"}}
+
+
+def test_the_simulator_marker_and_the_stack_marker_coexist():
+    """A simulated fan message carries the simulator's ownership marker; a
+    creator message carries the stack marker. Neither may shadow the other."""
+    from core.simulation import is_simulation_message, simulation_message_marker
+    from services.suggestions import _with_ai_stack, message_ai_stack_metadata
+
+    merged = _with_ai_stack(
+        simulation_message_marker(),
+        message_ai_stack_metadata(None, profile_id="cleo_v2"),
+    )
+
+    assert is_simulation_message(merged) is True
+    assert merged["ai_stack"]["profile"] == "cleo_v2"

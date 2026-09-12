@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.pagination import fetch_all_rows
+from core.simulation import exclude_simulation_fans
 from core.supabase import get_supabase
 from services.analyzer_telemetry import analyzer_health
 from db.commercial_queries import (
@@ -311,10 +312,19 @@ async def get_creator_full_auto_health(creator_id: str) -> dict[str, Any]:
             .range(start, end)
             .execute()
         )
+        # Owner test fans are excluded from this operator-facing health view.
+        # An agency reads these counts as a statement about its own customers,
+        # and a simulated fan sitting in HUMAN_REVIEW is not one of them. The
+        # simulator shows a test fan's state in its own panel, which is where
+        # that belongs. Filtered in the database, so a page boundary cannot let
+        # one through, and the states/actions rows below are then narrowed to
+        # the fans that survived.
         fans = fetch_all_rows(
-            lambda start, end: db.table("fans")
-            .select("id, display_name, auto_mode, needs_human_review, review_reason")
-            .eq("creator_id", creator_id)
+            lambda start, end: exclude_simulation_fans(
+                db.table("fans")
+                .select("id, display_name, auto_mode, needs_human_review, review_reason")
+                .eq("creator_id", creator_id)
+            )
             .order("id")
             .range(start, end)
             .execute()
@@ -349,6 +359,16 @@ async def get_creator_full_auto_health(creator_id: str) -> dict[str, Any]:
         lambda: asyncio.to_thread(_load),
         label="creator full-auto health",
     )
+    # The fans read above already dropped owner test fans. Their commercial
+    # states and scheduled actions are keyed by fan id, so narrowing to the fan
+    # ids that survived is what keeps the SUMMARY counts — payment pending,
+    # follow-ups owed, failed actions — a statement about real customers rather
+    # than one inflated by whatever the owner last simulated.
+    real_fan_ids = {str(row.get("id")) for row in fans}
+    states = [row for row in states if str(row.get("fan_id")) in real_fan_ids]
+    actions = [row for row in actions if str(row.get("fan_id")) in real_fan_ids]
+    recent = [row for row in recent if str(row.get("fan_id")) in real_fan_ids]
+
     names = {
         str(row.get("id")): row.get("display_name") or str(row.get("id"))
         for row in fans

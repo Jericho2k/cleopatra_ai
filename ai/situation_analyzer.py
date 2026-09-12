@@ -18,6 +18,7 @@ import json
 from typing import Any
 
 from ai.model_providers import complete, get_runtime_target
+from ai.stack_profiles import STAGE_SITUATION_ANALYZER, get_profile
 from ai.prompt_blocks import cacheable_system_blocks
 from models.model_runtime import ModelTelemetryContext
 from models.schemas import ConversationContext
@@ -138,24 +139,44 @@ def build_analyzer_prompt(ctx: ConversationContext) -> tuple[str, str]:
     return ANALYZER_SYSTEM, user_content
 
 
+def analyzer_target(profile_id: str | None = None):
+    """The analyzer model for one AI Stack Profile.
+
+    ``ANALYZER_PROVIDER`` / ``ANALYZER_MODEL`` still apply under
+    ``cleo_legacy_v1``, because a deployment that has them set is running that
+    model today and the frozen profile has to reproduce that. ``cleo_v2`` pins
+    the stage instead. ``get_runtime_target`` remains the fallback for a caller
+    that has no profile at all.
+    """
+    profile = get_profile(profile_id)
+    spec = profile.stages.get(STAGE_SITUATION_ANALYZER)
+    return spec.primary_target() if spec else get_runtime_target("ANALYZER")
+
+
 async def analyze_situation(
     ctx: ConversationContext,
     *,
     telemetry_context: dict[str, Any] | None = None,
+    profile_id: str | None = None,
 ) -> dict:
     recent = ctx.conversation_history[-12:]
     system_content, user_content = build_analyzer_prompt(ctx)
 
-    target = get_runtime_target("ANALYZER")
+    profile = get_profile(profile_id or getattr(ctx, "ai_stack_profile", None))
+    spec = profile.stages.get(STAGE_SITUATION_ANALYZER)
+    target = analyzer_target(profile.profile_id)
     metadata = telemetry_context or {}
     model_context = ModelTelemetryContext(
         feature=str(metadata.get("feature") or "situation_analyzer"),
         creator_id=metadata.get("creator_id"),
         fan_id=metadata.get("fan_id") or ctx.fan_profile.id,
         metadata={
-            key: value
-            for key, value in metadata.items()
-            if key not in {"feature", "creator_id", "fan_id"}
+            **{
+                key: value
+                for key, value in metadata.items()
+                if key not in {"feature", "creator_id", "fan_id"}
+            },
+            "ai_stack_profile": profile.profile_id,
         },
     )
 
@@ -164,8 +185,8 @@ async def analyze_situation(
             target,
             system=cacheable_system_blocks(system_content),
             messages=[{"role": "user", "content": user_content}],
-            max_tokens=650,
-            temperature=0.0,
+            max_tokens=spec.resolved_max_tokens() if spec else 650,
+            temperature=spec.temperature if spec else 0.0,
         )
         content = response.text.replace("```json", "").replace("```", "").strip()
         try:

@@ -12,10 +12,11 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Any, Literal
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from ai.generator import generate_replies
 from ai.prompt_builder import build_prompt
@@ -65,6 +66,7 @@ from models.schemas import (
     SuggestionRequest,
     SuggestionResponse,
 )
+from services.ai_stack import resolve_ai_stack
 from services.fan_intelligence import learn_from_fan_message
 from services.db_reliability import retry_db_read, retry_transient_db_operation
 from core.apifansly_gate import (
@@ -72,7 +74,7 @@ from core.apifansly_gate import (
     apifansly_enabled,
     describe_apifansly,
 )
-from core.simulation import is_simulation_message
+from core.simulation import exclude_simulation_fans, is_simulation_message
 from core.simulation_catalog import (
     exclude_simulation_only,
     run_live_catalog_query,
@@ -522,6 +524,8 @@ async def process_incoming_fan_message(
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
 
+    # The extractor stage of the same AI stack that will answer this message.
+    inbound_stack = await resolve_ai_stack(creator_id=creator_id, fan_id=fan_id)
     spawn(
         learn_from_fan_message(
             creator_id=creator_id,
@@ -529,6 +533,7 @@ async def process_incoming_fan_message(
             fan_message=message_content,
             source_message_id=message_id,
             conversation_history=conversation_history,
+            profile_id=inbound_stack.profile_id,
         ),
         name=f"fan_intelligence:{fan_id}",
     )
@@ -5797,9 +5802,15 @@ async def preview_auto_audience(creator_id: str) -> dict:
             .execute()
         ),
         fetch_all_rows_async(
-            lambda start, end: db.table("fans")
-            .select("id, auto_mode, total_spent, spend_tier, needs_human_review")
-            .eq("creator_id", creator_id)
+            # Owner test fans are excluded: this preview is a statement about
+            # how many real customers Full Auto would answer, and a simulation
+            # fan is not one. Filtered in the database rather than in Python so
+            # a page boundary cannot let one through.
+            lambda start, end: exclude_simulation_fans(
+                db.table("fans")
+                .select("id, auto_mode, total_spent, spend_tier, needs_human_review")
+                .eq("creator_id", creator_id)
+            )
             .order("id")
             .range(start, end)
             .execute()
@@ -6583,6 +6594,46 @@ async def simulation_capabilities(request: Request) -> dict:
     return {"auto_simulation": bool(request_may_simulate(request))}
 
 
+def _read_simulation_test_fans(db, creator_ids: list[str]):
+    """Read this creator's test fans, tolerating a missing ai_stack_profile column.
+
+    ``ai_stack_profile`` is the per-test-fan AI Stack override, which is what
+    lets two test fans under one creator be compared turn for turn. It arrives
+    with db/ai_stack_profile_v1.sql.
+
+    Until that migration is applied, PostgREST answers an unknown column with
+    42703 and fails the WHOLE read — which is exactly how this endpoint went
+    down before (#31), on a different column. So the select is retried without
+    it. A backend that ships ahead of its migration keeps listing test fans; it
+    simply reports no per-fan override yet, which is true by construction.
+    """
+    from core.simulation import TEST_FAN_PREFIX
+
+    def _query(columns: str):
+        return (
+            db.table("fans")
+            .select(columns)
+            .in_("creator_id", creator_ids)
+            .like("platform_fan_id", f"{TEST_FAN_PREFIX}%")
+            .order("display_name")
+            .limit(500)
+            .execute()
+        )
+
+    try:
+        return _query("id, display_name, creator_id, platform_fan_id, ai_stack_profile")
+    except Exception as exc:
+        text = str(exc).lower()
+        if "ai_stack_profile" not in text:
+            raise
+        print(
+            "[SIMULATION] ai_stack_profile column missing — apply "
+            "db/ai_stack_profile_v1.sql. Listing test fans without per-fan "
+            "AI stack overrides."
+        )
+        return _query("id, display_name, creator_id, platform_fan_id")
+
+
 @app.get("/simulation/creators")
 async def simulation_creators(request: Request) -> dict:
     """Creators the caller may simulate against, each with its test fans only.
@@ -6618,13 +6669,7 @@ async def simulation_creators(request: Request) -> dict:
                 label="simulation.creators",
             ),
             retry_db_read(
-                lambda: db.table("fans")
-                .select("id, display_name, creator_id, platform_fan_id")
-                .in_("creator_id", ids)
-                .like("platform_fan_id", f"{TEST_FAN_PREFIX}%")
-                .order("display_name")
-                .limit(500)
-                .execute(),
+                lambda: _read_simulation_test_fans(db, ids),
                 label="simulation.test_fans",
             ),
         )
@@ -6653,6 +6698,8 @@ async def simulation_creators(request: Request) -> dict:
             {
                 "id": str(fan.get("id")),
                 "display_name": fan.get("display_name") or str(fan.get("id")),
+                "platform_fan_id": fan.get("platform_fan_id"),
+                "ai_stack_profile": fan.get("ai_stack_profile"),
             }
         )
     return {
@@ -6854,6 +6901,448 @@ async def simulate_decline(
         session = mark_step_declined(session, reason=body.reason, pause=True)
         await save_fan_session(fan_id, session)
     return {"status": "ok", "simulation": True, "session": session}
+
+
+class SimulationTestFanRequest(BaseModel):
+    """Create one owner test fan. The platform id is NEVER client-supplied."""
+
+    creator_id: str = Field(min_length=1, max_length=64)
+    display_name: str | None = Field(default=None, max_length=80)
+
+
+class SimulationMediaPreviewRequest(BaseModel):
+    media_ids: list[str] = Field(default_factory=list, max_length=250)
+
+
+class AIStackOverrideRequest(BaseModel):
+    """Select an AI Stack Profile by identifier, or clear the override.
+
+    A stable identifier from the backend registry, never a provider or model
+    string. The frontend cannot name a model here, by construction.
+    """
+
+    ai_stack_profile: str | None = None
+
+
+@app.post("/simulation/test-fans")
+async def create_simulation_test_fan(
+    body: SimulationTestFanRequest,
+    request: Request,
+) -> dict:
+    """Create a clean, persistent simulation fan. Owner only.
+
+    The platform id is generated server-side and always carries the ``test_``
+    prefix, so this control cannot produce a fan the rest of the system would
+    treat as real. Nothing about a Fansly account is touched.
+    """
+    from core.simulation import require_simulation_user
+    from services.simulation_workspace import (
+        SimulationWorkspaceError,
+        create_test_fan,
+    )
+
+    await require_simulation_user(request)
+    # The ordinary creator tenancy check, so a simulator user still cannot
+    # create a fan under a creator they are not assigned to.
+    await require_creator_path_access(request, body.creator_id)
+    try:
+        fan = await create_test_fan(
+            creator_id=body.creator_id,
+            display_name=body.display_name,
+        )
+    except SimulationWorkspaceError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"status": "ok", "fan": fan}
+
+
+@app.get("/creator/{creator_id}/fan/{fan_id}/simulation-state")
+async def read_simulation_state(
+    creator_id: str,
+    fan_id: str,
+    request: Request,
+) -> dict:
+    """The persisted state of one test fan, from authoritative sources."""
+    from core.simulation import not_found
+    from services.simulation_workspace import NotASimulationFan, simulation_state
+
+    await _require_simulatable_fan(request, creator_id, fan_id)
+    try:
+        return await simulation_state(creator_id=creator_id, fan_id=fan_id)
+    except NotASimulationFan as exc:
+        raise not_found() from exc
+
+
+@app.post("/creator/{creator_id}/fan/{fan_id}/simulation-actions/{action_id}/run-now")
+async def run_simulation_action_now(
+    creator_id: str,
+    fan_id: str,
+    action_id: str,
+    request: Request,
+) -> dict:
+    """Fire one pending scheduled action immediately, through the real handler.
+
+    Owner only, test fans only. This is how delayed behaviour — payday
+    re-engagement, post-session follow-up, re-engagement after silence — is
+    tested without waiting days and without a fake clock: the production
+    revalidation, planner, writer and state transitions all run, inside
+    ``simulation_scope()``, so no platform call is possible.
+    """
+    from core.simulation import not_found
+    from services.simulation_workspace import (
+        NotASimulationFan,
+        SimulationWorkspaceError,
+        run_scheduled_action_now,
+    )
+
+    await _require_simulatable_fan(request, creator_id, fan_id)
+    try:
+        return await run_scheduled_action_now(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            action_id=action_id,
+        )
+    except NotASimulationFan as exc:
+        raise not_found() from exc
+    except SimulationWorkspaceError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/creator/{creator_id}/simulation-media-previews")
+async def read_simulation_media_previews(
+    creator_id: str,
+    body: SimulationMediaPreviewRequest,
+    request: Request,
+) -> dict:
+    """Owner-only display URLs for mirrored ``sim:`` test media.
+
+    Resolved through the mirror's provenance from the SOURCE creator's vault.
+    Nothing is written, and the source's platform media id is never copied onto
+    this creator's catalog, so a previewable row does not become a deliverable
+    one: simulation preview access and live delivery authority stay separate.
+    """
+    from core.simulation import require_simulation_user
+    from services.simulation_catalog import resolve_simulation_media_previews
+
+    await require_simulation_user(request)
+    await require_creator_path_access(request, creator_id)
+    media = await resolve_simulation_media_previews(
+        creator_id=creator_id,
+        media_ids=list(body.media_ids or []),
+    )
+    return {"media": media}
+
+
+@app.put("/creator/{creator_id}/fan/{fan_id}/ai-stack")
+async def update_simulation_fan_ai_stack(
+    creator_id: str,
+    fan_id: str,
+    body: AIStackOverrideRequest,
+    request: Request,
+) -> dict:
+    """Pin one TEST fan to an AI Stack Profile. Owner only.
+
+    This is what lets "Test Fan A -> cleo_legacy_v1" and "Test Fan B -> cleo_v2"
+    run under the same creator and be compared turn for turn. The route refuses
+    any fan that is not a ``test_`` fan, and the read path in services/ai_stack
+    re-checks the prefix independently, so a value that reached a real fan row
+    by any other means still has no effect.
+    """
+    from core.simulation import not_found
+    from services.ai_stack import set_simulation_fan_profile_override
+
+    await _require_simulatable_fan(request, creator_id, fan_id)
+    try:
+        stored = await set_simulation_fan_profile_override(
+            fan_id, body.ai_stack_profile
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"[AI STACK] simulation override write failed fan={fan_id}: {exc}")
+        raise not_found() from exc
+    return {"status": "ok", "fan_id": fan_id, "ai_stack_profile": stored}
+
+
+@app.get("/content-price-ranges")
+async def read_content_price_ranges(request: Request) -> dict:
+    """The agency's approved commercial price range per content category.
+
+    Read-only, and the same table models/content_pricing.py prices every offer
+    from. The Sets UI needs it for two honest things: to name where a set's
+    allowed range came from ("nude_photo default"), and to restore that default
+    after an operator has customised one.
+
+    Authenticated by the application's own middleware (deployment key plus the
+    signed-in Supabase session) but deliberately not creator-scoped: this is
+    deployment configuration rather than anyone's data — the same numbers for
+    every tenant, containing nothing about any creator, fan or sale.
+    """
+    from models.content_pricing import VAULT_CATEGORIES
+
+    # Referenced so the signature stays honest about needing an authenticated
+    # request; the middleware has already rejected an unauthenticated one.
+    _ = dashboard_user_id(request)
+    return {
+        "categories": [
+            {
+                "category": name,
+                "label": value["label"],
+                "min_dollars": int(value["min"]),
+                "max_dollars": int(value["max"]),
+                # A free/teaser/unclear category is NOT an approved commercial
+                # range and must never be presented as one.
+                "priced": int(value["max"]) > 0,
+            }
+            for name, value in sorted(VAULT_CATEGORIES.items())
+        ]
+    }
+
+
+# --- Agency pricing strategy ------------------------------------------------
+#
+# Railway's PRICE_LEARNING_* variables are DEPLOYMENT DEFAULTS. An agency
+# configures strategy here, and the precedence the backend already implements is
+# creator override, then agency policy, then those defaults
+# (db/pricing_policy_queries.get_effective_price_learning_policy).
+#
+# These routes are ordinary creator-scoped operator endpoints, not owner-only:
+# an agency configuring its own pricing is the point. Authorization is the
+# standard tenancy check, so an agency can only read or write a policy for a
+# creator it is actually assigned, and the agency scope it may write is the one
+# its own creator belongs to.
+#
+# Nothing here changes a pricing formula. A preset is a named set of values for
+# fields that already exist, and every write is validated against
+# PriceLearningPolicy before it is stored.
+
+
+class PricingPolicyRequest(BaseModel):
+    """Set a strategy preset, explicit advanced settings, or both."""
+
+    scope: Literal["creator", "agency"] = "creator"
+    preset: str | None = None
+    # Advanced tuning for operators who want the exact numbers. Applied on top
+    # of the preset when both are sent, so "Aggressive, but cap the ceiling" is
+    # expressible in one request.
+    settings: dict[str, Any] | None = None
+
+
+async def _pricing_scope_target(
+    request: Request,
+    creator_id: str,
+    scope: str,
+) -> tuple[str, str]:
+    """Resolve a request's scope to (scope_type, scope_id), or 400/403.
+
+    An agency-scope write is allowed only for the agency scope this creator
+    actually belongs to. That keeps the write inside the same tenancy boundary
+    as everything else: an operator cannot address another agency's policy by
+    naming its scope id, because no scope id is ever accepted from the client.
+    """
+    from db.pricing_policy_queries import get_agency_scope_id
+
+    await require_creator_path_access(request, creator_id)
+    if scope == "creator":
+        return "CREATOR", str(creator_id)
+
+    agency_scope_id = await get_agency_scope_id(creator_id)
+    if not agency_scope_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This creator is not a member of an agency pricing scope, so "
+                "there is no agency policy to configure. Set a creator policy "
+                "instead."
+            ),
+        )
+    return "AGENCY", agency_scope_id
+
+
+@app.get(
+    "/creator/{creator_id}/pricing-policy",
+    dependencies=[Depends(require_creator_path_access)],
+)
+async def read_pricing_policy(creator_id: str) -> dict:
+    """The effective pricing policy and where each layer's values came from."""
+    from db.pricing_policy_queries import (
+        environment_price_learning_policy,
+        get_agency_scope_id,
+        get_effective_price_learning_policy,
+        get_policy_scope_settings,
+    )
+    from services.price_learning import price_learning_enabled
+    from services.pricing_presets import describe_presets, preset_for_policy
+
+    agency_scope_id = await get_agency_scope_id(creator_id)
+    creator_settings, agency_settings, effective = await asyncio.gather(
+        get_policy_scope_settings("CREATOR", creator_id),
+        (
+            get_policy_scope_settings("AGENCY", agency_scope_id)
+            if agency_scope_id
+            else asyncio.sleep(0, result={})
+        ),
+        get_effective_price_learning_policy(creator_id),
+    )
+    return {
+        "creator_id": creator_id,
+        "agency_scope_id": agency_scope_id,
+        # Honest about the deployment gate: adaptive pricing does nothing at all
+        # unless PRICE_LEARNING_ENABLED is true, and the UI must not present a
+        # strategy as active while the backend has the feature switched off.
+        "price_learning_enabled": price_learning_enabled(),
+        "price_learning_env_var": "PRICE_LEARNING_ENABLED",
+        "environment_defaults": environment_price_learning_policy().model_dump(),
+        "agency": {
+            "settings": agency_settings,
+            "preset": preset_for_policy(agency_settings) if agency_scope_id else None,
+        },
+        "creator": {
+            "settings": creator_settings,
+            "preset": preset_for_policy(creator_settings) if creator_settings else None,
+        },
+        "effective": effective.model_dump(),
+        "effective_preset": preset_for_policy(effective.model_dump()),
+        "presets": describe_presets(),
+    }
+
+
+@app.put("/creator/{creator_id}/pricing-policy")
+async def update_pricing_policy(
+    creator_id: str,
+    body: PricingPolicyRequest,
+    request: Request,
+) -> dict:
+    """Write one pricing-policy scope. Agencies configure their own only."""
+    from db.pricing_policy_queries import (
+        get_effective_price_learning_policy,
+        get_policy_scope_settings,
+        save_policy_scope_settings,
+    )
+    from services.pricing_presets import apply_preset, normalize_preset
+
+    scope_type, scope_id = await _pricing_scope_target(request, creator_id, body.scope)
+
+    settings = await get_policy_scope_settings(scope_type, scope_id)
+    if body.preset is not None:
+        if normalize_preset(body.preset) is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Unknown pricing preset.",
+            )
+        settings = apply_preset(settings, body.preset)
+    if body.settings:
+        # Advanced values win over the preset, so both can be sent together.
+        settings = {**settings, **body.settings}
+
+    try:
+        stored = await save_policy_scope_settings(scope_type, scope_id, settings)
+    except (ValueError, ValidationError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"[PRICING POLICY] write failed {scope_type}/{scope_id}: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not save the pricing policy. Please retry.",
+        ) from exc
+
+    effective = await get_effective_price_learning_policy(creator_id)
+    print(
+        f"[PRICING POLICY] {scope_type}/{scope_id} updated by creator={creator_id} "
+        f"fields={sorted(stored)}"
+    )
+    return {
+        "status": "ok",
+        "scope": scope_type.lower(),
+        "scope_id": scope_id,
+        "settings": stored,
+        "effective": effective.model_dump(),
+    }
+
+
+# --- Owner-only AI Stack administration ------------------------------------
+#
+# The whole conversational AI configuration is a named profile
+# (ai/stack_profiles.py). These routes let the owner read what each profile
+# actually means and pin one creator to one. They are owner-only for the same
+# reason the simulator is: choosing which brain answers every fan of a creator
+# is an operational capability, not an agency product feature.
+#
+# There is deliberately no way to submit a provider or model string. The only
+# thing a client may send is a stable profile identifier, which is validated
+# against the backend registry.
+
+
+@app.get("/ai-stack/profiles")
+async def read_ai_stack_profiles(request: Request) -> dict:
+    """Every registered profile, fully resolved, plus the deployment default."""
+    from ai.stack_profiles import (
+        PROFILE_ENV_VAR,
+        describe_profiles,
+        environment_profile_id,
+    )
+    from core.simulation import require_simulation_user
+
+    await require_simulation_user(request)
+    return {
+        "profiles": describe_profiles(),
+        "environment_profile": environment_profile_id(),
+        "environment_variable": PROFILE_ENV_VAR,
+    }
+
+
+@app.get("/creator/{creator_id}/ai-stack")
+async def read_creator_ai_stack(creator_id: str, request: Request) -> dict:
+    """This creator's override and the profile that would actually answer."""
+    from ai.stack_profiles import environment_profile_id
+    from core.simulation import require_simulation_user
+    from services.ai_stack import creator_profile_override, resolve_ai_stack
+
+    await require_simulation_user(request)
+    await require_creator_path_access(request, creator_id)
+    override = await creator_profile_override(creator_id)
+    effective = await resolve_ai_stack(creator_id=creator_id)
+    return {
+        "creator_id": creator_id,
+        "override": override,
+        "environment_profile": environment_profile_id(),
+        "effective": effective.to_dict(),
+    }
+
+
+@app.put("/creator/{creator_id}/ai-stack")
+async def update_creator_ai_stack(
+    creator_id: str,
+    body: AIStackOverrideRequest,
+    request: Request,
+) -> dict:
+    """Persist (or clear) this creator's AI Stack Profile override. Owner only.
+
+    Persistent and creator-scoped rather than session-scoped, because Full Auto
+    answers asynchronously from a worker where no browser session exists.
+    """
+    from core.simulation import require_simulation_user
+    from services.ai_stack import resolve_ai_stack, set_creator_profile_override
+
+    await require_simulation_user(request)
+    await require_creator_path_access(request, creator_id)
+    try:
+        stored = await set_creator_profile_override(creator_id, body.ai_stack_profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"[AI STACK] creator override write failed creator={creator_id}: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not save the AI stack override. Please retry.",
+        ) from exc
+    effective = await resolve_ai_stack(creator_id=creator_id)
+    print(f"[AI STACK] creator={creator_id} override set to {stored or 'none'}")
+    return {
+        "status": "ok",
+        "creator_id": creator_id,
+        "override": stored,
+        "effective": effective.to_dict(),
+    }
 
 
 async def require_local_test_endpoints() -> None:

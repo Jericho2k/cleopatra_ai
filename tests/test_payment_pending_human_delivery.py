@@ -5,7 +5,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ai import prompt_builder
+from ai.writer_style import WRITER_V1, response_instructions
 from models.commercial import (
     ActionType,
     CommercialEvent,
@@ -291,7 +291,10 @@ def test_stale_auto_reply_cannot_clear_newer_task(monkeypatch):
 
 
 def test_prompt_has_narrow_anti_witty_and_bounded_knowledge_rules():
-    source = inspect.getsource(prompt_builder.build_prompt)
+    # The writer voice moved into ai/writer_style.py, keyed by prompt version.
+    # Asserted against the rendered frozen version rather than build_prompt's
+    # source, which is what the writer is actually handed.
+    source = response_instructions(WRITER_V1)
     assert "Do not try to land a clever line" in source
     assert "ordinary young woman with uneven knowledge" in source
     assert "ask him to explain" in source
