@@ -13,6 +13,7 @@ import re
 from typing import Any
 
 from ai.model_providers import complete, get_runtime_target
+from ai.stack_profiles import STAGE_FAN_INTELLIGENCE, get_profile
 from db.fan_intelligence_queries import (
     get_facts_for_key,
     insert_fact,
@@ -396,13 +397,16 @@ async def learn_from_fan_message(
     fan_message: str,
     source_message_id: str | None = None,
     conversation_history: list[Message] | None = None,
+    profile_id: str | None = None,
 ) -> None:
     """Extract and merge durable facts without ever blocking reply generation."""
 
     if not fan_intelligence_enabled() or not (fan_message or "").strip():
         return
 
-    target = get_runtime_target("EXTRACTOR")
+    profile = get_profile(profile_id)
+    spec = profile.stages.get(STAGE_FAN_INTELLIGENCE)
+    target = spec.primary_target() if spec else get_runtime_target("EXTRACTOR")
     context_lines: list[str] = []
     for message in (conversation_history or [])[-6:]:
         speaker = "Fan" if message.role == "fan" else "Creator"
@@ -420,7 +424,10 @@ async def learn_from_fan_message(
         feature="fan_intelligence_extraction",
         creator_id=creator_id,
         fan_id=fan_id,
-        metadata={"source_message_id": source_message_id},
+        metadata={
+            "source_message_id": source_message_id,
+            "ai_stack_profile": profile.profile_id,
+        },
     )
 
     try:
@@ -428,8 +435,12 @@ async def learn_from_fan_message(
             target,
             system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
-            max_tokens=int(os.getenv("EXTRACTOR_MAX_TOKENS", "700") or 700),
-            temperature=0.0,
+            max_tokens=(
+                spec.resolved_max_tokens()
+                if spec
+                else int(os.getenv("EXTRACTOR_MAX_TOKENS", "700") or 700)
+            ),
+            temperature=spec.temperature if spec else 0.0,
         )
         try:
             envelope = parse_extraction_payload(result.text)

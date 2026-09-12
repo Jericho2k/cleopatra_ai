@@ -55,6 +55,10 @@ fansly_lists_single_flight_v1.sql
 # that live planning filters on and that make a mirrored test row impossible to
 # deliver. Must precede tenant_isolation_v1, which discovers tables at run time.
 simulation_catalog_v1.sql
+# AI Stack Profile selection: nullable creators.ai_stack_profile and
+# fans.ai_stack_profile overrides. Additive; NULL everywhere reproduces the
+# pre-migration behaviour. Must precede tenant_isolation_v1.
+ai_stack_profile_v1.sql
 
 # Always last, and always as a PAIR, in this order.
 #

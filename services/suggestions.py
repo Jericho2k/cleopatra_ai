@@ -15,6 +15,7 @@ import uuid
 
 from ai.generator import generate_replies
 from ai.writer_router import select_writer_route
+from ai.stack_profiles import STAGE_FAN_SUMMARY, get_profile
 from openai import AsyncOpenAI
 from core.config import get_settings
 from core.supabase import get_supabase
@@ -57,6 +58,7 @@ from services.ppv_persistence import (
 from services.followup_lifecycle import (
     complete_session_state,
 )
+from services.ai_stack import log_effective_stack, resolve_ai_stack
 from services.fan_intelligence import learn_from_fan_message
 from services.affordability import (
     get_affordability_context,
@@ -168,6 +170,36 @@ def _release_auto_reply_slot(fan_id: str) -> bool:
         return False
     _pending_auto_replies.pop(fan_id, None)
     return True
+
+
+def message_ai_stack_metadata(route, *, profile_id: str) -> dict:
+    """The durable "which brain wrote this" marker for one creator message.
+
+    Persisted inside ``messages.media_context``, which is existing jsonb
+    metadata, so recording it needs no migration and nothing customer-visible
+    changes. It is deliberately small: the profile that answered, the writer
+    route it took, and the model that was actually asked. That is enough to
+    answer "which AI stack produced this message?" months later, from the row
+    alone, without a telemetry join.
+    """
+    marker: dict = {"profile": str(profile_id)}
+    if route is not None:
+        marker.update(
+            {
+                "route": route.route.value,
+                "prompt_version": route.prompt_version,
+                "provider": route.primary_target.provider,
+                "model": route.primary_target.model,
+            }
+        )
+    return {"ai_stack": marker}
+
+
+def _with_ai_stack(media_context: dict | None, marker: dict) -> dict:
+    """Merge the stack marker into whatever metadata this message already has."""
+    merged = dict(media_context or {})
+    merged.update(marker)
+    return merged
 
 
 def _is_local_test_fan(platform_fan_id: object) -> bool:
@@ -339,6 +371,15 @@ async def get_suggestions(
         fan_message, creator_id, enabled=False
     )
 
+    # Which AI brain answers this turn. Resolved once, before the first model
+    # call, so every stage of this turn — analyzer, writer, extractor — and the
+    # metadata persisted with the reply all name the same profile.
+    stack = await resolve_ai_stack(creator_id=creator_id, fan_id=fan_id)
+    log_effective_stack(
+        stack, creator_id=creator_id, fan_id=fan_id, feature="assisted_reply"
+    )
+    stack_profile = stack.profile
+
     ctx_without_situation = ConversationContext(
         fan_message=fan_message,
         conversation_history=conversation_history,
@@ -355,11 +396,14 @@ async def get_suggestions(
         buyer_lifecycle=buyer_lifecycle,
         affordability=affordability,
         price_learning=price_learning,
+        ai_stack_profile=stack.profile_id,
+        writer_prompt_version=stack_profile.writer_prompt_version(),
     )
 
     situation = await analyze_situation(
         ctx_without_situation,
         telemetry_context={"creator_id": creator_id, "fan_id": fan_id},
+        profile_id=stack.profile_id,
     )
     # REL-001 — Assisted keeps producing copy, because a human approves it before
     # anything reaches the fan, but the operator must be told the analysis behind
@@ -480,15 +524,18 @@ async def get_suggestions(
         price_learning=price_learning,
         session_strategy=session_strategy,
         conversation_director=conversation_director,
+        ai_stack_profile=stack.profile_id,
+        writer_prompt_version=stack_profile.writer_prompt_version(),
     )
 
-    route = select_writer_route(ctx)
+    route = select_writer_route(ctx, profile_id=stack.profile_id)
     print(
-        f"[WRITER ROUTE] fan={fan_id} mode=assisted route={route.route.value} "
+        f"[WRITER ROUTE] fan={fan_id} mode=assisted profile={stack.profile_id} "
+        f"route={route.route.value} "
         f"reason={route.reason} primary={route.primary_target.model} "
         f"fallback={(route.fallback_target.model if route.fallback_target else 'none')}"
     )
-    prompt = build_prompt(ctx)
+    prompt = build_prompt(ctx, prompt_version=route.prompt_version)
     replies = await generate_replies(
         prompt,
         creator_persona,
@@ -541,13 +588,19 @@ async def get_suggestions(
                 fan_message=fan_message,
                 source_message_id=evidence_message_id,
                 conversation_history=extraction_history,
+                profile_id=stack.profile_id,
             ),
             name=f"fan_intelligence:{fan_id}",
         )
 
     if _should_update_memory(conversation_history):
         spawn(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent), name="update_fan_memory")
-        spawn(_update_fan_ai_summary(fan_id, conversation_history), name="update_fan_ai_summary")
+        spawn(
+            _update_fan_ai_summary(
+                fan_id, conversation_history, profile_id=stack.profile_id
+            ),
+            name="update_fan_ai_summary",
+        )
 
     return SuggestionResponse(
         suggestions=replies,
@@ -684,8 +737,11 @@ async def _update_fan_memory(
 async def _update_fan_ai_summary(
     fan_id: str,
     conversation_history: list[Message],
+    *,
+    profile_id: str | None = None,
 ) -> None:
     try:
+        summary_spec = get_profile(profile_id).stages.get(STAGE_FAN_SUMMARY)
         convo_lines = []
         for msg in conversation_history[-20:]:
             speaker = "Fan" if msg.role == "fan" else "Creator"
@@ -719,14 +775,27 @@ async def _update_fan_ai_summary(
             f"{convo_text}"
         )
 
+        # The model, temperature and budget come from the turn's AI Stack
+        # Profile rather than being hardcoded here, so the profile detail view
+        # the owner reads is the truth about this stage too. Both shipped
+        # profiles name the same Together model; nothing about this pass gives a
+        # reason to re-point a background summariser.
         response = await together_client.chat.completions.create(
-            model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            model=(
+                summary_spec.resolved_primary()[1]
+                if summary_spec
+                else "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+            ),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.3,
-            max_tokens=1000,
+            temperature=(
+                summary_spec.temperature
+                if summary_spec and summary_spec.temperature is not None
+                else 0.3
+            ),
+            max_tokens=summary_spec.resolved_max_tokens() if summary_spec else 1000,
         )
 
         content = response.choices[0].message.content or ""
@@ -1082,6 +1151,18 @@ async def _debounced_auto_reply(
             remaining = active_session.get("cooldown_messages_remaining", 0)
             print(f"[SESSION] cooldown fan={fan_id} remaining={remaining}")
 
+        # Which AI brain answers this turn. Resolved once, before the first
+        # model call: the analyzer, the writer and the extractor below must all
+        # be the same profile, and so must the metadata persisted with the
+        # reply. A simulation fan's own override wins here, which is what lets
+        # two test fans under one creator be compared turn for turn.
+        stack = await resolve_ai_stack(creator_id=creator_id, fan_id=fan_id)
+        log_effective_stack(
+            stack, creator_id=creator_id, fan_id=fan_id, feature="full_auto"
+        )
+        stack_profile = stack.profile
+        writer_prompt_version = stack_profile.writer_prompt_version()
+
         ctx_without_situation = ConversationContext(
             fan_message=latest_message,
             conversation_history=conversation_history,
@@ -1097,12 +1178,15 @@ async def _debounced_auto_reply(
             buyer_lifecycle=buyer_lifecycle,
             affordability=affordability,
             price_learning=price_learning,
+            ai_stack_profile=stack.profile_id,
+            writer_prompt_version=writer_prompt_version,
         )
 
         with action_stage("analyzer_ms"):
             situation = await analyze_situation(
                 ctx_without_situation,
                 telemetry_context={"creator_id": creator_id, "fan_id": fan_id},
+                profile_id=stack.profile_id,
             )
 
         # REL-001 — Full Auto fails closed on a degraded analysis.
@@ -1490,15 +1574,18 @@ async def _debounced_auto_reply(
             session_strategy=session_strategy,
             conversation_director=conversation_director,
             message_shape=message_shape.to_context(),
+            ai_stack_profile=stack.profile_id,
+            writer_prompt_version=writer_prompt_version,
         )
 
-        route = select_writer_route(ctx)
+        route = select_writer_route(ctx, profile_id=stack.profile_id)
         print(
-            f"[WRITER ROUTE] fan={fan_id} mode=auto route={route.route.value} "
+            f"[WRITER ROUTE] fan={fan_id} mode=auto profile={stack.profile_id} "
+            f"route={route.route.value} "
             f"reason={route.reason} primary={route.primary_target.model} "
             f"fallback={(route.fallback_target.model if route.fallback_target else 'none')}"
         )
-        prompt = build_prompt(ctx)
+        prompt = build_prompt(ctx, prompt_version=route.prompt_version)
         with action_stage("writer_ms"):
             replies = await generate_replies(
                 prompt,
@@ -1867,6 +1954,11 @@ async def _debounced_auto_reply(
             record_stage("fansly_send_ms", (time.perf_counter() - send_started) * 1000)
 
             try:
+                # Every creator message this pipeline writes carries the AI
+                # stack that produced it, PPV and plain alike.
+                stack_marker = message_ai_stack_metadata(
+                    route, profile_id=stack.profile_id
+                )
                 if ppv_match:
                     await save_ppv_message_receipt(
                         fan_id=fan_id,
@@ -1874,7 +1966,7 @@ async def _debounced_auto_reply(
                         content=text_out,
                         was_ai_suggested=True,
                         platform_message_id=platform_message_id,
-                        media_context=ppv_media_context or {},
+                        media_context=_with_ai_stack(ppv_media_context, stack_marker),
                     )
                 else:
                     last_plain_message_id = await save_message(
@@ -1884,7 +1976,7 @@ async def _debounced_auto_reply(
                         content=text_out,
                         was_ai_suggested=True,
                         fansly_message_id=platform_message_id,
-                        media_context=ppv_media_context,
+                        media_context=_with_ai_stack(ppv_media_context, stack_marker),
                     )
                 if local_test_delivery:
                     print(
@@ -2628,12 +2720,18 @@ async def run_simulated_inbound(
         # simulation scope is still active while it runs and the caller's
         # response reflects a settled turn.
         try:
+            # The extractor runs under the same profile the rest of the turn
+            # will use, including a test fan's own simulation override.
+            extraction_stack = await resolve_ai_stack(
+                creator_id=creator_id, fan_id=fan_id
+            )
             await learn_from_fan_message(
                 creator_id=creator_id,
                 fan_id=fan_id,
                 fan_message=message,
                 source_message_id=fan_message_id,
                 conversation_history=history_before,
+                profile_id=extraction_stack.profile_id,
             )
         except Exception as exc:
             # Extraction is an enrichment, never a reason to lose the turn.

@@ -65,6 +65,7 @@ from models.schemas import (
     SuggestionRequest,
     SuggestionResponse,
 )
+from services.ai_stack import resolve_ai_stack
 from services.fan_intelligence import learn_from_fan_message
 from services.db_reliability import retry_db_read, retry_transient_db_operation
 from core.apifansly_gate import (
@@ -522,6 +523,8 @@ async def process_incoming_fan_message(
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
 
+    # The extractor stage of the same AI stack that will answer this message.
+    inbound_stack = await resolve_ai_stack(creator_id=creator_id, fan_id=fan_id)
     spawn(
         learn_from_fan_message(
             creator_id=creator_id,
@@ -529,6 +532,7 @@ async def process_incoming_fan_message(
             fan_message=message_content,
             source_message_id=message_id,
             conversation_history=conversation_history,
+            profile_id=inbound_stack.profile_id,
         ),
         name=f"fan_intelligence:{fan_id}",
     )

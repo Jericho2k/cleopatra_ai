@@ -1,14 +1,31 @@
 """Deterministic production writer routing for Cleopatra.
 
-Kimi K2.6 through OpenRouter, pinned to one upstream provider, handles ordinary
-conversation. Qwen3.7-Plus on Together handles commercially complex, high-value,
-session-active, and safety-sensitive turns. The router never asks a model to
-decide which business action should happen; it only chooses the writer that
-expresses the already-known context.
+This module answers one question: given conversation state that has already been
+computed, which of three writer ROUTES does this turn take — ordinary,
+commercially complex, or safety-sensitive? That decision is shared application
+logic and is identical under every AI Stack Profile, because it describes the
+conversation rather than the brain answering it. The router never asks a model
+which business action should happen.
 
-The two routes are deliberately on different providers: an OpenRouter outage
-must not take the commercial writer down with it, and the ordinary route's
-fail-closed provider pin must not be able to divert commercial turns.
+Which MODEL each route points at is a property of the turn's AI Stack Profile
+(ai/stack_profiles.py), not of this module:
+
+``cleo_legacy_v1``
+    Kimi K2.6 via OpenRouter writes ordinary conversation; Qwen3.7-Plus on
+    Together writes every commercial and safety-sensitive turn. The frozen
+    behaviour of main before the V2 pass.
+
+``cleo_v2``
+    Kimi K2.6 writes ordinary conversation AND commercial expression, with
+    Qwen3.7-Plus on Together as its deterministic fallback, so a sale no longer
+    arrives in a different voice than the conversation around it. The
+    safety-sensitive route stays on Together: a crisis turn is not commercial
+    expression, and keeping it on a second provider means one OpenRouter
+    incident cannot take every writer down at once.
+
+Provider diversity is deliberate in both profiles. The constants below remain
+the canonical default targets and are read by the availability check and the
+smoke script.
 """
 
 from __future__ import annotations
@@ -18,12 +35,13 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from ai.model_migrations import resolve_supported_model
-from ai.model_providers import (
-    find_catalog_target,
-    get_runtime_target,
-    provider_transport_defaults,
+from ai.stack_profiles import (
+    STAGE_WRITER_COMMERCIAL,
+    STAGE_WRITER_DEFAULT,
+    STAGE_WRITER_SAFETY,
+    get_profile,
 )
+from ai.model_providers import get_runtime_target
 from models.model_runtime import ModelTarget
 
 
@@ -58,11 +76,18 @@ class WriterRouteDecision:
     reason: str
     primary_target: ModelTarget
     fallback_target: ModelTarget | None = None
+    # Which AI Stack Profile produced these targets, and which writer voice goes
+    # with them. Carried on the decision so telemetry, the Railway log line and
+    # the persisted message metadata all name the same brain.
+    ai_stack_profile: str = ""
+    prompt_version: str = ""
 
     def telemetry_metadata(self) -> dict[str, Any]:
         return {
             "writer_route": self.route.value,
             "writer_route_reason": self.reason,
+            "ai_stack_profile": self.ai_stack_profile,
+            "writer_prompt_version": self.prompt_version,
             "writer_primary_provider": self.primary_target.provider,
             "writer_primary_model": self.primary_target.model,
             "writer_fallback_provider": (
@@ -95,34 +120,6 @@ def _mapping(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _resolve_target(
-    *,
-    provider_env: str,
-    model_env: str,
-    default_provider: str,
-    default_model: str,
-) -> ModelTarget:
-    provider = os.getenv(provider_env, default_provider).strip().lower()
-    model = resolve_supported_model(
-        provider,
-        os.getenv(model_env, default_model),
-    )
-
-    catalog_target = find_catalog_target(provider, model)
-    if catalog_target is not None:
-        return catalog_target
-
-    base_url, api_key_env = provider_transport_defaults(provider)
-
-    return ModelTarget(
-        name=f"{provider}:{model}",
-        provider=provider,
-        model=model,
-        base_url=base_url,
-        api_key_env=api_key_env,
-    )
-
-
 def _same_target(left: ModelTarget, right: ModelTarget | None) -> bool:
     return bool(
         right
@@ -132,29 +129,49 @@ def _same_target(left: ModelTarget, right: ModelTarget | None) -> bool:
     )
 
 
-def select_writer_route(ctx: Any) -> WriterRouteDecision:
-    """Choose a writer deterministically from already-computed conversation state."""
+def select_writer_route(
+    ctx: Any,
+    *,
+    profile_id: str | None = None,
+) -> WriterRouteDecision:
+    """Choose a writer deterministically from already-computed conversation state.
+
+    Which *models* the three routes point at is a property of the turn's AI
+    Stack Profile (ai/stack_profiles.py). Which *route* a turn takes is not: the
+    conditions below are shared application logic and are identical under every
+    profile, because they describe the conversation, not the brain answering it.
+    """
+
+    profile = get_profile(profile_id or getattr(ctx, "ai_stack_profile", None))
+    default_spec = profile.stage(STAGE_WRITER_DEFAULT)
+    commercial_spec = profile.stage(STAGE_WRITER_COMMERCIAL)
+    safety_spec = profile.stage(STAGE_WRITER_SAFETY)
+
+    def decide(
+        route: WriterRoute,
+        reason: str,
+        primary: ModelTarget,
+        fallback: ModelTarget | None = None,
+    ) -> WriterRouteDecision:
+        return WriterRouteDecision(
+            route=route,
+            reason=reason,
+            primary_target=primary,
+            fallback_target=None if _same_target(primary, fallback) else fallback,
+            ai_stack_profile=profile.profile_id,
+            prompt_version=default_spec.prompt_version,
+        )
 
     if not _enabled("WRITER_ROUTING_ENABLED", True):
         target = get_runtime_target("CHAT")
-        return WriterRouteDecision(
-            route=WriterRoute.DEFAULT,
-            reason="routing_disabled",
-            primary_target=target,
-        )
+        return decide(WriterRoute.DEFAULT, "routing_disabled", target)
 
-    default_target = _resolve_target(
-        provider_env="WRITER_DEFAULT_PROVIDER",
-        model_env="WRITER_DEFAULT_MODEL",
-        default_provider=DEFAULT_WRITER_PROVIDER,
-        default_model=DEFAULT_WRITER_MODEL,
-    )
-    complex_target = _resolve_target(
-        provider_env="WRITER_COMPLEX_PROVIDER",
-        model_env="WRITER_COMPLEX_MODEL",
-        default_provider=COMPLEX_WRITER_PROVIDER,
-        default_model=COMPLEX_WRITER_MODEL,
-    )
+    default_target = default_spec.primary_target()
+    default_fallback = default_spec.fallback_target()
+    complex_target = commercial_spec.primary_target()
+    complex_fallback = commercial_spec.fallback_target()
+    safety_target = safety_spec.primary_target()
+    safety_fallback = safety_spec.fallback_target()
 
     situation = _mapping(getattr(ctx, "situation", None))
     commercial_decision = _mapping(getattr(ctx, "commercial_decision", None))
@@ -173,14 +190,15 @@ def select_writer_route(ctx: Any) -> WriterRouteDecision:
         or needs_human_review
         or action == "HAND_OFF_TO_HUMAN"
     ):
-        return WriterRouteDecision(
-            route=WriterRoute.SAFETY_SENSITIVE,
-            reason=(
+        return decide(
+            WriterRoute.SAFETY_SENSITIVE,
+            (
                 f"crisis:{crisis_signal.lower()}"
                 if crisis_signal not in {"", "NONE"}
                 else "human_review"
             ),
-            primary_target=complex_target,
+            safety_target,
+            safety_fallback,
         )
 
     complex_actions = {
@@ -195,38 +213,43 @@ def select_writer_route(ctx: Any) -> WriterRouteDecision:
         "PAYDAY_REENGAGEMENT",
     }
     if action in complex_actions:
-        return WriterRouteDecision(
-            route=WriterRoute.COMMERCIAL_COMPLEX,
-            reason=f"commercial_action:{action.lower()}",
-            primary_target=complex_target,
+        return decide(
+            WriterRoute.COMMERCIAL_COMPLEX,
+            f"commercial_action:{action.lower()}",
+            complex_target,
+            complex_fallback,
         )
 
     if bool(getattr(ctx, "active_session", None)):
-        return WriterRouteDecision(
-            route=WriterRoute.COMMERCIAL_COMPLEX,
-            reason="active_paid_session",
-            primary_target=complex_target,
+        return decide(
+            WriterRoute.COMMERCIAL_COMPLEX,
+            "active_paid_session",
+            complex_target,
+            complex_fallback,
         )
 
     if purchase_signal in {"DECLINED", "MONEY_AVAILABLE", "READY_TO_BUY", "BOUGHT"}:
-        return WriterRouteDecision(
-            route=WriterRoute.COMMERCIAL_COMPLEX,
-            reason=f"purchase_signal:{purchase_signal.lower()}",
-            primary_target=complex_target,
+        return decide(
+            WriterRoute.COMMERCIAL_COMPLEX,
+            f"purchase_signal:{purchase_signal.lower()}",
+            complex_target,
+            complex_fallback,
         )
 
     if stage in {"OBJECTION", "UPSELL_ACTIVE", "HIGH_VALUE"}:
-        return WriterRouteDecision(
-            route=WriterRoute.COMMERCIAL_COMPLEX,
-            reason=f"conversation_stage:{stage.lower()}",
-            primary_target=complex_target,
+        return decide(
+            WriterRoute.COMMERCIAL_COMPLEX,
+            f"conversation_stage:{stage.lower()}",
+            complex_target,
+            complex_fallback,
         )
 
     if lifecycle_stage == "VIP":
-        return WriterRouteDecision(
-            route=WriterRoute.COMMERCIAL_COMPLEX,
-            reason="buyer_lifecycle:vip",
-            primary_target=complex_target,
+        return decide(
+            WriterRoute.COMMERCIAL_COMPLEX,
+            "buyer_lifecycle:vip",
+            complex_target,
+            complex_fallback,
         )
 
     spend_tier = str(getattr(fan, "spend_tier", "") or "").strip().lower()
@@ -242,16 +265,16 @@ def select_writer_route(ctx: Any) -> WriterRouteDecision:
         high_value_threshold = 100.0
 
     if spend_tier in {"whale", "vip", "high_value"} or total_spent >= high_value_threshold:
-        return WriterRouteDecision(
-            route=WriterRoute.COMMERCIAL_COMPLEX,
-            reason="high_value_fan",
-            primary_target=complex_target,
+        return decide(
+            WriterRoute.COMMERCIAL_COMPLEX,
+            "high_value_fan",
+            complex_target,
+            complex_fallback,
         )
 
-    fallback = None if _same_target(default_target, complex_target) else complex_target
-    return WriterRouteDecision(
-        route=WriterRoute.DEFAULT,
-        reason="ordinary_conversation",
-        primary_target=default_target,
-        fallback_target=fallback,
+    return decide(
+        WriterRoute.DEFAULT,
+        "ordinary_conversation",
+        default_target,
+        default_fallback,
     )

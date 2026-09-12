@@ -238,7 +238,7 @@ def world(monkeypatch):
         "sleeps": [],
     }
 
-    async def fake_analyze(ctx, telemetry_context=None):
+    async def fake_analyze(ctx, telemetry_context=None, **_kwargs):
         calls["analyzer"].append(ctx)
         return {
             "purchase_signal": "none",
@@ -251,13 +251,15 @@ def world(monkeypatch):
         calls["writer"].append({"prompt": prompt, **kwargs})
         return ["hey | what are you doing?"]
 
-    def fake_route(ctx):
+    def fake_route(ctx, **kwargs):
         calls["route"].append(ctx)
         return SimpleNamespace(
             route=SimpleNamespace(value="primary"),
             reason="test",
-            primary_target=SimpleNamespace(model="test-writer"),
+            primary_target=SimpleNamespace(model="test-writer", provider="test"),
             fallback_target=None,
+            prompt_version="writer_v1",
+            ai_stack_profile=str(kwargs.get("profile_id") or "cleo_legacy_v1"),
             telemetry_metadata=lambda: {},
         )
 
@@ -442,7 +444,7 @@ def test_analyzer_fail_closed_behaviour_is_preserved(world, spy, monkeypatch):
     """A degraded analysis sends nothing — the real Full Auto safety rule."""
     db, calls = world
 
-    async def degraded(_ctx, telemetry_context=None):
+    async def degraded(_ctx, telemetry_context=None, **_kwargs):
         return {"analysis_degraded": True, "degraded_reason": "provider_down"}
 
     monkeypatch.setattr(suggestions, "analyze_situation", degraded)
@@ -574,7 +576,7 @@ def test_resend_request_does_not_send_a_real_ppv(world, spy, monkeypatch, two_bu
             "reference": "ref-1",
         }
 
-    async def resend_requested(_ctx, telemetry_context=None):
+    async def resend_requested(_ctx, telemetry_context=None, **_kwargs):
         return {
             "purchase_signal": "none",
             "crisis_signal": "none",
@@ -679,7 +681,7 @@ def test_no_remote_reconciliation_is_triggered_after_a_simulated_ppv(
     db, _ = ppv_world
     verified: list[tuple] = []
 
-    async def bought(_ctx, telemetry_context=None):
+    async def bought(_ctx, telemetry_context=None, **_kwargs):
         return {
             "purchase_signal": "bought",
             "crisis_signal": "none",
@@ -1030,7 +1032,7 @@ def test_degraded_analysis_outranks_every_other_outcome(world, spy, monkeypatch)
     the generic no-send."""
     db, calls = world
 
-    async def degraded(_ctx, telemetry_context=None):
+    async def degraded(_ctx, telemetry_context=None, **_kwargs):
         return {"analysis_degraded": True, "degraded_reason": "provider_down"}
 
     monkeypatch.setattr(suggestions, "analyze_situation", degraded)
