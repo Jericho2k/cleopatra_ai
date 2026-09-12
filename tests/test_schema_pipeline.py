@@ -298,3 +298,215 @@ def test_the_mirror_identity_is_unique_per_target_and_source(pipeline):
 
     assert "vault_sets_simulation_mirror_idx" in indexes
     assert "creator_vault_media_simulation_mirror_idx" in indexes
+
+
+def _json_columns(connection, schema: str, table: str) -> set[str]:
+    """Which of a table's columns are json/jsonb, so a list can be adapted."""
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            select column_name
+              from information_schema.columns
+             where table_schema = %s and table_name = %s
+               and data_type in ('json', 'jsonb')
+            """,
+            (schema, table),
+        )
+        return {row[0] for row in cursor.fetchall()}
+
+
+def test_live_media_still_requires_a_platform_identity(pipeline):
+    """The half of the constraint that must not be weakened.
+
+    fansly_media_id is the platform's record that a real media item exists.
+    /vault-media-urls resolves thumbnails by it, the operator PPV composer
+    identifies sendable media by it, and set generation reads it. A live row
+    without one is meaningless, so relaxing the requirement for everything in
+    order to let simulation rows through would have been the wrong fix.
+    """
+    connection, name = pipeline
+
+    with connection.cursor() as cursor:
+        cursor.execute(f'set search_path to "{name}", public')
+        cursor.execute("insert into creators (id) values (gen_random_uuid()) returning id")
+        creator_id = cursor.fetchone()[0]
+
+        # The control: a live row WITH an identity inserts.
+        cursor.execute(
+            """
+            insert into creator_vault_media (creator_id, media_id, fansly_media_id)
+            values (%s, 'real-1', 'fansly-real-1')
+            """,
+            (creator_id,),
+        )
+
+        with pytest.raises(Exception) as failure:
+            cursor.execute(
+                """
+                insert into creator_vault_media (creator_id, media_id, fansly_media_id)
+                values (%s, 'real-2', null)
+                """,
+                (creator_id,),
+            )
+        assert "creator_vault_media_live_has_platform_identity" in str(failure.value)
+
+
+def test_simulation_media_may_have_no_platform_identity(pipeline):
+    """The bug this migration fixes, stated as the insert that used to fail.
+
+    A mirrored row carries a rewritten sim: media_id and NO fansly_media_id, on
+    purpose: fansly_media_id is the SOURCE creator's real Fansly id, and copying
+    it onto the simulation creator would produce a row every delivery path reads
+    as ordinary sendable inventory pointing at another account's media.
+    """
+    connection, name = pipeline
+
+    with connection.cursor() as cursor:
+        cursor.execute(f'set search_path to "{name}", public')
+        cursor.execute("insert into creators (id) values (gen_random_uuid()) returning id")
+        source_id = cursor.fetchone()[0]
+        cursor.execute("insert into creators (id) values (gen_random_uuid()) returning id")
+        target_id = cursor.fetchone()[0]
+
+        cursor.execute(
+            """
+            insert into creator_vault_media (
+                creator_id, media_id, fansly_media_id,
+                simulation_only, source_creator_id, source_media_id
+            )
+            values (%s, %s, null, true, %s, 'fansly-real-1')
+            returning media_id, fansly_media_id, simulation_only
+            """,
+            (target_id, f"sim:{str(source_id)[:8]}:fansly-real-1", source_id),
+        )
+        media_id, fansly_media_id, simulation_only = cursor.fetchone()
+
+        assert media_id.startswith("sim:")
+        assert fansly_media_id is None, "a mirrored row must hold no platform identity"
+        assert simulation_only is True
+
+
+def test_a_simulation_row_still_cannot_be_left_unmarked(pipeline):
+    """The relaxation is conditional on the flag, so the flag cannot be skipped.
+
+    Without this, "set fansly_media_id to null" would be a way to insert
+    unmarked test media that live planning would happily sell.
+    """
+    connection, name = pipeline
+
+    with connection.cursor() as cursor:
+        cursor.execute(f'set search_path to "{name}", public')
+        cursor.execute("insert into creators (id) values (gen_random_uuid()) returning id")
+        creator_id = cursor.fetchone()[0]
+
+        with pytest.raises(Exception) as failure:
+            cursor.execute(
+                """
+                insert into creator_vault_media (
+                    creator_id, media_id, fansly_media_id, simulation_only
+                )
+                values (%s, 'sim:abc:1', null, false)
+                """,
+                (creator_id,),
+            )
+        assert "creator_vault_media_live_has_platform_identity" in str(failure.value)
+
+
+def test_the_mirror_service_payload_satisfies_the_real_schema(pipeline):
+    """The test that would have caught the production failure.
+
+    Every other mirror test runs against an in-memory fake, which enforces no
+    constraints — so "the mirror works" was only ever a statement about Python.
+    Production rejected the insert on a NOT NULL the fake did not have.
+
+    This takes the row the service actually builds and puts it through the real
+    database, so the payload and the schema are checked against each other
+    rather than each being checked against an assumption.
+    """
+    from psycopg.types.json import Jsonb
+
+    from services.simulation_catalog import _mirrored_media_row, _mirrored_set_row
+
+    connection, name = pipeline
+
+    with connection.cursor() as cursor:
+        cursor.execute(f'set search_path to "{name}", public')
+        cursor.execute("insert into creators (id) values (gen_random_uuid()) returning id")
+        source_id = str(cursor.fetchone()[0])
+        cursor.execute("insert into creators (id) values (gen_random_uuid()) returning id")
+        target_id = str(cursor.fetchone()[0])
+
+        source_media = {
+            "media_id": "fansly-real-1",
+            "album_title": "Bedroom shoot",
+            "mimetype": "image/jpeg",
+            "content_category": "nude_photo",
+            "ai_description": "Soft bedroom photo.",
+            "price_min": 15,
+            "price_max": 80,
+            "scene_location": "bedroom",
+            "scene_outfit": "black lingerie",
+            "scene_lighting": "warm",
+            "scene_id": "shoot-1",
+        }
+        source_set = {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "title": "Bedroom - black lingerie",
+            "media_ids": ["fansly-real-1"],
+            "preview_media_id": "fansly-real-1",
+            "status": "approved",
+            "suggested_price": 25,
+            "base_price_cents": 2500,
+            "min_price_cents": 1500,
+            "max_price_cents": 8000,
+            "tags": ["nude_photo"],
+        }
+
+        media_row = _mirrored_media_row(
+            source_media, source_creator_id=source_id, target_creator_id=target_id
+        )
+        set_row = _mirrored_set_row(
+            source_set, source_creator_id=source_id, target_creator_id=target_id
+        )
+
+        # Exactly what the service hands PostgREST, inserted for real. JSON
+        # columns are wrapped rather than passed as Python lists: PostgREST does
+        # that encoding for the service, and psycopg does not.
+        for table, row in (("creator_vault_media", media_row), ("vault_sets", set_row)):
+            json_columns = _json_columns(connection, name, table)
+            columns = _columns(connection, name, table)
+            payload = {key: value for key, value in row.items() if key in columns}
+            assert payload, f"no mirrored column survived for {table}"
+            values = tuple(
+                Jsonb(value) if key in json_columns else value
+                for key, value in payload.items()
+            )
+            placeholders = ", ".join(["%s"] * len(payload))
+            cursor.execute(
+                f'insert into {table} ({", ".join(payload)}) values ({placeholders})',
+                values,
+            )
+
+        # And the safety contract still holds on the rows the database now holds.
+        cursor.execute(
+            """
+            select media_id, fansly_media_id, url, simulation_only, source_media_id
+              from creator_vault_media where creator_id = %s
+            """,
+            (target_id,),
+        )
+        media_id, fansly_media_id, url, simulation_only, source_media_id = cursor.fetchone()
+        assert media_id.startswith("sim:")
+        assert fansly_media_id is None, "the source's platform identity must not travel"
+        assert url is None, "no live location may travel with a mirrored row"
+        assert simulation_only is True
+        # Provenance survives, which is what the owner-only preview resolves through.
+        assert source_media_id == "fansly-real-1"
+
+        cursor.execute(
+            "select media_ids, simulation_only from vault_sets where creator_id = %s",
+            (target_id,),
+        )
+        media_ids, set_simulation_only = cursor.fetchone()
+        assert set_simulation_only is True
+        assert all(value.startswith("sim:") for value in media_ids)

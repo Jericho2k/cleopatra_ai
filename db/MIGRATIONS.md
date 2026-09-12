@@ -353,3 +353,68 @@ yet.
 `fans.ai_stack_profile` is read **only** for fans whose `platform_fan_id` starts
 with `test_`. A value on a real fan row has no effect, because the read path
 re-checks the prefix rather than trusting the column.
+
+## Applying `simulation_media_identity_v1.sql` (mirrored media has no platform id)
+
+Fixes a production failure in Simulation Catalog mirroring:
+
+```
+null value in column "fansly_media_id" of relation "creator_vault_media"
+violates not-null constraint
+```
+
+A mirrored media row carries a rewritten `sim:` media id and **no**
+`fansly_media_id`, deliberately: `fansly_media_id` is the SOURCE creator's real
+Fansly media id, and copying it onto the simulation creator would produce a row
+every delivery path reads as ordinary sendable inventory pointing at another
+account's media. Production's `NOT NULL` therefore made mirrored media
+impossible to insert at all.
+
+The requirement becomes conditional rather than being dropped:
+
+```
+simulation_only = true  OR  fansly_media_id IS NOT NULL
+```
+
+Live media still requires a platform identity; simulation media still must not
+have one.
+
+Requires `simulation_catalog_v1.sql` (which adds `simulation_only`) to have been
+applied first.
+
+```bash
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/simulation_media_identity_v1.sql
+```
+
+Verify:
+
+```sql
+select is_nullable
+  from information_schema.columns
+ where table_schema = 'public'
+   and table_name = 'creator_vault_media'
+   and column_name = 'fansly_media_id';
+-- expect: YES
+
+select conname, convalidated
+  from pg_constraint
+ where conname = 'creator_vault_media_live_has_platform_identity';
+-- expect: one row
+```
+
+`NOT VALID` skips re-checking existing rows; it does **not** skip enforcement on
+new writes, so the invariant holds from the moment the migration runs. Validate
+whenever convenient:
+
+```sql
+alter table public.creator_vault_media
+  validate constraint creator_vault_media_live_has_platform_identity;
+```
+
+### Why CI did not catch this
+
+`db/ci_baseline_schema.sql` declared `fansly_media_id text null` while production
+declared it `NOT NULL`. The fixture was more permissive than production, so the
+mirror's deliberate `NULL` passed CI and failed live. The fixture now matches
+production, and the relaxation lives in this migration — so the schema-pipeline
+test exercises the real sequence rather than a schema that never existed.

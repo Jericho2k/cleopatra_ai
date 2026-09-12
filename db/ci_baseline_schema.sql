@@ -211,7 +211,14 @@ create table public.creator_vault_media (
     -- reads these; SEC-001 deliberately does NOT grant UPDATE on url or
     -- fansly_media_id, because editing them locally would desynchronise the
     -- mirror without changing anything on Fansly.
-    fansly_media_id text null,
+    --
+    -- NOT NULL, matching production. This fixture said "null" while production
+    -- said NOT NULL, and that divergence is exactly how the simulation mirror
+    -- came to fail live while passing CI: the mirror inserts NULL here on
+    -- purpose, and only production rejected it. The relaxation now belongs to
+    -- db/simulation_media_identity_v1.sql, which replaces this NOT NULL with a
+    -- conditional CHECK — so the pipeline test exercises the real sequence.
+    fansly_media_id text not null,
     url text null,
     mimetype text null,
     -- The classifier's output, which an operator MAY correct from the preview

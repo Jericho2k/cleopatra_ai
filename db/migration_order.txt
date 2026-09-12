@@ -59,6 +59,10 @@ simulation_catalog_v1.sql
 # fans.ai_stack_profile overrides. Additive; NULL everywhere reproduces the
 # pre-migration behaviour. Must precede tenant_isolation_v1.
 ai_stack_profile_v1.sql
+# Lets a mirrored simulation media row exist with fansly_media_id NULL, while a
+# CHECK keeps that identity mandatory for every live row. Must run AFTER
+# simulation_catalog_v1.sql, whose simulation_only column the check references.
+simulation_media_identity_v1.sql
 
 # Always last, and always as a PAIR, in this order.
 #
