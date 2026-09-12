@@ -164,6 +164,25 @@ def spy():
 
 
 @pytest.fixture
+def two_bubble_turn(monkeypatch):
+    """Pin this turn's bubble count so multipart delivery can be asserted.
+
+    Full Auto now chooses the bubble count deterministically per turn
+    (services/message_shape.py), and most turns are one bubble by design. These
+    tests are about how a multipart reply is ordered, persisted and delivered,
+    not about how often one occurs, so the shape is fixed here and the
+    distribution is covered by tests/test_commercial_realism.py.
+    """
+    from services.message_shape import MessageShape
+
+    monkeypatch.setattr(
+        suggestions,
+        "choose_message_shape",
+        lambda **kwargs: MessageShape(target_bubbles=2, reason="pinned_by_test"),
+    )
+
+
+@pytest.fixture
 def world(monkeypatch):
     """A creator, a test fan, and two fan messages already in SQL history."""
     db = FakeDB(
@@ -444,7 +463,7 @@ def test_analyzer_fail_closed_behaviour_is_preserved(world, spy, monkeypatch):
 # --- 24, 25: local persistence and multipart order --------------------------
 
 
-def test_generated_creator_message_is_persisted_locally(world, spy):
+def test_generated_creator_message_is_persisted_locally(world, spy, two_bubble_turn):
     db, _ = world
     result = _run(
         suggestions.run_simulated_inbound(
@@ -455,7 +474,7 @@ def test_generated_creator_message_is_persisted_locally(world, spy):
     assert [r["content"] for r in _creator_rows(db)] == ["hey", "what are you doing?"]
 
 
-def test_multipart_order_is_preserved(world, spy):
+def test_multipart_order_is_preserved(world, spy, two_bubble_turn):
     db, _ = world
     result = _run(
         suggestions.run_simulated_inbound(
@@ -542,7 +561,7 @@ def test_missing_group_binding_does_not_trigger_a_chat_listing(world, spy, monke
     assert spy.requests == []
 
 
-def test_resend_request_does_not_send_a_real_ppv(world, spy, monkeypatch):
+def test_resend_request_does_not_send_a_real_ppv(world, spy, monkeypatch, two_bubble_turn):
     """The resend branch returns before the delivery block, so without its own
     guard a test fan could send a REAL PPV through the platform."""
     monkeypatch.setenv("APIFANSLY_ENABLED", "true")
@@ -755,7 +774,7 @@ async def _append(bucket, value):
 # --- 31: real-fan Auto behaviour is unchanged when the connector is on ------
 
 
-def test_real_fan_auto_still_delivers_through_the_platform(world, spy, monkeypatch):
+def test_real_fan_auto_still_delivers_through_the_platform(world, spy, monkeypatch, two_bubble_turn):
     """The simulation changes must not turn a real fan's Auto reply local."""
     monkeypatch.setenv("APIFANSLY_ENABLED", "true")
     db, calls = world
@@ -1028,7 +1047,7 @@ def test_degraded_analysis_outranks_every_other_outcome(world, spy, monkeypatch)
     assert result["analysis_degraded"] is True
 
 
-def test_a_successful_turn_reports_replied(world, spy):
+def test_a_successful_turn_reports_replied(world, spy, two_bubble_turn):
     result = _run(
         suggestions.run_simulated_inbound(
             fan_id="fan-test", creator_id="creator-1", message="hi", fast=True

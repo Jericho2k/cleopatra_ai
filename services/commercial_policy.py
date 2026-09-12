@@ -346,9 +346,14 @@ def decide_next_action(
         if ctx.session_cooldown_active:
             return CommercialDecision(
                 action=ActionType.CONTINUE_NORMAL_CHAT,
-                goal="continue the fantasy briefly between purchased PPV steps; no new media yet",
+                goal=(
+                    "react to the exact piece he just unlocked, keep the scene alive, "
+                    "and bridge toward the next planned step of this session without "
+                    "sending media, naming a price, or asking whether he wants more"
+                ),
                 must_not_send_media=True,
                 may_be_explicit=True,
+                must_not_ask_question=True,
                 reason="post-purchase cooldown",
             )
         if not ctx.session_has_remaining_steps:

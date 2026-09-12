@@ -32,7 +32,11 @@ from db.commercial_queries import (
 )
 from services.session_planner import plan_session_for_fan
 from core.action_telemetry import record_stage, stage as action_stage
-from services.human_delivery import build_availability_delay, build_delivery_schedule
+from services.human_delivery import (
+    build_availability_delay,
+    build_delivery_schedule,
+    visible_text,
+)
 from services.ppv_delivery import create_ppv_approval_request
 from services.db_reliability import retry_transient_db_operation
 from core.apifansly_gate import apifansly_enabled, simulation_scope
@@ -72,6 +76,12 @@ from services.session_lifecycle import (
     mark_step_declined,
     mark_step_purchased,
 )
+from services.message_shape import (
+    apply_message_shape,
+    choose_message_shape,
+    recent_bubble_counts,
+)
+from services.ppv_language import sanitize_candidates, sanitize_delivery_language
 from ai.situation_analyzer import (
     analyze_situation,
     analysis_is_degraded,
@@ -466,6 +476,10 @@ async def get_suggestions(
         target_override=route.primary_target,
         fallback_target_override=route.fallback_target,
     )
+
+    # Assisted candidates keep their own natural shapes — a human picks one —
+    # but the platform's delivery semantics still hold for all of them.
+    replies = sanitize_candidates(replies, active_session=active_session)
 
     if save_fan_message:
         evidence_message_id = await save_message(
@@ -1168,6 +1182,31 @@ async def _debounced_auto_reply(
         )
         situation["session_strategy"] = session_strategy
 
+        # Message shape is decided here, not by the writer. Full Auto sends
+        # option 1 verbatim, so whatever rhythm the model settles into becomes
+        # the creator's whole texting personality unless something outside the
+        # model varies it.
+        creator_turn_shapes = recent_bubble_counts(conversation_history)
+
+        def _shape(**extra):
+            return choose_message_shape(
+                fan_id=fan_id,
+                recent_counts=creator_turn_shapes,
+                turn_key=latest_message,
+                max_messages=getattr(decision, "max_messages", None),
+                is_ppv_delivery=bool(
+                    getattr(decision, "action", None)
+                    in {ActionType.CREATE_PAID_SESSION, ActionType.SEND_NEXT_PPV_STEP}
+                ),
+                **extra,
+            )
+
+        message_shape = _shape()
+        print(
+            f"[MESSAGE SHAPE] fan={fan_id} target={message_shape.target_bubbles} "
+            f"reason={message_shape.reason} recent={creator_turn_shapes}"
+        )
+
         ctx = ConversationContext(
             fan_message=latest_message,
             conversation_history=conversation_history,
@@ -1187,6 +1226,7 @@ async def _debounced_auto_reply(
             price_learning=price_learning,
             session_strategy=session_strategy,
             conversation_director=conversation_director,
+            message_shape=message_shape.to_context(),
         )
 
         route = select_writer_route(ctx)
@@ -1233,6 +1273,25 @@ async def _debounced_auto_reply(
             return
 
         reply = replies[0]
+
+        # Platform semantics are an invariant, not a prompt preference: paid
+        # media is attached in chat and there is no link to offer. Scoped to
+        # commercial turns so ordinary talk about links is untouched.
+        decision_action = getattr(getattr(decision, "action", None), "value", None)
+        reply, link_repaired = sanitize_delivery_language(
+            reply,
+            decision_action=decision_action,
+            active_session=active_session,
+        )
+        if link_repaired:
+            print(f"[PPV LANGUAGE] repaired delivery-link phrasing fan={fan_id}")
+
+        # Re-resolve the shape now that the copy exists: a reply that turned out
+        # to be one short thought is never worth two bubbles.
+        final_shape = _shape(
+            writer_word_count=len(visible_text(reply).replace("|", " ").split())
+        )
+        reply = apply_message_shape(reply, final_shape.target_bubbles)
 
         # Final check — abort if a new message arrived while we were generating
         current_task = _pending_auto_replies.get(fan_id)

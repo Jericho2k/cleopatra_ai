@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Any
 
 from core.supabase import get_supabase
@@ -31,11 +32,42 @@ def environment_price_learning_policy() -> PriceLearningPolicy:
         range_width_bps=max(0, _env_int("PRICE_LEARNING_RANGE_WIDTH_BPS", 2_000)),
         price_step_cents=max(1, _env_int("PRICE_LEARNING_PRICE_STEP_CENTS", 500)),
         evidence_lookback_days=max(1, _env_int("PRICE_LEARNING_LOOKBACK_DAYS", 365)),
+        cold_start_probe_bps=min(
+            10_000, max(0, _env_int("PRICE_LEARNING_COLD_START_PROBE_BPS", 2_500))
+        ),
+        effortless_purchase_streak=max(
+            1, _env_int("PRICE_LEARNING_EFFORTLESS_PURCHASE_STREAK", 2)
+        ),
+        customer_price_step_cents=max(
+            1, _env_int("PRICE_LEARNING_CUSTOMER_PRICE_STEP_CENTS", 500)
+        ),
     )
+
+
+# Scoped pricing settings change when an operator edits them, not per message,
+# but every inbound message now needs them to price an offer. A short in-process
+# TTL keeps that from adding two Supabase round trips to every turn.
+_POLICY_CACHE_TTL_SECONDS = max(
+    0, _env_int("PRICE_LEARNING_POLICY_CACHE_SECONDS", 60)
+)
+_policy_cache: dict[str, tuple[float, PriceLearningPolicy]] = {}
+
+
+def clear_price_learning_policy_cache(creator_id: str | None = None) -> None:
+    """Drop cached scoped settings after an operator writes new ones."""
+    if creator_id is None:
+        _policy_cache.clear()
+    else:
+        _policy_cache.pop(str(creator_id), None)
 
 
 async def get_effective_price_learning_policy(creator_id: str) -> PriceLearningPolicy:
     """Resolve environment fallback, then agency defaults, then creator overrides."""
+
+    cache_key = str(creator_id)
+    cached = _policy_cache.get(cache_key)
+    if cached and (time.monotonic() - cached[0]) < _POLICY_CACHE_TTL_SECONDS:
+        return cached[1]
 
     base = environment_price_learning_policy().model_dump()
 
@@ -75,16 +107,22 @@ async def get_effective_price_learning_policy(creator_id: str) -> PriceLearningP
         agency_settings, creator_settings = await asyncio.to_thread(_get)
     except Exception as exc:
         print(f"[PRICING POLICY] scoped read failed creator={creator_id}: {exc}")
-        return PriceLearningPolicy.model_validate(base)
+        return _remember(cache_key, PriceLearningPolicy.model_validate(base))
 
     effective = dict(base)
     effective.update(_clean(agency_settings))
     effective.update(_clean(creator_settings))
     try:
-        return PriceLearningPolicy.model_validate(effective)
+        return _remember(cache_key, PriceLearningPolicy.model_validate(effective))
     except Exception as exc:
         print(f"[PRICING POLICY] invalid scoped settings creator={creator_id}: {exc}")
-        return PriceLearningPolicy.model_validate(base)
+        return _remember(cache_key, PriceLearningPolicy.model_validate(base))
+
+
+def _remember(cache_key: str, policy: PriceLearningPolicy) -> PriceLearningPolicy:
+    if _POLICY_CACHE_TTL_SECONDS > 0:
+        _policy_cache[cache_key] = (time.monotonic(), policy)
+    return policy
 
 
 def _clean(settings: Any) -> dict[str, Any]:

@@ -222,6 +222,9 @@ async def get_offerable_packages(
         return available, preferred_tags
 
     rows, preferred_tags = await asyncio.to_thread(_get)
+    from db.pricing_policy_queries import get_effective_price_learning_policy
+
+    pricing_policy = await get_effective_price_learning_policy(creator_id)
     return build_offer_packages(
         rows,
         policy,
@@ -229,6 +232,7 @@ async def get_offerable_packages(
         price_learning=price_learning,
         desired_experience=desired_experience,
         hard_ceiling_cents=hard_ceiling_cents,
+        pricing_policy=pricing_policy,
     )
 
 

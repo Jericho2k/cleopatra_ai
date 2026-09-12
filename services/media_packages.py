@@ -6,11 +6,20 @@ from collections import defaultdict
 from typing import Any, Iterable
 
 from models.commercial import CreatorPolicy, PackageOption
+from models.content_pricing import DEFAULT_PRICE_STEP_CENTS
+from models.price_learning import PriceLearningPolicy, probe_price_cents
 from models.vault_pricing import (
-    approved_target_from_learning,
+    allocate_step_prices,
     cents_from_row,
-    resolve_sequence_price,
+    sequence_bounds,
 )
+
+VIDEO_REQUEST_RE = re.compile(r"\b(video|videos|vid|vids|clip|clips|movie)\b", re.IGNORECASE)
+
+# How much further into an approved content range a premium package probes than
+# an opener does. Expressed in basis points on top of the policy cold-start
+# position, so an agency retunes both from one dial.
+PREMIUM_PROBE_BONUS_BPS = 2_500
 
 
 def normalize_text(value: Any) -> str:
@@ -193,8 +202,13 @@ def choose_sequence(
             # contiguous window avoids stitching unrelated sub-shoots together.
             for start in range(0, len(group) - count + 1):
                 sequence = group[start : start + count]
-                resolved_price = resolve_sequence_price(sequence, effective_target)
-                if ceiling is not None and resolved_price > ceiling:
+                _, sequence_floor, sequence_ceiling = sequence_bounds(sequence)
+                if sequence_ceiling <= 0:
+                    # No approved paid value on this content at all.
+                    continue
+                if ceiling is not None and sequence_floor > ceiling:
+                    # Its cheapest approved price already breaks his stated
+                    # limit. Discounting below approved value is not an option.
                     continue
 
                 raw_total = sum(price_cents(row) for row in sequence)
@@ -223,51 +237,173 @@ def choose_sequence(
     return best[1] if best else []
 
 
-def allocate_budget(total_cents: int, rows: list[dict[str, Any]]) -> list[int]:
-    if not rows:
-        return []
-    total = max(len(rows), int(total_cents))
-    # Later/more explicit steps get more weight while preserving exact total.
-    base_weights = []
-    for index, row in enumerate(rows):
-        raw = price_cents(row)
-        escalation = 1.0 + (index * 0.35)
-        base_weights.append(max(1.0, raw / 100.0) * escalation)
-    weight_total = sum(base_weights)
-    allocations = [max(1, int(total * weight / weight_total)) for weight in base_weights]
-    delta = total - sum(allocations)
-    allocations[-1] += delta
-    # Guard against a negative final adjustment with very tiny budgets.
-    for index in range(len(allocations) - 1, -1, -1):
-        if allocations[index] <= 0:
-            needed = 1 - allocations[index]
-            allocations[index] = 1
-            for donor in range(len(allocations)):
-                if donor != index and allocations[donor] > needed:
-                    allocations[donor] -= needed
-                    break
-    return allocations
+def is_video_row(row: dict[str, Any]) -> bool:
+    tags = {str(tag).strip().lower() for tag in (row.get("tags") or [])}
+    if "individual_video" in tags:
+        return True
+    return str(row.get("asset_type") or "").lower() == "video"
+
+
+def split_media_types(
+    rows: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate lower-friction photo content from individual video assets."""
+    photos: list[dict[str, Any]] = []
+    videos: list[dict[str, Any]] = []
+    for row in rows:
+        (videos if is_video_row(row) else photos).append(row)
+    return photos, videos
+
+
+def wants_video(desired_experience: str | None) -> bool:
+    """True when the fan explicitly asked for video, not merely 'content'."""
+    return bool(VIDEO_REQUEST_RE.search(str(desired_experience or "")))
+
+
+def order_steps_for_progression(
+    sequence: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Order one package so it escalates: softer photos first, video last.
+
+    Explicitness still leads. Media type is the tiebreak, because a photo set is
+    the lower-friction way into a scene and a clip is the natural payoff.
+    """
+    return sorted(
+        sequence,
+        key=lambda row: (
+            explicitness(row),
+            1 if is_video_row(row) else 0,
+            price_cents(row),
+            str(row.get("id")),
+        ),
+    )
+
+
+def choose_video_finale(
+    sequence: list[dict[str, Any]],
+    videos: list[dict[str, Any]],
+    *,
+    desired_experience: str | None = None,
+    preferred_tags: list[str] | None = None,
+    excluded_set_ids: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Pick the video that best continues an already-chosen photo progression.
+
+    Scene continuity outranks raw explicitness: one coherent experience that
+    ends on a clip beats a stronger but unrelated clip bolted onto the end.
+    """
+    excluded = excluded_set_ids or set()
+    pool = [row for row in videos if str(row.get("id")) not in excluded]
+    if not sequence or not pool:
+        return None
+
+    scene_tokens = {token for row in sequence for token in row_experience_tokens(row)}
+    preferred = {normalize_text(tag) for tag in (preferred_tags or []) if normalize_text(tag)}
+    desired = experience_tokens(desired_experience)
+    peak = max(explicitness(row) for row in sequence)
+
+    best: tuple[tuple[float, float, int, str], dict[str, Any]] | None = None
+    for row in pool:
+        tokens = row_experience_tokens(row)
+        continuity = len(scene_tokens & tokens)
+        intent = len(desired & tokens) if desired else 0
+        preference = len(preferred & {normalize_text(tag) for tag in (row.get("tags") or [])})
+        score = (
+            continuity * 4.0
+            + intent * 3.0
+            + preference * 2.0
+            + (1.5 if explicitness(row) >= peak else 0.0)
+        )
+        key = (score, explicitness(row), price_cents(row), str(row.get("id")))
+        if best is None or key > best[0]:
+            best = (key, row)
+    return best[1] if best else None
+
+
+def allocate_step_pricing(
+    total_cents: int,
+    rows: list[dict[str, Any]],
+    *,
+    step_cents: int = DEFAULT_PRICE_STEP_CENTS,
+) -> list[int] | None:
+    """Split one sold session total into human-looking per-step PPV prices.
+
+    Returns ``None`` when no valid distribution exists. The previous weighted
+    division always produced *a* number — which is how a $25 session became a
+    $10.63 PPV followed by a $14.37 one.
+    """
+    return allocate_step_prices(total_cents, rows, step_cents=step_cents)
 
 
 def package_from_sequence(
     sequence: list[dict[str, Any]],
     *,
     label: str,
-    target_cents: int,
     package_key: str,
+    price_learning: dict[str, Any] | None = None,
+    pricing_policy: PriceLearningPolicy | None = None,
+    hard_ceiling_cents: int | None = None,
+    probe_bonus_bps: int = 0,
 ) -> PackageOption | None:
+    """Turn an approved sequence into one offer at one approved, clean price.
+
+    The price is decided in this order and no other: the content's approved
+    range, then where inside that range this fan should currently be probed,
+    then a human-looking price on the agency's grid. A package target is a
+    shape hint for choosing content, never a price.
+    """
     if not sequence:
         return None
-    set_ids = [str(row["id"]) for row in sequence]
-    legal_description = describe_sequence(sequence)
+    ordered = order_steps_for_progression(sequence)
+    _, floor_cents, ceiling_cents = sequence_bounds(ordered)
+    if ceiling_cents <= 0:
+        return None
+
+    policy = pricing_policy or PriceLearningPolicy()
+    if probe_bonus_bps:
+        policy = policy.model_copy(
+            update={
+                "cold_start_probe_bps": min(
+                    10_000, policy.cold_start_probe_bps + max(0, probe_bonus_bps)
+                )
+            }
+        )
+    probe = probe_price_cents(
+        floor_cents,
+        ceiling_cents,
+        price_learning=price_learning,
+        policy=policy,
+        hard_ceiling_cents=hard_ceiling_cents,
+    )
+    if probe is None or probe.price_cents <= 0:
+        return None
+
+    # An offer is only presentable if it can actually be delivered as planned
+    # steps. Discovering that after he has said yes is how a $25 offer turns
+    # into two fractional PPVs.
+    if allocate_step_pricing(
+        probe.price_cents,
+        ordered,
+        step_cents=policy.customer_price_step_cents,
+    ) is None:
+        return None
+
+    set_ids = [str(row["id"]) for row in ordered]
+    legal_description = describe_sequence(ordered)
     return PackageOption(
         package_id=f"package:{package_key}:{'-'.join(set_ids)}",
         label=label,
-        price_cents=resolve_sequence_price(sequence, int(target_cents)),
+        price_cents=probe.price_cents,
         set_id=set_ids[0],
         set_ids=set_ids,
         experience=legal_description,
         legal_description=legal_description,
+        step_count=len(ordered),
+        media_count=sum(len(row.get("media_ids") or []) for row in ordered),
+        asset_types=[("video" if is_video_row(row) else "photo_set") for row in ordered],
+        content_floor_cents=floor_cents,
+        content_ceiling_cents=ceiling_cents,
+        price_reason_codes=list(probe.reason_codes),
     )
 
 
@@ -279,73 +415,42 @@ def build_offer_packages(
     price_learning: dict[str, Any] | None = None,
     desired_experience: str | None = None,
     hard_ceiling_cents: int | None = None,
+    pricing_policy: PriceLearningPolicy | None = None,
 ) -> list[PackageOption]:
+    """Build up to two approved offers, photo-first unless told otherwise.
+
+    Commercial progression, not a media-type rule: a photo tease is the
+    lower-friction way into a paid session, so a generic offer opens on photos
+    and escalates into video. An explicit request for video, or a vault with
+    nothing else in it, overrides that immediately.
+    """
     if not rows:
         return []
 
-    individual_videos = [
-        row for row in rows if "individual_video" in (row.get("tags") or [])
-    ]
-    standard_rows = [
-        row for row in rows if "individual_video" not in (row.get("tags") or [])
-    ]
-    wants_video = bool(
-        re.search(
-            r"\b(video|videos|vid|clip|clips)\b",
-            str(desired_experience or ""),
-            re.IGNORECASE,
+    pricing_policy = pricing_policy or PriceLearningPolicy()
+    photo_rows, video_rows = split_media_types(rows)
+    fan_asked_for_video = wants_video(desired_experience)
+
+    if fan_asked_for_video or (video_rows and not photo_rows):
+        video_packages = _build_video_packages(
+            video_rows,
+            policy,
+            preferred_tags=preferred_tags,
+            price_learning=price_learning,
+            desired_experience=desired_experience,
+            hard_ceiling_cents=hard_ceiling_cents,
+            pricing_policy=pricing_policy,
         )
-    )
-    if wants_video or (individual_videos and not standard_rows):
-        video_packages: list[PackageOption] = []
-        excluded_video_ids: set[str] = set()
-        for key, label, target, use_ceiling in (
-            ("video-quick", "private video", policy.quick_package_target_cents, False),
-            ("video-premium", "premium private video", policy.full_package_target_cents, True),
-        ):
-            target = approved_target_from_learning(
-                price_learning,
-                fallback_cents=target,
-                use_ceiling=use_ceiling,
-            )
-            if hard_ceiling_cents:
-                target = min(target, int(hard_ceiling_cents))
-            sequence = choose_sequence(
-                individual_videos,
-                target_cents=target,
-                min_steps=1,
-                max_steps=1,
-                preferred_tags=preferred_tags,
-                excluded_set_ids=excluded_video_ids,
-                desired_experience=desired_experience,
-                hard_ceiling_cents=hard_ceiling_cents,
-            )
-            package = package_from_sequence(
-                sequence,
-                label=label,
-                target_cents=target,
-                package_key=key,
-            )
-            if package:
-                video_packages.append(package)
-                excluded_video_ids.update(package.set_ids)
-            if not policy.offer_two_packages:
-                break
         if video_packages:
-            return sorted(video_packages, key=lambda package: package.price_cents)
+            return video_packages
 
-    rows = standard_rows
-    if not rows:
+    sequence_rows = photo_rows or rows
+    if not sequence_rows:
         return []
 
-    quick_target_cents = approved_target_from_learning(
-        price_learning, fallback_cents=policy.quick_package_target_cents
-    )
-    if hard_ceiling_cents:
-        quick_target_cents = min(quick_target_cents, int(hard_ceiling_cents))
     quick_sequence = choose_sequence(
-        rows,
-        target_cents=quick_target_cents,
+        sequence_rows,
+        target_cents=policy.quick_package_target_cents,
         min_steps=policy.session_min_steps,
         max_steps=min(policy.session_max_steps, 3),
         preferred_tags=preferred_tags,
@@ -355,37 +460,113 @@ def build_offer_packages(
     quick = package_from_sequence(
         quick_sequence,
         label="quick private session",
-        target_cents=quick_target_cents,
         package_key="quick",
+        price_learning=price_learning,
+        pricing_policy=pricing_policy,
+        hard_ceiling_cents=hard_ceiling_cents,
     )
     packages = [quick] if quick else []
 
     if policy.offer_two_packages:
         # Reuse of the first step is allowed only if there is not enough coherent
         # media. Prefer a larger progression for the premium package.
-        full_target_cents = approved_target_from_learning(
-            price_learning,
-            fallback_cents=policy.full_package_target_cents,
-            use_ceiling=True,
-        )
-        if hard_ceiling_cents:
-            full_target_cents = min(full_target_cents, int(hard_ceiling_cents))
         full_sequence = choose_sequence(
-            rows,
-            target_cents=full_target_cents,
+            sequence_rows,
+            target_cents=policy.full_package_target_cents,
             min_steps=max(policy.session_min_steps, len(quick_sequence) + 1),
             max_steps=policy.session_max_steps,
             preferred_tags=preferred_tags,
             desired_experience=desired_experience,
             hard_ceiling_cents=hard_ceiling_cents,
         )
+        full_sequence = _with_video_finale(
+            full_sequence,
+            video_rows,
+            policy,
+            preferred_tags=preferred_tags,
+            desired_experience=desired_experience,
+        )
         full = package_from_sequence(
             full_sequence,
             label="full private session",
-            target_cents=full_target_cents,
             package_key="full",
+            price_learning=price_learning,
+            pricing_policy=pricing_policy,
+            hard_ceiling_cents=hard_ceiling_cents,
+            probe_bonus_bps=PREMIUM_PROBE_BONUS_BPS,
         )
         if full and (not quick or full.set_ids != quick.set_ids):
             packages.append(full)
 
+    return sorted(packages, key=lambda package: package.price_cents)
+
+
+def _with_video_finale(
+    sequence: list[dict[str, Any]],
+    video_rows: list[dict[str, Any]],
+    policy: CreatorPolicy,
+    *,
+    preferred_tags: list[str] | None,
+    desired_experience: str | None,
+) -> list[dict[str, Any]]:
+    """Let a premium session end on a coherent clip when there is room for one."""
+    if not sequence or not video_rows:
+        return sequence
+    if len(sequence) >= policy.session_max_steps:
+        return sequence
+    finale = choose_video_finale(
+        sequence,
+        video_rows,
+        desired_experience=desired_experience,
+        preferred_tags=preferred_tags,
+        excluded_set_ids={str(row.get("id")) for row in sequence},
+    )
+    return [*sequence, finale] if finale else sequence
+
+
+def _build_video_packages(
+    video_rows: list[dict[str, Any]],
+    policy: CreatorPolicy,
+    *,
+    preferred_tags: list[str] | None,
+    price_learning: dict[str, Any] | None,
+    desired_experience: str | None,
+    hard_ceiling_cents: int | None,
+    pricing_policy: PriceLearningPolicy,
+) -> list[PackageOption]:
+    packages: list[PackageOption] = []
+    excluded: set[str] = set()
+    for key, label, target, bonus in (
+        ("video-quick", "private video", policy.quick_package_target_cents, 0),
+        (
+            "video-premium",
+            "premium private video",
+            policy.full_package_target_cents,
+            PREMIUM_PROBE_BONUS_BPS,
+        ),
+    ):
+        sequence = choose_sequence(
+            video_rows,
+            target_cents=target,
+            min_steps=1,
+            max_steps=1,
+            preferred_tags=preferred_tags,
+            excluded_set_ids=excluded,
+            desired_experience=desired_experience,
+            hard_ceiling_cents=hard_ceiling_cents,
+        )
+        package = package_from_sequence(
+            sequence,
+            label=label,
+            package_key=key,
+            price_learning=price_learning,
+            pricing_policy=pricing_policy,
+            hard_ceiling_cents=hard_ceiling_cents,
+            probe_bonus_bps=bonus,
+        )
+        if package:
+            packages.append(package)
+            excluded.update(package.set_ids)
+        if not policy.offer_two_packages:
+            break
     return sorted(packages, key=lambda package: package.price_cents)

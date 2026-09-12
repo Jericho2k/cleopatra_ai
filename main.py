@@ -56,6 +56,7 @@ from db.queries import (
 )
 from db.commercial_queries import schedule_action
 from models.commercial import CreatorPolicy
+from models.content_pricing import VAULT_CATEGORIES as CONTENT_CATEGORY_RANGES
 from models.schemas import (
     ConversationContext,
     Fan,
@@ -3333,26 +3334,9 @@ async def _categorize_single_item_and_save(item: dict) -> None:
         print(f"[UPLOAD CATEGORIZE ERROR] {e}")
 
 
-VAULT_CATEGORIES = {
-    "teaser_clothed":   {"min": 0,   "max": 0,   "label": "Clothed teaser (free)"},
-    "teaser_bundle":    {"min": 0,   "max": 0,   "label": "Teaser bundle no nudity (free)"},
-    "legs_feet":        {"min": 15,  "max": 70,  "label": "Legs / feet / armpits"},
-    "lingerie_photo":   {"min": 10,  "max": 80,  "label": "Lingerie photo"},
-    "lingerie_video":   {"min": 15,  "max": 90,  "label": "Lingerie video"},
-    "nude_photo":       {"min": 15,  "max": 80,  "label": "Nude photo"},
-    "nude_video":       {"min": 20,  "max": 110, "label": "Nude video"},
-    "striptease_video": {"min": 15,  "max": 100, "label": "Striptease video"},
-    "closeup_photo":    {"min": 25,  "max": 130, "label": "Closeup photo"},
-    "closeup_video":    {"min": 25,  "max": 130, "label": "Closeup video"},
-    "dictate_video":    {"min": 15,  "max": 50,  "label": "Dictate / dirty talk video"},
-    "solo_toy_video":   {"min": 30,  "max": 150, "label": "Solo / toy / orgasm video"},
-    "solo_toy_photo":   {"min": 20,  "max": 80,  "label": "Solo / toy photo"},
-    "explicit_photo":   {"min": 25,  "max": 130, "label": "Explicit solo photo"},
-    "explicit_video":   {"min": 35,  "max": 170, "label": "Explicit solo video"},
-    "bg_content":       {"min": 50,  "max": 300, "label": "BG (boy-girl) content"},
-    "task":             {"min": 10,  "max": 50,  "label": "Task / custom request"},
-    "other":            {"min": 0,   "max": 0,   "label": "Other / unclear"},
-}
+# The approved commercial range per category lives in models/content_pricing.py,
+# so package pricing and the classifier cannot drift apart.
+VAULT_CATEGORIES = CONTENT_CATEGORY_RANGES
 
 class VaultVisualAccessError(RuntimeError):
     """The classifier could not obtain a usable visual for a vault item."""

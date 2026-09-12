@@ -122,6 +122,8 @@ class ConversationContext(BaseModel):
     price_learning: dict = Field(default_factory=dict)
     session_strategy: dict = Field(default_factory=dict)
     conversation_director: dict = Field(default_factory=dict)
+    # Deterministic bubble-count target for this turn (services/message_shape.py).
+    message_shape: dict = Field(default_factory=dict)
 
 
 class SuggestionRequest(BaseModel):
