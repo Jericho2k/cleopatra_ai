@@ -610,3 +610,126 @@ def test_an_empty_request_costs_nothing(db):
     assert run(
         resolve_simulation_media_previews(creator_id=TARGET, media_ids=[])
     ) == {}
+
+
+# ---------------------------------------------------------------------------
+# 9. Owner-only mirror SOURCE discovery
+# ---------------------------------------------------------------------------
+#
+# The source of a mirror is normally an AGENCY-OWNED creator that the platform
+# owner is deliberately not assigned to. Discovering it therefore cannot go
+# through the tenancy-scoped simulator creator list, and reading its vault
+# metadata must not turn into ordinary access to that agency's creator.
+
+
+def source_world() -> FakeSupabase:
+    """The two-tenant shape this feature exists for: Eliz (agency-owned, real
+    vault) and Sophia (the owner's simulation creator)."""
+    fake = world()
+    fake.tables["creators"] = [
+        {"id": SOURCE, "platform_username": "eliz"},
+        {"id": TARGET, "platform_username": "sophia"},
+        {"id": "empty-creator", "platform_username": "newly-connected"},
+    ]
+    return fake
+
+
+@pytest.fixture
+def sources(monkeypatch):
+    fake = source_world()
+    monkeypatch.setattr("core.supabase.get_supabase", lambda: fake)
+    monkeypatch.setattr("services.simulation_catalog.get_supabase", lambda: fake)
+    reset_missing_column_warning()
+    return fake
+
+
+def test_an_agency_owned_creator_is_listed_as_a_mirror_source(sources):
+    from services.simulation_catalog import list_mirror_source_creators
+
+    listed = {row.creator_id: row for row in run(list_mirror_source_creators())}
+
+    assert SOURCE in listed, "the agency-owned creator must be offerable as a source"
+    assert listed[SOURCE].name == "eliz"
+    assert listed[SOURCE].approved_sets == 2
+    assert listed[SOURCE].media_items == 2
+    assert listed[SOURCE].usable is True
+
+
+def test_a_creator_with_nothing_to_mirror_says_so(sources):
+    """Mirroring an empty vault is allowed but pointless, so the picker reports
+    it rather than letting the owner find out afterwards."""
+    from services.simulation_catalog import list_mirror_source_creators
+
+    listed = {row.creator_id: row for row in run(list_mirror_source_creators())}
+
+    assert listed["empty-creator"].approved_sets == 0
+    assert listed["empty-creator"].usable is False
+
+
+def test_the_listing_counts_real_content_not_mirrored_content(sources):
+    """A creator that is itself a mirror TARGET must not advertise somebody
+    else's catalog back as if it were its own."""
+    from services.simulation_catalog import list_mirror_source_creators
+
+    run(mirror_creator_catalog(source_creator_id=SOURCE, target_creator_id=TARGET))
+    listed = {row.creator_id: row for row in run(list_mirror_source_creators())}
+
+    # TARGET now holds mirrored rows plus its own single set.
+    assert any(row.get("simulation_only") for row in sources.tables["vault_sets"])
+    assert listed[TARGET].approved_sets == 1
+    assert listed[TARGET].media_items == 0
+
+
+def test_the_listing_exposes_nothing_about_the_account_itself(sources):
+    """Being mirrorable is not a reason to leak a creator's platform identity,
+    connection state or settings across tenants."""
+    from services.simulation_catalog import list_mirror_source_creators
+
+    for row in run(list_mirror_source_creators()):
+        assert set(row.to_dict()) == {
+            "creator_id",
+            "name",
+            "approved_sets",
+            "media_items",
+            "usable",
+        }
+
+
+def test_a_cross_tenant_mirror_never_writes_to_the_source(sources):
+    """The safety property the looser source authorization leans on."""
+    before_sets, before_media = source_rows(sources)
+    before_sets = [dict(row) for row in before_sets]
+    before_media = [dict(row) for row in before_media]
+
+    run(mirror_creator_catalog(source_creator_id=SOURCE, target_creator_id=TARGET))
+    run(delete_creator_catalog_mirror(source_creator_id=SOURCE, target_creator_id=TARGET))
+
+    after_sets, after_media = source_rows(sources)
+    assert [dict(row) for row in after_sets] == before_sets
+    assert [dict(row) for row in after_media] == before_media
+
+
+def test_a_cross_tenant_mirror_still_rewrites_every_media_id(sources):
+    """The source's Fansly media ids must not become live-deliverable under the
+    target merely because the source belongs to another tenant."""
+    run(mirror_creator_catalog(source_creator_id=SOURCE, target_creator_id=TARGET))
+
+    for row in mirrored_media(sources):
+        assert row["media_id"].startswith(SIMULATION_MEDIA_PREFIX)
+        assert row["simulation_only"] is True
+        assert row.get("fansly_media_id") is None
+        assert row.get("url") is None
+    for row in mirrored_sets(sources):
+        assert row["simulation_only"] is True
+        assert all(
+            media_id.startswith(SIMULATION_MEDIA_PREFIX)
+            for media_id in row["media_ids"]
+        )
+
+
+def test_a_mistyped_source_is_reported_rather_than_mirrored_as_empty(sources):
+    from services.simulation_catalog import mirror_source_exists
+
+    assert run(mirror_source_exists(SOURCE)) is True
+    assert run(mirror_source_exists("no-such-creator")) is False
+    assert run(mirror_source_exists("")) is False
