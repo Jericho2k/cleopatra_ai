@@ -24,6 +24,7 @@ from models.commercial import ActionType, FanStatus
 from db.fan_intelligence_queries import get_fan_intelligence_context
 from db.commercial_queries import (
     cancel_action_by_dedupe_key,
+    get_approved_asset_types,
     cancel_actions_for_fan,
     get_creator_policy,
     get_fan_state,
@@ -442,11 +443,21 @@ async def get_suggestions(
     )
     situation["session_strategy"] = session_strategy
 
+    # The assisted path has no commercial decision to carry the inventory, so
+    # it reads the asset types directly. A human approves these candidates, but
+    # a candidate that promises a clip the creator does not have is still a
+    # candidate somebody can send by accident.
+    try:
+        approved_asset_types = await get_approved_asset_types(creator_id)
+    except Exception as exc:
+        print(f"[INVENTORY] asset type read failed creator={creator_id}: {exc}")
+        approved_asset_types = ()
     media_inventory = _build_turn_inventory(
         decision=None,
         active_session=active_session,
         situation=situation,
         fan_message=fan_message,
+        vault_asset_types=approved_asset_types,
     )
 
     ctx = ConversationContext(
@@ -739,6 +750,7 @@ def _build_turn_inventory(
     active_session: dict | None,
     situation: dict,
     fan_message: str,
+    vault_asset_types: tuple[str, ...] = (),
 ) -> MediaInventory:
     """Assemble the turn's authoritative media capabilities.
 
@@ -755,15 +767,23 @@ def _build_turn_inventory(
     video_requested = bool(wants_video(desired) or wants_video(fan_message))
 
     if decision is None:
+        # An active plan is the narrowest authority; otherwise the approved
+        # vault is. Only with neither is the inventory genuinely unknown, and an
+        # unknown inventory states nothing rather than guessing.
+        authorized = session_types or tuple(vault_asset_types)
         return MediaInventory(
-            authorized_asset_types=session_types,
-            available_package_asset_types=session_types,
-            vault_asset_types=session_types,
+            authorized_asset_types=authorized,
+            available_package_asset_types=authorized,
+            vault_asset_types=tuple(vault_asset_types) or session_types,
             next_step_asset_type=next_step_asset_type(active_session),
             video_requested=video_requested,
-            known=bool(session_types),
-            reason_codes=("authorized_from_active_session",)
-            if session_types
+            known=bool(authorized),
+            reason_codes=(
+                ("authorized_from_active_session",)
+                if session_types
+                else ("authorized_from_approved_vault",)
+            )
+            if authorized
             else ("inventory_unknown",),
         )
 

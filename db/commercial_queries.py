@@ -153,6 +153,37 @@ async def merge_fan_ai_summary(fan_id: str, patch: dict) -> None:
     await asyncio.to_thread(_merge)
 
 
+async def get_approved_asset_types(creator_id: str) -> tuple[str, ...]:
+    """Which media types exist in this creator's approved, sellable vault.
+
+    A deliberately tiny read — two columns, no joins — because the assisted path
+    needs the inventory statement too and must not pay for a full package build
+    to get it. Without it an assisted turn with no active session would be told
+    nothing about inventory, and "told nothing" is the state that produced a
+    promise of video from a photo-only vault in the first place.
+    """
+    from services.inventory_authority import asset_types_from_rows
+
+    def _get() -> list[dict]:
+        db = get_supabase()
+
+        def _build(apply_filter: bool):
+            query = (
+                db.table("vault_sets")
+                .select("id, tags, media_ids")
+                .eq("creator_id", creator_id)
+                .eq("status", "approved")
+            )
+            if apply_filter:
+                query = exclude_simulation_only(query)
+            return query.execute()
+
+        return run_live_catalog_query(_build, label="commercial.asset_types").data or []
+
+    rows = await asyncio.to_thread(_get)
+    return asset_types_from_rows(row for row in rows if row.get("media_ids"))
+
+
 async def get_offerable_packages(
     creator_id: str,
     fan_id: str,

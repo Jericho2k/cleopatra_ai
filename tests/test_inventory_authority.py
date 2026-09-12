@@ -407,3 +407,88 @@ def test_nothing_is_sent_when_no_candidate_survives_repair():
     )
     assert repaired is True
     assert reply is None
+
+
+# ---------------------------------------------------------------------------
+# 4. The assisted path
+# ---------------------------------------------------------------------------
+#
+# Assisted candidates are approved by a human, which is a reason to repair a bad
+# promise rather than drop the candidate — not a reason to leave the writer
+# uninformed. An operator picking "wait till you see the video" is the same
+# broken promise reaching the same fan.
+
+
+def test_the_assisted_path_states_the_approved_vault(monkeypatch):
+    from services.suggestions import _build_turn_inventory
+
+    inventory = _build_turn_inventory(
+        decision=None,
+        active_session=None,
+        situation={"desired_experience": "any videos?"},
+        fan_message="got any videos?",
+        vault_asset_types=(ASSET_PHOTO_SET,),
+    )
+
+    assert inventory.known is True
+    assert inventory.authorized_asset_types == (ASSET_PHOTO_SET,)
+    assert inventory.may_promise_video is False
+    assert inventory.video_requested_but_unavailable is True
+    assert "authorized_from_approved_vault" in inventory.reason_codes
+
+
+def test_an_active_plan_still_outranks_the_vault_in_the_assisted_path():
+    from services.suggestions import _build_turn_inventory
+
+    inventory = _build_turn_inventory(
+        decision=None,
+        active_session={
+            "status": "active",
+            "current_index": 0,
+            "plan": [{"asset_type": ASSET_PHOTO_SET, "sent": False}],
+        },
+        situation={},
+        fan_message="hey",
+        vault_asset_types=(ASSET_PHOTO_SET, ASSET_VIDEO),
+    )
+
+    assert inventory.authorized_asset_types == (ASSET_PHOTO_SET,)
+    assert inventory.may_promise_video is False
+
+
+def test_with_no_session_and_no_vault_the_inventory_is_unknown_not_empty():
+    """Unknown states nothing and enforces nothing. Claiming an empty vault on
+    a failed read would silently gag every assisted turn."""
+    from services.suggestions import _build_turn_inventory
+
+    inventory = _build_turn_inventory(
+        decision=None,
+        active_session=None,
+        situation={},
+        fan_message="hey",
+        vault_asset_types=(),
+    )
+
+    assert inventory.known is False
+    assert render_inventory_block(inventory) == ""
+    repaired, was_repaired = sanitize_media_promises(
+        "i have a video for you",
+        inventory,
+        decision_action="PRESENT_SESSION_OPTIONS",
+    )
+    assert was_repaired is False
+    assert repaired == "i have a video for you"
+
+
+def test_a_failed_asset_type_read_does_not_break_the_assisted_turn():
+    """The read is an enrichment; losing it must never lose the suggestion."""
+    source = (
+        Path(__file__).resolve().parents[1] / "services" / "suggestions.py"
+    ).read_text(encoding="utf-8")
+
+    block = source[
+        source.index("approved_asset_types = await get_approved_asset_types"):
+        source.index("media_inventory = _build_turn_inventory(\n        decision=None,")
+    ]
+    assert "except Exception" in block
+    assert "approved_asset_types = ()" in block
