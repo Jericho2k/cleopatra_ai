@@ -5,7 +5,7 @@ from db.commercial_queries import (
     cancel_actions_for_fan,
     get_creator_policy,
     get_fan_state,
-    get_offerable_packages,
+    get_offerable_packages_with_inventory,
     merge_fan_ai_summary,
     save_fan_state,
     schedule_action,
@@ -260,7 +260,7 @@ async def orchestrate(
     current_desired = str(situation.get("desired_experience") or "").strip()
     desired_experience = current_desired or str(state.desired_experience or "").strip()
     hard_ceiling_cents = _current_hard_ceiling(situation, events)
-    package_options = await get_offerable_packages(
+    package_options, vault_asset_types = await get_offerable_packages_with_inventory(
         creator_id,
         fan_id,
         policy,
@@ -295,6 +295,18 @@ async def orchestrate(
         session_cooldown_active=is_cooldown_active(session),
     )
     decision = decide_next_action(policy, state, events, ctx)
+
+    # The authoritative inventory statement travels WITH the decision, built
+    # from the rows this very call loaded. Downstream nothing has to re-derive
+    # what exists, so the writer's statement and the planner's rows cannot drift.
+    _attach_media_inventory(
+        decision,
+        active_offer_options=active_offer_options,
+        vault_asset_types=vault_asset_types,
+        session=session,
+        desired_experience=desired_experience,
+        latest_fan_message=str(situation.get("_latest_fan_message") or ""),
+    )
 
     if decision.new_status:
         state.status = decision.new_status
@@ -333,6 +345,19 @@ async def orchestrate(
             # Give the writer the exact selected snapshot entry, including its
             # approved description. Selection still does not equal purchase.
             decision.package_options = [package]
+            # Narrow the authorised inventory to the one package he chose: an
+            # offer set that contained a clip does not authorise promising one
+            # once he has picked the photo session out of it.
+            from services.inventory_authority import asset_types_from_packages
+
+            decision.authorized_asset_types = list(
+                asset_types_from_packages([package])
+            )
+            if (
+                decision.unavailable_asset_type_requested
+                in decision.authorized_asset_types
+            ):
+                decision.unavailable_asset_type_requested = None
 
         if decision.action == ActionType.CREATE_PAID_SESSION and package:
             # Selection authorizes creation of a locked PPV. It is not a paid
@@ -493,6 +518,59 @@ async def orchestrate(
         f"status={state.status.value} ({decision.reason})"
     )
     return decision
+
+
+def _attach_media_inventory(
+    decision: CommercialDecision,
+    *,
+    active_offer_options: list[PackageOption],
+    vault_asset_types: tuple[str, ...],
+    session: dict | None,
+    desired_experience: str,
+    latest_fan_message: str,
+) -> None:
+    """Record what media this decision may actually promise.
+
+    Deliberately derived here rather than in the writer layer: this is the only
+    place that has the approved rows, the offer snapshot and the active session
+    in one scope at the same instant.
+    """
+    from services.inventory_authority import (
+        ASSET_VIDEO,
+        asset_types_from_packages,
+        asset_types_from_session,
+    )
+    from services.media_packages import wants_video
+
+    session_types = asset_types_from_session(session)
+    decision_types = asset_types_from_packages(decision.package_options)
+    option_types = asset_types_from_packages(active_offer_options)
+
+    decision.vault_asset_types = list(vault_asset_types)
+    decision.authorized_asset_types = list(
+        decision_types or session_types or option_types
+    )
+    # Presenting a menu authorises promising everything on it. Committing to one
+    # package does not: from that point the contract is the contract, and the
+    # wider offer set is no longer something that may be promised.
+    offering = decision.action in {
+        ActionType.PRESENT_SESSION_OPTIONS,
+        ActionType.END_TEASER_AND_OFFER,
+        ActionType.RESUME_PREVIOUS_OFFER,
+    }
+    decision.available_package_asset_types = (
+        list(option_types) if offering else list(decision.authorized_asset_types)
+    )
+
+    promisable = set(decision.authorized_asset_types) | set(
+        decision.available_package_asset_types
+    )
+    asked_for_video = bool(
+        wants_video(desired_experience) or wants_video(latest_fan_message)
+    )
+    decision.unavailable_asset_type_requested = (
+        ASSET_VIDEO if asked_for_video and ASSET_VIDEO not in promisable else None
+    )
 
 
 def _resolve_selected_package(

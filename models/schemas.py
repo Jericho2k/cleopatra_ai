@@ -124,6 +124,9 @@ class ConversationContext(BaseModel):
     conversation_director: dict = Field(default_factory=dict)
     # Deterministic bubble-count target for this turn (services/message_shape.py).
     message_shape: dict = Field(default_factory=dict)
+    # The authoritative statement of what media actually exists for this turn
+    # (services/inventory_authority.py). The writer is told; it never infers.
+    media_inventory: dict = Field(default_factory=dict)
 
 
 class SuggestionRequest(BaseModel):

@@ -166,12 +166,34 @@ Specifically to confirm:
 | `fan_list_members` | `fan_id` | Auto Audience and list reconciliation |
 | `scheduled_actions` | `(status, execute_at)`, `dedupe_key` | The durable queue |
 
-### Before applying `message_platform_identity_v1.sql` (REL-002)
+### Applying `message_platform_identity_v1.sql` (REL-002)
 
-Run this against production first. The migration refuses to create the index if
-it finds duplicates, reports how many and which, and changes nothing — but
-knowing the answer beforehand is better than learning it from a failed
-migration.
+Production is currently logging:
+
+```
+[MESSAGE IDENTITY] unique index missing — falling back to check-then-insert.
+Apply db/message_platform_identity_v1.sql (creator=...)
+```
+
+Ingestion still works in that state, which is exactly why it must not be left
+alone: the fallback is a read followed by a non-atomic write, so two writers
+racing on one platform message (webhook redelivery, webhook racing the poller,
+two workers) can each decide the row is absent and each insert it. The unique
+index is what makes ingestion idempotent; without it, idempotency is a
+coincidence. The process also publishes `message_identity_index_missing` in
+`/health` → `degraded_reasons` once it has taken that fallback, and the
+dashboard surfaces it as a pending migration.
+
+The file is unchanged and still correct: the key is
+`(creator_id, fansly_message_id)`, partial on `fansly_message_id is not null`,
+and it is what `save_message_result` upserts against
+(`_PLATFORM_IDENTITY_CONFLICT` in `db/queries.py`). It is idempotent and safe to
+re-run.
+
+**Step 1 — duplicate diagnostic.** Run this against production first. The
+migration refuses to create the index if it finds duplicates, reports how many
+and which, and changes nothing — but knowing the answer beforehand is better
+than learning it from a failed migration.
 
 ```sql
 select creator_id, fansly_message_id, count(*) as copies,
@@ -183,7 +205,55 @@ having count(*) > 1
  order by copies desc;
 ```
 
-An empty result means the migration applies cleanly. A non-empty result is
+**Step 2 — expected clean result.** Zero rows:
+
+```
+ creator_id | fansly_message_id | copies | first_seen | last_seen
+------------+-------------------+--------+------------+-----------
+(0 rows)
+```
+
+Anything else is **production history**. Do not delete or merge it to make the
+migration pass. Investigate which ingestion path produced each pair, decide
+deliberately which row is canonical, and design an explicit cleanup; the
+migration is intentionally refusing rather than repairing.
+
+**Step 3 — apply.** Either paste the file into the Supabase SQL editor and run
+it, or from a shell with `psql`:
+
+```bash
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/message_platform_identity_v1.sql
+```
+
+`ON_ERROR_STOP=1` matters: the file's guard and its `CREATE UNIQUE INDEX` share
+one `DO` block precisely so a refusal aborts both, but a `psql` run without it
+would still continue to the second block.
+
+**Step 4 — verify.** The index exists, is unique, and is partial:
+
+```sql
+select indexname, indexdef
+  from pg_indexes
+ where schemaname = 'public'
+   and tablename = 'messages'
+   and indexname = 'messages_creator_platform_identity_idx';
+```
+
+Expected — one row, reading:
+
+```
+create unique index messages_creator_platform_identity_idx
+    on public.messages using btree (creator_id, fansly_message_id)
+    where (fansly_message_id is not null)
+```
+
+Then confirm the application agrees: restart is not required, but the next
+`save_message` with a platform id stops logging `[MESSAGE IDENTITY] unique index
+missing`, and `/health` stops reporting `message_identity_index_missing` in
+`degraded_reasons`. `scripts/production_preflight.py` also checks for it,
+read-only.
+
+An empty diagnostic result means the migration applies cleanly. A non-empty result is
 **production history** — investigate which ingestion path produced each pair and
 design an explicit cleanup. Do not delete rows to make the migration pass.
 
@@ -205,3 +275,48 @@ select c.relname, c.reloptions
  where n.nspname = 'public'
    and c.relname = 'fan_conversation_summaries';
 ```
+
+## Applying `simulation_catalog_v1.sql` (owner-only simulation catalog)
+
+Purely additive: two boolean/uuid/text column sets, four indexes, two `NOT VALID`
+check constraints. It creates no table, drops nothing, and moves no data.
+
+```bash
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/simulation_catalog_v1.sql
+```
+
+Verify:
+
+```sql
+select table_name, column_name, column_default, is_nullable
+  from information_schema.columns
+ where table_schema = 'public'
+   and column_name in ('simulation_only', 'source_creator_id',
+                       'source_set_id', 'source_media_id')
+ order by table_name, column_name;
+```
+
+Expected — `simulation_only` on both `vault_sets` and `creator_vault_media`,
+`not null` with default `false`, plus the provenance columns. Defaulting to
+`false` is the safety property: every pre-existing row, and every row a future
+writer inserts without knowing about this feature, is live inventory. Test
+content is the thing that has to be declared.
+
+The two check constraints (`..._mirror_is_simulation_only`) are created `NOT
+VALID` so the migration does not scan a large vault. They apply to every write
+from the moment they exist. Validate them whenever convenient — both are no-ops
+on a database that has never had a mirror:
+
+```sql
+alter table public.vault_sets
+  validate constraint vault_sets_mirror_is_simulation_only;
+alter table public.creator_vault_media
+  validate constraint creator_vault_media_mirror_is_simulation_only;
+```
+
+**Deploy order.** The backend tolerates the columns being absent — the live
+catalog filter retries once without it and logs
+`[SIMULATION CATALOG] simulation_only column missing` — so the code may ship
+first. The mirror endpoints will not work until the migration is applied, which
+is correct: with no columns there can be no mirrored rows, and therefore nothing
+for live planning to exclude.

@@ -123,7 +123,9 @@ def test_orchestrator_resolves_anchor_before_package_build():
         Path(__file__).parents[1] / "services" / "commercial_orchestrator.py"
     ).read_text()
     desired_at = source.index("current_desired =")
-    package_at = source.index("package_options = await get_offerable_packages")
+    # The call is the inventory-reporting variant: it returns the offers AND
+    # the asset types of the rows they were built from, in one read.
+    package_at = source.index("await get_offerable_packages_with_inventory")
     assert desired_at < package_at
     assert "desired_experience=desired_experience or None" in source
     assert "hard_ceiling_cents=hard_ceiling_cents" in source

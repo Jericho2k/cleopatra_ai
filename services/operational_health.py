@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from core.action_failures import TERMINAL_PREFIX, terminal_code
+from core.db_health_state import DATABASE_HEALTH, DatabaseHealthState
 from core.model_gate import MODEL_GATE
 from core.vault_gate import VAULT_GATE
 from services.db_reliability import retry_transient_db_operation
@@ -134,6 +135,7 @@ async def probe_database() -> dict:
             asyncio.to_thread(_ping), timeout=_DB_PROBE_TIMEOUT_SECONDS
         )
 
+    error: str | None = None
     try:
         await retry_transient_db_operation(
             _attempt,
@@ -144,22 +146,29 @@ async def probe_database() -> dict:
             reset_after_attempt=None,
         )
     except (asyncio.TimeoutError, TimeoutError):
-        return {
-            "reachable": False,
-            "latency_ms": int((time.perf_counter() - started) * 1000),
-            "error": "timeout",
-        }
+        error = "timeout"
     except Exception as exc:
-        return {
-            "reachable": False,
-            "latency_ms": int((time.perf_counter() - started) * 1000),
-            # Type name only. The message can carry a connection string.
-            "error": type(exc).__name__,
-        }
+        # Type name only. The message can carry a connection string.
+        error = type(exc).__name__
+
+    # The in-probe retry above tells a recycled connection from an outage
+    # WITHIN one probe. The tracker tells a bad probe from a bad database
+    # ACROSS probes — which is the distinction the banner was missing.
+    verdict = DATABASE_HEALTH.observe(reachable=error is None, error=error)
+    if error is not None:
+        print(
+            f"[HEALTH DB] probe failed error={error} "
+            f"state={verdict.state.value} "
+            f"consecutive={verdict.consecutive_failures} "
+            f"failing_for={verdict.failing_for_seconds:.1f}s"
+        )
     return {
-        "reachable": True,
+        "reachable": error is None,
         "latency_ms": int((time.perf_counter() - started) * 1000),
-        "error": None,
+        "error": error,
+        # Confirmation state, not a raw sample. evaluate() reads this and
+        # nothing else when deciding whether the deployment is fatally broken.
+        "confirmation": verdict.to_context(),
     }
 
 
@@ -287,8 +296,23 @@ def evaluate(
     degraded: list[str] = []
     fatal: list[str] = []
 
+    # A single failed probe is not an outage, and the operator is not told it is.
+    # Only a confirmed, sustained inability to reach the database is fatal.
+    confirmation = database.get("confirmation") or {}
+    confirmation_state = str(confirmation.get("state") or "")
     if not database.get("reachable"):
-        fatal.append(f"database_unreachable:{database.get('error') or 'unknown'}")
+        error = database.get("error") or "unknown"
+        if confirmation_state == DatabaseHealthState.UNAVAILABLE.value:
+            fatal.append(f"database_unavailable:{error}")
+        elif confirmation_state == DatabaseHealthState.UNSTABLE.value:
+            degraded.append(f"database_unstable:{error}")
+        elif confirmation_state == DatabaseHealthState.UNCONFIRMED.value:
+            degraded.append(f"database_probe_failed_unconfirmed:{error}")
+        else:
+            # No confirmation record at all — an injected probe result in a
+            # test, or a caller that built the dict by hand. Preserve the
+            # original fail-closed behaviour rather than inventing leniency.
+            fatal.append(f"database_unavailable:{error}")
 
     max_age = queue_max_age_seconds()
     max_depth = queue_max_depth()
@@ -322,6 +346,14 @@ def evaluate(
     # alert says what to fix.
     for code, count in sorted((queue.get("blocked_by_reason") or {}).items()):
         degraded.append(f"actions_blocked_{code}:{count}")
+
+    # Ingestion still works without the platform-identity index — it falls back
+    # to a racy check-then-insert — which is precisely why its absence has to be
+    # published rather than logged once and forgotten.
+    from db.queries import message_identity_index_missing
+
+    if message_identity_index_missing():
+        degraded.append("message_identity_index_missing")
 
     limit = int(model_gate.get("limit") or 0)
     if limit and int(model_gate.get("waiting") or 0) >= limit:
@@ -417,3 +449,4 @@ def reset_cache() -> None:
     """Test-support only."""
     _cache["at"] = 0.0
     _cache["value"] = None
+    DATABASE_HEALTH.reset()

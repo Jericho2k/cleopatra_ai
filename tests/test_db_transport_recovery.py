@@ -545,7 +545,14 @@ def test_database_health_recovers_once_the_database_does(monkeypatch):
             return SimpleNamespace(data=[{"id": "creator-1"}])
 
     monkeypatch.setattr("core.supabase.get_supabase", lambda: _Probe())
+    monkeypatch.setenv("HEALTH_DB_UNAVAILABLE_AFTER_FAILURES", "2")
+    monkeypatch.setenv("HEALTH_DB_SUSTAINED_SECONDS", "0")
+    operational_health.reset_cache()
 
+    # Two failed probes, so the hysteresis ladder reaches a CONFIRMED outage.
+    # One failure is deliberately not enough any more; that is what stopped a
+    # recycled connection putting an outage banner in front of an operator.
+    run(operational_health.probe_database())
     unhealthy = run(operational_health.probe_database())
     assert unhealthy["reachable"] is False
     assert unhealthy["error"] == "RemoteProtocolError"
@@ -558,7 +565,7 @@ def test_database_health_recovers_once_the_database_does(monkeypatch):
         model_availability={"status": "ok"},
     )
     assert verdict["status"] == "unhealthy"
-    assert any(r.startswith("database_unreachable") for r in verdict["fatal_reasons"])
+    assert any(r.startswith("database_unavailable") for r in verdict["fatal_reasons"])
 
     # The database comes back. Nothing is latched: the next probe is a live one.
     state["fail"] = False

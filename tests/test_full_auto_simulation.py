@@ -1085,3 +1085,345 @@ def test_live_inbound_path_is_unaffected_by_the_outcome_sink(world, spy, monkeyp
 
     assert _creator_rows(db) == []
     assert spy.requests == []
+
+
+# --- fast mode really is fast ----------------------------------------------
+#
+# Railway showed ``fast=True`` next to
+# ``[AUTO TIMING] mode=live away=5.39s compose=6.03s``. The pauses were in fact
+# already skipped — the line reported the schedule the planner COMPUTED, not the
+# one the turn awaited — but an operator cannot tell those apart from a log, and
+# "is the simulator actually waiting six seconds?" is not a question that should
+# need a code read. So the behaviour is pinned and the line now says which it is.
+
+
+def test_a_fast_simulated_turn_awaits_no_human_delay(world, spy):
+    db, calls = world
+
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hii", fast=True
+        )
+    )
+
+    assert all(seconds == 0 for seconds in calls["sleeps"]), (
+        f"a fast simulated turn must not wait: {calls['sleeps']}"
+    )
+    assert _creator_rows(db), "and it still produces the reply"
+
+
+def test_fast_mode_says_so_in_the_timing_line(world, spy, capsys):
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hii", fast=True
+        )
+    )
+
+    timing = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "[AUTO TIMING]" in line and "parts=" in line
+    ]
+    assert timing, "the turn must report its timing"
+    line = timing[-1]
+    assert "mode=simulation_fast" in line
+    assert "delays_skipped=true" in line
+    assert "away=0.00s" in line
+    assert "compose=0.00s" in line
+    # The computed schedule is still reported, so the two can be compared.
+    assert "planned_mode=" in line
+    assert "planned_away=" in line
+
+
+def test_a_fast_turn_still_runs_the_real_pipeline(world, spy, monkeypatch):
+    """Fast removes the waiting and nothing else. Analysis, planning, routing
+    and generation all run exactly as they do live."""
+    db, calls = world
+
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hii", fast=True
+        )
+    )
+
+    assert len(calls["analyzer"]) == 1
+    assert len(calls["director"]) == 1
+    assert len(calls["route"]) == 1
+    assert len(calls["writer"]) == 1
+
+
+def test_live_timing_is_untouched(world, spy, capsys):
+    """The same turn with fast=False keeps the real schedule and says so."""
+    db, calls = world
+
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hii", fast=False
+        )
+    )
+
+    timing = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "[AUTO TIMING]" in line and "parts=" in line
+    ]
+    assert timing
+    assert "mode=simulation_fast" not in timing[-1]
+    # Availability is skipped for every simulator turn (there is nobody to be
+    # away from); the composition pause is real and is genuinely awaited.
+    assert any(seconds > 0 for seconds in calls["sleeps"]), (
+        "fast=False must still exercise the human-delay path"
+    )
+
+
+# --- inventory authority, end to end ---------------------------------------
+#
+# The unit-level contract lives in tests/test_inventory_authority.py. What is
+# pinned here is that the real Full Auto turn carries it: the writer is TOLD
+# what exists, and a writer that promises a clip anyway does not get to send it.
+
+
+def _photo_only_decision(action=None):
+    from models.commercial import ActionType, CommercialDecision, PackageOption
+
+    return CommercialDecision(
+        action=action or ActionType.PRESENT_SESSION_OPTIONS,
+        goal="present the approved options",
+        package_options=[
+            PackageOption(
+                package_id="package:quick:a",
+                label="quick private session",
+                price_cents=3000,
+                set_ids=["a", "b"],
+                experience="bedroom, black lingerie",
+                legal_description="bedroom, black lingerie",
+                step_count=2,
+                media_count=5,
+                asset_types=["photo_set", "photo_set"],
+            )
+        ],
+        authorized_asset_types=["photo_set"],
+        available_package_asset_types=["photo_set"],
+        vault_asset_types=["photo_set"],
+        unavailable_asset_type_requested="video",
+    )
+
+
+def test_the_writer_is_told_there_is_no_video(world, spy, monkeypatch):
+    monkeypatch.setenv("COMMERCIAL_LAYER_ENABLED", "true")
+    db, calls = world
+
+    async def fake_orchestrate(**_kwargs):
+        return _photo_only_decision()
+
+    monkeypatch.setattr(suggestions, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(
+        suggestions, "_within_daily_caps", lambda *_a, **_k: _value((True, ""))
+    )
+
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test",
+            creator_id="creator-1",
+            message="do you have any videos?",
+            fast=True,
+        )
+    )
+
+    prompt = calls["writer"][-1]["prompt"]
+    text = "\n".join(
+        str(message["content"])
+        for message in prompt
+        if isinstance(message, dict)
+    )
+    assert "CONTENT INVENTORY" in text
+    assert "NO video" in text
+    assert "photo sets" in text
+    # And the pivot instruction, because he asked for one in as many words.
+    assert "he just asked for video and there is none" in text
+
+
+def test_an_explicit_video_request_with_no_videos_still_gets_a_real_reply(
+    world, spy, monkeypatch
+):
+    """Not silence, not a fabricated clip, not an inventory explanation."""
+    monkeypatch.setenv("COMMERCIAL_LAYER_ENABLED", "true")
+    db, calls = world
+
+    async def fake_orchestrate(**_kwargs):
+        return _photo_only_decision()
+
+    async def promises_video(prompt, persona, **kwargs):
+        calls["writer"].append({"prompt": prompt, **kwargs})
+        return [
+            "omg yes i have a video for you 😏",
+            "wait till you see the clip",
+            "i'll send you a vid",
+        ]
+
+    monkeypatch.setattr(suggestions, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(suggestions, "generate_replies", promises_video)
+    monkeypatch.setattr(
+        suggestions, "_within_daily_caps", lambda *_a, **_k: _value((True, ""))
+    )
+
+    result = _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test",
+            creator_id="creator-1",
+            message="got any videos?",
+            fast=True,
+        )
+    )
+
+    assert result["outcome"] == "replied", "an unavailable format is not a no-send"
+    sent = " ".join(row["content"] for row in result["creator_messages"])
+    assert sent.strip(), "the fan gets an actual message"
+    for word in ("video", "clip", "vid"):
+        assert word not in sent.lower(), f"promised {word} with none in inventory"
+    # And no internal language leaks in its place.
+    for leak in ("inventory", "vault", "approved", "system", "unavailable"):
+        assert leak not in sent.lower()
+
+
+def test_an_authorised_video_is_still_allowed_through(world, spy, monkeypatch):
+    monkeypatch.setenv("COMMERCIAL_LAYER_ENABLED", "true")
+    db, calls = world
+
+    async def fake_orchestrate(**_kwargs):
+        decision = _photo_only_decision()
+        decision.authorized_asset_types = ["photo_set", "video"]
+        decision.available_package_asset_types = ["photo_set", "video"]
+        decision.vault_asset_types = ["photo_set", "video"]
+        decision.unavailable_asset_type_requested = None
+        return decision
+
+    async def promises_video(prompt, persona, **kwargs):
+        calls["writer"].append({"prompt": prompt, **kwargs})
+        return ["wait till you see the video 😈"]
+
+    monkeypatch.setattr(suggestions, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(suggestions, "generate_replies", promises_video)
+    monkeypatch.setattr(
+        suggestions, "_within_daily_caps", lambda *_a, **_k: _value((True, ""))
+    )
+
+    result = _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test",
+            creator_id="creator-1",
+            message="got any videos?",
+            fast=True,
+        )
+    )
+
+    sent = " ".join(row["content"] for row in result["creator_messages"])
+    assert "video" in sent.lower(), "an approved video may be offered as planned"
+
+
+# --- a recoverable plan failure is not a no-send ----------------------------
+
+
+def test_a_stale_package_recovers_instead_of_sending_nothing(world, spy, monkeypatch):
+    """The exact production trace: CREATE_PAID_SESSION, selected_set_unavailable,
+    outcome=no_send — with the same message succeeding on the next attempt."""
+    from models.commercial import ActionType, PackageOption
+    from services import session_plan_recovery
+
+    monkeypatch.setenv("COMMERCIAL_LAYER_ENABLED", "true")
+    db, calls = world
+
+    async def fake_orchestrate(**_kwargs):
+        decision = _photo_only_decision(action=ActionType.CREATE_PAID_SESSION)
+        decision.selected_package_set_ids = ["gone-1"]
+        decision.session_budget_cents = 3000
+        return decision
+
+    async def stale_plan(*_args, **_kwargs):
+        return {"status": "selected_set_unavailable", "session": None, "missing_set_ids": ["gone-1"]}
+
+    replacement = PackageOption(
+        package_id="package:quick:fresh",
+        label="quick private session",
+        price_cents=3000,
+        set_ids=["fresh-1", "fresh-2"],
+        asset_types=["photo_set", "photo_set"],
+        step_count=2,
+    )
+
+    async def fake_recover(**kwargs):
+        assert kwargs["status"] == "selected_set_unavailable"
+        assert kwargs["had_accepted_contract"] is True
+        return session_plan_recovery.PlanRecovery(
+            status="selected_set_unavailable",
+            failure_class=session_plan_recovery.PlanFailureClass.RECOVERABLE,
+            replacement_packages=[replacement],
+            present_replacement=True,
+            accepted_contract_lost=True,
+            reason="accepted_contract_unavailable",
+        )
+
+    monkeypatch.setattr(suggestions, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(suggestions, "plan_session_for_fan", stale_plan)
+    monkeypatch.setattr(session_plan_recovery, "recover_session_plan", fake_recover)
+    monkeypatch.setattr(
+        suggestions, "_within_daily_caps", lambda *_a, **_k: _value((True, ""))
+    )
+
+    result = _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="yes the $30 one", fast=True
+        )
+    )
+
+    assert result["outcome"] == "replied", (
+        "a recoverable planning failure must never read as a decision to send nothing"
+    )
+    assert result["creator_messages"], "the fan gets an answer"
+    # The replacement is presented, not charged for: no PPV was delivered.
+    assert all(
+        not (row.get("media_context") or {}).get("ppv")
+        for row in result["creator_messages"]
+    )
+
+
+def test_an_unrecoverable_plan_reports_itself_rather_than_a_no_send(
+    world, spy, monkeypatch
+):
+    from models.commercial import ActionType
+    from services import session_plan_recovery
+
+    monkeypatch.setenv("COMMERCIAL_LAYER_ENABLED", "true")
+    db, calls = world
+
+    async def fake_orchestrate(**_kwargs):
+        decision = _photo_only_decision(action=ActionType.CREATE_PAID_SESSION)
+        decision.selected_package_set_ids = ["gone-1"]
+        decision.session_budget_cents = 3000
+        return decision
+
+    async def stale_plan(*_args, **_kwargs):
+        return {"status": "selected_set_unavailable", "session": None}
+
+    async def exploding_recovery(**_kwargs):
+        raise RuntimeError("PostgREST connection terminated")
+
+    monkeypatch.setattr(suggestions, "orchestrate", fake_orchestrate)
+    monkeypatch.setattr(suggestions, "plan_session_for_fan", stale_plan)
+    monkeypatch.setattr(
+        session_plan_recovery, "recover_session_plan", exploding_recovery
+    )
+    monkeypatch.setattr(
+        suggestions, "_within_daily_caps", lambda *_a, **_k: _value((True, ""))
+    )
+
+    result = _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="yes the $30 one", fast=True
+        )
+    )
+
+    assert result["outcome"] == "plan_unrecoverable", (
+        "a broken sale must be reported as broken, not as the product working"
+    )
+    assert result["outcome"] != "no_send"

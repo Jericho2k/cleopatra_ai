@@ -230,10 +230,19 @@ def test_auto_prepared_approval_keeps_exact_media_and_price():
 def test_operator_ppv_options_matches_production_vault_schema():
     source = inspect.getsource(read_operator_ppv_options)
     vault_query = source[
-        source.index('lambda: db.table("creator_vault_media")'):
-        source.index('lambda: db.table("vault_sets")')
+        source.index("def _load_operator_vault_media"):
+        source.index("def _load_operator_approved_sets")
     ]
 
     assert '.table("creator_vault_media")' in vault_query
     assert '.order("created_at"' not in vault_query
     assert "Could not load the creator vault for this PPV." in source
+
+
+def test_operator_ppv_options_never_offer_simulation_only_media():
+    """The manual send path is the one a human drives, so it is filtered
+    unconditionally rather than by execution context."""
+    source = inspect.getsource(read_operator_ppv_options)
+
+    assert source.count("exclude_simulation_only(query)") == 2
+    assert source.count("include_simulation=False") >= 2

@@ -232,6 +232,8 @@ def test_selected_offer_strategy_does_not_claim_payment_confirmation():
 def test_prompt_contract_numbers_and_preserves_persisted_options():
     source = inspect.getsource(prompt_builder.build_prompt)
     assert "EXACT PERSISTED OFFER SNAPSHOT, ORIGINAL ORDER" in source
-    assert 'f"{index}) {label}: ${cents / 100:g}"' in source
+    # Money crosses into writer context through exactly one renderer, so a raw
+    # cent value can never reach a customer-facing string (models/money.py).
+    assert 'f"{index}) {label}: {customer_dollars(cents)}"' in source
     assert "Do not rebuild, replace, reorder, or" in source
     assert "This is a selection, not proof of payment" in source

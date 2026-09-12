@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import OrderedDict
 
 from fastapi import HTTPException, Request, status
 
@@ -146,14 +147,21 @@ def is_simulation_message(media_context: object) -> bool:
     """Whether one message row was written by the owner-only simulator.
 
     Accepts whatever the Supabase webhook happens to deliver for a ``jsonb``
-    column — a decoded mapping or the raw JSON text — because a transport detail
-    must not decide whether a simulated turn is processed twice.
+    column — a decoded mapping, the raw JSON text, or JSON text that was itself
+    double-encoded by a relay — because a transport detail must not decide
+    whether a simulated turn is processed twice.
 
     Fails closed in the direction that matters: anything it cannot positively
     identify as a simulator event is an ordinary production message and is
     processed normally.
     """
-    if isinstance(media_context, str):
+    # Two unwraps, not one. A payload that reaches us as "\"{...}\"" — a jsonb
+    # value serialised by one hop and then string-encoded by the next — decodes
+    # to a string on the first pass, and returning False there is precisely the
+    # silent failure that let a simulated turn be processed twice.
+    for _ in range(2):
+        if not isinstance(media_context, str):
+            break
         try:
             media_context = json.loads(media_context)
         except (ValueError, TypeError):
@@ -163,3 +171,101 @@ def is_simulation_message(media_context: object) -> bool:
     if media_context.get("simulation") is not True:
         return False
     return str(media_context.get("simulation_source") or "") == SIMULATION_SOURCE
+
+
+# ---------------------------------------------------------------------------
+# Ownership when the payload cannot answer
+# ---------------------------------------------------------------------------
+#
+# The marker above is written into the same INSERT the database webhook fires
+# on, so in principle the webhook record always carries it. In practice the
+# record is a JSON document built by somebody else's trigger and shipped over
+# somebody else's transport, and Railway kept showing one simulated INSERT
+# followed by a full ordinary pipeline pass. Rather than keep guessing which
+# hop drops or reshapes ``media_context``, ownership is settled by two things
+# that do not depend on the payload's shape at all:
+#
+# 1. An in-process registry of the message ids the simulator wrote. Same
+#    process, zero cost, and immune to every transport question.
+# 2. The database row itself, re-read by id. Authoritative by construction,
+#    used only when the payload did not positively answer, so the ordinary
+#    production path costs no extra read.
+#
+# Both are additive. Neither can make an ordinary fan message be skipped: they
+# can only recognise a row the simulator actually wrote.
+
+_SIMULATION_OWNED_MESSAGE_IDS: "OrderedDict[str, None]" = OrderedDict()
+
+# Bounded so a long-lived process cannot accumulate ids forever. Generous
+# relative to how many turns one owner runs in a sitting, and the database
+# fallback still covers anything evicted.
+_OWNED_ID_LIMIT = 512
+
+
+def mark_simulation_owned_message(message_id: object) -> None:
+    """Record that the simulator wrote this row and owns its processing."""
+    key = str(message_id or "").strip()
+    if not key:
+        return
+    _SIMULATION_OWNED_MESSAGE_IDS.pop(key, None)
+    _SIMULATION_OWNED_MESSAGE_IDS[key] = None
+    while len(_SIMULATION_OWNED_MESSAGE_IDS) > _OWNED_ID_LIMIT:
+        _SIMULATION_OWNED_MESSAGE_IDS.popitem(last=False)
+
+
+def is_simulation_owned_message_id(message_id: object) -> bool:
+    """Whether this process wrote that row as a simulator event."""
+    return str(message_id or "").strip() in _SIMULATION_OWNED_MESSAGE_IDS
+
+
+def reset_simulation_owned_message_ids() -> None:
+    """Test-support only."""
+    _SIMULATION_OWNED_MESSAGE_IDS.clear()
+
+
+def payload_media_context(record: object) -> tuple[object, bool]:
+    """Extract ``media_context`` from a webhook record.
+
+    Returns ``(value, present)``. ``present`` is False when the key is absent
+    entirely, which is the case that must NOT be read as "not a simulation" —
+    it is the case where the payload simply did not say, and the database has
+    to be asked instead.
+    """
+    if not isinstance(record, dict):
+        return None, False
+    for key in ("media_context", "mediaContext"):
+        if key in record:
+            return record[key], True
+    return None, False
+
+
+async def message_row_is_simulation_owned(message_id: object) -> bool:
+    """Ask the database whether that row carries the simulator's marker.
+
+    The authoritative answer, used when the webhook payload did not carry one.
+    Never raises: a read failure means "not positively identified", which routes
+    the message through the ordinary pipeline exactly as before.
+    """
+    key = str(message_id or "").strip()
+    if not key:
+        return False
+    try:
+        import asyncio
+
+        from core.supabase import get_supabase
+
+        def _read() -> object:
+            response = (
+                get_supabase().table("messages")
+                .select("media_context")
+                .eq("id", key)
+                .limit(1)
+                .execute()
+            )
+            rows = response.data or []
+            return rows[0].get("media_context") if rows else None
+
+        return is_simulation_message(await asyncio.to_thread(_read))
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[WEBHOOK] simulation ownership read failed id={key}: {exc}")
+        return False

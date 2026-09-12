@@ -91,8 +91,31 @@ def _clean_experience_part(value: Any) -> str:
     return " ".join(text.split()).strip(" -·|—,")
 
 
+# Format words that are only true of a clip. A photo set's own metadata can
+# legitimately contain them — the tag list of a shoot that also produced a video,
+# an album title like "shower video day" — and that description is handed to the
+# writer as the approved experience. Left in, it is an invitation to promise
+# video that this package does not contain.
+_VIDEO_FORMAT_RE = re.compile(
+    r"\b(videos?|vids?|clips?|movies?|footage|recording|filmed?|filming)\b",
+    re.IGNORECASE,
+)
+
+
+def strip_video_format_words(value: str) -> str:
+    """Remove clip-only format words from a photo-set description fragment."""
+    cleaned = _VIDEO_FORMAT_RE.sub(" ", str(value or ""))
+    return " ".join(cleaned.split()).strip(" -·|—,")
+
+
 def describe_sequence(sequence: list[dict[str, Any]]) -> str | None:
-    """Produce writer-safe semantic context for the exact approved package."""
+    """Produce writer-safe semantic context for the exact approved package.
+
+    Format words are filtered against the package's ACTUAL contents: a package
+    with no video in it never describes itself using the word video, whatever
+    the source rows happen to be tagged with.
+    """
+    has_video = any(is_video_row(row) for row in sequence)
     parts: list[str] = []
     seen: set[str] = set()
     for row in sequence:
@@ -107,6 +130,8 @@ def describe_sequence(sequence: list[dict[str, Any]]) -> str | None:
         ]
         for value in values:
             cleaned = _clean_experience_part(value)
+            if not has_video:
+                cleaned = strip_video_format_words(cleaned)
             key = cleaned.lower()
             if not cleaned or key in seen:
                 continue

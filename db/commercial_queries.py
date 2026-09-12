@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 from core.pagination import fetch_all_rows
+from core.simulation_catalog import exclude_simulation_only, run_live_catalog_query
 from core.supabase import get_supabase
 from models.commercial import CreatorPolicy, FanCommercialState, PackageOption
 from services.media_packages import build_offer_packages, usable_sets
@@ -152,6 +153,37 @@ async def merge_fan_ai_summary(fan_id: str, patch: dict) -> None:
     await asyncio.to_thread(_merge)
 
 
+async def get_approved_asset_types(creator_id: str) -> tuple[str, ...]:
+    """Which media types exist in this creator's approved, sellable vault.
+
+    A deliberately tiny read — two columns, no joins — because the assisted path
+    needs the inventory statement too and must not pay for a full package build
+    to get it. Without it an assisted turn with no active session would be told
+    nothing about inventory, and "told nothing" is the state that produced a
+    promise of video from a photo-only vault in the first place.
+    """
+    from services.inventory_authority import asset_types_from_rows
+
+    def _get() -> list[dict]:
+        db = get_supabase()
+
+        def _build(apply_filter: bool):
+            query = (
+                db.table("vault_sets")
+                .select("id, tags, media_ids")
+                .eq("creator_id", creator_id)
+                .eq("status", "approved")
+            )
+            if apply_filter:
+                query = exclude_simulation_only(query)
+            return query.execute()
+
+        return run_live_catalog_query(_build, label="commercial.asset_types").data or []
+
+    rows = await asyncio.to_thread(_get)
+    return asset_types_from_rows(row for row in rows if row.get("media_ids"))
+
+
 async def get_offerable_packages(
     creator_id: str,
     fan_id: str,
@@ -161,19 +193,53 @@ async def get_offerable_packages(
     hard_ceiling_cents: int | None = None,
 ) -> list[PackageOption]:
     """Build up to two coherent, multi-step packages from approved vault sets."""
+    packages, _ = await get_offerable_packages_with_inventory(
+        creator_id,
+        fan_id,
+        policy,
+        price_learning=price_learning,
+        desired_experience=desired_experience,
+        hard_ceiling_cents=hard_ceiling_cents,
+    )
+    return packages
+
+
+async def get_offerable_packages_with_inventory(
+    creator_id: str,
+    fan_id: str,
+    policy: CreatorPolicy,
+    price_learning: dict | None = None,
+    desired_experience: str | None = None,
+    hard_ceiling_cents: int | None = None,
+) -> tuple[list[PackageOption], tuple[str, ...]]:
+    """Offers plus the asset types that exist in approved, unsent inventory.
+
+    The second value is what makes the inventory statement handed to the writer
+    authoritative rather than inferred: it is derived from the very rows the
+    offers were built from, in the same read, so the two can never disagree.
+    """
     def _get():
         db = get_supabase()
-        rows = (
-            db.table("vault_sets")
-            .select(
-                "id, title, description, location, outfit, suggested_price, tags, "
-                "explicit_min, explicit_max, media_ids, base_price_cents, "
-                "min_price_cents, max_price_cents, dynamic_pricing_enabled"
+        def _build_sets(apply_filter: bool):
+            query = (
+                db.table("vault_sets")
+                .select(
+                    "id, title, description, location, outfit, suggested_price, tags, "
+                    "explicit_min, explicit_max, media_ids, base_price_cents, "
+                    "min_price_cents, max_price_cents, dynamic_pricing_enabled"
+                )
+                .eq("creator_id", creator_id)
+                .eq("status", "approved")
             )
-            .eq("creator_id", creator_id)
-            .eq("status", "approved")
-            .execute()
-        ).data or []
+            # Owner-only mirrored test content never reaches a live offer.
+            if apply_filter:
+                query = exclude_simulation_only(query)
+            return query.execute()
+
+        rows = (
+            run_live_catalog_query(_build_sets, label="commercial.offerable_sets").data
+            or []
+        )
 
         # Paginated: this set is the "never offer this again" list. Truncated at
         # 1,000 creator messages it silently forgets older sends, and Cleopatra
@@ -223,9 +289,10 @@ async def get_offerable_packages(
 
     rows, preferred_tags = await asyncio.to_thread(_get)
     from db.pricing_policy_queries import get_effective_price_learning_policy
+    from services.inventory_authority import asset_types_from_rows
 
     pricing_policy = await get_effective_price_learning_policy(creator_id)
-    return build_offer_packages(
+    packages = build_offer_packages(
         rows,
         policy,
         preferred_tags=preferred_tags,
@@ -234,6 +301,7 @@ async def get_offerable_packages(
         hard_ceiling_cents=hard_ceiling_cents,
         pricing_policy=pricing_policy,
     )
+    return packages, asset_types_from_rows(rows)
 
 
 async def schedule_action(

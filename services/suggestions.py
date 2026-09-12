@@ -24,6 +24,7 @@ from models.commercial import ActionType, FanStatus
 from db.fan_intelligence_queries import get_fan_intelligence_context
 from db.commercial_queries import (
     cancel_action_by_dedupe_key,
+    get_approved_asset_types,
     cancel_actions_for_fan,
     get_creator_policy,
     get_fan_state,
@@ -40,7 +41,8 @@ from services.human_delivery import (
 from services.ppv_delivery import create_ppv_approval_request
 from services.db_reliability import retry_transient_db_operation
 from core.apifansly_gate import apifansly_enabled, simulation_scope
-from core.simulation import simulation_message_marker
+from core.simulation import mark_simulation_owned_message, simulation_message_marker
+from core.simulation_catalog import contains_simulation_media
 from services.apifansly import (
     headers as apifansly_headers,
     shared_client as apifansly_shared_client,
@@ -82,6 +84,13 @@ from services.message_shape import (
     recent_bubble_counts,
 )
 from services.ppv_language import sanitize_candidates, sanitize_delivery_language
+from services.inventory_authority import (
+    MediaInventory,
+    asset_types_from_session,
+    choose_inventory_safe_reply,
+    next_step_asset_type,
+    sanitize_media_promises,
+)
 from ai.situation_analyzer import (
     analyze_situation,
     analysis_is_degraded,
@@ -133,6 +142,12 @@ AUTO_OUTCOME_REPLIED = "replied"
 AUTO_OUTCOME_NO_SEND = "no_send"
 AUTO_OUTCOME_ANALYZER_DEGRADED = "analyzer_degraded"
 AUTO_OUTCOME_WRITER_FAILED = "writer_failed"
+# A commercial plan could not be produced and recovery could not repair it.
+# Distinct from an intentional no-send: it names a broken sale, not a choice.
+AUTO_OUTCOME_PLAN_UNRECOVERABLE = "plan_unrecoverable"
+# Every writer candidate promised media that does not exist, and repairing
+# them left nothing sendable. Never send the promise instead.
+AUTO_OUTCOME_INVENTORY_UNSAFE = "inventory_unsafe"
 
 
 class AnalyzerDegradedError(RuntimeError):
@@ -428,6 +443,23 @@ async def get_suggestions(
     )
     situation["session_strategy"] = session_strategy
 
+    # The assisted path has no commercial decision to carry the inventory, so
+    # it reads the asset types directly. A human approves these candidates, but
+    # a candidate that promises a clip the creator does not have is still a
+    # candidate somebody can send by accident.
+    try:
+        approved_asset_types = await get_approved_asset_types(creator_id)
+    except Exception as exc:
+        print(f"[INVENTORY] asset type read failed creator={creator_id}: {exc}")
+        approved_asset_types = ()
+    media_inventory = _build_turn_inventory(
+        decision=None,
+        active_session=active_session,
+        situation=situation,
+        fan_message=fan_message,
+        vault_asset_types=approved_asset_types,
+    )
+
     ctx = ConversationContext(
         fan_message=fan_message,
         conversation_history=conversation_history,
@@ -440,6 +472,7 @@ async def get_suggestions(
         ppv_offers=ppv_offers,
         sent_ppv=sent_ppv,
         active_session=active_session,
+        media_inventory=media_inventory.to_context(),
         creator_legend=creator_legend,
         fan_intelligence=fan_intelligence,
         buyer_lifecycle=buyer_lifecycle,
@@ -480,6 +513,18 @@ async def get_suggestions(
     # Assisted candidates keep their own natural shapes — a human picks one —
     # but the platform's delivery semantics still hold for all of them.
     replies = sanitize_candidates(replies, active_session=active_session)
+    # A human approves an assisted candidate, so a promise of media that does
+    # not exist is repaired rather than dropped: the operator still sees a
+    # usable option, and it is one the creator can actually keep.
+    replies = [
+        sanitize_media_promises(
+            candidate,
+            media_inventory,
+            active_session=active_session,
+        )[0]
+        or candidate
+        for candidate in replies
+    ]
 
     if save_fan_message:
         evidence_message_id = await save_message(
@@ -697,6 +742,184 @@ async def _update_fan_ai_summary(
         print(f"[AI SUMMARY ERROR] fan={fan_id} error={e}")
         import traceback
         traceback.print_exc()
+
+
+def _build_turn_inventory(
+    *,
+    decision,
+    active_session: dict | None,
+    situation: dict,
+    fan_message: str,
+    vault_asset_types: tuple[str, ...] = (),
+) -> MediaInventory:
+    """Assemble the turn's authoritative media capabilities.
+
+    The commercial decision already carries the asset types of the rows the
+    orchestrator loaded, so this reads no database and cannot disagree with the
+    planner. Without a decision — Commercial v2 off, or an assisted turn — the
+    live session plan is the authority and anything it does not contain is not
+    promisable.
+    """
+    from services.media_packages import wants_video
+
+    session_types = asset_types_from_session(active_session)
+    desired = str(situation.get("desired_experience") or "")
+    video_requested = bool(wants_video(desired) or wants_video(fan_message))
+
+    if decision is None:
+        # An active plan is the narrowest authority; otherwise the approved
+        # vault is. Only with neither is the inventory genuinely unknown, and an
+        # unknown inventory states nothing rather than guessing.
+        authorized = session_types or tuple(vault_asset_types)
+        return MediaInventory(
+            authorized_asset_types=authorized,
+            available_package_asset_types=authorized,
+            vault_asset_types=tuple(vault_asset_types) or session_types,
+            next_step_asset_type=next_step_asset_type(active_session),
+            video_requested=video_requested,
+            known=bool(authorized),
+            reason_codes=(
+                ("authorized_from_active_session",)
+                if session_types
+                else ("authorized_from_approved_vault",)
+            )
+            if authorized
+            else ("inventory_unknown",),
+        )
+
+    authorized = tuple(getattr(decision, "authorized_asset_types", None) or ())
+    available = tuple(getattr(decision, "available_package_asset_types", None) or ())
+    vault = tuple(getattr(decision, "vault_asset_types", None) or ())
+    # An active plan is narrower than any offer snapshot: it names the exact
+    # steps that will be delivered, so it wins.
+    if session_types:
+        authorized = session_types
+        available = session_types
+    return MediaInventory(
+        authorized_asset_types=authorized,
+        available_package_asset_types=available,
+        vault_asset_types=vault,
+        next_step_asset_type=next_step_asset_type(active_session),
+        video_requested=video_requested,
+        known=True,
+        reason_codes=("authorized_from_commercial_decision",),
+    )
+
+
+async def _recover_or_downgrade_plan(
+    *,
+    creator_id: str,
+    fan_id: str,
+    status: str,
+    decision,
+    situation: dict,
+    price_learning: dict,
+) -> tuple[dict | None, object, str | None]:
+    """Turn a failed plan into a real turn, or into an honest failure.
+
+    Returns ``(active_session, decision, abort_outcome)``. An ``abort_outcome``
+    that is not ``None`` means the turn genuinely cannot proceed and the caller
+    should stop — with that outcome recorded, never as a bare "sent nothing".
+
+    Three things can come back:
+
+    * a replanned session, so the decided sale proceeds against current
+      inventory;
+    * a downgraded decision that PRESENTS the valid replacement, used when the
+      fan had already accepted an exact package that can no longer be delivered
+      — he is told and asked, never silently charged for a substitute;
+    * a downgraded decision to continue the conversation without an offer, used
+      when there is genuinely nothing left to sell him.
+    """
+    from services.session_plan_recovery import (
+        classify_plan_status,
+        recover_session_plan,
+    )
+
+    failure_class = classify_plan_status(status)
+    had_contract = bool(
+        decision is not None and getattr(decision, "selected_package_set_ids", None)
+    )
+    print(
+        f"[SESSION] plan-session status={status} fan={fan_id} "
+        f"class={failure_class.value} accepted_contract={had_contract}"
+    )
+
+    try:
+        recovery = await recover_session_plan(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            status=status,
+            had_accepted_contract=had_contract,
+            desired_experience=str(situation.get("desired_experience") or "") or None,
+            price_learning=price_learning,
+        )
+    except Exception as exc:
+        print(f"[SESSION RECOVERY ERROR] fan={fan_id} status={status} error={exc}")
+        return None, decision, AUTO_OUTCOME_PLAN_UNRECOVERABLE
+
+    print(
+        f"[SESSION RECOVERY] fan={fan_id} from={status} "
+        f"outcome={recovery.reason} recovered={recovery.recovered} "
+        f"present_replacement={recovery.present_replacement} "
+        f"continue_without_offer={recovery.continue_without_offer}"
+    )
+
+    if recovery.recovered:
+        return (
+            recovery.session or await get_fan_session(fan_id),
+            decision,
+            None,
+        )
+
+    if decision is None:
+        return None, decision, AUTO_OUTCOME_PLAN_UNRECOVERABLE
+
+    if recovery.present_replacement:
+        decision.action = ActionType.PRESENT_SESSION_OPTIONS
+        decision.package_options = list(recovery.replacement_packages or [])
+        decision.must_not_send_media = True
+        decision.mention_price = None
+        decision.session_budget_cents = None
+        decision.selected_package_set_id = None
+        decision.selected_package_set_ids = []
+        decision.replacement_for_unavailable = True
+        decision.new_status = FanStatus.OFFER_PENDING
+        decision.goal = (
+            "The exact thing he picked is no longer available. Acknowledge that "
+            "naturally in your own voice — no systems, inventory or approval "
+            "talk — and offer what is actually there now."
+        )
+        decision.reason = f"plan_recovery:{recovery.reason}"
+        from services.inventory_authority import asset_types_from_packages
+
+        decision.authorized_asset_types = list(
+            asset_types_from_packages(decision.package_options)
+        )
+        decision.available_package_asset_types = list(
+            decision.authorized_asset_types
+        )
+        return None, decision, None
+
+    if recovery.continue_without_offer:
+        decision.action = ActionType.CONTINUE_NORMAL_CHAT
+        decision.package_options = []
+        decision.must_not_send_media = True
+        decision.mention_price = None
+        decision.session_budget_cents = None
+        decision.selected_package_set_id = None
+        decision.selected_package_set_ids = []
+        decision.authorized_asset_types = []
+        decision.available_package_asset_types = []
+        decision.new_status = FanStatus.IDLE
+        decision.goal = (
+            "Keep the conversation warm and going. Do not offer, promise or "
+            "tease any paid content this turn."
+        )
+        decision.reason = f"plan_recovery:{recovery.reason}"
+        return None, decision, None
+
+    return None, decision, AUTO_OUTCOME_PLAN_UNRECOVERABLE
 
 
 async def _debounced_auto_reply(
@@ -982,16 +1205,37 @@ async def _debounced_auto_reply(
                         selected_set_ids=(decision.selected_package_set_ids if decision else None),
                         selected_price_cents=(decision.session_budget_cents if decision else None),
                     )
-                    if plan_data.get("status") == "ok":
+                    plan_status = str(plan_data.get("status") or "")
+                    if plan_status == "ok":
                         active_session = plan_data.get("session") or await get_fan_session(fan_id)
                         print(f"[SESSION] Planned for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
-                    else:
-                        print(f"[SESSION] plan-session status={plan_data.get('status')} fan={fan_id}")
-                        if commercial_enabled:
+                    elif commercial_enabled:
+                        # A plan that cannot be built is not a decision to say
+                        # nothing. Classify it, repair what is repairable, and
+                        # only then decide what this turn actually is.
+                        active_session, decision, recovery_outcome = (
+                            await _recover_or_downgrade_plan(
+                                creator_id=creator_id,
+                                fan_id=fan_id,
+                                status=plan_status,
+                                decision=decision,
+                                situation=situation,
+                                price_learning=price_learning,
+                            )
+                        )
+                        if recovery_outcome is not None:
+                            if outcome_sink is not None:
+                                outcome_sink["outcome"] = recovery_outcome
                             return
+                    else:
+                        print(f"[SESSION] plan-session status={plan_status} fan={fan_id}")
                 except Exception as e:
-                    print(f"[SESSION PLAN ERROR] {e}")
+                    # An exception is an infrastructure failure, not a commercial
+                    # outcome. Report it as one instead of as a no-send.
+                    print(f"[SESSION PLAN ERROR] fan={fan_id} error={e}")
                     if commercial_enabled:
+                        if outcome_sink is not None:
+                            outcome_sink["outcome"] = AUTO_OUTCOME_PLAN_UNRECOVERABLE
                         return
 
         # Inject tip context into situation so prompt builder can use it
@@ -1207,6 +1451,24 @@ async def _debounced_auto_reply(
             f"reason={message_shape.reason} recent={creator_turn_shapes}"
         )
 
+        # What media actually exists for this turn, stated rather than inferred.
+        # Built from the decision (which carries the approved rows' asset types)
+        # and the live session plan, so the writer's statement and the planner's
+        # rows cannot disagree.
+        media_inventory = _build_turn_inventory(
+            decision=decision,
+            active_session=active_session,
+            situation=situation,
+            fan_message=latest_message,
+        )
+        print(
+            f"[INVENTORY] fan={fan_id} "
+            f"authorized={','.join(media_inventory.authorized_asset_types) or 'none'} "
+            f"vault={','.join(media_inventory.vault_asset_types) or 'none'} "
+            f"video_requested={media_inventory.video_requested} "
+            f"may_promise_video={media_inventory.may_promise_video}"
+        )
+
         ctx = ConversationContext(
             fan_message=latest_message,
             conversation_history=conversation_history,
@@ -1219,6 +1481,7 @@ async def _debounced_auto_reply(
             ppv_offers=ppv_offers,
             sent_ppv=sent_ppv,
             active_session=active_session,
+            media_inventory=media_inventory.to_context(),
             commercial_decision=decision.model_dump(mode="json") if decision else None,
             fan_intelligence=fan_intelligence,
             buyer_lifecycle=buyer_lifecycle,
@@ -1272,12 +1535,34 @@ async def _debounced_auto_reply(
                 outcome_sink["outcome"] = AUTO_OUTCOME_WRITER_FAILED
             return
 
-        reply = replies[0]
+        decision_action = getattr(getattr(decision, "action", None), "value", None)
+
+        # Inventory is an invariant, not a prompt preference. A promise of media
+        # that does not exist is repaired into what does, and a candidate that
+        # cannot be repaired into something honest is not sent at all.
+        safe_reply, inventory_repaired = choose_inventory_safe_reply(
+            replies,
+            media_inventory,
+            decision_action=decision_action,
+            active_session=active_session,
+        )
+        if safe_reply is None:
+            print(
+                f"[INVENTORY GUARD] fan={fan_id} every candidate promised "
+                f"unavailable media and none survived repair — sending nothing"
+            )
+            if outcome_sink is not None:
+                outcome_sink["outcome"] = AUTO_OUTCOME_INVENTORY_UNSAFE
+            return
+        if inventory_repaired:
+            print(
+                f"[INVENTORY GUARD] repaired unavailable-media promise fan={fan_id}"
+            )
+        reply = safe_reply
 
         # Platform semantics are an invariant, not a prompt preference: paid
         # media is attached in chat and there is no link to offer. Scoped to
         # commercial turns so ordinary talk about links is untouched.
-        decision_action = getattr(getattr(decision, "action", None), "value", None)
         reply, link_repaired = sanitize_delivery_language(
             reply,
             decision_action=decision_action,
@@ -1343,6 +1628,13 @@ async def _debounced_auto_reply(
 
             group_id = await get_or_fetch_group_id(apifansly_account_id, str(platform_fan_id), fan_id)
 
+        # One name for "this turn does not wait". Availability and composition
+        # were skipped by two separate flags, which is why the timing line could
+        # read mode=live away=5.39s next to fast=True and leave an operator
+        # unable to tell a computed delay from an awaited one.
+        simulation_fast = bool(skip_human_delays)
+        delays_skipped = bool(skip_human_delays or skip_availability)
+
         async def _pause(seconds: float, *, phase: str) -> bool:
             """Apply one human-like pause, or skip its duration in simulation.
 
@@ -1351,7 +1643,7 @@ async def _debounced_auto_reply(
             """
             return await _sleep_while_current(
                 fan_id,
-                0.0 if skip_human_delays else seconds,
+                0.0 if simulation_fast else seconds,
                 phase=phase,
             )
 
@@ -1363,12 +1655,27 @@ async def _debounced_auto_reply(
             conversation_phase=conversation_director.get("phase"),
             active_session=active_session,
         )
+        # The delays are reported as what will actually happen, not as what the
+        # schedule computed. In a fast simulated turn every one of them is zero,
+        # and the mode says so rather than naming the live availability mode the
+        # scheduler would have used.
+        awaited_away = 0.0 if (simulation_fast or skip_availability) else timing.availability_delay_seconds
+        awaited_compose = 0.0 if simulation_fast else timing.composition_delay_seconds
+        awaited_between = (
+            [0.0 for _ in timing.inter_part_delays_seconds]
+            if simulation_fast
+            else list(timing.inter_part_delays_seconds)
+        )
         print(
             f"[AUTO TIMING] fan={fan_id} parts={len(parts)} "
-            f"mode={timing.availability_mode.value} "
-            f"away={timing.availability_delay_seconds:.2f}s "
-            f"compose={timing.composition_delay_seconds:.2f}s "
-            f"between={list(timing.inter_part_delays_seconds)}"
+            f"mode={'simulation_fast' if simulation_fast else timing.availability_mode.value} "
+            f"delays_skipped={'true' if delays_skipped else 'false'} "
+            f"away={awaited_away:.2f}s "
+            f"compose={awaited_compose:.2f}s "
+            f"between={awaited_between} "
+            f"planned_mode={timing.availability_mode.value} "
+            f"planned_away={timing.availability_delay_seconds:.2f}s "
+            f"planned_compose={timing.composition_delay_seconds:.2f}s"
         )
 
         # Do not advertise typing while the simulated creator is unavailable.
@@ -1507,6 +1814,19 @@ async def _debounced_auto_reply(
                         f"[AUTO TEST DELIVERY] fan={fan_id} "
                         f"kind={'ppv' if ppv_match else 'text'} accepted=true"
                     )
+                elif ppv_match and contains_simulation_media(media_ids):
+                    # Belt and braces alongside services/ppv_delivery.py: this
+                    # branch builds its own platform call, so it enforces the
+                    # same invariant rather than trusting that planning already
+                    # did. A simulated turn never reaches here (local_test_delivery
+                    # is handled above), so arriving with a sim: id means a real
+                    # fan was about to receive mirrored test media.
+                    print(
+                        f"[AUTO DELIVERY ERROR] fan={fan_id}: refused "
+                        f"simulation-only media on a live route media={media_ids}"
+                    )
+                    await freeze_fan_for_review(fan_id, "simulation_media_on_live_route")
+                    return
                 elif ppv_match:
                     ppv_content = text_out if text_out else random.choice([
                         "here it is 😏",
@@ -2293,6 +2613,11 @@ async def run_simulated_inbound(
         message,
         media_context=simulation_message_marker(),
     )
+    # Belt and braces for the single-process deployment Railway actually runs:
+    # the webhook can recognise this row without depending on how the database
+    # webhook serialises a jsonb column. Registered before the turn starts, so
+    # a webhook delivery that arrives while we are still analysing is covered.
+    mark_simulation_owned_message(fan_message_id)
 
     history_before = await get_conversation_history(fan_id)
     creator_ids_before = {row["id"] for row in await _recent_creator_message_rows(fan_id)}

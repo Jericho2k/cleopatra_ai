@@ -198,3 +198,103 @@ def test_migrations_are_idempotent(pipeline):
                 raise AssertionError(
                     f"migration {filename} is not idempotent: {exc}"
                 ) from exc
+
+
+def _columns(connection, schema, table) -> set[str]:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            select column_name
+              from information_schema.columns
+             where table_schema = %s and table_name = %s
+            """,
+            (schema, table),
+        )
+        return {row[0] for row in cursor.fetchall()}
+
+
+def test_the_simulation_catalog_columns_exist_and_default_to_live(pipeline):
+    """The live/simulation boundary is a column, so it has to actually be there.
+
+    Defaulting to ``false`` matters as much as existing: every row that predates
+    the migration, and every row a future writer inserts without thinking about
+    this feature, is live inventory. Test content is the thing that has to be
+    declared.
+    """
+    connection, name = pipeline
+
+    for table in ("vault_sets", "creator_vault_media"):
+        columns = _columns(connection, name, table)
+        assert "simulation_only" in columns, f"{table} has no live/test boundary"
+        assert "source_creator_id" in columns, f"{table} keeps no provenance"
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                select column_default, is_nullable
+                  from information_schema.columns
+                 where table_schema = %s and table_name = %s
+                   and column_name = 'simulation_only'
+                """,
+                (name, table),
+            )
+            default, nullable = cursor.fetchone()
+            assert default == "false", f"{table}.simulation_only must default to live"
+            assert nullable == "NO"
+
+    assert "source_set_id" in _columns(connection, name, "vault_sets")
+    assert "source_media_id" in _columns(connection, name, "creator_vault_media")
+
+
+def test_a_mirrored_row_cannot_be_left_unmarked(pipeline):
+    """Provenance without the flag would be sellable test content."""
+    connection, name = pipeline
+
+    with connection.cursor() as cursor:
+        cursor.execute(f'set search_path to "{name}", public')
+        cursor.execute(
+            """
+            insert into creators (id) values (gen_random_uuid()) returning id
+            """
+        )
+        creator_id = cursor.fetchone()[0]
+
+        # The control: correctly marked, it inserts. Without this the negative
+        # case below could be passing for some unrelated NOT NULL violation.
+        cursor.execute(
+            """
+            insert into vault_sets (creator_id, source_creator_id, simulation_only)
+            values (%s, %s, true)
+            """,
+            (creator_id, creator_id),
+        )
+
+        with pytest.raises(Exception) as failure:
+            cursor.execute(
+                """
+                insert into vault_sets (creator_id, source_creator_id, simulation_only)
+                values (%s, %s, false)
+                """,
+                (creator_id, creator_id),
+            )
+        assert "vault_sets_mirror_is_simulation_only" in str(failure.value)
+
+
+def test_the_mirror_identity_is_unique_per_target_and_source(pipeline):
+    """A refresh updates rather than duplicating, which the index is what makes
+    true rather than the code remembering to delete first."""
+    connection, name = pipeline
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            select indexname
+              from pg_indexes
+             where schemaname = %s and tablename in ('vault_sets', 'creator_vault_media')
+            """,
+            (name,),
+        )
+        indexes = {row[0] for row in cursor.fetchall()}
+
+    assert "vault_sets_simulation_mirror_idx" in indexes
+    assert "creator_vault_media_simulation_mirror_idx" in indexes

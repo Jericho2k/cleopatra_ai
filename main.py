@@ -73,6 +73,10 @@ from core.apifansly_gate import (
     describe_apifansly,
 )
 from core.simulation import is_simulation_message
+from core.simulation_catalog import (
+    exclude_simulation_only,
+    run_live_catalog_query,
+)
 from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
@@ -4853,6 +4857,40 @@ async def get_media_url(account_id: str, content_id: str) -> dict:
         return response.json()
 
 
+async def _simulation_owns_message(message_id: object, record: dict) -> bool:
+    """Whether the owner-only simulator already owns this message's turn.
+
+    Split out of the route so the decision is testable against a real Supabase
+    database-webhook payload rather than only against the route's happy path.
+    """
+    from core.simulation import (
+        is_simulation_owned_message_id,
+        message_row_is_simulation_owned,
+        payload_media_context,
+    )
+
+    if is_simulation_owned_message_id(message_id):
+        return True
+
+    media_context, present = payload_media_context(record)
+    if present:
+        return is_simulation_message(media_context)
+
+    # The payload said nothing about media_context. That is not evidence that
+    # the row has none — it is the absence of evidence, and the database is the
+    # only authority. One indexed primary-key read, on a path that otherwise
+    # runs the whole analyzer.
+    #
+    # Wrapped again here even though the helper swallows its own failures: an
+    # ownership check must never be able to turn a fan's message into a 500 and
+    # a Supabase redelivery loop. Not positively identified means processed.
+    try:
+        return await message_row_is_simulation_owned(message_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[WEBHOOK] simulation ownership check failed id={message_id}: {exc}")
+        return False
+
+
 @app.post("/generate-suggestions")
 async def generate_suggestions_webhook(
     payload: WebhookPayload,
@@ -4874,8 +4912,18 @@ async def generate_suggestions_webhook(
     # ignored, so an ordinary production fan message — including one typed into
     # a test fan's chat by hand — is processed exactly as before. The response is
     # a 2xx so Supabase treats the delivery as handled rather than retrying it.
-    if is_simulation_message(record.get("media_context")):
-        print(f"[WEBHOOK] message_id={message_id} owner simulation event — simulator owns this turn")
+    # Ownership is settled in three ways, cheapest first, and only the LAST one
+    # depends on the payload being shaped the way a unit test shapes it:
+    #
+    #   1. this process wrote the row as a simulator event;
+    #   2. the record carries the marker (decoded, or as jsonb text);
+    #   3. the record did not carry a media_context key at all, so the database
+    #      row is read and asked directly.
+    #
+    # (3) is the one that matters in production. Nothing here can skip an
+    # ordinary fan message: every branch requires a positive identification.
+    if await _simulation_owns_message(message_id, record):
+        print(f"[WEBHOOK] simulation-owned message skipped id={message_id}")
         return {"status": "skipped - owner simulation"}
 
     print(f"[WEBHOOK] message_id={message_id} role={record.get('role')} content={message_content[:30]}")
@@ -5426,14 +5474,22 @@ class FanAutoModeRequest(BaseModel):
 
 
 async def _creator_auto_availability(creator_id: str) -> dict:
-    result = await asyncio.to_thread(
-        lambda: get_supabase().table("vault_sets")
-        .select("id", count="exact")
-        .eq("creator_id", creator_id)
-        .eq("status", "approved")
-        .limit(1)
-        .execute()
-    )
+    def _count():
+        def _build(apply_filter: bool):
+            query = (
+                get_supabase().table("vault_sets")
+                .select("id", count="exact")
+                .eq("creator_id", creator_id)
+                .eq("status", "approved")
+            )
+            # Mirrored test content never makes a creator "ready for Auto".
+            if apply_filter:
+                query = exclude_simulation_only(query)
+            return query.limit(1).execute()
+
+        return run_live_catalog_query(_build, label="auto_availability.approved_sets")
+
+    result = await asyncio.to_thread(_count)
     count = int(result.count or 0)
     if not apifansly_enabled():
         # Real Full Auto has nowhere to deliver, so it is not available for real
@@ -6098,31 +6154,54 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
     if str(fan.get("creator_id") or "") != str(creator_id):
         raise HTTPException(status_code=404, detail="fan not found for creator")
 
-    try:
-        from services.ppv_delivery_ledger import list_fan_deliveries
-
-        vault_rows, set_rows, message_rows, deliveries = await asyncio.gather(
-            asyncio.to_thread(
-                lambda: db.table("creator_vault_media")
+    # An operator sends these by hand, so the simulation filter is applied
+    # unconditionally (include_simulation=False): the manual path must never be
+    # able to put mirrored test media in front of a real fan, not even when it
+    # is somehow invoked from inside a simulated turn.
+    def _load_operator_vault_media():
+        def _build(apply_filter: bool):
+            query = (
+                db.table("creator_vault_media")
                 .select(
                     "id, fansly_media_id, media_id, url, thumbnail_url, mimetype, filename, "
                     "album_title, content_category, ai_description, price_min, price_max, is_active"
                 )
                 .eq("creator_id", creator_id)
                 .eq("is_active", True)
-                .execute()
-            ),
-            asyncio.to_thread(
-                lambda: db.table("vault_sets")
+            )
+            if apply_filter:
+                query = exclude_simulation_only(query)
+            return query.execute()
+
+        return run_live_catalog_query(
+            _build, label="operator_ppv.vault_media", include_simulation=False
+        )
+
+    def _load_operator_approved_sets():
+        def _build(apply_filter: bool):
+            query = (
+                db.table("vault_sets")
                 .select(
                     "id, title, description, media_ids, suggested_price, base_price_cents, min_price_cents, "
                     "max_price_cents, dynamic_pricing_enabled, tags, status"
                 )
                 .eq("creator_id", creator_id)
                 .eq("status", "approved")
-                .order("created_at", desc=True)
-                .execute()
-            ),
+            )
+            if apply_filter:
+                query = exclude_simulation_only(query)
+            return query.order("created_at", desc=True).execute()
+
+        return run_live_catalog_query(
+            _build, label="operator_ppv.vault_sets", include_simulation=False
+        )
+
+    try:
+        from services.ppv_delivery_ledger import list_fan_deliveries
+
+        vault_rows, set_rows, message_rows, deliveries = await asyncio.gather(
+            asyncio.to_thread(_load_operator_vault_media),
+            asyncio.to_thread(_load_operator_approved_sets),
             asyncio.to_thread(
                 lambda: db.table("messages")
                 .select("media_context")
@@ -6431,6 +6510,13 @@ class SimulateDeclineRequest(BaseModel):
     reason: str = "simulated_decline"
 
 
+class SimulationCatalogMirrorRequest(BaseModel):
+    """Which creator's vault to mirror into which creator's TEST catalog."""
+
+    source_creator_id: str = Field(min_length=1, max_length=64)
+    target_creator_id: str = Field(min_length=1, max_length=64)
+
+
 async def _creator_ids_for_user_cached(request: Request) -> set[str]:
     """The caller's assigned creator ids, reusing the tenancy layer's cache.
 
@@ -6608,6 +6694,96 @@ async def simulate_inbound(
         message=body.message,
         fast=body.fast,
     )
+
+
+async def _require_simulation_catalog_access(
+    request: Request,
+    source_creator_id: str,
+    target_creator_id: str,
+) -> None:
+    """Owner-only, and only over creators this caller is already assigned.
+
+    The simulator allowlist decides WHO may mirror; ordinary tenancy decides
+    WHICH creators. Both, in that order, and the same 404 for either failure —
+    an agency account must not be able to discover that this feature exists,
+    let alone learn another tenant's creator ids by probing it.
+    """
+    from core.simulation import not_found, require_simulation_user
+
+    await require_simulation_user(request)
+    allowed = await _creator_ids_for_user_cached(request)
+    if str(source_creator_id) not in allowed or str(target_creator_id) not in allowed:
+        raise not_found()
+
+
+@app.post("/simulation/catalog/mirror")
+async def mirror_simulation_catalog(
+    body: SimulationCatalogMirrorRequest,
+    request: Request,
+) -> dict:
+    """Refresh the target creator's owner-only TEST catalog from a source vault.
+
+    Mirrored rows are marked ``simulation_only`` and carry rewritten ``sim:``
+    media ids, so they are visible to the simulator, excluded from live package
+    planning, and refused by every delivery path. The source creator's vault is
+    read only — a mirror can be rebuilt or deleted without touching it.
+    """
+    from services.simulation_catalog import (
+        SimulationCatalogError,
+        mirror_creator_catalog,
+    )
+
+    await _require_simulation_catalog_access(
+        request, body.source_creator_id, body.target_creator_id
+    )
+    try:
+        result = await mirror_creator_catalog(
+            source_creator_id=body.source_creator_id,
+            target_creator_id=body.target_creator_id,
+        )
+    except SimulationCatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"[SIMULATION CATALOG] mirror failed: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not mirror the simulation catalog. Please retry.",
+        ) from exc
+    return {"status": "ok", **result.to_dict()}
+
+
+@app.post("/simulation/catalog/mirror/delete")
+async def delete_simulation_catalog_mirror(
+    body: SimulationCatalogMirrorRequest,
+    request: Request,
+) -> dict:
+    """Remove a mirror. Deletes only mirrored rows on the target creator.
+
+    POST rather than DELETE because the operation is identified by a body, not
+    by a path: the pair (source, target) is what names a mirror.
+    """
+    from services.simulation_catalog import (
+        SimulationCatalogError,
+        delete_creator_catalog_mirror,
+    )
+
+    await _require_simulation_catalog_access(
+        request, body.source_creator_id, body.target_creator_id
+    )
+    try:
+        result = await delete_creator_catalog_mirror(
+            source_creator_id=body.source_creator_id,
+            target_creator_id=body.target_creator_id,
+        )
+    except SimulationCatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"[SIMULATION CATALOG] mirror delete failed: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not delete the simulation catalog mirror. Please retry.",
+        ) from exc
+    return {"status": "ok", **result.to_dict()}
 
 
 @app.post("/creator/{creator_id}/fan/{fan_id}/simulate-purchase")
