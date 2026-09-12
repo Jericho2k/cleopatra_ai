@@ -4880,7 +4880,15 @@ async def _simulation_owns_message(message_id: object, record: dict) -> bool:
     # the row has none — it is the absence of evidence, and the database is the
     # only authority. One indexed primary-key read, on a path that otherwise
     # runs the whole analyzer.
-    return await message_row_is_simulation_owned(message_id)
+    #
+    # Wrapped again here even though the helper swallows its own failures: an
+    # ownership check must never be able to turn a fan's message into a 500 and
+    # a Supabase redelivery loop. Not positively identified means processed.
+    try:
+        return await message_row_is_simulation_owned(message_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        print(f"[WEBHOOK] simulation ownership check failed id={message_id}: {exc}")
+        return False
 
 
 @app.post("/generate-suggestions")

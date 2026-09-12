@@ -535,3 +535,117 @@ def test_no_user_id_is_hardcoded_in_source():
             source,
             re.IGNORECASE,
         ), f"{module.__name__} contains a literal UUID"
+
+
+# --- the owner-only simulation catalog mirror -------------------------------
+#
+# The mirror copies one creator's vault metadata into another's TEST catalog. It
+# is an owner capability over creators the caller already holds: the allowlist
+# decides WHO, ordinary tenancy decides WHICH. An agency account must not be
+# able to invoke it, and must not be able to learn that it exists.
+
+
+def _mirror(client, user, *, source="creator-1", target="creator-1", delete=False):
+    path = "/simulation/catalog/mirror/delete" if delete else "/simulation/catalog/mirror"
+    return client.post(
+        path,
+        headers=_headers(user),
+        json={"source_creator_id": source, "target_creator_id": target},
+    )
+
+
+@pytest.fixture
+def mirror_spy(monkeypatch):
+    """Record every mirror the routes would perform, and perform none of them."""
+    calls: list[tuple] = []
+
+    async def fake_mirror(*, source_creator_id, target_creator_id):
+        calls.append(("mirror", source_creator_id, target_creator_id))
+        from services.simulation_catalog import MirrorResult
+
+        return MirrorResult(
+            source_creator_id=source_creator_id,
+            target_creator_id=target_creator_id,
+            media_mirrored=2,
+            sets_mirrored=2,
+            media_removed=0,
+            sets_removed=0,
+        )
+
+    async def fake_delete(*, source_creator_id, target_creator_id):
+        calls.append(("delete", source_creator_id, target_creator_id))
+        from services.simulation_catalog import MirrorResult
+
+        return MirrorResult(
+            source_creator_id=source_creator_id,
+            target_creator_id=target_creator_id,
+            media_mirrored=0,
+            sets_mirrored=0,
+            media_removed=2,
+            sets_removed=2,
+        )
+
+    monkeypatch.setattr(
+        "services.simulation_catalog.mirror_creator_catalog", fake_mirror
+    )
+    monkeypatch.setattr(
+        "services.simulation_catalog.delete_creator_catalog_mirror", fake_delete
+    )
+    return calls
+
+
+def test_an_agency_account_cannot_invoke_the_mirror(client, mirror_spy):
+    """Same 404 as every other simulator rejection: an agency must not learn
+    that this capability exists at all."""
+    response = _mirror(client, AGENCY, source="creator-1", target="creator-1")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Resource not found"}
+    assert mirror_spy == [], "no mirror may be performed for a rejected caller"
+
+
+def test_an_agency_account_cannot_delete_a_mirror(client, mirror_spy):
+    assert _mirror(client, AGENCY, delete=True).status_code == 404
+    assert mirror_spy == []
+
+
+def test_the_mirror_is_off_when_the_feature_switch_is_off(client, mirror_spy, monkeypatch):
+    monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "false")
+    assert _mirror(client, OWNER).status_code == 404
+    assert mirror_spy == []
+
+
+def test_the_owner_cannot_mirror_a_creator_they_are_not_assigned(client, mirror_spy):
+    """Owner-only does not mean owner-of-everything: ordinary tenancy still
+    decides which creators are in reach."""
+    assert _mirror(client, OWNER, source="creator-2").status_code == 404
+    assert _mirror(client, OWNER, target="creator-2").status_code == 404
+    assert mirror_spy == []
+
+
+def test_an_unauthenticated_caller_cannot_invoke_the_mirror(client, mirror_spy):
+    response = client.post(
+        "/simulation/catalog/mirror",
+        headers={"X-API-Key": "test-dashboard-secret"},
+        json={"source_creator_id": "creator-1", "target_creator_id": "creator-1"},
+    )
+    assert response.status_code in (401, 404)
+    assert mirror_spy == []
+
+
+def test_the_owner_may_mirror_between_creators_they_hold(client, mirror_spy):
+    response = _mirror(client, OWNER, source="creator-1", target="creator-1")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["simulation_only"] is True
+    assert mirror_spy == [("mirror", "creator-1", "creator-1")]
+
+
+def test_the_owner_may_delete_a_mirror_they_created(client, mirror_spy):
+    response = _mirror(client, OWNER, delete=True)
+
+    assert response.status_code == 200
+    assert response.json()["sets_removed"] == 2
+    assert mirror_spy == [("delete", "creator-1", "creator-1")]

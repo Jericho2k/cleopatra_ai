@@ -37,8 +37,9 @@ select a package; it can only narrow what may be said to what was approved.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 # The two asset types the commercial layer actually produces. ``media_packages``
 # emits exactly these strings on PackageOption.asset_types and session steps.
@@ -67,7 +68,15 @@ _HUMAN_ASSET_NAMES = {
 }
 
 _VIDEO_NOUN = r"(?:video|videos|vid|vids|clip|clips|movie|movies|footage|recording)"
-_PHOTO_NOUN = r"(?:photo|photos|pic|pics|picture|pictures|set|sets|album|shoot)"
+
+# Adjectives that routinely sit between a determiner and the noun. Kept in one
+# place so a phrasing one rule handles is handled by all of them — a rule that
+# misses the adjective falls through to the residual check and deletes the whole
+# sentence, which is a worse reply than a repaired one.
+_ADJ = (
+    r"(?:new\s+|hot\s+|little\s+|short\s+|naughty\s+|next\s+|last\s+|"
+    r"latest\s+|second\s+|other\s+|first\s+|full\s+)*"
+)
 
 
 def human_asset_name(asset_type: str, *, plural: bool = False) -> str:
@@ -306,7 +315,7 @@ _PROMISE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
             r"\bi(?:'ve|\s+have|\s+ve|\s+got|'ll\s+have)?\s*(?:do\s+)?"
             r"(?:have|got|made|shot|filmed|recorded)\s+"
             r"(?:a|an|this|some|a\s+few|another|one|new|my)?\s*"
-            r"(?:new\s+|hot\s+|little\s+|short\s+|naughty\s+)*" + _VIDEO_NOUN + r"\b",
+            + _ADJ + _VIDEO_NOUN + r"\b",
             re.IGNORECASE,
         ),
         "i have a {noun}",
@@ -316,7 +325,7 @@ _PROMISE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(
             r"\bwait\s+(?:un)?til+\s+(?:you|u)\s+see\s+"
             r"(?:the|my|this|that)?\s*"
-            r"(?:new\s+|last\s+|next\s+)*" + _VIDEO_NOUN + r"\b",
+            + _ADJ + _VIDEO_NOUN + r"\b",
             re.IGNORECASE,
         ),
         "wait till you see the {noun}",
@@ -328,7 +337,7 @@ _PROMISE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
             r"gonna|i'?m\s+gonna|i\s+wanna|i\s+want\s+to)\s+"
             r"(?:send|drop|shoot|film|record|make|show)\s+"
             r"(?:you|u|ya)?\s*(?:a|an|the|my|this|some|another)?\s*"
-            r"(?:new\s+|hot\s+|little\s+|short\s+|naughty\s+)*" + _VIDEO_NOUN + r"\b",
+            + _ADJ + _VIDEO_NOUN + r"\b",
             re.IGNORECASE,
         ),
         "i'll send you a {noun}",
@@ -338,7 +347,7 @@ _PROMISE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(
             r"\b(?:sending|dropping|filming|recording|making)\s+"
             r"(?:you|u|ya)?\s*(?:a|an|the|my|this|some)?\s*"
-            r"(?:new\s+|hot\s+|little\s+|short\s+)*" + _VIDEO_NOUN + r"\b",
+            + _ADJ + _VIDEO_NOUN + r"\b",
             re.IGNORECASE,
         ),
         "sending you a {noun}",
@@ -347,7 +356,7 @@ _PROMISE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"\b(?:the|my|this|that)\s+"
-            r"(?:new\s+|next\s+|last\s+|second\s+|other\s+)*" + _VIDEO_NOUN
+            + _ADJ + _VIDEO_NOUN
             + r"\s+(?:is|was|gets|goes|hits|will)\b",
             re.IGNORECASE,
         ),
@@ -358,7 +367,7 @@ _PROMISE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(
             r"\b(?:do\s+)?(?:you\s+|u\s+)?wan+(?:t|na)\s+"
             r"(?:to\s+see\s+)?(?:the|a|an|my|this|some)\s*"
-            r"(?:new\s+|hot\s+|little\s+)*" + _VIDEO_NOUN + r"\b",
+            + _ADJ + _VIDEO_NOUN + r"\b",
             re.IGNORECASE,
         ),
         "want the {noun}",
@@ -368,10 +377,33 @@ _PROMISE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(
             r"\bthere(?:'s|\s+is|\s+are)\s+"
             r"(?:a|an|some|this|my)?\s*"
-            r"(?:new\s+|hot\s+|little\s+)*" + _VIDEO_NOUN + r"\b",
+            + _ADJ + _VIDEO_NOUN + r"\b",
             re.IGNORECASE,
         ),
         "there's a {noun}",
+    ),
+    # "you're gonna love the video", "you'll die when you see my clip"
+    (
+        re.compile(
+            r"\b(?:you'?re|u\s*r|you\s+are|ur|you'?ll|you\s+will)\s+"
+            r"(?:gonna|going\s+to|gna)?\s*"
+            r"(?:love|like|die|lose\s+it|freak|melt)\s+"
+            r"(?:when\s+(?:you|u)\s+see\s+)?"
+            r"(?:the|my|this|that)\s+"
+            + _ADJ + _VIDEO_NOUN + r"\b",
+            re.IGNORECASE,
+        ),
+        "you're gonna love the {noun}",
+    ),
+    # "check out my video", "peep the clip"
+    (
+        re.compile(
+            r"\b(?:check\s+out|look\s+at|peep|go\s+see|open)\s+"
+            r"(?:the|my|this|that)\s+"
+            + _ADJ + _VIDEO_NOUN + r"\b",
+            re.IGNORECASE,
+        ),
+        "check out the {noun}",
     ),
     # "on video", "caught it on camera" — only as an offer of what she has.
     (
@@ -384,12 +416,22 @@ _PROMISE_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
 )
 
-# A sentence that still names creator video after repair is dropped whole.
+# A bare first-person possession claim: "my video", "my latest clip". This is
+# the one phrasing that is a promise of creator inventory with no verb attached,
+# so it is checked separately from the rules above.
+#
+# Deliberately narrow. An earlier draft matched any determiner, which turned
+# "that video you sent me of your dog" and "halfway through the movie" into
+# violations — and a guard that rewrites ordinary conversation is worse than the
+# problem it solves. "my" is the only determiner that always means hers.
 _RESIDUAL_PROMISE_RE = re.compile(
-    r"\b(?:my|the|a|an|this|that|another|some)\s+"
-    r"(?:new\s+|hot\s+|little\s+|short\s+|next\s+|last\s+)*" + _VIDEO_NOUN + r"\b",
+    r"\bmy\s+" + _ADJ + _VIDEO_NOUN + r"\b",
     re.IGNORECASE,
 )
+
+# Anything a repair rule can still match after substitution is also residual: it
+# means the rule expressed only part of the promise. Checked by re-running the
+# rules, which are idempotent substitutions and cannot re-match their own output.
 
 _PPV_TAG_RE = re.compile(r"\[PPV:[^\]]+\]", re.IGNORECASE)
 
@@ -426,13 +468,20 @@ def _tidy(text: str) -> str:
     return text.strip(" \t,;")
 
 
+def _names_creator_video(fragment: str) -> bool:
+    """Whether one fragment claims or offers creator video."""
+    if _RESIDUAL_PROMISE_RE.search(fragment):
+        return True
+    return any(pattern.search(fragment) for pattern, _ in _PROMISE_RULES)
+
+
 def _drop_clauses_naming_video(text: str) -> str:
     """Remove only the fragments that still promise video, keeping the reply."""
     bubbles_out: list[str] = []
     for bubble in str(text or "").split("|"):
         kept: list[str] = []
         for sentence in re.split(r"(?<=[.!?])\s+", bubble):
-            if _RESIDUAL_PROMISE_RE.search(sentence):
+            if _names_creator_video(sentence):
                 continue
             kept.append(sentence)
         joined = _tidy(" ".join(part for part in kept if part.strip()))
@@ -445,10 +494,7 @@ def promises_unavailable_media(text: str, inventory: MediaInventory) -> bool:
     """True when the copy offers creator video that is not authorised."""
     if inventory.may_promise_video:
         return False
-    body = str(text or "")
-    if any(pattern.search(body) for pattern, _ in _PROMISE_RULES):
-        return True
-    return bool(_RESIDUAL_PROMISE_RE.search(body))
+    return _names_creator_video(str(text or ""))
 
 
 def repair_media_promises(text: str, inventory: MediaInventory) -> str:
@@ -479,7 +525,7 @@ def repair_media_promises(text: str, inventory: MediaInventory) -> str:
             template.format(noun=noun, nouns=nouns).replace("\\", ""), repaired
         )
     repaired = _tidy(repaired)
-    if _RESIDUAL_PROMISE_RE.search(repaired):
+    if _names_creator_video(repaired):
         repaired = _drop_clauses_naming_video(repaired)
     return repaired
 
@@ -536,9 +582,12 @@ def choose_inventory_safe_reply(
         )
         if not repaired:
             return text, False
-        if text.strip() and not promises_unavailable_media(text, inventory or UNKNOWN_INVENTORY):
-            if repaired_fallback is None:
-                repaired_fallback = text
+        if (
+            repaired_fallback is None
+            and text.strip()
+            and not promises_unavailable_media(text, inventory or UNKNOWN_INVENTORY)
+        ):
+            repaired_fallback = text
     if repaired_fallback is not None:
         return repaired_fallback, True
     return None, True

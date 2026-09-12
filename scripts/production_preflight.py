@@ -328,6 +328,35 @@ def check_schema(catalog: Catalog, report: Report) -> None:
             "apply db/message_platform_identity_v1.sql",
         )
 
+    # --- Owner-only simulation catalog -------------------------------------
+    #
+    # A warning rather than a failure: without these columns no mirrored row can
+    # exist, so live planning is correct by construction and the deployment is
+    # fine. It is reported because the owner simulator's test catalog does not
+    # work until the migration is applied.
+    missing_catalog = [
+        f"{table}.{column}"
+        for table, column in (
+            ("vault_sets", "simulation_only"),
+            ("vault_sets", "source_creator_id"),
+            ("creator_vault_media", "simulation_only"),
+            ("creator_vault_media", "source_creator_id"),
+        )
+        if not catalog.column_exists(table, column)
+    ]
+    if missing_catalog:
+        report.warn(
+            "simulation catalog boundary",
+            "missing " + ", ".join(missing_catalog)
+            + "; apply db/simulation_catalog_v1.sql to use the owner simulator's "
+            "test catalog",
+        )
+    else:
+        report.ok(
+            "simulation catalog boundary",
+            "simulation_only and provenance columns present",
+        )
+
     # --- The hottest read in the product -----------------------------------
     if catalog.index_definition("messages", "fan_id"):
         report.ok("messages conversation index", "an index on fan_id exists")

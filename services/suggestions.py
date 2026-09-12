@@ -84,7 +84,6 @@ from services.message_shape import (
 )
 from services.ppv_language import sanitize_candidates, sanitize_delivery_language
 from services.inventory_authority import (
-    UNKNOWN_INVENTORY,
     MediaInventory,
     asset_types_from_session,
     choose_inventory_safe_reply,
@@ -813,7 +812,6 @@ async def _recover_or_downgrade_plan(
       when there is genuinely nothing left to sell him.
     """
     from services.session_plan_recovery import (
-        PlanFailureClass,
         classify_plan_status,
         recover_session_plan,
     )
