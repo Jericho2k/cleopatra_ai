@@ -1427,3 +1427,86 @@ def test_an_unrecoverable_plan_reports_itself_rather_than_a_no_send(
         "a broken sale must be reported as broken, not as the product working"
     )
     assert result["outcome"] != "no_send"
+
+
+# --- a fresh fan's very first turn -----------------------------------------
+#
+# The director opens every new conversation with
+# phase=OPENING action=RESPOND_AND_OPEN, and derive_session_strategy mapped that
+# to NextBestAction.RESPOND_AND_OPEN — an enum member that has never existed.
+# Because derive_session_strategy runs OUTSIDE the persistence try/except in
+# plan_next_action, the AttributeError propagated out of the whole Auto turn:
+# no strategy, no writer call, no reply. The unit contract lives in
+# tests/test_session_strategy_director.py; what is pinned here is that the real
+# pipeline survives the turn end to end.
+
+
+def test_a_fresh_fans_opening_turn_runs_the_writer_and_replies(
+    world, spy, monkeypatch
+):
+    from services.adaptive_session_planner import plan_next_action
+
+    monkeypatch.setenv("ADAPTIVE_SESSION_PLANNER_ENABLED", "true")
+    db, calls = world
+
+    async def opening_director(**_kwargs):
+        # Exactly what advance_conversation_director emits for a new fan.
+        return {
+            "phase": "OPENING",
+            "action": "RESPOND_AND_OPEN",
+            "transition_reason": "first_contact",
+            "turns_in_phase": 1,
+            "engagement_score": 0,
+        }
+
+    monkeypatch.setattr(suggestions, "direct_conversation", opening_director)
+    # The real planner, not the fixture's stub: derive_session_strategy is the
+    # code under test.
+    monkeypatch.setattr(suggestions, "plan_next_action", plan_next_action)
+
+    result = _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hey there", fast=True
+        )
+    )
+
+    assert result["outcome"] == "replied", (
+        "an opening turn must not fail closed; it is the product's first message"
+    )
+    assert result["creator_messages"], "the fan gets an actual reply"
+    assert len(calls["writer"]) == 1, "the writer ran"
+
+    strategy = calls["writer"][-1]
+    assert strategy, "the writer received a prompt"
+
+
+def test_the_opening_strategy_reaches_the_writer_prompt(world, spy, monkeypatch):
+    """Not just 'no exception' — the strategy has to arrive intact."""
+    from services.adaptive_session_planner import plan_next_action
+
+    monkeypatch.setenv("ADAPTIVE_SESSION_PLANNER_ENABLED", "true")
+    db, calls = world
+
+    async def opening_director(**_kwargs):
+        return {
+            "phase": "OPENING",
+            "action": "RESPOND_AND_OPEN",
+            "transition_reason": "first_contact",
+        }
+
+    monkeypatch.setattr(suggestions, "direct_conversation", opening_director)
+    monkeypatch.setattr(suggestions, "plan_next_action", plan_next_action)
+
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hey there", fast=True
+        )
+    )
+
+    prompt = calls["writer"][-1]["prompt"]
+    text = "\n".join(
+        str(message["content"]) for message in prompt if isinstance(message, dict)
+    )
+    assert "ADAPTIVE SESSION STRATEGY" in text
+    assert "next action: CONTINUE_CHAT" in text
+    assert "respond specifically to what he said" in text

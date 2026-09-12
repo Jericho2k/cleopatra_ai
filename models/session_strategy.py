@@ -458,8 +458,26 @@ def derive_session_strategy(
             return SessionStrategy(
                 goal=SessionGoal.RAPPORT,
                 phase=director_phase or "RAPPORT",
+                # DirectorAction and NextBestAction are deliberately different
+                # vocabularies, not two copies of one list. The director says
+                # WHY the conversation moves (RESPOND_AND_OPEN is the opening
+                # beat with a fresh fan); NextBestAction says WHAT the writer
+                # does next. DISCOVER_PREFERENCE -> ASK_ONE_QUESTION above is
+                # the same translation, and several director actions
+                # (HANDLE_OBJECTION, WAIT_FOR_PAYMENT, CONTINUE_PAID_SESSION)
+                # have no planner twin at all because the commercial decision
+                # handles those turns before this block is reached.
+                #
+                # So an opening turn is CONTINUE_CHAT, not a seventeenth enum
+                # member: there is no rapport to DEEPEN on the first exchange,
+                # and every other field of this strategy is already identical
+                # for both director actions. Nothing is lost by not duplicating
+                # the label — the writer still sees RESPOND_AND_OPEN, because
+                # _render_conversation_director renders the director's own
+                # action and _render_expression_guidance reads director_action
+                # in preference to this one.
                 next_action=(
-                    NextBestAction.RESPOND_AND_OPEN
+                    NextBestAction.CONTINUE_CHAT
                     if director_action == "RESPOND_AND_OPEN"
                     else NextBestAction.DEEPEN_RAPPORT
                 ),
