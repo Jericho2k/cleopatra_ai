@@ -290,23 +290,46 @@ def _is_missing_conflict_target(error: Exception) -> bool:
     return any(marker.lower() in text for marker in _MISSING_CONFLICT_TARGET_MARKERS)
 
 
-# Whether this process has observed the platform-identity index to be missing.
+# Whether the platform-identity index is currently believed to be missing.
 #
 # The fallback below keeps ingestion working without it, which is exactly why a
 # log line alone was not enough: the deployment looked fine while running on a
 # racy check-then-insert that the migration exists to remove. Health publishes
 # this, so "apply db/message_platform_identity_v1.sql" is a visible operator
 # task rather than a line somebody has to notice in Railway.
+#
+# It is NOT a latch. An operator who applies the migration must see the signal
+# clear without restarting the process — a health signal that survives the fix
+# is the same stale-notice problem the database banner has, one table over. A
+# successful upsert against the conflict target is proof the index exists, so
+# that is what clears it.
 _message_identity_index_missing = False
 
 
 def message_identity_index_missing() -> bool:
-    """True once ingestion has had to fall back to check-then-insert."""
+    """Whether ingestion is currently running without the unique index."""
     return _message_identity_index_missing
 
 
+def _clear_message_identity_index_missing() -> None:
+    """Record that the conflict target demonstrably exists."""
+    global _message_identity_index_missing
+    if _message_identity_index_missing:
+        print(
+            "[MESSAGE IDENTITY] unique index is present again — "
+            "db/message_platform_identity_v1.sql has been applied"
+        )
+    _message_identity_index_missing = False
+
+
 def reset_message_identity_index_state() -> None:
-    """Test-support only."""
+    """Test-support only.
+
+    This module-level flag is deliberately process-global, which makes it
+    exactly the kind of state one test can leak into another. tests/conftest.py
+    resets it around every test so an unrelated health assertion can never
+    inherit it.
+    """
     global _message_identity_index_missing
     _message_identity_index_missing = False
 
@@ -437,6 +460,13 @@ async def save_message_result(
                 )
                 return _legacy_check_then_insert()
             raise
+
+        # The upsert named (creator_id, fansly_message_id) as its conflict
+        # target and Postgres accepted it, which it only does when a matching
+        # unique index exists. Whatever we believed a moment ago, it is there
+        # now — so a deployment that has just had the migration applied stops
+        # reporting it as pending without needing a restart.
+        _clear_message_identity_index_missing()
 
         data = response.data or []
         if data and data[0].get("id") is not None:

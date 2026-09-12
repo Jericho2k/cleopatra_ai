@@ -289,3 +289,54 @@ def test_the_pending_message_identity_migration_is_published(monkeypatch):
 
     assert "message_identity_index_missing" in verdict["degraded_reasons"]
     assert verdict["fatal_reasons"] == [], "a pending migration is not an outage"
+
+
+def test_the_migration_signal_clears_itself_once_the_index_exists(monkeypatch):
+    """An operator who applies the migration must see the signal go without a
+    restart. A health signal that survives its own fix is the stale-notice
+    problem this whole change exists to remove, one table over.
+
+    A successful upsert against the conflict target is the proof: Postgres only
+    accepts ``on_conflict`` when a matching unique index is there.
+    """
+    from types import SimpleNamespace
+
+    import db.queries as queries
+
+    class _Query:
+        def table(self, _name):
+            return self
+
+        def upsert(self, _payload, **_kwargs):
+            return self
+
+        def execute(self):
+            return SimpleNamespace(data=[{"id": "msg-1"}])
+
+    monkeypatch.setattr(queries, "get_supabase", _Query)
+    queries._message_identity_index_missing = True
+    assert queries.message_identity_index_missing() is True
+
+    asyncio.run(
+        queries.save_message_result(
+            "fan-1", "creator-1", "fan", "hi", fansly_message_id="m-1"
+        )
+    )
+
+    assert queries.message_identity_index_missing() is False
+    verdict = _evaluate({"reachable": True, "latency_ms": 8, "error": None})
+    assert "message_identity_index_missing" not in verdict["degraded_reasons"]
+
+
+def test_process_global_signals_do_not_leak_between_tests():
+    """The conftest fixture is load-bearing, so it is asserted rather than assumed.
+
+    CI ran the missing-index fallback test (skipped locally without
+    TEST_DATABASE_URL), and every later health assertion inherited `degraded`.
+    """
+    import db.queries as queries
+
+    from core.db_health_state import DATABASE_HEALTH
+
+    assert queries.message_identity_index_missing() is False
+    assert DATABASE_HEALTH.snapshot().consecutive_failures == 0
