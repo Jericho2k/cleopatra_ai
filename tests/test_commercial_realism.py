@@ -730,3 +730,31 @@ def test_an_agency_can_still_configure_cent_level_pricing_deliberately():
     steps = [photo_set("a", price=20, level=2), photo_set("b", price=30, level=4)]
     allocation = allocate_step_prices(6013, steps, step_cents=1)
     assert allocation is not None and sum(allocation) == 6013
+
+
+def test_the_operator_send_path_enforces_the_same_content_bounds():
+    """An operator and the commercial layer must price the same set the same way.
+
+    A row backfilled to min = max = base would otherwise let the AI price it
+    across its approved category range while rejecting the operator for the
+    exact same price.
+    """
+    import inspect
+
+    import main
+
+    source = inspect.getsource(main.send_operator_ppv)
+    assert "price_bounds(approved_set)" in source
+    assert "dynamic_pricing_enabled" in source
+
+    row = {
+        "status": "approved",
+        "suggested_price": 25,
+        "base_price_cents": 2500,
+        "min_price_cents": 2500,
+        "max_price_cents": 2500,
+        "dynamic_pricing_enabled": True,
+        "tags": ["nude_photo"],
+    }
+    _, minimum, maximum, _ = price_bounds(row)
+    assert (minimum, maximum) == NUDE_RANGE

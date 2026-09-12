@@ -57,6 +57,7 @@ from db.queries import (
 from db.commercial_queries import schedule_action
 from models.commercial import CreatorPolicy
 from models.content_pricing import VAULT_CATEGORIES as CONTENT_CATEGORY_RANGES
+from models.vault_pricing import price_bounds
 from models.schemas import (
     ConversationContext,
     Fan,
@@ -6157,12 +6158,27 @@ async def read_operator_ppv_options(fan_id: str, creator_id: str) -> dict:
         status = status_by_id.get(external_id, "unused")
         media.append({**row, "external_media_id": external_id, "fan_sale_status": status})
 
+    # Report the bounds actually enforced below, not the raw columns. A legacy
+    # row backfilled to min = max = base would otherwise show the operator a
+    # one-price band while the commercial layer prices it across its approved
+    # category range.
+    approved_sets = []
+    for row in (set_rows.data or []):
+        base, minimum, maximum, dynamic = price_bounds(row)
+        approved_sets.append({
+            **row,
+            "base_price_cents": base,
+            "min_price_cents": minimum,
+            "max_price_cents": maximum,
+            "dynamic_pricing_enabled": dynamic,
+        })
+
     return {
         "fan_id": fan_id,
         "creator_id": creator_id,
         "has_payment_pending": bool(fan.get("pending_ppv_check")),
         "media": media,
-        "approved_sets": set_rows.data or [],
+        "approved_sets": approved_sets,
     }
 
 
@@ -6207,7 +6223,10 @@ async def send_operator_ppv(
     if request.set_id:
         set_row = await asyncio.to_thread(
             lambda: db.table("vault_sets")
-            .select("media_ids, status, min_price_cents, max_price_cents")
+            .select(
+                "media_ids, status, suggested_price, tags, base_price_cents, "
+                "min_price_cents, max_price_cents, dynamic_pricing_enabled"
+            )
             .eq("id", request.set_id)
             .eq("creator_id", creator_id)
             .single()
@@ -6218,8 +6237,9 @@ async def send_operator_ppv(
             raise HTTPException(status_code=400, detail="the selected set is not approved")
         if set(normalize_media_ids(approved_set.get("media_ids") or [])) != set(exact_ids):
             raise HTTPException(status_code=400, detail="selected media no longer matches the approved set")
-        minimum = int(approved_set.get("min_price_cents") or 0)
-        maximum = int(approved_set.get("max_price_cents") or 0)
+        # One authority for what this content may cost, so an operator and the
+        # commercial layer cannot disagree about the same set.
+        _, minimum, maximum, _ = price_bounds(approved_set)
         if minimum and request.price_cents < minimum:
             raise HTTPException(status_code=400, detail=f"price is below the set minimum (${minimum / 100:g})")
         if maximum and request.price_cents > maximum:
