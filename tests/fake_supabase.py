@@ -90,15 +90,20 @@ class _FakeQuery:
         self._db = db
         self._record = ExecutedQuery(table=table)
         self._single = False
+        self._count_mode: str | None = None
         self._op: str | None = None
         self._payload: Any = None
         self._on_conflict: str | None = None
 
     # --- read builders ------------------------------------------------------
 
-    def select(self, columns: str = "*", **_kwargs):
+    def select(self, columns: str = "*", count: str | None = None, **_kwargs):
         self._op = "select"
         self._record.columns = columns
+        # PostgREST's count mode. Recorded so a caller that asks for a count and
+        # a single row — the cheap way to count without transferring the rows —
+        # gets the total here too, rather than the length of the truncated page.
+        self._count_mode = count
         return self
 
     def eq(self, column: str, value: Any):
@@ -193,6 +198,9 @@ class _FakeQuery:
 
         self._db.queries.append(self._record)
         rows = self._matching_rows()
+        # Captured before ordering, paging and the row cap, because a count is
+        # a statement about the whole match, not about the page.
+        matched_total = len(rows)
 
         if self._record.orders:
             for column, desc in reversed(self._record.orders):
@@ -214,6 +222,10 @@ class _FakeQuery:
         rows = [dict(row) for row in rows]
         if self._single:
             return SimpleNamespace(data=rows[0] if rows else None)
+        if self._count_mode:
+            # The count describes every matching row, not the page returned —
+            # which is the whole reason a caller pairs count with limit(1).
+            return SimpleNamespace(data=rows, count=matched_total)
         return SimpleNamespace(data=rows)
 
     def _execute_write(self):
