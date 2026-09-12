@@ -56,6 +56,35 @@ class FakeSupabase:
         return [query for query in self.queries if query.table == table]
 
 
+def _like_matches(value: str, pattern: str) -> bool:
+    """SQL LIKE, enough of it for the filters this fake sees.
+
+    ``%`` is any run of characters, ``_`` is exactly one, and a backslash
+    escapes either. The escape matters here rather than being pedantry: the
+    simulation-fan filter is ``test\\_%``, and treating that underscore as a
+    wildcard would make the fake agree with a buggy query that also excludes a
+    real fan whose platform id merely starts with "test".
+    """
+    import re
+
+    regex = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "\\" and index + 1 < len(pattern):
+            regex.append(re.escape(pattern[index + 1]))
+            index += 2
+            continue
+        if char == "%":
+            regex.append(".*")
+        elif char == "_":
+            regex.append(".")
+        else:
+            regex.append(re.escape(char))
+        index += 1
+    return re.fullmatch("".join(regex), value) is not None
+
+
 class _FakeQuery:
     def __init__(self, db: FakeSupabase, table: str):
         self._db = db
@@ -86,6 +115,10 @@ class _FakeQuery:
 
     def is_(self, column: str, value):
         self._record.filters.append(("is", column, value))
+        return self
+
+    def like(self, column: str, pattern: str):
+        self._record.filters.append(("like", column, pattern))
         return self
 
     @property
@@ -238,6 +271,10 @@ class _FakeQuery:
                 str(item) for item in value
             }:
                 return False
+            if kind == "like" and not _like_matches(str(row.get(column) or ""), value):
+                return False
+            if kind == "not.like" and _like_matches(str(row.get(column) or ""), value):
+                return False
         return True
 
 
@@ -262,4 +299,8 @@ class _NegatedFilters:
 
     def in_(self, column: str, values):
         self._query._record.filters.append(("not.in", column, list(values)))
+        return self._query
+
+    def like(self, column: str, pattern: str):
+        self._query._record.filters.append(("not.like", column, pattern))
         return self._query

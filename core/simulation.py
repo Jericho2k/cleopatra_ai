@@ -114,6 +114,44 @@ def is_simulatable_fan(platform_fan_id: object) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Keeping simulated fans out of production analytics
+# ---------------------------------------------------------------------------
+#
+# Simulation state is deliberately PERSISTENT and realistic — that is the whole
+# point of a long-lived testing workspace. A test fan therefore accumulates real
+# rows: confirmed spend, purchase counts, price-learning evidence, lifecycle
+# transitions. None of that is agency revenue, and none of it may appear in a
+# number an agency reads as its business.
+#
+# The isolation is analytical, not a second database. One filter, applied at
+# every read that produces a production metric; the simulator applies the
+# opposite and shows the simulated numbers, which is what it is for.
+
+
+def exclude_simulation_fans(query: object) -> object:
+    """Narrow a PostgREST ``fans`` query to real customers.
+
+    ``not_`` + ``like`` rather than a Python filter, so a paginated read cannot
+    include test fans merely because they fell outside the page that was
+    filtered. The underscore in ``test\_`` is escaped: in SQL LIKE it is a
+    single-character wildcard, and leaving it unescaped would also exclude a
+    genuine fan whose platform id happened to be ``testX...``.
+    """
+    return query.not_.like("platform_fan_id", f"{TEST_FAN_PREFIX[:-1]}\\_%")
+
+
+def is_simulation_fan_row(row: object) -> bool:
+    """Whether one ``fans`` row is an owner test fan.
+
+    The in-Python counterpart, for data that has already been read (a browser
+    query, a cached list) rather than a query being built.
+    """
+    if not isinstance(row, dict):
+        return False
+    return is_simulatable_fan(row.get("platform_fan_id"))
+
+
+# ---------------------------------------------------------------------------
 # The simulator's event marker
 # ---------------------------------------------------------------------------
 #

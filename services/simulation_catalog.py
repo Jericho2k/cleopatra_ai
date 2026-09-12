@@ -335,3 +335,133 @@ def _delete_mirror(
         .execute()
     )
     return len(response.data or [])
+
+
+# ---------------------------------------------------------------------------
+# Owner-only visual preview of mirrored test media
+# ---------------------------------------------------------------------------
+#
+# A mirrored row deliberately carries no ``url`` and no ``fansly_media_id``, so
+# the simulator can plan a PPV against realistic content but cannot render it.
+# Showing the owner a grey box where the fan would see a locked photo defeats
+# the point of a full-fidelity workspace.
+#
+# The resolution below is a PREVIEW, and the distinction from delivery is the
+# whole design:
+#
+# * it goes through PROVENANCE (``source_creator_id`` + ``source_media_id``),
+#   reading the SOURCE creator's own row for a display URL;
+# * it never writes anything. The source's platform media id is not copied onto
+#   the simulation creator's catalog, so nothing here can make a mirrored row
+#   deliverable. ``send_locked_ppv`` and the Auto delivery branch still refuse a
+#   ``sim:`` id, and the simulation creator still has no platform identity for
+#   the source's media;
+# * it is owner-only, enforced at the route with the same allowlist the rest of
+#   the simulator uses.
+#
+# In other words: simulation preview access and live delivery authority stay
+# separate, which is exactly the property the mirror was built to guarantee.
+
+
+async def resolve_simulation_media_previews(
+    *,
+    creator_id: str,
+    media_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Display URLs for mirrored test media, resolved through provenance.
+
+    Returns one entry per requested id. An id that is not a mirrored row of this
+    creator resolves to nulls rather than raising: the caller is rendering a
+    chat, and one unresolvable thumbnail must not fail the request.
+    """
+    wanted = [str(value).strip() for value in media_ids if str(value or "").strip()]
+    wanted = list(dict.fromkeys(wanted))
+    if not wanted:
+        return {}
+
+    from core.simulation_catalog import is_simulation_media_id
+
+    simulated = [value for value in wanted if is_simulation_media_id(value)]
+    empty = {"url": None, "thumbnail_url": None, "mimetype": None, "source": None}
+    resolved: dict[str, dict[str, Any]] = {value: dict(empty) for value in wanted}
+    if not simulated:
+        return resolved
+
+    def _load_mirrors() -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        db = get_supabase()
+        for start in range(0, len(simulated), 200):
+            chunk = simulated[start : start + 200]
+            response = (
+                db.table("creator_vault_media")
+                .select(
+                    "media_id, source_creator_id, source_media_id, mimetype, "
+                    "simulation_only"
+                )
+                .eq("creator_id", str(creator_id))
+                .in_("media_id", chunk)
+                .execute()
+            )
+            rows.extend(response.data or [])
+        return rows
+
+    try:
+        mirrors = await asyncio.to_thread(_load_mirrors)
+    except Exception as exc:
+        print(f"[SIMULATION PREVIEW] mirror read failed creator={creator_id}: {exc}")
+        return resolved
+
+    # Group the source lookups by source creator: one query per source, not one
+    # per media item.
+    by_source: dict[str, dict[str, str]] = {}
+    for row in mirrors:
+        # Only a genuinely mirrored row is previewable. A row that somehow
+        # carries a sim: id without the flag and without provenance is not one.
+        if not row.get("simulation_only"):
+            continue
+        source_creator = str(row.get("source_creator_id") or "").strip()
+        source_media = str(row.get("source_media_id") or "").strip()
+        mirrored_id = str(row.get("media_id") or "").strip()
+        if not (source_creator and source_media and mirrored_id):
+            continue
+        by_source.setdefault(source_creator, {})[source_media] = mirrored_id
+        resolved[mirrored_id]["mimetype"] = row.get("mimetype")
+
+    def _load_source(source_creator: str, source_media_ids: list[str]) -> list[dict]:
+        rows: list[dict] = []
+        db = get_supabase()
+        for start in range(0, len(source_media_ids), 200):
+            response = (
+                db.table("creator_vault_media")
+                .select("media_id, url, thumbnail_url, mimetype")
+                .eq("creator_id", source_creator)
+                .in_("media_id", source_media_ids[start : start + 200])
+                .execute()
+            )
+            rows.extend(response.data or [])
+        return rows
+
+    for source_creator, mapping in by_source.items():
+        try:
+            source_rows = await asyncio.to_thread(
+                _load_source, source_creator, list(mapping)
+            )
+        except Exception as exc:
+            print(
+                f"[SIMULATION PREVIEW] source read failed "
+                f"creator={source_creator}: {exc}"
+            )
+            continue
+        for row in source_rows:
+            mirrored_id = mapping.get(str(row.get("media_id") or ""))
+            if not mirrored_id:
+                continue
+            resolved[mirrored_id] = {
+                "url": row.get("url"),
+                "thumbnail_url": row.get("thumbnail_url"),
+                "mimetype": row.get("mimetype") or resolved[mirrored_id].get("mimetype"),
+                # Named so the operator can see this pixel came from another
+                # creator's vault and is a preview, not this creator's content.
+                "source": "simulation_mirror",
+            }
+    return resolved
