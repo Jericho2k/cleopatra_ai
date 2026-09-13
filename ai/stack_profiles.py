@@ -8,10 +8,11 @@ each stage targets, what it falls back to, which prompt version it uses, whether
 reasoning is on, and the generation parameters that materially change what comes
 back.
 
-It exists so the owner can run two different AI brains side by side against the
-same fixed runtime and compare them. ``cleo_legacy_v1`` is a frozen snapshot of
-the AI configuration that shipped on main before this change; ``cleo_v2`` is the
-new one.
+It exists so the owner can run different AI brains side by side against the same
+fixed runtime and compare them. ``cleo_legacy_v1`` is a frozen snapshot of the
+AI configuration that shipped on main before the V2 pass; ``cleo_v2`` is the one
+that followed it; ``cleo_v3`` runs V2's models against a far smaller writer
+prompt, so that "V2 vs V3" answers a question about the prompt alone.
 
 WHAT A PROFILE IS NOT
 ---------------------
@@ -33,8 +34,9 @@ because preserving today's behaviour means preserving them too: a deployment
 that has one of those set is running that model today, and the frozen profile
 must reproduce that.
 
-``cleo_v2`` is pinned. Its routing is the point of the profile, so it is not
-silently re-pointed by a variable somebody set months ago for the old stack.
+``cleo_v2`` and ``cleo_v3`` are pinned. Their routing is the point of the
+profile, so it is not silently re-pointed by a variable somebody set months ago
+for the old stack.
 """
 
 from __future__ import annotations
@@ -421,12 +423,75 @@ CLEO_V2 = AIStackProfile(
 
 
 # ---------------------------------------------------------------------------
+# cleo_v3 — same models as V2, much less prompt
+# ---------------------------------------------------------------------------
+#
+# V3 exists to test one hypothesis: that the writer was being micromanaged, not
+# under-instructed. So the model routing is deliberately IDENTICAL to V2 — same
+# Kimi for ordinary and commercial turns, same Qwen fallback, same Qwen safety
+# writer, same analyzer, extractor and summary, reasoning still off. If V3 reads
+# better than V2 in the Simulator, the prompt was the difference; a routing
+# change here would make that unanswerable.
+#
+# What differs is entirely inside ``writer_v3`` and the machinery it opts out of
+# (ai/writer_style.py): one reply in Full Auto instead of three options, no
+# deterministic bubble count, no mirroring of the fan's typing, no invented
+# "favourite creator" relationship, and ordinary personal facts improvised and
+# then persisted as creator canon. The commercial engine is untouched.
+
+_V3_WRITER_DEFAULT = replace(
+    _V2_WRITER_DEFAULT,
+    prompt_version="writer_v3",
+    notes="Same target as V2. The difference is the prompt, not the model.",
+)
+
+_V3_WRITER_COMMERCIAL = replace(
+    _V2_WRITER_COMMERCIAL,
+    prompt_version="writer_v3",
+    notes=(
+        "Same target as V2: a sale arrives in the same voice as the "
+        "conversation around it. Commercial authority stays deterministic."
+    ),
+)
+
+_V3_WRITER_SAFETY = replace(
+    _V2_WRITER_SAFETY,
+    prompt_version="writer_v3",
+    notes=(
+        "Unchanged routing from V2 and legacy. A crisis turn stays off "
+        "OpenRouter so one provider incident cannot take every writer down."
+    ),
+)
+
+CLEO_V3 = AIStackProfile(
+    profile_id="cleo_v3",
+    label="Cleo V3",
+    summary=(
+        "V2's models with a much smaller writer prompt (writer_v3). Full Auto "
+        "asks for ONE reply instead of three options, the deterministic "
+        "bubble-count policy is off, the creator no longer mirrors the fan's "
+        "typing or claims to be his favourite, and ordinary personal facts she "
+        "improvises are persisted as creator canon."
+    ),
+    stages={
+        STAGE_SITUATION_ANALYZER: CLEO_V2.stage(STAGE_SITUATION_ANALYZER),
+        STAGE_WRITER_DEFAULT: _V3_WRITER_DEFAULT,
+        STAGE_WRITER_COMMERCIAL: _V3_WRITER_COMMERCIAL,
+        STAGE_WRITER_SAFETY: _V3_WRITER_SAFETY,
+        STAGE_FAN_INTELLIGENCE: CLEO_V2.stage(STAGE_FAN_INTELLIGENCE),
+        STAGE_FAN_SUMMARY: CLEO_V2.stage(STAGE_FAN_SUMMARY),
+    },
+)
+
+
+# ---------------------------------------------------------------------------
 # The registry
 # ---------------------------------------------------------------------------
 
 PROFILES: dict[str, AIStackProfile] = {
     CLEO_LEGACY_V1.profile_id: CLEO_LEGACY_V1,
     CLEO_V2.profile_id: CLEO_V2,
+    CLEO_V3.profile_id: CLEO_V3,
 }
 
 PROFILE_IDS: tuple[str, ...] = tuple(PROFILES)

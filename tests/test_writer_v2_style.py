@@ -164,8 +164,13 @@ def test_no_manipulative_relationship_scripting_in_any_version(version):
     ):
         assert banned not in text, banned
 
-    # And the prohibitions themselves are present rather than merely absent.
-    assert "never confess love or promise to meet in person" in text
+    # And the boundary itself is stated rather than merely not violated. Each
+    # version words it its own way; what matters is that a real-life meeting is
+    # refused somewhere in the voice the writer is actually given.
+    assert (
+        "never confess love or promise to meet in person" in text
+        or "no promise of a real-life meeting" in text
+    )
 
 
 def test_v2_states_the_relationship_boundary_positively():
@@ -194,8 +199,14 @@ def test_v2_says_explicitly_that_the_decision_is_already_made():
     assert "never promise something the approved details do not contain" in text
 
 
-@pytest.mark.parametrize("version", WRITER_PROMPT_VERSIONS)
-def test_stop_words_and_the_em_dash_rule_survive_in_every_version(version):
+@pytest.mark.parametrize("version", (WRITER_V1, WRITER_V2))
+def test_stop_words_and_the_em_dash_rule_survive_in_the_frozen_versions(version):
+    """V1 and V2 keep their stop-word list verbatim.
+
+    V3 drops it on purpose (the pet names are style, not safety) and is covered
+    by ``tests/test_writer_v3_style.py`` instead, which pins what V3 keeps: the
+    em dash rule, and the refusal to promise a real-life meeting.
+    """
     text = voice_rules(version)
     assert "baby, babe, daddy, mommy" in text
     assert "NEVER use an em dash" in text
@@ -218,6 +229,6 @@ def test_an_unknown_version_resolves_to_the_frozen_default():
     assert normalize_writer_prompt_version("") == WRITER_V1
 
 
-def test_the_two_versions_are_genuinely_different_text():
+def test_the_versions_are_genuinely_different_text():
     assert v1_text() != v2_text()
     assert len(v2_text()) > 1000

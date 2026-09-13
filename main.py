@@ -1386,6 +1386,42 @@ async def regenerate_suggestions(
     return result
 
 
+async def _record_sent_creator_canon(
+    *,
+    creator_id: str,
+    fan_id: str,
+    sent_reply: str,
+) -> None:
+    """Persist ordinary self-facts from a reply an operator just sent.
+
+    Runs entirely in the background: the message is already delivered, so this
+    must add nothing to the operator's response time and must never fail the
+    request. Only writer versions that allow improvised personal facts record
+    them (ai/writer_style.py), which keeps the frozen profiles frozen.
+    """
+    try:
+        from ai.writer_style import persists_improvised_facts
+        from services.ai_stack import resolve_ai_stack
+        from services.creator_canon import persist_sent_creator_facts
+
+        stack = await resolve_ai_stack(creator_id=creator_id, fan_id=fan_id)
+        if not persists_improvised_facts(stack.profile.writer_prompt_version()):
+            return
+
+        history = await get_conversation_history(fan_id)
+        fan_messages = [message for message in history if message.role == "fan"]
+        await persist_sent_creator_facts(
+            creator_id=creator_id,
+            sent_reply=sent_reply,
+            fan_message=fan_messages[-1].content if fan_messages else "",
+            conversation_history=history,
+            fan_id=fan_id,
+            profile_id=stack.profile_id,
+        )
+    except Exception as exc:
+        print(f"[CREATOR CANON] assisted capture skipped fan={fan_id}: {exc}")
+
+
 @app.post("/reply", dependencies=[Depends(require_apifansly_connector)])
 async def save_reply(req: ReplyRequest, request: Request) -> dict:
     await require_creator_fan_access(request, req.creator_id, req.fan_id)
@@ -1430,6 +1466,19 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
         req.content,
         req.was_ai_suggested,
         fansly_message_id=platform_message_id,
+    )
+
+    # An assisted reply becomes creator canon here and nowhere earlier: this is
+    # the point at which a suggestion stops being a candidate and becomes
+    # something the fan actually received. The two suggestions the operator did
+    # not pick never reach this code, so they cannot establish anything.
+    spawn(
+        _record_sent_creator_canon(
+            creator_id=req.creator_id,
+            fan_id=req.fan_id,
+            sent_reply=req.content,
+        ),
+        name=f"creator_canon:{req.fan_id}",
     )
 
     return {"status": "ok", "message_id": message_id}

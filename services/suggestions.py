@@ -20,6 +20,13 @@ from openai import AsyncOpenAI
 from core.config import get_settings
 from core.supabase import get_supabase
 from ai.prompt_builder import build_prompt
+from ai.writer_style import (
+    MODE_ASSISTED,
+    MODE_AUTO,
+    candidate_count as writer_candidate_count,
+    enforces_message_shape as writer_enforces_message_shape,
+    persists_improvised_facts as writer_persists_improvised_facts,
+)
 from services.commercial_orchestrator import orchestrate
 from models.commercial import ActionType, FanStatus
 from db.fan_intelligence_queries import get_fan_intelligence_context
@@ -80,6 +87,7 @@ from services.session_lifecycle import (
     mark_step_declined,
     mark_step_purchased,
 )
+from services.creator_canon import persist_sent_creator_facts
 from services.message_shape import (
     apply_message_shape,
     choose_message_shape,
@@ -539,10 +547,16 @@ async def get_suggestions(
         f"reason={route.reason} primary={route.primary_target.model} "
         f"fallback={(route.fallback_target.model if route.fallback_target else 'none')}"
     )
-    prompt = build_prompt(ctx, prompt_version=route.prompt_version)
+    # Assisted asks for a list because a human picks from one. That is a
+    # property of this path, not of the writer version: the same version asked
+    # for one reply on the Auto path below.
+    prompt = build_prompt(
+        ctx, prompt_version=route.prompt_version, reply_mode=MODE_ASSISTED
+    )
     replies = await generate_replies(
         prompt,
         creator_persona,
+        max_candidates=writer_candidate_count(route.prompt_version, MODE_ASSISTED),
         telemetry_context={
             "creator_id": creator_id,
             "fan_id": fan_id,
@@ -1518,10 +1532,17 @@ async def _debounced_auto_reply(
         )
         situation["session_strategy"] = session_strategy
 
-        # Message shape is decided here, not by the writer. Full Auto sends
-        # option 1 verbatim, so whatever rhythm the model settles into becomes
-        # the creator's whole texting personality unless something outside the
-        # model varies it.
+        # Message shape is decided here, not by the writer — under the writer
+        # versions that ask for it. V1 and V2 send option 1 verbatim, so
+        # whatever rhythm the model settles into becomes the creator's whole
+        # texting personality unless something outside the model varies it.
+        #
+        # writer_v3 opts out (ai/writer_style.py): it asks for one reply and
+        # lets the model decide whether that reply is one bubble or a few. The
+        # policy module is untouched and still runs for the older profiles, so
+        # a V2-vs-V3 comparison is a comparison of exactly this difference.
+        shape_enforced = writer_enforces_message_shape(writer_prompt_version)
+        commercial_max_messages = getattr(decision, "max_messages", None)
         creator_turn_shapes = recent_bubble_counts(conversation_history)
 
         def _shape(**extra):
@@ -1529,7 +1550,7 @@ async def _debounced_auto_reply(
                 fan_id=fan_id,
                 recent_counts=creator_turn_shapes,
                 turn_key=latest_message,
-                max_messages=getattr(decision, "max_messages", None),
+                max_messages=commercial_max_messages,
                 is_ppv_delivery=bool(
                     getattr(decision, "action", None)
                     in {ActionType.CREATE_PAID_SESSION, ActionType.SEND_NEXT_PPV_STEP}
@@ -1537,11 +1558,18 @@ async def _debounced_auto_reply(
                 **extra,
             )
 
-        message_shape = _shape()
-        print(
-            f"[MESSAGE SHAPE] fan={fan_id} target={message_shape.target_bubbles} "
-            f"reason={message_shape.reason} recent={creator_turn_shapes}"
-        )
+        message_shape = _shape() if shape_enforced else None
+        if message_shape is not None:
+            print(
+                f"[MESSAGE SHAPE] fan={fan_id} target={message_shape.target_bubbles} "
+                f"reason={message_shape.reason} recent={creator_turn_shapes}"
+            )
+        else:
+            print(
+                f"[MESSAGE SHAPE] fan={fan_id} target=model_decides "
+                f"reason=writer_version:{writer_prompt_version} "
+                f"commercial_max_messages={commercial_max_messages or 'none'}"
+            )
 
         # What media actually exists for this turn, stated rather than inferred.
         # Built from the decision (which carries the approved rows' asset types)
@@ -1581,7 +1609,7 @@ async def _debounced_auto_reply(
             price_learning=price_learning,
             session_strategy=session_strategy,
             conversation_director=conversation_director,
-            message_shape=message_shape.to_context(),
+            message_shape=message_shape.to_context() if message_shape else {},
             ai_stack_profile=stack.profile_id,
             writer_prompt_version=writer_prompt_version,
         )
@@ -1593,11 +1621,19 @@ async def _debounced_auto_reply(
             f"reason={route.reason} primary={route.primary_target.model} "
             f"fallback={(route.fallback_target.model if route.fallback_target else 'none')}"
         )
-        prompt = build_prompt(ctx, prompt_version=route.prompt_version)
+        # Full Auto sends exactly one message, so under a writer version that
+        # understands the distinction it asks for exactly one. Asking for three
+        # options and discarding two was never the design; it was V1's assisted
+        # prompt reused on a path that has no operator to choose between them.
+        auto_candidates = writer_candidate_count(route.prompt_version, MODE_AUTO)
+        prompt = build_prompt(
+            ctx, prompt_version=route.prompt_version, reply_mode=MODE_AUTO
+        )
         with action_stage("writer_ms"):
             replies = await generate_replies(
                 prompt,
                 creator_persona,
+                max_candidates=auto_candidates,
                 telemetry_context={
                     "creator_id": creator_id,
                     "fan_id": fan_id,
@@ -1666,12 +1702,19 @@ async def _debounced_auto_reply(
         if link_repaired:
             print(f"[PPV LANGUAGE] repaired delivery-link phrasing fan={fan_id}")
 
-        # Re-resolve the shape now that the copy exists: a reply that turned out
-        # to be one short thought is never worth two bubbles.
-        final_shape = _shape(
-            writer_word_count=len(visible_text(reply).replace("|", " ").split())
-        )
-        reply = apply_message_shape(reply, final_shape.target_bubbles)
+        if shape_enforced:
+            # Re-resolve the shape now that the copy exists: a reply that turned
+            # out to be one short thought is never worth two bubbles.
+            final_shape = _shape(
+                writer_word_count=len(visible_text(reply).replace("|", " ").split())
+            )
+            reply = apply_message_shape(reply, final_shape.target_bubbles)
+        elif commercial_max_messages:
+            # No shape policy for this writer version, but a commercial
+            # decision that caps message parts is commercial authority, not
+            # style. apply_message_shape only ever merges, so the cap is honoured
+            # without imposing a bubble count the decision did not ask for.
+            reply = apply_message_shape(reply, max(1, int(commercial_max_messages)))
 
         # Final check — abort if a new message arrived while we were generating
         current_task = _pending_auto_replies.get(fan_id)
@@ -2049,6 +2092,22 @@ async def _debounced_auto_reply(
                     return
 
             print(f"[AUTO REPLY] Sent part {i+1}: {text_out[:50]}")
+
+        # The reply is delivered and persisted. Only now may anything the
+        # creator improvised about herself become canon: a turn that aborted at
+        # any of the returns above sent nothing, so it established nothing.
+        if writer_persists_improvised_facts(writer_prompt_version):
+            spawn(
+                persist_sent_creator_facts(
+                    creator_id=creator_id,
+                    sent_reply=visible_text(reply),
+                    fan_message=latest_message,
+                    conversation_history=conversation_history,
+                    fan_id=fan_id,
+                    profile_id=stack.profile_id,
+                ),
+                name=f"creator_canon:{fan_id}",
+            )
 
         if last_plain_message_id:
             try:

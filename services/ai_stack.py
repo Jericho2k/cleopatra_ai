@@ -4,9 +4,9 @@ Resolution order, most specific first:
 
 1. **Simulation fan override** — ``fans.ai_stack_profile``, honoured only for a
    fan whose ``platform_fan_id`` starts with ``test_``. This is what lets the
-   owner keep "Test Fan A -> cleo_legacy_v1" and "Test Fan B -> cleo_v2" under
-   one creator and compare them turn for turn. A value on a real fan row is
-   ignored outright, so a simulation setting can never reach a paying customer.
+   owner keep "Test Fan A -> cleo_v2" and "Test Fan B -> cleo_v3" under one
+   creator and compare them turn for turn. A value on a real fan row is ignored
+   outright, so a simulation setting can never reach a paying customer.
 2. **Creator override** — ``creators.ai_stack_profile``. Persistent and
    creator-scoped rather than per-session, because Full Auto answers
    asynchronously from a worker where no browser session exists.

@@ -136,23 +136,40 @@ class ParseOutcome:
     reason: str = PARSE_OK
 
 
+# How many candidates a turn keeps when the caller does not say. Three is the
+# historical behaviour and what Assisted wants: an operator picks from a list.
+DEFAULT_MAX_CANDIDATES = 3
+
+
 def parse_reply_candidates(
     content: str,
     creator_persona: Persona,
+    *,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
 ) -> list[str]:
     """Parse model output into validated reply candidates.
 
     Invalid, malformed, or non-JSON model output must fail closed by
     returning an empty list. Full Auto must never send fallback filler.
     """
-    return parse_reply_outcome(content, creator_persona).replies
+    return parse_reply_outcome(
+        content, creator_persona, max_candidates=max_candidates
+    ).replies
 
 
 def parse_reply_outcome(
     content: str,
     creator_persona: Persona,
+    *,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
 ) -> ParseOutcome:
-    """parse_reply_candidates, plus the reason nothing survived."""
+    """parse_reply_candidates, plus the reason nothing survived.
+
+    ``max_candidates`` is the cardinality the CALLER will actually use. A Full
+    Auto turn under a writer version that asks for one reply keeps one, so a
+    model that ignores the instruction and returns three alternatives cannot
+    have the extra two reach any downstream chooser.
+    """
     if not content or not content.strip():
         return ParseOutcome(reason=PARSE_UNPARSEABLE)
 
@@ -217,7 +234,13 @@ def parse_reply_outcome(
     # ones, and otherwise returned nothing. That both discarded working copy and
     # padded results with replies the validator had just refused.
     if valid:
-        return ParseOutcome(replies=filter_suggestions(valid[:3]))
+        keep = max(1, int(max_candidates))
+        if len(valid) > keep:
+            print(
+                f"[GENERATOR] writer returned {len(valid)} candidates for a "
+                f"{keep}-candidate turn; keeping the first {keep}"
+            )
+        return ParseOutcome(replies=filter_suggestions(valid[:keep]))
 
     return ParseOutcome(reason=PARSE_ALL_REJECTED)
 
@@ -387,6 +410,7 @@ async def generate_replies(
     telemetry_context: dict[str, Any] | None = None,
     target_override: ModelTarget | None = None,
     fallback_target_override: ModelTarget | None = None,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
 ) -> list[str]:
     """Generate candidates with a bounded primary-to-fallback plan.
 
@@ -482,7 +506,9 @@ async def generate_replies(
             )
             record_model_transport_success(attempt_target.model)
             try:
-                outcome = parse_reply_outcome(result.text, creator_persona)
+                outcome = parse_reply_outcome(
+                    result.text, creator_persona, max_candidates=max_candidates
+                )
                 replies = outcome.replies
                 parse_reason = outcome.reason
             except Exception as parse_error:

@@ -64,6 +64,11 @@ ai_stack_profile_v1.sql
 # simulation_catalog_v1.sql, whose simulation_only column the check references.
 simulation_media_identity_v1.sql
 
+# Widens the two ai_stack_profile CHECK constraints to accept cleo_v3. Must run
+# AFTER ai_stack_profile_v1.sql, which created the columns and the constraints
+# it replaces, and (like v1) before tenant_isolation_v1.
+ai_stack_profile_v3.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each

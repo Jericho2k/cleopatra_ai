@@ -510,3 +510,48 @@ def test_the_mirror_service_payload_satisfies_the_real_schema(pipeline):
         media_ids, set_simulation_only = cursor.fetchone()
         assert set_simulation_only is True
         assert all(value.startswith("sim:") for value in media_ids)
+
+
+def test_every_registered_ai_stack_profile_is_writable(pipeline):
+    """The CHECK constraint and ai/stack_profiles.py must agree.
+
+    db/ai_stack_profile_v1.sql deliberately duplicates the set of valid profile
+    identifiers into the database, so no route can write a value the registry
+    does not know. The cost of that friction is this: a profile added to the
+    registry and not to the constraint is selectable in the dashboard and then
+    rejected on write, which is the exact failure this asserts away.
+    """
+    from ai.stack_profiles import PROFILE_IDS
+
+    connection, name = pipeline
+    with connection.cursor() as cursor:
+        cursor.execute(f'set search_path to "{name}", public')
+        cursor.execute(
+            "insert into creators (id) values (gen_random_uuid()) returning id"
+        )
+        creator_id = cursor.fetchone()[0]
+        cursor.execute(
+            "insert into fans (creator_id, display_name, platform_fan_id) "
+            "values (%s, %s, %s) returning id",
+            (creator_id, "Test Fan", f"test_{uuid.uuid4().hex[:6]}"),
+        )
+        fan_id = cursor.fetchone()[0]
+
+        for profile_id in PROFILE_IDS:
+            cursor.execute(
+                "update creators set ai_stack_profile = %s where id = %s",
+                (profile_id, creator_id),
+            )
+            cursor.execute(
+                "update fans set ai_stack_profile = %s where id = %s",
+                (profile_id, fan_id),
+            )
+
+        # And the constraint is still a constraint.
+        for table, row_id in (("creators", creator_id), ("fans", fan_id)):
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cursor.execute(
+                    f"update {table} set ai_stack_profile = %s where id = %s",
+                    ("cleo_not_a_profile", row_id),
+                )
+            connection.rollback()
