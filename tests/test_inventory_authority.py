@@ -25,12 +25,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from models.commercial import ActionType, CommercialDecision, CreatorPolicy, PackageOption
+from models.commercial import ActionType, CommercialDecision, CreatorPolicy, Offer
 from services.inventory_authority import (
     ASSET_PHOTO_SET,
     ASSET_VIDEO,
     MediaInventory,
-    asset_types_from_packages,
+    asset_types_from_offer,
     asset_types_from_rows,
     asset_types_from_session,
     build_media_inventory,
@@ -40,7 +40,7 @@ from services.inventory_authority import (
     render_inventory_block,
     sanitize_media_promises,
 )
-from services.media_packages import build_offer_packages, describe_sequence
+from services.media_packages import build_next_offer, describe_sequence
 
 
 PHOTO_ROWS = [
@@ -87,7 +87,6 @@ VIDEO_ROW = {
 def photo_only_inventory(**overrides) -> MediaInventory:
     base = dict(
         authorized_asset_types=(ASSET_PHOTO_SET,),
-        available_package_asset_types=(ASSET_PHOTO_SET,),
         vault_asset_types=(ASSET_PHOTO_SET,),
     )
     base.update(overrides)
@@ -108,51 +107,33 @@ def test_asset_types_come_from_the_rows_the_planner_used():
     assert asset_types_from_rows([VIDEO_ROW]) == (ASSET_VIDEO,)
 
 
-def test_a_photo_only_vault_can_never_produce_a_video_package():
-    policy = CreatorPolicy(
-        quick_package_target_cents=2500,
-        full_package_target_cents=5000,
-        session_min_steps=1,
-        session_max_steps=3,
-    )
+def test_a_photo_only_vault_can_never_produce_a_video_offer():
+    policy = CreatorPolicy(next_offer_target_cents=2500)
     # The fan asked for video in as many words. The offer builder must still
     # only offer what exists.
-    offers = build_offer_packages(
+    offer = build_next_offer(
         PHOTO_ROWS, policy, desired_experience="any videos?"
     )
-    assert offers, "a photo vault is still sellable when he asks for video"
-    assert asset_types_from_packages(offers) == (ASSET_PHOTO_SET,)
-    for offer in offers:
-        assert ASSET_VIDEO not in offer.asset_types
+    assert offer is not None, "a photo vault is still sellable when he asks for video"
+    assert asset_types_from_offer(offer) == (ASSET_PHOTO_SET,)
+    assert ASSET_VIDEO not in offer.asset_types
 
 
 def test_an_approved_video_is_still_offerable():
-    policy = CreatorPolicy(
-        quick_package_target_cents=4000,
-        full_package_target_cents=6000,
-        session_min_steps=1,
-        session_max_steps=3,
-    )
-    offers = build_offer_packages(
+    policy = CreatorPolicy(next_offer_target_cents=4000)
+    offer = build_next_offer(
         [*PHOTO_ROWS, VIDEO_ROW], policy, desired_experience="got any videos?"
     )
-    assert offers
-    assert ASSET_VIDEO in asset_types_from_packages(offers)
+    assert offer is not None
+    assert ASSET_VIDEO in asset_types_from_offer(offer)
 
 
-def test_a_generic_session_opens_on_photos_when_good_photo_content_exists():
+def test_a_generic_offer_opens_on_photos_when_good_photo_content_exists():
     """Commercial progression, not a media rule: the opener is lower friction."""
-    policy = CreatorPolicy(
-        quick_package_target_cents=2500,
-        full_package_target_cents=6000,
-        session_min_steps=1,
-        session_max_steps=3,
-        offer_two_packages=True,
-    )
-    offers = build_offer_packages([*PHOTO_ROWS, VIDEO_ROW], policy)
-    assert offers
-    cheapest = offers[0]
-    assert cheapest.asset_types[0] == ASSET_PHOTO_SET, (
+    policy = CreatorPolicy(next_offer_target_cents=2500)
+    offer = build_next_offer([*PHOTO_ROWS, VIDEO_ROW], policy)
+    assert offer is not None
+    assert offer.asset_type == ASSET_PHOTO_SET, (
         "a generic offer must not open on the clip when photos are available"
     )
 
@@ -177,20 +158,18 @@ def test_a_photo_package_never_describes_itself_as_video():
 
 def test_inventory_is_built_from_the_decision_not_from_the_conversation():
     decision = CommercialDecision(
-        action=ActionType.PRESENT_SESSION_OPTIONS,
-        package_options=[
-            PackageOption(
-                package_id="package:quick:p1",
-                label="quick private session",
-                price_cents=2500,
-                set_ids=["p1"],
-                asset_types=[ASSET_PHOTO_SET],
-            )
-        ],
+        action=ActionType.OFFER_NEXT_UNLOCK,
+        next_offer=Offer(
+            offer_id="offer:p1",
+            label="private photo set",
+            price_cents=2500,
+            set_id="p1",
+            asset_type=ASSET_PHOTO_SET,
+        ),
     )
     inventory = build_media_inventory(
         decision=decision,
-        package_options=decision.package_options,
+        next_offer=decision.next_offer,
         approved_rows=PHOTO_ROWS,
         fan_message="do you have any videos?",
     )
@@ -200,7 +179,7 @@ def test_inventory_is_built_from_the_decision_not_from_the_conversation():
     assert inventory.video_requested_but_unavailable is True
 
 
-def test_an_active_plan_is_narrower_than_the_offer_menu():
+def test_an_active_plan_is_narrower_than_the_current_offer():
     session = {
         "status": "active",
         "current_index": 0,
@@ -214,14 +193,13 @@ def test_an_active_plan_is_narrower_than_the_offer_menu():
 
     inventory = build_media_inventory(
         active_session=session,
-        package_options=[
-            PackageOption(
-                package_id="p",
-                label="l",
-                price_cents=4000,
-                asset_types=[ASSET_PHOTO_SET, ASSET_VIDEO],
-            )
-        ],
+        next_offer=Offer(
+            offer_id="offer:v",
+            label="private video",
+            price_cents=4000,
+            set_id="v",
+            asset_type=ASSET_VIDEO,
+        ),
     )
     assert inventory.authorized_asset_types == (ASSET_PHOTO_SET,)
 
@@ -246,7 +224,6 @@ def test_the_prompt_block_permits_video_when_it_is_authorised():
     block = render_inventory_block(
         MediaInventory(
             authorized_asset_types=(ASSET_PHOTO_SET, ASSET_VIDEO),
-            available_package_asset_types=(ASSET_PHOTO_SET, ASSET_VIDEO),
             vault_asset_types=(ASSET_PHOTO_SET, ASSET_VIDEO),
         )
     )
@@ -298,7 +275,7 @@ def test_every_promise_of_absent_video_is_repaired(promise):
     assert promises_unavailable_media(promise, inventory) is True
 
     repaired, was_repaired = sanitize_media_promises(
-        promise, inventory, decision_action="PRESENT_SESSION_OPTIONS"
+        promise, inventory, decision_action="OFFER_NEXT_UNLOCK"
     )
     assert was_repaired is True
     assert repaired.strip(), "a repair must leave something sendable"
@@ -319,7 +296,7 @@ def test_every_promise_of_absent_video_is_repaired(promise):
 def test_ordinary_conversation_about_video_is_untouched(ordinary):
     """Mentioning video is fine; offering creator inventory is not."""
     repaired, was_repaired = sanitize_media_promises(
-        ordinary, photo_only_inventory(), decision_action="PRESENT_SESSION_OPTIONS"
+        ordinary, photo_only_inventory(), decision_action="OFFER_NEXT_UNLOCK"
     )
     assert was_repaired is False
     assert repaired == ordinary
@@ -340,7 +317,7 @@ def test_with_nothing_authorised_the_promise_is_removed_not_softened():
     repaired, was_repaired = sanitize_media_promises(
         "hey you | i have a video for you",
         empty,
-        decision_action="PRESENT_SESSION_OPTIONS",
+        decision_action="OFFER_NEXT_UNLOCK",
     )
     assert was_repaired is True
     assert "video" not in repaired.lower()
@@ -350,12 +327,11 @@ def test_with_nothing_authorised_the_promise_is_removed_not_softened():
 def test_authorised_video_is_left_exactly_as_written():
     inventory = MediaInventory(
         authorized_asset_types=(ASSET_VIDEO,),
-        available_package_asset_types=(ASSET_VIDEO,),
         vault_asset_types=(ASSET_PHOTO_SET, ASSET_VIDEO),
     )
     original = "wait till you see the video 😈"
     repaired, was_repaired = sanitize_media_promises(
-        original, inventory, decision_action="CREATE_PAID_SESSION"
+        original, inventory, decision_action="SEND_NEXT_PPV_STEP"
     )
     assert was_repaired is False
     assert repaired == original
@@ -364,10 +340,10 @@ def test_authorised_video_is_left_exactly_as_written():
 def test_repair_is_idempotent():
     inventory = photo_only_inventory()
     once, _ = sanitize_media_promises(
-        "i have a video for you", inventory, decision_action="CREATE_PAID_SESSION"
+        "i have a video for you", inventory, decision_action="SEND_NEXT_PPV_STEP"
     )
     twice, repaired_again = sanitize_media_promises(
-        once, inventory, decision_action="CREATE_PAID_SESSION"
+        once, inventory, decision_action="SEND_NEXT_PPV_STEP"
     )
     assert repaired_again is False
     assert twice == once
@@ -381,7 +357,7 @@ def test_the_first_clean_candidate_wins_over_a_repaired_one():
             "another one",
         ],
         photo_only_inventory(),
-        decision_action="PRESENT_SESSION_OPTIONS",
+        decision_action="OFFER_NEXT_UNLOCK",
     )
     assert repaired is False
     assert reply == "i've been thinking about you all day"
@@ -391,7 +367,7 @@ def test_a_repaired_candidate_is_used_when_none_are_clean():
     reply, repaired = choose_inventory_safe_reply(
         ["i have a video for you 😏"],
         photo_only_inventory(),
-        decision_action="PRESENT_SESSION_OPTIONS",
+        decision_action="OFFER_NEXT_UNLOCK",
     )
     assert repaired is True
     assert reply is not None
@@ -403,7 +379,7 @@ def test_nothing_is_sent_when_no_candidate_survives_repair():
     reply, repaired = choose_inventory_safe_reply(
         ["i have a video for you", "wait till you see the clip"],
         MediaInventory(),  # nothing authorised at all
-        decision_action="PRESENT_SESSION_OPTIONS",
+        decision_action="OFFER_NEXT_UNLOCK",
     )
     assert repaired is True
     assert reply is None
@@ -474,7 +450,7 @@ def test_with_no_session_and_no_vault_the_inventory_is_unknown_not_empty():
     repaired, was_repaired = sanitize_media_promises(
         "i have a video for you",
         inventory,
-        decision_action="PRESENT_SESSION_OPTIONS",
+        decision_action="OFFER_NEXT_UNLOCK",
     )
     assert was_repaired is False
     assert repaired == "i have a video for you"

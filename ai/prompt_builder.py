@@ -260,16 +260,15 @@ def _render_conversation_director(
         lines.append("do not repeat the most recent conversational move or wording")
 
     if conversation_director.get("question_due"):
-        if candidates == 1:
-            lines.append(
-                "MANDATORY: the reply must contain exactly one natural, "
-                "context-specific question"
-            )
-        else:
-            lines.append(
-                f"MANDATORY: all {candidates} reply options must contain exactly one "
-                "natural, context-specific question"
-            )
+        # An OBJECTIVE, not a sentence. "Ask exactly one question" is how the
+        # creator ends up interviewing him; what actually has to happen is that
+        # she learns something about what he wants.
+        lines.append(
+            "objective this turn: find out more about what he actually wants. A "
+            "question is one way. An observation, a guess, a tease or an opinion "
+            "that invites him to correct or confirm it works just as well. Do not "
+            "produce a bare interview question"
+        )
         if dictates_style:
             lines.append(
                 "React first and wrap the question inside a personal or playful response; "
@@ -277,9 +276,14 @@ def _render_conversation_director(
             )
     if conversation_director.get("must_not_ask_question"):
         lines.append(
-            "MANDATORY: do not ask a question in this reply"
+            "do not ask a question in this reply"
             if candidates == 1
-            else "MANDATORY: do not ask a question in any reply option"
+            else "do not ask a question in any reply option"
+        )
+    if conversation_director.get("direct_interest"):
+        lines.append(
+            "he has already said what he wants. Do not run him back through "
+            "small talk or qualification to get there"
         )
 
     if conversation_director.get("offer_eligible"):
@@ -393,7 +397,10 @@ def _render_session_strategy(session_strategy: dict) -> str:
     if avoid:
         lines.append("avoid: " + ", ".join(avoid))
     if session_strategy.get("must_ask_question"):
-        lines.append("ask exactly one natural question")
+        lines.append(
+            "learn one more thing about what he wants; a question is optional, "
+            "not required"
+        )
     if session_strategy.get("must_not_ask_question"):
         lines.append("do not ask a question")
     if session_strategy.get("max_messages") is not None:
@@ -425,9 +432,6 @@ def _render_media_inventory(media_inventory: dict) -> str:
         MediaInventory(
             authorized_asset_types=tuple(
                 media_inventory.get("authorized_asset_types") or ()
-            ),
-            available_package_asset_types=tuple(
-                media_inventory.get("available_package_asset_types") or ()
             ),
             vault_asset_types=tuple(media_inventory.get("vault_asset_types") or ()),
             next_step_asset_type=media_inventory.get("next_step_asset_type"),
@@ -1117,74 +1121,40 @@ Fan just said: "{fan_message}"
     purchase_signal = situation.get("purchase_signal", "none")
 
     # A commercial decision is authoritative. Session-specific instructions are
-    # included only when the policy explicitly created/continued a paid session.
-    if active_session and (
-        not decision
-        or decision_action in {"CREATE_PAID_SESSION", "SEND_NEXT_PPV_STEP"}
-    ):
-        plan = active_session.get("plan", [])
-        idx = active_session.get("current_index", 0)
-        remaining = [p for p in plan[idx:] if not p.get("sent")]
-
+    # included only when the policy explicitly authorised a delivery.
+    ppv_delivery = getattr(ctx, "ppv_delivery", None) or {}
+    if active_session and (not decision or decision_action == "SEND_NEXT_PPV_STEP"):
         if active_session.get("post_ppv_cooldown"):
             messages_left = active_session.get("cooldown_messages_remaining", 2)
             user_prompt += (
-                f"\n\nPOST-PPV COOLDOWN ({messages_left} exchanges remaining): "
-                "Do NOT send the next item yet and do NOT include a [PPV:...] tag. "
-                "React to what he actually just unlocked, stay in the scene, and keep "
-                "the tension going."
+                f"\n\nJUST UNLOCKED ({messages_left} exchanges before anything else "
+                "is offered): react to what he actually opened and stay in it with "
+                "him. Nothing is being sent this message and nothing new is being "
+                "offered. Do not name a price and do not ask whether he wants more."
             )
-            if remaining:
-                # The session already knows what comes next. Waiting to be asked
-                # for more is what makes a planned experience read as a vending
-                # machine; see PAID SESSION CHOREOGRAPHY above for the exact
-                # approved next step.
-                user_prompt += (
-                    " The session is not over and the next piece is already planned. "
-                    "Bridge toward it naturally using the approved scene details you "
-                    "were given, so it feels like one continuous experience. Do not "
-                    "ask him whether he wants more, do not name a price, and do not "
-                    "promise anything the plan does not contain."
-                )
-        # Force send if session planned and fan has sent 3+ messages since qualification.
-        # NEVER while selling is paused (he told us he can't afford it) — that's how a
-        # broke fan ended up getting PPVs pushed at him repeatedly mid-session.
-        selling_paused = bool(getattr(fan, "sale_paused_at", None)) and purchase_signal != "money_available"
-        fan_msg_count = len([m for m in ctx.conversation_history if m.role == "fan"])
-        session_started_at_msg = active_session.get("started_at_fan_msg_count", 0)
-        msgs_since_session = fan_msg_count - session_started_at_msg
-        should_force_send = (not selling_paused) and msgs_since_session >= 3 and remaining
 
-        if not selling_paused and (should_force_send or (purchase_signal == "ready_to_buy" and remaining)):
-            next_item = remaining[0]
-            next_media_id = next_item.get("media_id", "")
-            next_price = next_item.get("price", 0)
-            next_description = (next_item.get("description", "") or "")[:100]
-            next_transition = next_item.get("transition", "")
-            user_prompt += (
-                f"\n\n🚨 TIME TO SEND — stop teasing, send the PPV now. "
-                f"Use this transition naturally: \"{next_transition}\" "
-                f"then end your message with [PPV:{next_media_id}:{next_price}]. "
-                f"Content: {next_description}. "
-                f"Keep it short, flirty, one line max before the tag."
-            )
-        elif remaining:
-            next_item = remaining[0]
-            next_media_id = next_item.get("media_id", "")
-            next_description = (next_item.get("description", "") or "")[:100]
-            next_price = next_item.get("price", 0)
-            next_transition = next_item.get("transition", "")
-            user_prompt += "\n\nACTIVE SEXTING SESSION - follow this plan:\n"
-            user_prompt += f"Next content to send: [{next_media_id}] {next_description}\n"
-            user_prompt += f"Approved price for this step: ${float(next_price):g}\n"
-            user_prompt += f'Transition line: "{next_transition}"\n'
-            user_prompt += f"Items remaining in session: {len(remaining)}\n"
-            user_prompt += f"Use the transition line naturally, then send the PPV with [PPV:{next_media_id}:{next_price}]\n"
-            user_prompt += (
-                f"IMPORTANT: The price is ${float(next_price):g} — do not mention any "
-                "other price, and never offer a link for it.\n"
-            )
-            user_prompt += "After sending, continue the intimate conversation - do not immediately push the next item."
+    if ppv_delivery.get("attached"):
+        # The backend attaches the media to this very message. The writer's only
+        # job is the human text it arrives with; it has no tag to emit and no
+        # way to alter what is sent, so nothing here tells it how to serialise
+        # a delivery command.
+        pieces = int(ppv_delivery.get("media_count") or 0)
+        asset = "clip" if ppv_delivery.get("asset_type") == "video" else "photo set"
+        description = str(ppv_delivery.get("description") or "").strip()
+        user_prompt += (
+            "\n\nTHIS MESSAGE CARRIES THE UNLOCK. The "
+            f"{asset}"
+            + (f" ({pieces} pieces)" if pieces > 1 else "")
+            + " is attached to this exact message automatically and unlocks in "
+            "the chat when he pays for it. Write only the message it arrives "
+            "with: short, in your voice, in the moment. Do not write a tag, a "
+            "code, a link, or any kind of instruction — the attachment is not "
+            "yours to send. Do not ask whether he wants it: he already said yes. "
+            "Do not say he has seen it or reacted to it; he has not opened it "
+            "yet."
+        )
+        if description:
+            user_prompt += f" What is attached: {description}."
 
     # ---- COMMERCIAL DECISION (authoritative) --------------------------------
     # Appended after session context, and legacy sales heuristics below are disabled
@@ -1198,14 +1168,11 @@ Fan just said: "{fan_message}"
             f"WHAT TO ACHIEVE: {goal}",
         ]
         if decision.get("must_not_send_media"):
-            lines.append("Do NOT send media and do NOT include a [PPV:...] tag.")
-        if act in {
-            "PRESENT_SESSION_OPTIONS",
-            "END_TEASER_AND_OFFER",
-            "CREATE_PAID_SESSION",
-            "SEND_NEXT_PPV_STEP",
-            "RESUME_PREVIOUS_OFFER",
-        }:
+            lines.append(
+                "Nothing is being attached to this message. Do not say you are "
+                "sending anything, and do not act as if you already did."
+            )
+        if act in {"OFFER_NEXT_UNLOCK", "SEND_NEXT_PPV_STEP", "RESUME_PREVIOUS_OFFER"}:
             lines.append(
                 "DELIVERY LANGUAGE: your content is attached to the message itself "
                 "and unlocks in this chat. There is no link. Never write \"want the "
@@ -1218,69 +1185,47 @@ Fan just said: "{fan_message}"
         else:
             lines.append("Explicit text is allowed only to the degree required by the decided action.")
 
-        options = decision.get("package_options") or []
-        if options:
-            rendered = []
-            for index, option in enumerate(options, start=1):
-                if isinstance(option, dict):
-                    label = option.get("label") or "private experience"
-                    cents = int(option.get("price_cents") or 0)
-                    legal_description = str(
-                        option.get("legal_description") or option.get("experience") or ""
-                    ).strip()
-                    item = f"{index}) {label}: {customer_dollars(cents)}"
-                    if legal_description:
-                        item += f" — approved experience: {legal_description}"
-                    rendered.append(item)
-                else:
-                    rendered.append(f"{index}) ${option}")
+        offer = decision.get("next_offer")
+        if hasattr(offer, "model_dump"):
+            offer = offer.model_dump(mode="json")
+        if isinstance(offer, dict) and offer:
+            label = offer.get("label") or "private photo set"
+            cents = int(offer.get("price_cents") or 0)
+            legal_description = str(
+                offer.get("legal_description") or offer.get("experience") or ""
+            ).strip()
+            pieces = int(offer.get("media_count") or 0)
+            rendered = f"{label} at {customer_dollars(cents)}"
+            if pieces > 1:
+                rendered += f" ({pieces} pieces)"
+            if legal_description:
+                rendered += f" — approved content: {legal_description}"
 
-            exact_options = "; ".join(rendered)
-            multi_step = [
-                option
-                for option in options
-                if isinstance(option, dict) and int(option.get("step_count") or 1) > 1
-            ]
-            if multi_step:
+            if act == "RESUME_PREVIOUS_OFFER":
                 lines.append(
-                    "Some of these prices buy a multi-part private session, not a "
-                    "single drop: "
-                    + "; ".join(
-                        f"{option.get('label') or 'session'} = "
-                        f"{customer_dollars(option.get('price_cents') or 0)} "
-                        f"total for {int(option.get('step_count') or 1)} parts"
-                        for option in multi_step
-                    )
-                    + ". Present the total honestly as a session in parts. Never "
-                    "describe it as a fixed number of photos unless that is exactly "
-                    "what one part is."
-                )
-            if act == "CREATE_PAID_SESSION":
-                lines.append(
-                    "EXACT SELECTED OPTION: " + exact_options + ". "
-                    "This is a selection, not proof of payment. Confirm the choice naturally and "
-                    "continue only through the purchase-gated flow. Do not reopen the option menu."
-                )
-            elif act == "RESUME_PREVIOUS_OFFER":
-                lines.append(
-                    "EXACT PERSISTED OFFER SNAPSHOT, ORIGINAL ORDER: " + exact_options + ". "
-                    "Explain or restate only these options. Do not rebuild, replace, reorder, or "
-                    "rename them."
-                )
-            elif "clarification" in goal.lower() or "ambiguous" in str(decision.get("reason") or "").lower():
-                lines.append(
-                    "EXACT ACTIVE OPTIONS, ORIGINAL ORDER: " + exact_options + ". "
-                    "Ask one concise clarification that distinguishes only these options. Do not guess."
+                    "THE OFFER ALREADY ON THE TABLE, UNCHANGED: " + rendered + ". "
+                    "Answer him about this exact thing at this exact price. Do not "
+                    "replace it, re-price it, or add a second option."
                 )
             else:
                 lines.append(
-                    "Offer ONLY these exact ordered options: " + exact_options + ". "
-                    "Do not invent another price or package. Let him choose without asking his budget."
+                    "THE ONE NEXT THING YOU MAY OFFER: " + rendered + ". "
+                    "Name it and its price once, in your own words, as the next "
+                    "moment rather than a product. There is no second option, no "
+                    "package, no tier and no menu — do not invent one, do not "
+                    "present a cheaper or fuller version, and do not offer him a "
+                    "choice between things."
                 )
             lines.append(
-                "The approved experience descriptions above are the only concrete content you may "
-                "tease or promise. Do not name a requested theme unless it appears in an approved "
-                "experience; otherwise stay generic or present the approved alternative honestly."
+                "NEVER tell him how much he might spend in total, how many further "
+                "pieces exist, how far this could go, or that there is a sequence "
+                "at all. He sees this one thing and its price. What comes after it "
+                "is not his to be told and not yours to promise."
+            )
+            lines.append(
+                "The approved content description above is the only concrete content you may "
+                "tease or promise. Do not name a requested theme unless it appears in that "
+                "description; otherwise stay generic or offer what is actually there, honestly."
             )
         if decision.get("mention_price") is not None:
             lines.append(f"The exact price is ${decision['mention_price']}.")
@@ -1318,49 +1263,24 @@ Fan just said: "{fan_message}"
             "Shift back to normal conversation and keep the vibe good."
         )
 
-    if not decision and purchase_signal == "ready_to_buy" and ppv_offers:
-        # Fan said yes to a price — find the best matching offer and force send it
-        available = [
-            o for o in ppv_offers
-            if o.get("media_id") and o["media_id"] not in purchased_ids
-        ]
-        unsent = [o for o in available if o["media_id"] not in sent_ids]
-        if unsent:
-            # Pick the cheapest unsent offer as the most likely one being discussed
-            target = min(unsent, key=lambda o: o.get("price", 0))
-            mid = target.get("media_id", "")
-            price = target.get("price", 0)
-            desc = (target.get("description", "") or "")[:80]
-            user_prompt += (
-                f"\n\n🚨 FAN JUST SAID YES TO BUYING — send the PPV now. "
-                f"Don't tease further. Write a short natural message and end it with [PPV:{mid}:{price}]. "
-                f"Content: {desc}. "
-                f"Example: 'here it is, just for you 😏 [PPV:{mid}:{price}]'"
-            )
-        elif available:
-            # Everything available was already sent (just not purchased). NEVER resend —
-            # he already has it locked in chat. Nudge him to the unopened one instead.
-            user_prompt += (
-                "\n\nHe sounds ready to buy, but everything you have is ALREADY sitting in his chat "
-                "locked and waiting. Do NOT send anything again. Instead, playfully point him back to "
-                "what you already sent (it's right there, still waiting for him). No [PPV] tag this message."
-            )
-
     if not decision and ppv_offers:
+        # The pre-commercial-engine path. It still states what exists, so the
+        # writer can talk about it honestly — but it no longer asks the writer
+        # to *send* anything. Delivery is decided by services/ppv_turn.py from
+        # the planned session, on both paths, and a tag in free text is stripped
+        # rather than obeyed.
         available = [o for o in ppv_offers if o.get("media_id") and o["media_id"] not in purchased_ids]
         offers_text = "\n".join([
-            f"- [{o.get('media_id', '')}] {o['title']}: ${o.get('price', 0)} — {o.get('description', '')}"
+            f"- {o['title']}: ${o.get('price', 0)} — {o.get('description', '')}"
             + (" (already sent, not purchased yet)" if o.get("media_id") in sent_ids else "")
             for o in available
         ])
         if offers_text:
             user_prompt += (
-                f"\n\nCONTENT YOU CAN SELL RIGHT NOW:\n{offers_text}\n"
-                "When sending a PPV, end your message with [PPV:media_id:price] tag. "
-                "Example: 'I made this just for you 😏 [PPV:8745xxx:20]'\n"
-                "Only offer PPV when the conversation energy supports it, don't force it.\n"
-                "NEVER mention a specific price in conversation unless you are sending the actual [PPV:id:price] tag in that same message.\n"
-                "Never resend content the fan already purchased."
+                f"\n\nCONTENT THAT EXISTS RIGHT NOW:\n{offers_text}\n"
+                "Talk about it only when the conversation actually supports it, and "
+                "never resend content he already purchased. Whether anything is "
+                "attached to this message is decided outside this conversation.\n"
             )
 
     if purchased_ids:

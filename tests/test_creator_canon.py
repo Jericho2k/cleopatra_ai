@@ -524,3 +524,100 @@ def test_unused_simple_namespace_history_is_tolerated(canon_world):
 
     assert "Fan: hey" in calls[0]
     assert "Creator: hi you" in calls[0]
+
+
+# ---------------------------------------------------------------------------
+# Flirting is not a fact
+# ---------------------------------------------------------------------------
+#
+# The exact line from the failing Simulator run::
+#
+#     [CREATOR CANON] established=[
+#       'interest in attention: likes knowing what gets your attention'
+#     ]
+#
+# That is not something the creator IS. It is something she said to one fan, in
+# one moment, to keep him interested — and a creator legend is shared by every
+# conversation she will ever have. The prompt now says so, and the filter below
+# enforces it whatever the model decides to call the topic.
+
+
+@pytest.mark.parametrize(
+    "topic,value",
+    (
+        ("interest in attention", "likes knowing what gets your attention"),
+        ("flirting", "likes making you hard"),
+        ("mood", "feels naughty tonight"),
+        ("intent", "wants to tease this fan"),
+        ("opinion of fan", "thinks this fan is cute"),
+        ("current state", "is excited right now"),
+        ("attitude", "loves teasing him"),
+        ("feeling", "is turned on"),
+        ("preference", "likes when you say that"),
+    ),
+)
+def test_transient_flirting_never_becomes_canon(topic, value, canon_world):
+    store, extracted, _calls = canon_world
+    extracted["text"] = '{"facts": [{"topic": "%s", "value": "%s"}]}' % (topic, value)
+
+    added = _run(
+        creator_canon.persist_sent_creator_facts(
+            creator_id="creator-1",
+            sent_reply="i love knowing what gets your attention 😏",
+            fan_message="what do you like?",
+            profile_id=CLEO_V3.profile_id,
+        )
+    )
+
+    assert added == [], f"{topic}: {value} is not a durable creator fact"
+    assert store.writes == []
+    assert store.legend.get("other") in (None, [])
+
+
+@pytest.mark.parametrize(
+    "topic,value",
+    (
+        ("favorite color", "dark green"),
+        ("favorite food", "sushi"),
+        ("music taste", "r&b"),
+        ("coffee", "prefers iced coffee"),
+        ("hobby", "drawing"),
+    ),
+)
+def test_ordinary_stable_preferences_still_become_canon(topic, value, canon_world):
+    """The filter has to keep the thing the feature exists for."""
+    store, extracted, _calls = canon_world
+    extracted["text"] = '{"facts": [{"topic": "%s", "value": "%s"}]}' % (topic, value)
+
+    added = _run(
+        creator_canon.persist_sent_creator_facts(
+            creator_id="creator-1",
+            sent_reply=f"honestly? {value}",
+            fan_message=f"what's your {topic}?",
+            profile_id=CLEO_V3.profile_id,
+        )
+    )
+
+    assert added == [f"{topic}: {value}"]
+    assert store.legend["other"] == [f"{topic}: {value}"]
+
+
+def test_the_extraction_prompt_names_the_false_positives_it_saw():
+    """Belt to the filter's braces: the model is told, in its own examples."""
+    prompt = creator_canon._SYSTEM_PROMPT
+    assert "likes knowing what gets your attention" in prompt
+    assert "feels naughty tonight" in prompt
+    assert "Flirting is not a fact." in prompt
+    assert "would still be true next month" in prompt
+
+
+def test_the_filter_is_deterministic_and_does_not_need_the_model(canon_world):
+    """A model that ignores every instruction still cannot write flirt to canon."""
+    from services.creator_canon import is_transient_or_relational
+
+    assert is_transient_or_relational(
+        "interest in attention", "likes knowing what gets your attention"
+    )
+    assert is_transient_or_relational("mood", "feels naughty tonight")
+    assert not is_transient_or_relational("favorite color", "dark green")
+    assert not is_transient_or_relational("music taste", "r&b")

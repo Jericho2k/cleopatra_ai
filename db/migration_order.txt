@@ -69,6 +69,13 @@ simulation_media_identity_v1.sql
 # it replaces, and (like v1) before tenant_isolation_v1.
 ai_stack_profile_v3.sql
 
+# One next unlock at a time instead of a two-package menu. Drops the quick/full
+# policy dials and the ordered offer snapshot, and backfills the single pending
+# offer from the first entry of that snapshot. Must run AFTER
+# full_auto_lifecycle_v1.sql, whose fan_commercial_states.last_session_package_id
+# it renames, and before tenant_isolation_v1.
+incremental_offer_v1.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each

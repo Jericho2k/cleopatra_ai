@@ -287,7 +287,6 @@ def session_progress(session: dict[str, Any] | None) -> dict[str, Any]:
             normalized.get("cooldown_messages_remaining", 0) or 0
         ),
         "has_next_step": bool(upcoming),
-        "session_total_cents": int(normalized.get("total_budget_cents", 0) or 0),
     }
     if purchased:
         context["just_purchased"] = _writer_safe_step(purchased)

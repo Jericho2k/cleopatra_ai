@@ -122,14 +122,15 @@ out of:
 
 | | `cleo_v2` | `cleo_v3` |
 | --- | --- | --- |
-| Full Auto output | 3 options, option 1 sent | **1 reply**, that reply sent |
+| Full Auto output | 3 options, option 1 sent | **1 reply**, returned as `{"messages": [...]}` — the bubbles that reply is actually sent in, all of them |
 | Assisted output | 3 options | 3 options (unchanged — an operator picks) |
 | Bubble count | chosen by `services/message_shape.py`, enforced by merging after generation | **the model decides**; only a commercial `max_messages` cap still merges |
 | Fan's writing style | "match his energy", persona default "Short casual texts, mirrors energy." | **never mirrored.** She adapts to mood and intimacy, not to his slang, spelling, punctuation or emoji habits |
 | Role framing | "You are {fan}'s favorite creator." | "You are the creator replying to a fan in private messages on a paid creator platform." |
 | Personal facts | "never invent current-life facts" | ordinary details (colour, food, music, a hobby) **may be improvised, and are then persisted as canon**. Identity — name, age, origin, location, job, background, meeting in person — never is |
 | Style layers | writer voice + stage instruction + director + expression calibration all prescribe phrasing | style lives in the writer voice; the other blocks state what must HAPPEN, not how it should sound |
-| Static writer prompt | ~9 KB | ~2.5 KB |
+| Writer retry | one Kimi failure falls back to Qwen | **4 Kimi attempts** spaced 5s / 30s / 60s before Qwen is reached at all; a permanent failure (bad key, unknown model) skips the waits |
+| Static writer prompt | ~8.0 KB | ~4.6 KB |
 
 Improvised facts are written back through the **existing** creator legend
 (`creators.legend`, `db/queries.update_creator_legend`) by
@@ -139,10 +140,13 @@ memory system and no new table. The merge is first-established-wins per topic,
 and protected identity keys are never passed to it at all, so improvisation can
 neither fill in nor overwrite a configured name, age, origin, job or background.
 
-Everything commercial is untouched: inventory authority, approved content,
-pricing, purchase state, PPV and session logic, affordability evidence, safety
-boundaries and simulation isolation are shared application state under V3
-exactly as under V1 and V2.
+The commercial RUNTIME is shared by every profile and is not part of what a
+profile selects: inventory authority, approved content, pricing, purchase state,
+PPV delivery, session logic, affordability evidence, safety boundaries and
+simulation isolation behave identically under V1, V2 and V3. The September
+incremental-offer pass changed that shared runtime — one offer at a time,
+deterministic PPV delivery — so all three profiles run the corrected flow, and
+what still separates them is prompts, model routing and retry policy.
 
 ## Resolution
 

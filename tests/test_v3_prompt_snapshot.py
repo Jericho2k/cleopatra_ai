@@ -68,22 +68,22 @@ def realistic_context() -> ConversationContext:
         media_inventory={
             "known": True,
             "authorized_asset_types": ("photo_set",),
-            "available_package_asset_types": ("photo_set",),
             "vault_asset_types": ("photo_set",),
             "video_requested": True,
         },
         commercial_decision={
-            "action": "PRESENT_SESSION_OPTIONS",
-            "goal": "let him choose between the approved experiences",
+            "action": "OFFER_NEXT_UNLOCK",
+            "goal": "offer him the one next thing",
             "may_be_explicit": False,
-            "package_options": [
-                {
-                    "label": "afternoon set",
-                    "price_cents": 2500,
-                    "legal_description": "12 photos, hotel window light",
-                    "step_count": 1,
-                }
-            ],
+            "next_offer": {
+                "offer_id": "offer:afternoon",
+                "label": "afternoon set",
+                "price_cents": 2500,
+                "set_id": "afternoon",
+                "legal_description": "12 photos, hotel window light",
+                "media_count": 12,
+                "asset_type": "photo_set",
+            },
             "mention_price": 25,
         },
         conversation_director={
@@ -159,12 +159,12 @@ def test_nothing_in_the_assembled_prompt_tells_her_to_mirror_him(v3_auto, v2_aut
 
 def test_it_does_not_ask_for_three_reply_options(v3_auto, v2_auto):
     assert "Write ONE reply." in v3_auto
-    assert 'Return ONLY a JSON array containing exactly one string' in v3_auto
+    assert '{"messages": ["first message", "second message"]}' in v3_auto
+    assert "These are not alternatives" in v3_auto
     for banned in (
         "Write 3 reply options",
         "JSON array of 3 strings",
         "all 3 options",
-        "all 3 reply options",
         "auto mode may send option 1",
         "OPTION ORDER MATTERS",
         "At least one option should be a single message",
@@ -212,10 +212,14 @@ def test_it_still_carries_every_commercial_and_inventory_constraint(v3_auto):
     assert "content you may offer, promise or describe as yours this turn" in v3_auto
     # The decision itself, verbatim and authoritative.
     assert "FINAL COMMERCIAL POLICY — THIS OVERRIDES CONFLICTING TEXT ABOVE" in v3_auto
-    assert "DECIDED ACTION: PRESENT_SESSION_OPTIONS" in v3_auto
-    assert "1) afternoon set: $25 — approved experience" in v3_auto
-    assert "approved experience: 12 photos, hotel window light" in v3_auto
-    assert "Do not invent another price or package" in v3_auto
+    assert "DECIDED ACTION: OFFER_NEXT_UNLOCK" in v3_auto
+    assert (
+        "THE ONE NEXT THING YOU MAY OFFER: afternoon set at $25 (12 pieces) "
+        "— approved content" in v3_auto
+    )
+    assert "NEVER tell him how much he might spend in total" in v3_auto
+    assert "approved content: 12 photos, hotel window light" in v3_auto
+    assert "do not invent one" in v3_auto
     assert "The exact price is $25." in v3_auto
     assert "Keep this response non-explicit." in v3_auto
     # And the writer block agrees rather than arguing with it.
@@ -241,11 +245,10 @@ def test_only_one_layer_dictates_how_a_sentence_should_sound(v3_auto, v2_auto):
     # The director still says what has to happen this turn.
     assert "CONVERSATION DIRECTOR (internal):" in v3_auto
     assert "required move: PLAYFUL_FLIRT" in v3_auto
-    assert (
-        "MANDATORY: the reply must contain exactly one natural, "
-        "context-specific question" in v3_auto
-    )
-    # But not how to phrase it.
+    assert "find out more about what he actually wants" in v3_auto
+    # As an objective, never as a mandated sentence.
+    assert "MANDATORY" not in v3_auto
+    # And not how to phrase it.
     assert "wrap the question inside a personal or playful response" not in v3_auto
     assert "wrap the question inside a personal or playful response" in v2_auto
 
@@ -278,8 +281,8 @@ def test_assisted_under_v3_still_offers_the_operator_three(v3_auto):
     assert "Do not adapt to the mechanics of how he types" in assisted
     assert "favorite creator" not in assisted
     # The director agrees with the cardinality it was assembled for.
-    assert "all 3 reply options must contain exactly one" in assisted
-    assert "all 3 reply options must contain exactly one" not in v3_auto
+    # The director states one objective, whatever the cardinality.
+    assert "find out more about what he actually wants" in assisted
 
 
 # --- readable by a human ----------------------------------------------------

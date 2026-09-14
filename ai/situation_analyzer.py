@@ -68,7 +68,6 @@ Return ONLY valid JSON with exactly these fields:
   "purchase_signal": "none/ready_to_buy/bought/declined/money_available/uncertain",
   "offer_response": "none/accepted/declined/counteroffer/deferred",
   "selected_offer_price_usd": "number only, or empty string",
-  "selected_offer_position": "first/second/empty",
   "current_budget_limit_usd": "number only, or empty string",
   "cannot_afford_any_offer_now": "true/false",
   "deferred_purchase_intent": "true/false",
@@ -84,15 +83,17 @@ Return ONLY valid JSON with exactly these fields:
 }
 
 COMMERCIAL INTERPRETATION RULES:
-- Treat facts independently. A fan can select a cheaper offer now AND mention a future payday.
-- Example: "can we do the $28 one, I don't have more right now, I get paid Friday" means:
-  offer_response=accepted, selected_offer_price_usd=28, current_budget_limit_usd=28,
-  cannot_afford_any_offer_now=false, payday_raw=Friday, deferred_purchase_intent=false,
-  purchase_signal=ready_to_buy.
-- cannot_afford_any_offer_now=true only when he cannot buy ANY offered option now.
-- "I can't spend more than $28" is a limit, not a refusal, if he accepts the $28 option.
-- declined means he refused the available offer(s), not merely that he chose the cheaper one.
-- deferred means he wants a specific offer later rather than now.
+- There is only ever ONE offer on the table. offer_response describes what he did
+  about that one thing; there is no option to pick and no position to report.
+- Treat facts independently. A fan can accept the offer now AND mention a future payday.
+- Example: "yeah send it, I don't have more right now, I get paid Friday" means:
+  offer_response=accepted, selected_offer_price_usd=<the offered price>,
+  current_budget_limit_usd=<that price>, cannot_afford_any_offer_now=false,
+  payday_raw=Friday, deferred_purchase_intent=false, purchase_signal=ready_to_buy.
+- cannot_afford_any_offer_now=true only when he cannot buy the offer now.
+- "I can't spend more than $28" is a limit, not a refusal, if he accepts at $28.
+- declined means he refused the offer.
+- deferred means he wants it later rather than now.
 - money_available means previously unavailable money is available now.
 - A compliment alone is NOT a content request. "you look sexy", "cute", "hot", or
   "that last post was sexy" means wants_explicit=false, wants_media=false,
@@ -266,7 +267,6 @@ def _fallback_result(reason: str = DEGRADED_TRANSPORT) -> dict:
         "purchase_signal": "none",
         "offer_response": "none",
         "selected_offer_price_usd": "",
-        "selected_offer_position": "",
         "current_budget_limit_usd": "",
         "cannot_afford_any_offer_now": "false",
         "deferred_purchase_intent": "false",

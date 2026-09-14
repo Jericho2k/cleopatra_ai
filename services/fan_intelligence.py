@@ -184,13 +184,63 @@ def _normalize_value(observation: ProposedObservation) -> Any | None:
     return text
 
 
+def _first_json_object(text: str) -> str | None:
+    """The first balanced ``{...}`` in the text, ignoring braces inside strings.
+
+    A model that wraps its JSON in a sentence, or appends one after it, produced
+    a whole lost extraction before this existed: json.loads saw prose, raised,
+    and the turn's durable facts were dropped on the floor.
+    """
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    return text[start : index + 1]
+    return None
+
+
 def parse_extraction_payload(raw_text: str) -> ExtractionEnvelope:
+    """Read one extraction response, repairing the shapes models actually emit.
+
+    Three repairs, all local and all deterministic: strip code fences, take the
+    first balanced JSON object when the model wrapped it in prose, and accept a
+    bare list of observations as ``{"observations": [...]}``. Anything past that
+    is a genuinely malformed response and raises, which the caller answers with
+    one bounded retry against the same model.
+    """
     cleaned = "\n".join(
         line for line in (raw_text or "").splitlines() if not line.lstrip().startswith("```")
     ).strip()
     if not cleaned:
         raise ValueError("empty extraction response")
-    payload = json.loads(cleaned)
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        candidate = _first_json_object(cleaned)
+        if candidate is None:
+            raise
+        payload = json.loads(candidate)
+    if isinstance(payload, list):
+        payload = {"observations": payload}
     return ExtractionEnvelope.model_validate(payload)
 
 
@@ -430,21 +480,33 @@ async def learn_from_fan_message(
         },
     )
 
+    max_tokens = (
+        spec.resolved_max_tokens()
+        if spec
+        else int(os.getenv("EXTRACTOR_MAX_TOKENS", "700") or 700)
+    )
+    temperature = spec.temperature if spec else 0.0
+
     try:
         result = await complete(
             target,
             system=_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
-            max_tokens=(
-                spec.resolved_max_tokens()
-                if spec
-                else int(os.getenv("EXTRACTOR_MAX_TOKENS", "700") or 700)
-            ),
-            temperature=spec.temperature if spec else 0.0,
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
         try:
             envelope = parse_extraction_payload(result.text)
         except Exception as exc:
+            # One bounded repair attempt against the SAME model, told exactly
+            # what was wrong with its last answer. A malformed response used to
+            # silently lose everything the fan said this turn; it is still
+            # best-effort and still never blocks the reply, which is why there
+            # is exactly one retry and no backoff.
+            print(
+                f"[FAN INTELLIGENCE] invalid extraction fan={fan_id}: {exc} — "
+                "retrying once for a valid object"
+            )
             await record_model_result(
                 result,
                 telemetry,
@@ -452,8 +514,49 @@ async def learn_from_fan_message(
                 parse_valid=False,
                 error=f"invalid extraction JSON: {exc}",
             )
-            print(f"[FAN INTELLIGENCE] invalid extraction fan={fan_id}: {exc}")
-            return
+            try:
+                repair = await complete(
+                    target,
+                    system=_SYSTEM_PROMPT,
+                    messages=[
+                        {"role": "user", "content": user_prompt},
+                        {"role": "assistant", "content": (result.text or "")[:2000]},
+                        {
+                            "role": "user",
+                            "content": (
+                                "That was not valid JSON for this schema. Return "
+                                'ONLY {"observations": [...]} — no prose, no '
+                                "markdown, no code fence. If nothing durable was "
+                                'learned, return {"observations": []}.'
+                            ),
+                        },
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except Exception as repair_exc:
+                print(
+                    f"[FAN INTELLIGENCE] extraction repair failed fan={fan_id}: "
+                    f"{repair_exc}"
+                )
+                return
+            try:
+                envelope = parse_extraction_payload(repair.text)
+            except Exception as repair_exc:
+                await record_model_result(
+                    repair,
+                    telemetry,
+                    success=False,
+                    parse_valid=False,
+                    error=f"invalid extraction JSON after repair: {repair_exc}",
+                )
+                print(
+                    f"[FAN INTELLIGENCE] extraction still invalid after repair "
+                    f"fan={fan_id}: {repair_exc}"
+                )
+                return
+            result = repair
+            print(f"[FAN INTELLIGENCE] extraction repaired fan={fan_id}")
 
         validated = [
             observation

@@ -123,10 +123,6 @@ PRESET_DESCRIPTIONS: dict[str, str] = {
 }
 
 
-def is_valid_preset(value: Any) -> bool:
-    return str(value or "").strip().lower() in PRESETS
-
-
 def normalize_preset(value: Any) -> str | None:
     text = str(value or "").strip().lower()
     return text if text in PRESETS else None

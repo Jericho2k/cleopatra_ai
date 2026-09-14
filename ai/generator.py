@@ -141,6 +141,28 @@ class ParseOutcome:
 DEFAULT_MAX_CANDIDATES = 3
 
 
+# ---------------------------------------------------------------------------
+# Output contracts
+# ---------------------------------------------------------------------------
+#
+# ``candidates`` is the historical shape: a JSON array of alternative replies,
+# one of which is chosen. It is what Assisted needs, because a human picks.
+#
+# ``auto_messages`` is the Full Auto shape. A Full Auto turn has ONE reply, and
+# that reply is one or several natural message bubbles. It is not a list of
+# alternatives with the extras thrown away, and the array-of-one workaround kept
+# leaking that meaning: a model that returned two perfectly good bubbles was
+# logged as "returned 2 candidates for a 1-candidate turn" and had the second
+# one deleted. The object form removes the ambiguity at the source.
+CONTRACT_CANDIDATES = "candidates"
+CONTRACT_AUTO_MESSAGES = "auto_messages"
+
+# An upper bound on bubbles, not a target. One is fine, two or three are normal.
+# Beyond this the model has stopped writing a text message and started writing a
+# transcript, which is a structural failure and is retried rather than truncated.
+MAX_AUTO_MESSAGE_BUBBLES = 6
+
+
 def parse_reply_candidates(
     content: str,
     creator_persona: Persona,
@@ -157,21 +179,10 @@ def parse_reply_candidates(
     ).replies
 
 
-def parse_reply_outcome(
-    content: str,
-    creator_persona: Persona,
-    *,
-    max_candidates: int = DEFAULT_MAX_CANDIDATES,
-) -> ParseOutcome:
-    """parse_reply_candidates, plus the reason nothing survived.
-
-    ``max_candidates`` is the cardinality the CALLER will actually use. A Full
-    Auto turn under a writer version that asks for one reply keeps one, so a
-    model that ignores the instruction and returns three alternatives cannot
-    have the extra two reach any downstream chooser.
-    """
+def _decoded_payload(content: str) -> Any | None:
+    """Strip reminder blocks and code fences, then decode JSON. None on failure."""
     if not content or not content.strip():
-        return ParseOutcome(reason=PARSE_UNPARSEABLE)
+        return None
 
     # Remove injected/reminder blocks.
     cleaned = re.sub(
@@ -190,13 +201,44 @@ def parse_reply_outcome(
     cleaned = "\n".join(cleaned_lines).strip()
 
     if not cleaned:
-        return ParseOutcome(reason=PARSE_UNPARSEABLE)
+        return None
 
     try:
-        payload = json.loads(cleaned)
+        return json.loads(cleaned)
     except (json.JSONDecodeError, TypeError, ValueError):
-        return ParseOutcome(reason=PARSE_UNPARSEABLE)
+        return None
 
+
+def _is_valid_reply(reply: str, creator_persona: Persona) -> bool:
+    lowered = reply.lower()
+
+    if any(phrase in lowered for phrase in BOT_PHRASES):
+        return False
+
+    if _is_standalone_filler(lowered):
+        return False
+
+    if (
+        creator_persona.avg_message_length == "short"
+        and len(reply.split()) > 25
+    ):
+        return False
+
+    return True
+
+
+def parse_reply_outcome(
+    content: str,
+    creator_persona: Persona,
+    *,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+) -> ParseOutcome:
+    """parse_reply_candidates, plus the reason nothing survived.
+
+    ``max_candidates`` is the cardinality the CALLER will actually use. An
+    Assisted turn keeps three, because a human picks between them.
+    """
+    payload = _decoded_payload(content)
     if not isinstance(payload, list):
         return ParseOutcome(reason=PARSE_UNPARSEABLE)
 
@@ -210,24 +252,7 @@ def parse_reply_outcome(
     if not replies:
         return ParseOutcome(reason=PARSE_UNPARSEABLE)
 
-    def is_valid(reply: str) -> bool:
-        lowered = reply.lower()
-
-        if any(phrase in lowered for phrase in BOT_PHRASES):
-            return False
-
-        if _is_standalone_filler(lowered):
-            return False
-
-        if (
-            creator_persona.avg_message_length == "short"
-            and len(reply.split()) > 25
-        ):
-            return False
-
-        return True
-
-    valid = [reply for reply in replies if is_valid(reply)]
+    valid = [reply for reply in replies if _is_valid_reply(reply, creator_persona)]
 
     # COST-001 — one good candidate is a usable answer. The old rule required
     # three survivors, or two plus padding back up to three from the rejected
@@ -243,6 +268,58 @@ def parse_reply_outcome(
         return ParseOutcome(replies=filter_suggestions(valid[:keep]))
 
     return ParseOutcome(reason=PARSE_ALL_REJECTED)
+
+
+def parse_auto_messages_outcome(
+    content: str,
+    creator_persona: Persona,
+) -> ParseOutcome:
+    """Parse the Full Auto contract: ONE reply, in one or several bubbles.
+
+    The expected shape is ``{"messages": ["first bubble", "second bubble"]}``.
+    There are no alternatives to choose between, so nothing here truncates a
+    valid second or third bubble — they are the rest of the same reply.
+
+    Any other shape is a structural failure and is reported as
+    ``PARSE_UNPARSEABLE`` so the caller retries the same model under its retry
+    policy. Coercing an array, an object with a different key, or a bare string
+    into "close enough" is how the candidate semantics leaked back in.
+    """
+    payload = _decoded_payload(content)
+    if not isinstance(payload, dict):
+        return ParseOutcome(reason=PARSE_UNPARSEABLE)
+
+    raw = payload.get("messages")
+    if not isinstance(raw, list) or not raw:
+        return ParseOutcome(reason=PARSE_UNPARSEABLE)
+    if any(not isinstance(bubble, str) for bubble in raw):
+        return ParseOutcome(reason=PARSE_UNPARSEABLE)
+
+    bubbles = [_clean_reply(bubble) for bubble in raw]
+    bubbles = [bubble for bubble in bubbles if bubble]
+    if not bubbles:
+        return ParseOutcome(reason=PARSE_UNPARSEABLE)
+    if len(bubbles) > MAX_AUTO_MESSAGE_BUBBLES:
+        print(
+            f"[GENERATOR] auto reply had {len(bubbles)} bubbles "
+            f"(max {MAX_AUTO_MESSAGE_BUBBLES}); treating as malformed structure"
+        )
+        return ParseOutcome(reason=PARSE_UNPARSEABLE)
+
+    reply = " | ".join(bubbles)
+    # Bot-speak is judged per bubble; "is this whole reply filler" and the
+    # persona length rule are judged on the reply, because that is what gets
+    # sent. One rejected bubble rejects the reply: there is no alternative to
+    # fall back to, and sending the rest would send a reply nobody wrote.
+    if any(
+        any(phrase in bubble.lower() for phrase in BOT_PHRASES)
+        for bubble in bubbles
+    ):
+        return ParseOutcome(reason=PARSE_ALL_REJECTED)
+    if not _is_valid_reply(reply, creator_persona):
+        return ParseOutcome(reason=PARSE_ALL_REJECTED)
+
+    return ParseOutcome(replies=[reply])
 
 
 def _log_unsuccessful_generation(
@@ -347,6 +424,129 @@ _BACKOFF_MAX_SECONDS = float(os.getenv("WRITER_RETRY_MAX_SECONDS", "8.0"))
 _RETRY_AFTER_CAP_SECONDS = float(os.getenv("WRITER_RETRY_AFTER_CAP_SECONDS", "30.0"))
 
 
+# ---------------------------------------------------------------------------
+# Writer retry policy
+# ---------------------------------------------------------------------------
+#
+# The fallback model is not a second opinion. It is a different voice, chosen
+# because it is on a different provider, and reaching it means the conversation
+# is no longer being written by the model the profile actually selected. Under
+# the legacy plan one Kimi hiccup — a 429, a truncated body, a rejected
+# candidate — was enough to hand the turn to Qwen, so "primary: Kimi" was true
+# of the configuration and frequently false of the output.
+#
+# The persistent plan gives the primary model four real attempts, spaced far
+# enough apart that a rate limit or a brief provider incident has time to clear,
+# and only then falls back. The waits are constants here rather than sleeps
+# scattered through the attempt loop, so the schedule is one thing to read, one
+# thing to configure, and one thing for a test to patch.
+
+
+def _wait_schedule(env_name: str, default: tuple[float, ...]) -> tuple[float, ...]:
+    """Read a comma-separated wait schedule from the environment."""
+    raw = os.getenv(env_name)
+    if not raw:
+        return default
+    waits: list[float] = []
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            waits.append(max(0.0, float(chunk)))
+        except ValueError:
+            return default
+    return tuple(waits) or default
+
+
+# Waits BEFORE primary attempts 2, 3 and 4. Attempt 1 is immediate.
+PRIMARY_RETRY_WAIT_SECONDS: tuple[float, ...] = _wait_schedule(
+    "WRITER_PRIMARY_RETRY_WAIT_SECONDS", (5.0, 30.0, 60.0)
+)
+PRIMARY_RETRY_ATTEMPTS = max(
+    1, int(os.getenv("WRITER_PRIMARY_RETRY_ATTEMPTS", "4") or 4)
+)
+
+
+@dataclass(frozen=True)
+class WriterRetryPolicy:
+    """How hard a turn tries the primary writer before accepting the fallback."""
+
+    label: str
+    #: Attempts against the profile's primary model before any fallback.
+    primary_attempts: int = 2
+    #: Fixed waits before primary attempts 2..N. Empty means jittered backoff.
+    primary_waits: tuple[float, ...] = ()
+    #: Whether output the validator rejected is worth another primary attempt.
+    retry_rejected_output: bool = False
+    #: Whether a turn with no configured fallback repeats the primary once more.
+    repeat_primary_without_fallback: bool = True
+    #: Whether the primary's backoff is also applied before the fallback attempt.
+    #: The fallback is a different provider, so the primary's rate limit says
+    #: nothing about it; the legacy plan waits anyway and keeps doing so.
+    backoff_before_fallback: bool = True
+
+    def wait_before_primary_attempt(self, attempt_number: int) -> float:
+        """Seconds to wait before primary attempt ``attempt_number`` (1-based)."""
+        index = attempt_number - 2
+        if index < 0 or index >= len(self.primary_waits):
+            return 0.0
+        return float(self.primary_waits[index])
+
+
+# The frozen plan. ``cleo_legacy_v1`` and ``cleo_v2`` keep it exactly: two Kimi
+# attempts with jittered backoff, then the configured fallback. Changing it
+# would change the baseline those profiles exist to be.
+LEGACY_WRITER_RETRY_POLICY = WriterRetryPolicy(label="legacy")
+
+# ``cleo_v3``: Kimi is the writer, so Qwen is a last resort rather than a second
+# attempt.
+PERSISTENT_PRIMARY_RETRY_POLICY = WriterRetryPolicy(
+    label="persistent_primary",
+    primary_attempts=PRIMARY_RETRY_ATTEMPTS,
+    primary_waits=PRIMARY_RETRY_WAIT_SECONDS,
+    retry_rejected_output=True,
+    repeat_primary_without_fallback=False,
+    backoff_before_fallback=False,
+)
+
+
+# Statuses that no amount of waiting can fix. Sleeping 95 seconds before
+# discovering the API key is still wrong helps nobody, so these skip straight to
+# the fallback. A 408/409/425/429 and every 5xx are deliberately absent: those
+# are exactly what the waits exist for.
+_PERMANENT_STATUS_CODES = frozenset({400, 401, 402, 403, 404, 405, 422})
+
+_PERMANENT_ERROR_MARKERS = (
+    "api key",
+    "api_key",
+    "unauthorized",
+    "invalid authentication",
+    "authentication_error",
+    "permission denied",
+    "not configured",
+    "no such model",
+    "unknown model",
+    "model not found",
+    "unable to access non-serverless model",
+)
+
+
+def is_permanent_failure(error: Exception) -> bool:
+    """Whether retrying this exact request against this model is pointless."""
+    status = _status_code(error)
+    if status is not None:
+        if status in _PERMANENT_STATUS_CODES:
+            return True
+        # Any other status that is not a server error and not a rate limit is
+        # still a client-side problem; retrying identical input will repeat it.
+        if 400 <= status < 500 and status not in {408, 409, 425, 429}:
+            return True
+        return False
+    text = str(error).lower()
+    return any(marker in text for marker in _PERMANENT_ERROR_MARKERS)
+
+
 async def _sleep(seconds: float) -> None:
     """Indirection so tests can assert on delays without waiting for them."""
     await asyncio.sleep(seconds)
@@ -411,27 +611,40 @@ async def generate_replies(
     target_override: ModelTarget | None = None,
     fallback_target_override: ModelTarget | None = None,
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    output_contract: str = CONTRACT_CANDIDATES,
+    retry_policy: WriterRetryPolicy = LEGACY_WRITER_RETRY_POLICY,
+    profile_id: str = "",
 ) -> list[str]:
-    """Generate candidates with a bounded primary-to-fallback plan.
+    """Generate the turn's copy with a bounded primary-to-fallback plan.
 
-    Ordinary routed turns try Kimi twice, then DeepSeek once. Complex and
-    safety-sensitive routes use DeepSeek only. Every attempt is logged with the
-    route, reason, model role, and whether fallback was used. Routing itself is
-    unchanged: no OpenRouter provider fallback is enabled here, and the only
-    fallback ever used is the explicitly configured target.
+    ``retry_policy`` decides how many attempts the profile's PRIMARY model gets
+    and how long the turn waits between them. ``LEGACY_WRITER_RETRY_POLICY`` is
+    the frozen plan — two primary attempts with jittered backoff, then the
+    configured fallback — and is what ``cleo_legacy_v1`` and ``cleo_v2`` run.
+    ``PERSISTENT_PRIMARY_RETRY_POLICY`` gives the primary four attempts spaced
+    by ``PRIMARY_RETRY_WAIT_SECONDS`` before the fallback is reached at all,
+    because on ``cleo_v3`` Kimi IS the writer and Qwen is the last resort.
 
-    COST-001 — the three attempts are no longer interchangeable. What went wrong
-    decides what happens next:
+    What went wrong still decides what happens next:
 
-    * transport/provider failure — retryable, after bounded jittered backoff
-      that honours Retry-After. Kimi is pinned to one upstream, so retrying
-      without a delay just re-enters a throttled provider.
-    * unparseable output — the model misbehaved; one more attempt on the same
-      target is reasonable, with no delay since nothing is throttling us.
-    * every candidate rejected by validation — the model answered fine and our
-      filter refused it. Paying for an identical generation from the same model
-      cannot help, so the same target is not tried again; only an explicitly
-      configured fallback model is.
+    * transport/provider failure — retryable. Under the persistent policy the
+      wait is the configured one (raised to a longer advertised Retry-After,
+      capped); under the legacy policy it is bounded jittered backoff.
+    * a failure that no wait can fix — a bad key, an unknown model, a rejected
+      request — skips the remaining primary attempts and their sleeps entirely
+      and goes straight to the fallback.
+    * unparseable output — the model ignored the output contract. Retried on the
+      same target, because that is a generation fault, not a routing one.
+    * every candidate rejected by validation — under the legacy policy the model
+      is retired for this turn (COST-001: an identical generation cannot help).
+      Under the persistent policy it is retried, because four attempts at the
+      profile's own writer is the point and sampling is not deterministic.
+
+    ``output_contract`` selects how the model's text is read back:
+    ``CONTRACT_CANDIDATES`` for a JSON array of alternatives (Assisted), or
+    ``CONTRACT_AUTO_MESSAGES`` for the Full Auto object whose ``messages`` array
+    is ONE reply's bubbles. The auto contract returns a single joined reply, so
+    downstream code still receives "the reply to send" and never a choice.
     """
 
     primary_target = target_override or get_runtime_target("CHAT")
@@ -439,10 +652,17 @@ async def generate_replies(
     if _same_model_target(primary_target, fallback_target):
         fallback_target = None
 
-    attempt_targets = [primary_target, primary_target]
-    attempt_targets.append(fallback_target or primary_target)
+    primary_attempts = max(1, int(retry_policy.primary_attempts))
+    attempt_targets = [primary_target] * primary_attempts
+    if fallback_target is not None:
+        attempt_targets.append(fallback_target)
+    elif retry_policy.repeat_primary_without_fallback:
+        attempt_targets.append(primary_target)
 
     metadata = dict(telemetry_context or {})
+    profile = str(
+        profile_id or metadata.get("ai_stack_profile") or "unknown"
+    )
     # COST-002a — the system content is handed to the transport in whatever
     # shape build_prompt produced. Flattening it here is what used to discard
     # the cache_control marker before Anthropic ever saw it; the transport now
@@ -466,27 +686,73 @@ async def generate_replies(
         metadata.get("fan_id"),
     )
 
+    def _parse(text: str) -> ParseOutcome:
+        if output_contract == CONTRACT_AUTO_MESSAGES:
+            return parse_auto_messages_outcome(text, creator_persona)
+        return parse_reply_outcome(
+            text, creator_persona, max_candidates=max_candidates
+        )
+
     exhausted_targets: set[tuple[str, str]] = set()
     pending_backoff: float = 0.0
+    pending_reason: str = ""
+    skip_remaining_primary = False
+    primary_attempt_number = 0
 
     for attempt, attempt_target in enumerate(attempt_targets):
+        is_primary = _same_model_target(primary_target, attempt_target)
+        if is_primary:
+            primary_attempt_number += 1
         target_key = (attempt_target.provider, attempt_target.model)
+
+        if is_primary and skip_remaining_primary and primary_attempt_number > 1:
+            # A failure no wait can repair. Do not spend the configured delay
+            # rediscovering it; the fallback is the only thing left that can
+            # still answer this turn.
+            print(
+                f"[WRITER RETRY] profile={profile} model={attempt_target.model} "
+                f"attempt={primary_attempt_number} wait=0 "
+                f"reason=skipped_permanent_failure:{pending_reason or 'unknown'}"
+            )
+            continue
+
         if target_key in exhausted_targets:
-            # Validation already refused this model's output. Another identical
-            # generation from it is pure cost (COST-001).
+            # Validation already refused this model's output and the policy says
+            # another identical generation from it is pure cost (COST-001).
             print(
                 f"[GENERATOR] skipping attempt {attempt + 1} on "
                 f"{attempt_target.model}: validation already rejected its output"
             )
             continue
 
-        if pending_backoff > 0:
+        if is_primary and primary_attempt_number > 1:
+            wait = retry_policy.wait_before_primary_attempt(primary_attempt_number)
+            # A provider that asked for longer than the schedule gets it, up to
+            # the cap; the schedule is a floor, never a way to ignore a 429.
+            wait = max(wait, pending_backoff)
+            print(
+                f"[WRITER RETRY] profile={profile} model={attempt_target.model} "
+                f"attempt={primary_attempt_number} wait={wait:g} "
+                f"reason={pending_reason or 'unknown'}"
+            )
+            if wait > 0:
+                await _sleep(wait)
+            pending_backoff = 0.0
+        elif pending_backoff > 0 and (is_primary or retry_policy.backoff_before_fallback):
             print(
                 f"[GENERATOR] backing off {pending_backoff:.2f}s before attempt "
                 f"{attempt + 1} on {attempt_target.model}"
             )
             await _sleep(pending_backoff)
             pending_backoff = 0.0
+
+        if not is_primary:
+            print(
+                f"[WRITER FALLBACK] profile={profile} "
+                f"primary={primary_target.model} fallback={attempt_target.model} "
+                f"after_primary_attempts={primary_attempt_number} "
+                f"reason={pending_reason or 'unknown'}"
+            )
 
         context = _telemetry_context_for_attempt(
             metadata,
@@ -506,14 +772,13 @@ async def generate_replies(
             )
             record_model_transport_success(attempt_target.model)
             try:
-                outcome = parse_reply_outcome(
-                    result.text, creator_persona, max_candidates=max_candidates
-                )
+                outcome = _parse(result.text)
                 replies = outcome.replies
                 parse_reason = outcome.reason
             except Exception as parse_error:
                 replies = []
                 parse_reason = PARSE_UNPARSEABLE
+                pending_reason = f"parse_error:{parse_error}"
                 await record_model_result(
                     result,
                     context,
@@ -551,6 +816,7 @@ async def generate_replies(
                     )
                 return replies
 
+            pending_reason = parse_reason
             _log_unsuccessful_generation(
                 attempt=attempt + 1,
                 target=attempt_target,
@@ -559,7 +825,7 @@ async def generate_replies(
                 output_tokens=result.usage.output_tokens,
             )
 
-            if parse_reason == PARSE_ALL_REJECTED:
+            if parse_reason == PARSE_ALL_REJECTED and not retry_policy.retry_rejected_output:
                 # Retire this model for this turn. A different, explicitly
                 # configured fallback may still be tried below.
                 exhausted_targets.add(target_key)
@@ -570,7 +836,14 @@ async def generate_replies(
         except Exception as error:
             record_model_transport_failure(attempt_target.model, error)
             status = _status_code(error)
-            pending_backoff = _backoff_delay(attempt, error)
+            permanent = is_permanent_failure(error)
+            pending_reason = (
+                f"{'permanent' if permanent else 'transport'}"
+                f"{f':{status}' if status is not None else ''}"
+            )
+            pending_backoff = 0.0 if permanent else _backoff_delay(attempt, error)
+            if permanent and is_primary:
+                skip_remaining_primary = True
             await record_model_failure(
                 attempt_target,
                 context,

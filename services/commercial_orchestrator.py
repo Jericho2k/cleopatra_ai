@@ -5,7 +5,7 @@ from db.commercial_queries import (
     cancel_actions_for_fan,
     get_creator_policy,
     get_fan_state,
-    get_offerable_packages_with_inventory,
+    get_next_offer_with_inventory,
     merge_fan_ai_summary,
     save_fan_state,
     schedule_action,
@@ -17,12 +17,12 @@ from models.commercial import (
     CommercialEvent,
     EventType,
     FanStatus,
-    PackageOption,
+    Offer,
 )
 from services.commercial_events import (
+    accepted_offer_event,
     augment_pending_offer_events,
     extract_events,
-    selected_package_event,
     stated_budget_cents,
 )
 from services.commercial_policy import CommercialContext, decide_next_action
@@ -30,7 +30,6 @@ from services.followup_lifecycle import (
     complete_session_state,
     pending_offer_expiry_obligation,
 )
-from services.price_learning import select_recommended_packages
 from services.payday import resolve_payday
 from services.session_lifecycle import (
     has_pending_purchase,
@@ -126,7 +125,7 @@ async def _sync_pending_offer_expiry(
     anchor: datetime,
 ) -> None:
     """Make fan state and the durable queue agree about one pending offer."""
-    if state.status != FanStatus.OFFER_PENDING or not state.offered_packages:
+    if state.status != FanStatus.OFFER_PENDING or state.pending_offer is None:
         try:
             await cancel_actions_for_fan(fan_id, "OFFER_EXPIRY")
         except Exception as exc:
@@ -196,7 +195,7 @@ async def acknowledge_fan_return(
         _clear_followup_obligation(state)
         changed = True
 
-    if state.status == FanStatus.OFFER_PENDING and state.offered_packages:
+    if state.status == FanStatus.OFFER_PENDING and state.pending_offer is not None:
         policy = await get_creator_policy(creator_id)
         await _sync_pending_offer_expiry(
             creator_id=creator_id,
@@ -238,11 +237,11 @@ async def orchestrate(
         else:
             _clear_followup_obligation(state)
 
-    if state.status == FanStatus.OFFER_PENDING and state.offered_packages:
+    if state.status == FanStatus.OFFER_PENDING and state.pending_offer is not None:
         augment_pending_offer_events(
             events,
             str(situation.get("_latest_fan_message") or ""),
-            state.offered_packages,
+            state.pending_offer,
         )
 
     # Reset a consumed free allowance only after the configured cooldown has
@@ -260,7 +259,7 @@ async def orchestrate(
     current_desired = str(situation.get("desired_experience") or "").strip()
     desired_experience = current_desired or str(state.desired_experience or "").strip()
     hard_ceiling_cents = _current_hard_ceiling(situation, events)
-    package_options, vault_asset_types = await get_offerable_packages_with_inventory(
+    next_offer, vault_asset_types = await get_next_offer_with_inventory(
         creator_id,
         fan_id,
         policy,
@@ -268,25 +267,22 @@ async def orchestrate(
         desired_experience=desired_experience or None,
         hard_ceiling_cents=hard_ceiling_cents,
     )
-    package_options = select_recommended_packages(
-        package_options,
-        price_learning,
-        max_options=2 if policy.offer_two_packages else 1,
+    # A live offer is held to exactly as presented until it is resolved; only
+    # when nothing is pending does the freshly built next unlock apply.
+    active_offer = (
+        state.pending_offer
+        if state.status == FanStatus.OFFER_PENDING and state.pending_offer is not None
+        else next_offer
     )
-    active_offer_options = (
-        state.offered_packages
-        if state.status == FanStatus.OFFER_PENDING and state.offered_packages
-        else package_options
-    )
-    _resolve_selected_package(events, active_offer_options)
+    _resolve_accepted_offer(events, active_offer)
 
     session = normalize_session(active_session)
     ctx = CommercialContext(
         fan_has_bought_before=fan_has_bought_before,
-        approved_sets_available=approved_sets_available and bool(active_offer_options),
+        approved_sets_available=approved_sets_available and active_offer is not None,
         within_daily_caps=within_daily_caps,
         frozen_for_review=frozen_for_review,
-        package_options=active_offer_options,
+        next_offer=active_offer,
         now=now,
         session_exists=bool(session),
         paused_session_available=bool(session and session.get("status") == "paused"),
@@ -301,7 +297,7 @@ async def orchestrate(
     # what exists, so the writer's statement and the planner's rows cannot drift.
     _attach_media_inventory(
         decision,
-        active_offer_options=active_offer_options,
+        active_offer=active_offer,
         vault_asset_types=vault_asset_types,
         session=session,
         desired_experience=desired_experience,
@@ -314,53 +310,41 @@ async def orchestrate(
     if current_desired:
         state.desired_experience = current_desired
 
-    if decision.action in {ActionType.PRESENT_SESSION_OPTIONS, ActionType.END_TEASER_AND_OFFER}:
-        state.offered_packages = decision.package_options
+    if decision.action == ActionType.OFFER_NEXT_UNLOCK and decision.next_offer:
+        state.pending_offer = decision.next_offer
         state.last_offer_at = now
-        state.selected_package_id = None
-        state.selected_package_set_id = None
-        state.selected_package_set_ids = []
-        state.selected_package_label = None
-        state.selected_package_price_cents = None
+        state.accepted_offer_id = None
+        state.accepted_offer_set_id = None
+        state.accepted_offer_label = None
+        state.accepted_offer_price_cents = None
 
-    selected = selected_package_event(events)
-    if selected:
-        package = _package_from_event(selected, state.offered_packages or package_options)
-        cents = selected.amount_cents or (package.price_cents if package else None)
+    accepted = accepted_offer_event(events)
+    if accepted:
+        offer = _offer_from_event(accepted, state.pending_offer or active_offer)
+        cents = accepted.amount_cents or (offer.price_cents if offer else None)
         if cents:
             state.confirmed_budget_cents = cents
-            state.budget_source = "package_selected" if package else "fan_explicit"
+            state.budget_source = "offer_accepted" if offer else "fan_explicit"
 
-        if package:
-            set_ids = list(package.set_ids or ([package.set_id] if package.set_id else []))
-            state.selected_package_id = package.package_id
-            state.selected_package_set_id = set_ids[0] if set_ids else None
-            state.selected_package_set_ids = set_ids
-            state.selected_package_label = package.label
-            state.selected_package_price_cents = package.price_cents
-            decision.selected_package_set_id = state.selected_package_set_id
-            decision.selected_package_set_ids = set_ids
-            decision.session_budget_cents = package.price_cents
-            decision.mention_price = package.price_cents // 100
-            # Give the writer the exact selected snapshot entry, including its
-            # approved description. Selection still does not equal purchase.
-            decision.package_options = [package]
-            # Narrow the authorised inventory to the one package he chose: an
-            # offer set that contained a clip does not authorise promising one
-            # once he has picked the photo session out of it.
-            from services.inventory_authority import asset_types_from_packages
-
-            decision.authorized_asset_types = list(
-                asset_types_from_packages([package])
-            )
+        if offer:
+            state.pending_offer = offer
+            state.accepted_offer_id = offer.offer_id
+            state.accepted_offer_set_id = offer.set_id
+            state.accepted_offer_label = offer.label
+            state.accepted_offer_price_cents = offer.price_cents
+            decision.accepted_offer_set_id = offer.set_id
+            decision.session_budget_cents = offer.price_cents
+            decision.mention_price = offer.price_cents // 100
+            # Narrow the authorised inventory to the one thing he accepted.
+            decision.authorized_asset_types = list(offer.asset_types)
             if (
                 decision.unavailable_asset_type_requested
                 in decision.authorized_asset_types
             ):
                 decision.unavailable_asset_type_requested = None
 
-        if decision.action == ActionType.CREATE_PAID_SESSION and package:
-            # Selection authorizes creation of a locked PPV. It is not a paid
+        if decision.action == ActionType.SEND_NEXT_PPV_STEP and offer:
+            # Acceptance authorizes creation of a locked PPV. It is not a paid
             # session until the platform confirms the unlock.
             state.status = FanStatus.OFFER_SELECTED
             state.free_session_ended_at = now if state.free_session_started_at else state.free_session_ended_at
@@ -385,7 +369,11 @@ async def orchestrate(
         if state.teaser_messages_used >= max(1, limit):
             state.free_session_ended_at = now
 
-    if decision.action == ActionType.END_TEASER_AND_OFFER and state.free_session_started_at:
+    if (
+        decision.action == ActionType.OFFER_NEXT_UNLOCK
+        and state.free_session_started_at
+        and state.teaser_messages_used
+    ):
         state.free_session_ended_at = state.free_session_ended_at or now
 
     if decision.action == ActionType.RESUME_PREVIOUS_OFFER and session and session.get("status") == "paused":
@@ -450,14 +438,12 @@ async def orchestrate(
                 payday_payload = {
                     "desired_experience": state.desired_experience or "",
                     "last_offer_price_cents": state.last_declined_price_cents,
-                    "selected_package_id": state.selected_package_id,
-                    "selected_package": next(
-                        (
-                            package.model_dump(mode="json")
-                            for package in state.offered_packages
-                            if package.package_id == state.selected_package_id
-                        ),
-                        None,
+                    "accepted_offer_id": state.accepted_offer_id,
+                    "accepted_offer": (
+                        state.pending_offer.model_dump(mode="json")
+                        if state.pending_offer is not None
+                        and state.pending_offer.offer_id == state.accepted_offer_id
+                        else None
                     ),
                     "payday_at": when.isoformat(),
                     "payday_raw": raw,
@@ -484,12 +470,12 @@ async def orchestrate(
                 state.next_followup_dedupe_key = None
                 print(f"[COMMERCIAL] fan={fan_id} payday '{raw}' unresolved")
 
-    selected_resolved_now = bool(
-        selected
-        and selected.metadata.get("package_id")
-        and decision.action == ActionType.CREATE_PAID_SESSION
+    accepted_resolved_now = bool(
+        accepted
+        and accepted.metadata.get("offer_id")
+        and decision.action == ActionType.SEND_NEXT_PPV_STEP
     )
-    resolved_now = selected_resolved_now or any(
+    resolved_now = accepted_resolved_now or any(
         event.type in {EventType.MONEY_AVAILABLE, EventType.PURCHASED}
         for event in events
     )
@@ -523,7 +509,7 @@ async def orchestrate(
 def _attach_media_inventory(
     decision: CommercialDecision,
     *,
-    active_offer_options: list[PackageOption],
+    active_offer: Offer | None,
     vault_asset_types: tuple[str, ...],
     session: dict | None,
     desired_experience: str,
@@ -537,34 +523,19 @@ def _attach_media_inventory(
     """
     from services.inventory_authority import (
         ASSET_VIDEO,
-        asset_types_from_packages,
         asset_types_from_session,
     )
     from services.media_packages import wants_video
 
     session_types = asset_types_from_session(session)
-    decision_types = asset_types_from_packages(decision.package_options)
-    option_types = asset_types_from_packages(active_offer_options)
+    decision_types = tuple(decision.next_offer.asset_types) if decision.next_offer else ()
+    offer_types = tuple(active_offer.asset_types) if active_offer else ()
 
     decision.vault_asset_types = list(vault_asset_types)
     decision.authorized_asset_types = list(
-        decision_types or session_types or option_types
+        decision_types or session_types or offer_types
     )
-    # Presenting a menu authorises promising everything on it. Committing to one
-    # package does not: from that point the contract is the contract, and the
-    # wider offer set is no longer something that may be promised.
-    offering = decision.action in {
-        ActionType.PRESENT_SESSION_OPTIONS,
-        ActionType.END_TEASER_AND_OFFER,
-        ActionType.RESUME_PREVIOUS_OFFER,
-    }
-    decision.available_package_asset_types = (
-        list(option_types) if offering else list(decision.authorized_asset_types)
-    )
-
-    promisable = set(decision.authorized_asset_types) | set(
-        decision.available_package_asset_types
-    )
+    promisable = set(decision.authorized_asset_types)
     asked_for_video = bool(
         wants_video(desired_experience) or wants_video(latest_fan_message)
     )
@@ -573,51 +544,45 @@ def _attach_media_inventory(
     )
 
 
-def _resolve_selected_package(
+def _resolve_accepted_offer(
     events: list[CommercialEvent],
-    offered_packages: list[PackageOption],
+    active_offer: Offer | None,
 ) -> None:
-    event = selected_package_event(events)
-    if not event or not offered_packages:
+    """Bind an acceptance to the exact offer that was on the table.
+
+    There is one offer, so there is nothing to match against except it. A price
+    the fan named that is not its price is not acceptance of it and is left
+    alone for the counteroffer path.
+    """
+    event = accepted_offer_event(events)
+    if not event or active_offer is None:
         return
-
-    package: PackageOption | None = None
-    package_id = str(event.metadata.get("package_id") or "")
-    if package_id:
-        package = next(
-            (item for item in offered_packages if item.package_id == package_id),
-            None,
-        )
-    if package is None:
-        if event.amount_cents is not None:
-            package = min(offered_packages, key=lambda item: abs(item.price_cents - event.amount_cents))
-            if abs(package.price_cents - event.amount_cents) > 100:
-                package = None
-        elif event.package_position == "first":
-            package = offered_packages[0]
-        elif event.package_position == "second" and len(offered_packages) >= 2:
-            package = offered_packages[1]
-
-    if package:
-        set_ids = list(package.set_ids or ([package.set_id] if package.set_id else []))
-        event.amount_cents = package.price_cents
-        event.metadata.update({
-            "package_id": package.package_id,
-            "set_id": set_ids[0] if set_ids else None,
-            "set_ids": set_ids,
-            "label": package.label,
-            "experience": package.experience,
-            "legal_description": package.legal_description or package.experience,
-        })
+    if (
+        event.amount_cents is not None
+        and abs(active_offer.price_cents - event.amount_cents) > 100
+    ):
+        return
+    event.amount_cents = active_offer.price_cents
+    event.metadata.update(
+        {
+            "offer_id": active_offer.offer_id,
+            "set_id": active_offer.set_id,
+            "label": active_offer.label,
+            "experience": active_offer.experience,
+            "legal_description": active_offer.legal_description or active_offer.experience,
+        }
+    )
 
 
-def _package_from_event(
+def _offer_from_event(
     event: CommercialEvent,
-    offered_packages: list[PackageOption],
-) -> PackageOption | None:
-    package_id = event.metadata.get("package_id")
-    if package_id:
-        return next((package for package in offered_packages if package.package_id == package_id), None)
-    if event.amount_cents is not None:
-        return next((package for package in offered_packages if package.price_cents == event.amount_cents), None)
-    return None
+    active_offer: Offer | None,
+) -> Offer | None:
+    if active_offer is None:
+        return None
+    offer_id = str(event.metadata.get("offer_id") or "")
+    if offer_id and offer_id != active_offer.offer_id:
+        return None
+    if not offer_id and event.amount_cents is not None:
+        return active_offer if active_offer.price_cents == event.amount_cents else None
+    return active_offer

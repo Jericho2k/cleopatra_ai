@@ -19,7 +19,7 @@ from models.commercial import CreatorPolicy
 from models.content_pricing import human_price_cents
 from models.price_learning import PriceLearningPolicy, probe_price_cents
 from models.vault_pricing import allocate_step_prices, price_bounds, sequence_bounds
-from services.media_packages import build_offer_packages
+from services.media_packages import build_next_offer
 from services.message_shape import apply_message_shape, choose_message_shape
 from services.ppv_language import (
     contains_delivery_link_language,
@@ -85,14 +85,12 @@ def test_a_cold_fan_is_priced_inside_the_approved_content_range():
     # its floor, and nothing may push it past its ceiling either.
     assert probe.price_cents >= 1500
 
-    packages = build_offer_packages(
+    offer = build_next_offer(
         [row, photo_set("kitchen-2", price=30, level=4)],
-        CreatorPolicy(session_min_steps=1),
+        CreatorPolicy(),
     )
-    assert packages
-    for package in packages:
-        assert package.content_floor_cents <= package.price_cents
-        assert package.price_cents <= package.content_ceiling_cents
+    assert offer is not None
+    assert offer.content_floor_cents <= offer.price_cents <= offer.content_ceiling_cents
 
 
 # --- B. demonstrated spender ------------------------------------------------
@@ -171,25 +169,25 @@ def test_d_an_explicit_current_ceiling_caps_every_offer():
     assert probe.price_cents <= 2500
     assert probe.explicit_ceiling_cents == 2500
 
-    packages = build_offer_packages(
+    offer = build_next_offer(
         [photo_set("kitchen-1", price=25, level=3)],
-        CreatorPolicy(session_min_steps=1),
+        CreatorPolicy(),
         hard_ceiling_cents=2500,
     )
-    assert packages
-    assert all(package.price_cents <= 2500 for package in packages)
+    assert offer is not None
+    assert offer.price_cents <= 2500
 
 
 def test_d_content_above_the_stated_ceiling_is_not_discounted_into_range():
     expensive = video_set("bg", minimum=5000, maximum=15000)
     assert (
-        build_offer_packages(
+        build_next_offer(
             [expensive],
             CreatorPolicy(),
             desired_experience="send me a video",
             hard_ceiling_cents=2500,
         )
-        == []
+        is None
     )
 
 
@@ -198,10 +196,9 @@ def test_d_content_above_the_stated_ceiling_is_not_discounted_into_range():
 
 def test_e_a_single_set_offer_is_delivered_at_exactly_its_offered_price():
     row = photo_set("kitchen-1", price=25, level=3)
-    packages = build_offer_packages([row], CreatorPolicy(session_min_steps=1))
-    assert packages
-    offered = packages[0]
-    assert offered.step_count == 1
+    offered = build_next_offer([row], CreatorPolicy())
+    assert offered is not None
+    assert offered.set_ids == [row["id"]]
 
     allocation = allocate_step_prices(offered.price_cents, [row])
     assert allocation == [offered.price_cents]
@@ -248,15 +245,15 @@ def test_f_the_observed_25_dollar_split_can_no_longer_happen():
     ]
     assert allocate_step_prices(2500, steps) is None
 
-    packages = build_offer_packages(steps, CreatorPolicy(session_min_steps=2))
-    assert packages
-    for package in packages:
-        assert package.price_cents >= 3000
-        allocation = allocate_step_prices(package.price_cents, steps)
-        assert allocation is not None
-        assert sum(allocation) == package.price_cents
-        assert allocation not in ([1063, 1437], [1437, 1063])
-        assert all(value % 500 == 0 for value in allocation)
+    # One unlock is one set, so it is only ever priced against its own bounds
+    # and can never be a total split across two steps at all.
+    offer = build_next_offer(steps, CreatorPolicy())
+    assert offer is not None
+    allocation = allocate_step_prices(
+        offer.price_cents, [row for row in steps if row["id"] == offer.set_id]
+    )
+    assert allocation == [offer.price_cents]
+    assert offer.price_cents % 500 == 0
 
 
 def test_f_an_impossible_allocation_fails_before_the_offer_is_presented():
@@ -280,9 +277,11 @@ def test_f_an_impossible_allocation_fails_before_the_offer_is_presented():
     ]
     assert allocate_step_prices(2500, fixed) is None
 
-    # And no package is ever built at a price its own steps cannot carry.
-    for package in build_offer_packages(fixed, CreatorPolicy(session_min_steps=1)):
-        assert allocate_step_prices(package.price_cents, fixed[: package.step_count])
+    # And no offer is ever built at a price its own content cannot carry.
+    offer = build_next_offer(fixed, CreatorPolicy())
+    if offer is not None:
+        row = next(item for item in fixed if item["id"] == offer.set_id)
+        assert allocate_step_prices(offer.price_cents, [row])
 
 
 def test_f_allocation_is_deterministic():
@@ -304,7 +303,7 @@ def test_f_prices_snap_to_a_human_grid(value):
 def test_g_delivery_link_language_is_repaired_on_commercial_turns():
     original = "i have a kitchen set that's pure trouble, 3 pics for $25 | want the link?"
     repaired, changed = sanitize_delivery_language(
-        original, decision_action="PRESENT_SESSION_OPTIONS"
+        original, decision_action="OFFER_NEXT_UNLOCK"
     )
     assert changed
     assert "link" not in repaired.lower()
@@ -332,7 +331,7 @@ def test_g_unrelated_uses_of_link_are_untouched():
     ):
         assert not contains_delivery_link_language(phrasing)
         assert sanitize_delivery_language(
-            phrasing, decision_action="PRESENT_SESSION_OPTIONS"
+            phrasing, decision_action="OFFER_NEXT_UNLOCK"
         ) == (phrasing, False)
         assert sanitize_delivery_language(
             phrasing, decision_action="CONTINUE_NORMAL_CHAT"
@@ -440,36 +439,37 @@ def _mixed_vault():
     ]
 
 
-def test_i_a_generic_offer_opens_on_photos_and_can_escalate_into_video():
-    packages = build_offer_packages(_mixed_vault(), CreatorPolicy())
-    assert packages
+def test_i_a_generic_offer_opens_on_photos_and_the_clip_stays_for_later():
+    from services.media_packages import plan_progression
 
-    opener = packages[0]
-    assert opener.asset_types[0] == "photo_set"
-    assert "video" not in opener.asset_types, "do not burn the clip as the opener"
+    offer = build_next_offer(_mixed_vault(), CreatorPolicy())
+    assert offer is not None
+    assert offer.asset_type == "photo_set", "do not burn the clip as the opener"
 
-    premium = packages[-1]
-    assert premium.asset_types[0] == "photo_set"
-    assert premium.asset_types[-1] == "video", "the premium session ends on the clip"
+    # The clip is where the INTERNAL progression ends. It is not part of the
+    # offer, is not priced with it, and is never mentioned to the fan.
+    ladder = plan_progression(_mixed_vault())
+    assert ladder[0]["id"] == offer.set_id
+    assert ladder[-1]["id"] == "kitchen-clip"
 
 
 def test_j_an_explicit_video_request_outranks_photo_first():
-    packages = build_offer_packages(
+    offer = build_next_offer(
         _mixed_vault(),
         CreatorPolicy(),
         desired_experience="can i get a video of you in the kitchen",
     )
-    assert packages
-    assert all(package.asset_types == ["video"] for package in packages)
-    assert all(package.set_ids == ["kitchen-clip"] for package in packages)
+    assert offer is not None
+    assert offer.asset_type == "video"
+    assert offer.set_id == "kitchen-clip"
 
 
 def test_i_a_video_only_vault_still_sells():
-    packages = build_offer_packages(
+    offer = build_next_offer(
         [video_set("only", minimum=4000, maximum=9000)], CreatorPolicy()
     )
-    assert packages
-    assert packages[0].set_ids == ["only"]
+    assert offer is not None
+    assert offer.set_id == "only"
 
 
 # --- K. session continuation --------------------------------------------------
@@ -573,10 +573,9 @@ def test_l_already_sold_content_cannot_reappear_as_a_fresh_paid_step():
     remaining = usable_sets(vault, sent_set_ids={"kitchen-1", "kitchen-clip"})
     assert {row["id"] for row in remaining} == {"kitchen-2", "kitchen-3"}
 
-    packages = build_offer_packages(remaining, CreatorPolicy())
-    for package in packages:
-        assert "kitchen-1" not in package.set_ids
-        assert "kitchen-clip" not in package.set_ids
+    offer = build_next_offer(remaining, CreatorPolicy())
+    assert offer is not None
+    assert offer.set_id not in {"kitchen-1", "kitchen-clip"}
 
 
 # --- M. the observed conversation, end to end ---------------------------------
@@ -585,26 +584,22 @@ def test_l_already_sold_content_cannot_reappear_as_a_fresh_paid_step():
 def test_m_the_observed_simulator_conversation_is_now_well_formed():
     """The exact shape of the real failure, as one contract check."""
     vault = _mixed_vault()
-    packages = build_offer_packages(vault, CreatorPolicy())
-    assert packages
-    offered = packages[0]
+    offered = build_next_offer(vault, CreatorPolicy())
+    assert offered is not None
 
     # The presented price is approved, human-looking, and inside content bounds.
     assert offered.price_cents % 500 == 0
     assert offered.content_floor_cents <= offered.price_cents <= offered.content_ceiling_cents
 
-    # It is deliverable at that exact total, with no fractional sub-steps.
-    steps = [row for row in vault if row["id"] in offered.set_ids]
-    steps.sort(key=lambda row: offered.set_ids.index(row["id"]))
+    # It is deliverable at exactly that price, as one step, with no fractions.
+    steps = [row for row in vault if row["id"] == offered.set_id]
     allocation = allocate_step_prices(offered.price_cents, steps)
-    assert allocation is not None
-    assert sum(allocation) == offered.price_cents
-    assert all(value % 500 == 0 for value in allocation)
+    assert allocation == [offered.price_cents]
 
     # The copy that presents it cannot offer a link.
     copy = f"i have a kitchen set that's pure trouble, ${offered.price_cents / 100:g} | want the link?"
     cleaned, changed = sanitize_delivery_language(
-        copy, decision_action="PRESENT_SESSION_OPTIONS"
+        copy, decision_action="OFFER_NEXT_UNLOCK"
     )
     assert changed and "link" not in cleaned.lower()
 
@@ -656,25 +651,51 @@ def test_platform_context_forbids_link_language_for_our_own_media():
 def test_a_selling_turn_is_told_how_delivery_actually_works():
     text = _prompt(
         commercial_decision={
-            "action": "PRESENT_SESSION_OPTIONS",
-            "goal": "offer the exact available packages",
+            "action": "OFFER_NEXT_UNLOCK",
+            "goal": "offer him the one next thing",
             "must_not_send_media": True,
             "may_be_explicit": True,
-            "package_options": [
-                {
-                    "label": "quick private session",
-                    "price_cents": 3000,
-                    "legal_description": "kitchen, apron",
-                    "step_count": 2,
-                }
-            ],
+            "next_offer": {
+                "offer_id": "offer:kitchen-2",
+                "label": "private photo set",
+                "price_cents": 3000,
+                "set_id": "kitchen-2",
+                "legal_description": "kitchen, apron",
+                "media_count": 6,
+                "asset_type": "photo_set",
+            },
         }
     )
     assert "DELIVERY LANGUAGE" in text
     assert "want the link" in text.lower()
     assert "sending it now" in text.lower()
-    # A two-part session is presented as a total for two parts, not as N photos.
-    assert "$30 total for 2 parts" in text
+    # One thing, one price, and nothing about a total or a sequence.
+    assert "THE ONE NEXT THING YOU MAY OFFER: private photo set at $30" in text
+    assert "no second option" in text
+    assert "NEVER tell him how much he might spend in total" in text
+    assert "total for" not in text
+
+
+def test_a_selling_turn_can_never_be_handed_two_prices():
+    text = _prompt(
+        commercial_decision={
+            "action": "OFFER_NEXT_UNLOCK",
+            "goal": "offer him the one next thing",
+            "must_not_send_media": True,
+            "next_offer": {
+                "offer_id": "offer:kitchen-2",
+                "label": "private photo set",
+                "price_cents": 3000,
+                "set_id": "kitchen-2",
+            },
+        }
+    )
+    # Scoped to the commercial block: the writer VOICE block for V1 legitimately
+    # talks about its three assisted options, which is a different thing.
+    commercial = text[text.index("FINAL COMMERCIAL POLICY"):]
+    assert commercial.count("$30") >= 1
+    for menu_language in ("quick private", "full private", "1) ", "2) ", "ORIGINAL ORDER"):
+        assert menu_language not in commercial, menu_language
 
 
 def test_message_shape_target_reaches_the_writer():

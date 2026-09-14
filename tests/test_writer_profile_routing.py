@@ -32,7 +32,7 @@ def ctx(**overrides):
     return SimpleNamespace(**base)
 
 
-COMMERCIAL = ctx(commercial_decision={"action": "PRESENT_SESSION_OPTIONS"})
+COMMERCIAL = ctx(commercial_decision={"action": "OFFER_NEXT_UNLOCK"})
 ORDINARY = ctx()
 CRISIS = ctx(situation={"crisis_signal": "self_harm"})
 
@@ -191,12 +191,16 @@ def test_the_context_carries_the_version_when_the_caller_does_not():
 def test_both_versions_keep_the_deterministic_commercial_authority():
     """The writer voice changes. What the writer is ALLOWED to do does not."""
     decision = {
-        "action": "PRESENT_SESSION_OPTIONS",
-        "goal": "offer the approved options",
+        "action": "OFFER_NEXT_UNLOCK",
+        "goal": "offer him the one next thing",
         "must_not_send_media": True,
-        "package_options": [
-            {"label": "quick private session", "price_cents": 2500, "step_count": 2}
-        ],
+        "next_offer": {
+            "offer_id": "offer:p1",
+            "label": "private photo set",
+            "price_cents": 2500,
+            "set_id": "p1",
+            "asset_type": "photo_set",
+        },
     }
     for version in (WRITER_V1, WRITER_V2):
         prompt = str(
@@ -206,6 +210,7 @@ def test_both_versions_keep_the_deterministic_commercial_authority():
             )
         )
         assert "FINAL COMMERCIAL POLICY" in prompt
-        assert "PRESENT_SESSION_OPTIONS" in prompt
-        assert "Do NOT send media" in prompt
-        assert "Do not invent another price or package" in prompt
+        assert "OFFER_NEXT_UNLOCK" in prompt
+        assert "Nothing is being attached to this message" in prompt
+        assert "THE ONE NEXT THING YOU MAY OFFER" in prompt
+        assert "no second option" in prompt

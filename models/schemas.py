@@ -127,6 +127,11 @@ class ConversationContext(BaseModel):
     # The authoritative statement of what media actually exists for this turn
     # (services/inventory_authority.py). The writer is told; it never infers.
     media_inventory: dict = Field(default_factory=dict)
+    # Set when the backend will attach a locked PPV to this turn's message
+    # (services/ppv_turn.py). Writer-safe: asset type, how many pieces, the
+    # price and the approved description — never media ids, and never a tag to
+    # serialise. Empty means nothing is being attached.
+    ppv_delivery: dict = Field(default_factory=dict)
 
     # Which AI Stack Profile is answering this turn, and which writer voice it
     # selects (ai/stack_profiles.py, ai/writer_style.py). Resolved once per turn

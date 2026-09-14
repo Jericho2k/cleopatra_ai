@@ -207,10 +207,8 @@ def select_writer_route(
         )
 
     complex_actions = {
-        "ASK_ONE_QUALIFYING_QUESTION",
-        "END_TEASER_AND_OFFER",
-        "PRESENT_SESSION_OPTIONS",
-        "CREATE_PAID_SESSION",
+        "DISCOVER_DESIRED_EXPERIENCE",
+        "OFFER_NEXT_UNLOCK",
         "SEND_NEXT_PPV_STEP",
         "PAUSE_NO_BUDGET",
         "PAUSE_UNTIL_PAYDAY",

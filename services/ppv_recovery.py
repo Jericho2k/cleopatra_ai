@@ -266,9 +266,9 @@ async def _mark_receipt_not_sent(fan_id: str) -> dict[str, Any]:
     )
     state.status = (
         FanStatus.OFFER_SELECTED
-        if state.selected_package_id
+        if state.accepted_offer_id
         else FanStatus.OFFER_PENDING
-        if state.offered_packages
+        if state.pending_offer is not None
         else FanStatus.IDLE
     )
     await retry_transient_db_operation(

@@ -1,8 +1,14 @@
-"""Coherent multi-step paid-session planner.
+"""Turn one accepted offer into the one locked PPV step that delivers it.
 
-The commercial policy selects a confirmed package/budget. This service turns
-that contract into 1–4 approved, visually coherent PPV steps. It does not infer
-how much the fan can spend and it does not choose a different price.
+The commercial policy decides WHAT was accepted and at WHAT price. This service
+turns that into a single purchase-gated step. It does not infer how much the fan
+can spend, it does not choose a different price, and — since the two-package
+flow was removed — it does not split one payment across several deliveries.
+
+A "session" here is now one unlock. The next unlock is planned separately, later,
+at a price decided then, only if the conversation actually gets there. That is
+what makes the fan's spend incremental instead of a prepaid bundle, and it is why
+nothing in this module knows how many steps might eventually follow.
 """
 from __future__ import annotations
 
@@ -13,16 +19,12 @@ from typing import Any
 from core.simulation_catalog import exclude_simulation_only, run_live_catalog_query
 from core.supabase import get_supabase
 from db.commercial_queries import get_creator_policy, get_fan_state
-from db.queries import get_fan_by_id, get_sent_ppv, save_fan_session
+from db.queries import get_sent_ppv, save_fan_session
 from models.commercial import FanStatus
 from db.pricing_policy_queries import get_effective_price_learning_policy
 from services.media_packages import (
     allocate_step_pricing,
-    choose_sequence,
-    choose_video_finale,
     is_video_row,
-    order_steps_for_progression,
-    split_media_types,
     usable_sets,
 )
 
@@ -31,28 +33,25 @@ async def plan_session_for_fan(
     creator_id: str,
     fan_id: str,
     *,
-    selected_set_ids: list[str] | None = None,
-    selected_price_cents: int | None = None,
-    confirmed_kinks: list[str] | None = None,
+    accepted_set_id: str | None = None,
+    accepted_price_cents: int | None = None,
 ) -> dict[str, Any]:
+    """Build the single locked step that delivers the accepted offer."""
     policy = await get_creator_policy(creator_id)
     state = await get_fan_state(fan_id)
-    fan = await get_fan_by_id(fan_id)
 
-    authoritative_set_ids = [str(value) for value in (selected_set_ids or []) if value]
-    if not authoritative_set_ids:
-        authoritative_set_ids = [str(value) for value in state.selected_package_set_ids if value]
-    if not authoritative_set_ids and state.selected_package_set_id:
-        authoritative_set_ids = [str(state.selected_package_set_id)]
+    set_id = str(accepted_set_id or state.accepted_offer_set_id or "").strip()
+    if not set_id:
+        return {"status": "missing_accepted_offer", "session": None}
 
-    budget_cents = (
-        selected_price_cents
-        or state.selected_package_price_cents
+    price_cents = (
+        accepted_price_cents
+        or state.accepted_offer_price_cents
         or state.confirmed_budget_cents
     )
-    if not budget_cents or int(budget_cents) <= 0:
+    if not price_cents or int(price_cents) <= 0:
         return {"status": "missing_confirmed_budget", "session": None}
-    budget_cents = int(budget_cents)
+    price_cents = int(price_cents)
 
     rows = await _load_approved_sets(creator_id)
     sent_ppv = await get_sent_ppv(fan_id)
@@ -74,107 +73,72 @@ async def plan_session_for_fan(
     if not sellable:
         return {"status": "no_sets", "session": None}
 
-    by_id = {str(row["id"]): row for row in sellable}
-    if authoritative_set_ids:
-        missing = [set_id for set_id in authoritative_set_ids if set_id not in by_id]
-        if missing:
-            return {
-                "status": "selected_set_unavailable",
-                "session": None,
-                "missing_set_ids": missing,
-            }
-        sequence = [by_id[set_id] for set_id in authoritative_set_ids]
-    else:
-        preferred = list(confirmed_kinks or [])
-        if not preferred and fan and getattr(fan, "ai_summary", None):
-            preferred = list((fan.ai_summary or {}).get("kinks") or [])
-        photo_rows, video_rows = split_media_types(sellable)
-        sequence = choose_sequence(
-            photo_rows or sellable,
-            target_cents=budget_cents,
-            min_steps=policy.session_min_steps,
-            max_steps=policy.session_max_steps,
-            preferred_tags=preferred,
-        )
-        # A generic session opens on lower-friction photo content and escalates
-        # into a clip; it does not burn the best video as the opener.
-        if sequence and video_rows and len(sequence) < policy.session_max_steps:
-            finale = choose_video_finale(
-                sequence,
-                video_rows,
-                preferred_tags=preferred,
-                excluded_set_ids={str(row.get("id")) for row in sequence},
-            )
-            if finale:
-                sequence = [*sequence, finale]
+    row = next((item for item in sellable if str(item["id"]) == set_id), None)
+    if row is None:
+        return {
+            "status": "selected_set_unavailable",
+            "session": None,
+            "missing_set_ids": [set_id],
+        }
 
-    if not sequence:
-        return {"status": "no_coherent_sequence", "session": None}
-
-    # Always escalate within the already-coherent selected sequence: softer
-    # photos first, the clip last.
-    sequence = order_steps_for_progression(sequence)
     pricing_policy = await get_effective_price_learning_policy(creator_id)
     allocations = allocate_step_pricing(
-        budget_cents,
-        sequence,
+        price_cents,
+        [row],
         step_cents=pricing_policy.customer_price_step_cents,
     )
     if allocations is None:
-        # The sold total cannot be split across these steps without breaking a
-        # step's approved bounds or inventing a fractional price. Fail closed:
-        # a session must never be delivered at prices nobody approved.
+        # The accepted price is not a valid price for this content. Fail closed:
+        # an unlock must never be delivered at a price nobody approved.
         print(
             f"[SESSION] no valid allocation fan={fan_id} "
-            f"budget=${budget_cents / 100:.2f} steps={len(sequence)}"
+            f"price=${price_cents / 100:.2f} set={set_id}"
         )
         return {"status": "no_valid_allocation", "session": None}
-    plan: list[dict[str, Any]] = []
-    for index, (row, cents) in enumerate(zip(sequence, allocations, strict=True)):
-        media_ids = [str(value) for value in (row.get("media_ids") or []) if value]
-        is_individual_video = is_video_row(row)
-        plan.append({
-            "step_number": index + 1,
-            "step_count": len(sequence),
-            "media_ids": media_ids,
-            "media_id": media_ids[0],  # compatibility with current executor
-            "price": round(cents / 100, 2),
-            "price_cents": cents,
-            "set_id": str(row["id"]),
-            "scene_key": row.get("title") or row.get("location") or f"step {index + 1}",
-            "location": row.get("location"),
-            "outfit": row.get("outfit"),
-            "explicit_min": row.get("explicit_min"),
-            "explicit_max": row.get("explicit_max"),
-            "description": (
-                f"{row.get('title') or row.get('location') or 'private'} video"
-                if is_individual_video
-                else (
-                    f"{row.get('title') or row.get('location') or 'private'} "
-                    f"bundle ({len(media_ids)} pcs)"
-                )
-            ),
-            "asset_type": "video" if is_individual_video else "photo_set",
-            "sent": False,
-            "purchased": False,
-            "declined": False,
-        })
+
+    cents = allocations[0]
+    media_ids = [str(value) for value in (row.get("media_ids") or []) if value]
+    is_individual_video = is_video_row(row)
+    step = {
+        "step_number": 1,
+        "step_count": 1,
+        "media_ids": media_ids,
+        "media_id": media_ids[0],
+        "price": round(cents / 100, 2),
+        "price_cents": cents,
+        "set_id": str(row["id"]),
+        "scene_key": row.get("title") or row.get("location") or "private",
+        "location": row.get("location"),
+        "outfit": row.get("outfit"),
+        "explicit_min": row.get("explicit_min"),
+        "explicit_max": row.get("explicit_max"),
+        "description": (
+            f"{row.get('title') or row.get('location') or 'private'} video"
+            if is_individual_video
+            else (
+                f"{row.get('title') or row.get('location') or 'private'} "
+                f"bundle ({len(media_ids)} pcs)"
+            )
+        ),
+        "asset_type": "video" if is_individual_video else "photo_set",
+        "sent": False,
+        "purchased": False,
+        "declined": False,
+    }
 
     now = datetime.now(timezone.utc).isoformat()
     session = {
         "status": "active",
-        "plan": plan,
+        "plan": [step],
         "current_index": 0,
         "awaiting_purchase_index": None,
         "started_at": now,
         "updated_at": now,
-        "fan_kinks": list(confirmed_kinks or []),
-        "set_id": plan[0]["set_id"],
-        "set_ids": [item["set_id"] for item in plan],
-        "scene_key": plan[0]["scene_key"],
-        "commercial_package_id": state.selected_package_id,
-        "confirmed_budget_cents": budget_cents,
-        "total_budget_cents": budget_cents,
+        "set_id": step["set_id"],
+        "set_ids": [step["set_id"]],
+        "scene_key": step["scene_key"],
+        "commercial_offer_id": state.accepted_offer_id,
+        "confirmed_budget_cents": cents,
         "revenue_cents": 0,
         "payment_state": "OFFER_SELECTED",
         "post_ppv_cooldown": False,
@@ -183,17 +147,17 @@ async def plan_session_for_fan(
     }
     await save_fan_session(fan_id, session)
 
-    # A plan authorizes the first locked PPV; it is not a paid session until
-    # the platform confirms an unlock.
+    # A plan authorizes the locked PPV; it is not paid until the platform
+    # confirms the unlock.
     state.status = FanStatus.OFFER_SELECTED
-    state.confirmed_budget_cents = budget_cents
-    state.selected_package_set_ids = [item["set_id"] for item in plan]
+    state.confirmed_budget_cents = cents
+    state.accepted_offer_set_id = step["set_id"]
     from db.commercial_queries import save_fan_state
     await save_fan_state(fan_id, creator_id, state)
 
     print(
-        f"[SESSION] planned fan={fan_id} steps={len(plan)} "
-        f"budget=${budget_cents / 100:.2f} sets={session['set_ids']}"
+        f"[SESSION] planned fan={fan_id} unlock={step['set_id']} "
+        f"price=${cents / 100:.2f}"
     )
     return {"status": "ok", "session": session}
 

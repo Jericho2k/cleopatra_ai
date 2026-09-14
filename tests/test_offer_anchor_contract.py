@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from models.commercial import CreatorPolicy
-from services.media_packages import build_offer_packages
+from services.media_packages import build_next_offer
 
 
 def _set(
@@ -31,12 +31,7 @@ def _set(
 
 
 def _policy() -> CreatorPolicy:
-    return CreatorPolicy(
-        offer_two_packages=False,
-        quick_package_target_cents=2500,
-        session_min_steps=1,
-        session_max_steps=3,
-    )
+    return CreatorPolicy(next_offer_target_cents=2500)
 
 
 def test_current_experience_outranks_soft_initial_target():
@@ -61,19 +56,19 @@ def test_current_experience_outranks_soft_initial_target():
         ),
     ]
 
-    packages = build_offer_packages(
+    offer = build_next_offer(
         rows,
         _policy(),
         desired_experience="I want to see what happened in the shower",
     )
 
-    assert len(packages) == 1
-    assert packages[0].set_ids == ["shower-premium"]
-    # The soft package target is $25; the shower set's approved range is
+    assert offer is not None
+    assert offer.set_id == "shower-premium"
+    # The soft content target is $25; the shower set's approved range is
     # $45-$70. The request wins on content, and the content wins on price.
-    assert 4500 <= packages[0].price_cents <= 7000
-    assert packages[0].price_cents % 500 == 0
-    assert "shower" in (packages[0].experience or "").lower()
+    assert 4500 <= offer.price_cents <= 7000
+    assert offer.price_cents % 500 == 0
+    assert "shower" in (offer.experience or "").lower()
 
 
 def test_explicit_current_ceiling_blocks_unaffordable_requested_set():
@@ -98,34 +93,34 @@ def test_explicit_current_ceiling_blocks_unaffordable_requested_set():
         ),
     ]
 
-    packages = build_offer_packages(
+    offer = build_next_offer(
         rows,
         _policy(),
         desired_experience="show me the shower set",
         hard_ceiling_cents=3000,
     )
 
-    assert len(packages) == 1
-    assert packages[0].set_ids == ["bedroom-affordable"]
-    assert packages[0].price_cents <= 3000
-    assert "shower" not in (packages[0].experience or "").lower()
+    assert offer is not None
+    assert offer.set_id == "bedroom-affordable"
+    assert offer.price_cents <= 3000
+    assert "shower" not in (offer.experience or "").lower()
 
 
 def test_writer_receives_only_approved_experience_contract():
     source = (Path(__file__).parents[1] / "ai" / "prompt_builder.py").read_text()
-    assert "approved experience:" in source
+    assert "approved content:" in source
     assert "only concrete content you may" in source
     assert "Do not name a requested theme unless it appears" in source
 
 
-def test_orchestrator_resolves_anchor_before_package_build():
+def test_orchestrator_resolves_anchor_before_the_offer_is_built():
     source = (
         Path(__file__).parents[1] / "services" / "commercial_orchestrator.py"
     ).read_text()
     desired_at = source.index("current_desired =")
-    # The call is the inventory-reporting variant: it returns the offers AND
-    # the asset types of the rows they were built from, in one read.
-    package_at = source.index("await get_offerable_packages_with_inventory")
-    assert desired_at < package_at
+    # The call is the inventory-reporting variant: it returns the offer AND
+    # the asset types of the rows it was built from, in one read.
+    offer_at = source.index("await get_next_offer_with_inventory")
+    assert desired_at < offer_at
     assert "desired_experience=desired_experience or None" in source
     assert "hard_ceiling_cents=hard_ceiling_cents" in source

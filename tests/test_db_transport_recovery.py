@@ -130,12 +130,23 @@ def test_my_creators_survives_one_terminated_connection(dashboard_client, monkey
 def test_my_creators_still_fails_when_the_database_is_genuinely_gone(
     dashboard_client, monkeypatch
 ):
-    """Fail-closed is preserved: a real outage is still an error, not an empty list."""
+    """Fail-closed is preserved: a real outage is still an error, not an empty list.
+
+    It is now reported as a JSON 500 rather than an exception escaping into the
+    ASGI server. That is the point of the unhandled-error middleware: a response
+    that never passes through the CORS layer is one the browser refuses to read
+    and reports as the opaque "Failed to fetch".
+    """
     db = _FlakyCreators(failures=99)
     monkeypatch.setattr(main, "get_supabase", lambda: db)
 
-    with pytest.raises(httpx.RemoteProtocolError):
-        dashboard_client.get("/my-creators", headers=_headers())
+    response = dashboard_client.get("/my-creators", headers=_headers())
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error_type"] == "RemoteProtocolError"
+    assert body["error_id"]
+    assert "creators" not in body, "an outage is never an empty list"
 
 
 # ---------------------------------------------------------------------------

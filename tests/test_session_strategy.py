@@ -11,18 +11,19 @@ def test_crisis_always_hands_off_and_suppresses_selling():
     assert "selling" in result.writer_avoid
 
 
-def test_selected_approved_offer_closes_exactly():
+def test_accepted_approved_offer_closes_exactly():
     result = derive_session_strategy(
         commercial_decision={
-            "action": "CREATE_PAID_SESSION",
+            "action": "SEND_NEXT_PPV_STEP",
+            "new_status": "OFFER_SELECTED",
             "session_budget_cents": 2800,
-            "package_options": [{"package_id": "package:1", "price_cents": 2800}],
+            "next_offer": {"offer_id": "offer:1", "price_cents": 2800},
         }
     )
     assert result.goal == SessionGoal.CLOSE
-    assert result.next_action == NextBestAction.CREATE_PAID_SESSION
+    assert result.next_action == NextBestAction.SEND_NEXT_STEP
     assert result.selected_offer_price_cents == 2800
-    assert result.approved_offer_ids == ["package:1"]
+    assert result.approved_offer_ids == ["offer:1"]
 
 
 def test_affordability_pause_never_counteroffers():
@@ -41,5 +42,7 @@ def test_new_prospect_qualifies_once():
         conversation_stage="WARMING_UP",
     )
     assert result.goal == SessionGoal.QUALIFY
-    assert result.must_ask_question is True
+    # An objective, not a forced sentence: discovery no longer demands a question.
+    assert result.must_ask_question is False
+    assert result.next_action == NextBestAction.ASK_ONE_QUESTION
     assert result.next_action == NextBestAction.ASK_ONE_QUESTION

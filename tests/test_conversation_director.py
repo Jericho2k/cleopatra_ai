@@ -60,12 +60,12 @@ def test_tension_does_not_loop_forever():
 def test_commercial_offer_overrides_progression():
     result = advance_conversation_director(
         previous={"phase": "RAPPORT", "action": "DEEPEN_RAPPORT"},
-        commercial_decision={"action": "PRESENT_SESSION_OPTIONS"},
+        commercial_decision={"action": "OFFER_NEXT_UNLOCK"},
         fan_turn_count=3,
     )
 
     assert result.phase == ConversationPhase.OFFER
-    assert result.action == DirectorAction.PRESENT_APPROVED_OPTIONS
+    assert result.action == DirectorAction.OFFER_NEXT_UNLOCK
     assert result.offer_eligible is True
 
 

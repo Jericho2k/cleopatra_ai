@@ -90,7 +90,7 @@ def test_mark_ppv_purchased_finds_an_old_send(monkeypatch):
 # --- offer packages ---------------------------------------------------------
 
 
-def test_offer_packages_never_reoffer_a_set_sent_past_the_cap(monkeypatch):
+def test_the_next_offer_never_reoffers_a_set_sent_past_the_cap(monkeypatch):
     """The audit's headline example: an incomplete sent_set_ids re-sells.
 
     sent_set_ids is the "never offer this again" list. Truncated at 1,000
@@ -136,20 +136,20 @@ def test_offer_packages_never_reoffer_a_set_sent_past_the_cap(monkeypatch):
     monkeypatch.setattr(commercial, "usable_sets", fake_usable_sets)
     monkeypatch.setattr(
         commercial,
-        "build_offer_packages",
-        lambda rows, *_args, **_kwargs: list(rows),
+        "build_next_offer",
+        lambda rows, *_args, **_kwargs: (list(rows) or [None])[0],
     )
 
-    packages = asyncio.run(
-        commercial.get_offerable_packages(
+    offer = asyncio.run(
+        commercial.get_next_offer(
             creator_id=CREATOR_ID,
             fan_id=FAN_ID,
-            policy=SimpleNamespace(),
+            policy=SimpleNamespace(next_offer_target_cents=2500),
         )
     )
 
     assert old_set in captured["sent_set_ids"]
-    assert packages == []
+    assert offer is None
 
 
 # --- pending PPV repair sweep ----------------------------------------------

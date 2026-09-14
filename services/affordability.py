@@ -211,7 +211,7 @@ def _to_affordability_event(
             amount_cents=event.amount_cents,
             **common,
         )
-    if event.type == EventType.PACKAGE_SELECTED:
+    if event.type == EventType.OFFER_ACCEPTED:
         return AffordabilityEvent(
             event_type=AffordabilityEventType.OFFER_SELECTED,
             amount_cents=event.amount_cents,

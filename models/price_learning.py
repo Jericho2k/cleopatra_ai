@@ -271,62 +271,6 @@ def derive_price_learning_profile(
     )
 
 
-def select_recommended_packages(
-    package_options: list[Any],
-    price_learning: dict[str, Any] | None,
-    *,
-    max_options: int = 2,
-) -> list[Any]:
-    """Choose the best approved packages; never create or alter a price."""
-
-    options = list(package_options or [])
-    if not options:
-        return []
-    context = price_learning or {}
-    mode = str(context.get("mode") or "").upper()
-    target = _money(context.get("recommended_target_cents"))
-    floor = _money(context.get("recommended_floor_cents"))
-    ceiling = _money(context.get("recommended_ceiling_cents"))
-    limit = max(1, int(max_options))
-
-    if target is None or mode in {"", "NO_OFFER"}:
-        return options
-
-    priced = [(option, _option_price(option)) for option in options]
-    priced = [(option, price) for option, price in priced if price is not None]
-    if not priced:
-        return options[:limit]
-
-    if mode == "EXACT":
-        return [min(priced, key=lambda pair: abs(pair[1] - target))[0]]
-
-    eligible = [
-        (option, price)
-        for option, price in priced
-        if (floor is None or price >= floor) and (ceiling is None or price <= ceiling)
-    ]
-    pool = eligible or priced
-    lower = sorted(
-        (pair for pair in pool if pair[1] <= target),
-        key=lambda pair: (target - pair[1], -pair[1]),
-    )
-    upper = sorted(
-        (pair for pair in pool if pair[1] > target),
-        key=lambda pair: (pair[1] - target, pair[1]),
-    )
-    selected: list[Any] = []
-    for bucket in (lower, upper):
-        if bucket and bucket[0][0] not in selected:
-            selected.append(bucket[0][0])
-    if len(selected) < limit:
-        for option, _ in sorted(pool, key=lambda pair: abs(pair[1] - target)):
-            if option not in selected:
-                selected.append(option)
-            if len(selected) >= limit:
-                break
-    return selected[:limit]
-
-
 def profile_from_row(row: dict[str, Any] | None) -> PriceLearningProfile:
     if not row:
         return PriceLearningProfile()
@@ -334,12 +278,6 @@ def profile_from_row(row: dict[str, Any] | None) -> PriceLearningProfile:
     for key in ("fan_id", "creator_id", "created_at"):
         payload.pop(key, None)
     return PriceLearningProfile.model_validate(payload)
-
-
-def _option_price(option: Any) -> int | None:
-    if isinstance(option, dict):
-        return _money(option.get("price_cents"))
-    return _money(getattr(option, "price_cents", None))
 
 
 def _latest_event_time(events: list[dict[str, Any]], event_type: str) -> datetime | None:

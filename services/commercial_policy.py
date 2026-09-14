@@ -3,6 +3,19 @@
 ``decide_next_action`` is pure: policy + persisted state + typed observations +
 read-only runtime facts -> one commercial decision. The LLM only phrases that
 decision.
+
+THE SHAPE OF A SALE
+-------------------
+One offer at a time. The fan is shown the next thing and its price; he is never
+shown a menu, never told how many further steps might exist, and never quoted an
+eventual session total. When he accepts, the next move is DELIVERY — not a
+confirmation, not a restatement, and not a question about which part he wants
+first. After the purchase the conversation goes back to being a conversation for
+a beat before anything else is offered.
+
+Everything about how far the progression could go is internal (see
+``services/media_packages.plan_progression``). This module only ever emits the
+single next unlock.
 """
 from datetime import datetime, timedelta, timezone
 
@@ -14,8 +27,25 @@ from models.commercial import (
     EventType,
     FanCommercialState,
     FanStatus,
-    PackageOption,
+    Offer,
     SextingMode,
+)
+
+
+# What "he has told us what he wants" is worth. A fan who arrives explicitly
+# asking to see more is not in the same conversation as one who said "hey", and
+# making him serve a fixed number of rapport turns before anything can be
+# offered is a state machine talking to itself.
+OFFER_READINESS_THRESHOLD = 5
+
+# Explicit interest in content is, on its own, enough to reach that threshold.
+# This is the high-intent fast path: it is not a shortcut around inventory,
+# pricing, caps or purchase gating, every one of which still applies below.
+HIGH_INTENT_EVENTS = (
+    EventType.WANTS_EXPLICIT,
+    EventType.READY_TO_BUY,
+    EventType.BUDGET_STATED,
+    EventType.COUNTEROFFER_STATED,
 )
 
 
@@ -27,7 +57,7 @@ class CommercialContext:
         within_daily_caps: bool = True,
         frozen_for_review: bool = False,
         fan_repeats_interest: bool = False,
-        package_options: list[PackageOption] | None = None,
+        next_offer: Offer | None = None,
         now: datetime | None = None,
         session_exists: bool = False,
         paused_session_available: bool = False,
@@ -40,7 +70,7 @@ class CommercialContext:
         self.within_daily_caps = within_daily_caps
         self.frozen_for_review = frozen_for_review
         self.fan_repeats_interest = fan_repeats_interest
-        self.package_options = package_options or []
+        self.next_offer = next_offer
         self.now = now or datetime.now(timezone.utc)
         self.session_exists = session_exists
         self.paused_session_available = paused_session_available
@@ -77,9 +107,9 @@ def compute_readiness(
 ) -> int:
     score = 0
     if _has(events, EventType.WANTS_EXPLICIT):
-        score += 3
+        score += 5
     if _has(events, EventType.WANTS_MEDIA):
-        score += 2
+        score += 3
     if ctx.fan_has_bought_before:
         score += 1
     if ctx.fan_repeats_interest:
@@ -89,12 +119,47 @@ def compute_readiness(
     if _has(events, EventType.COUNTEROFFER_STATED):
         score += 3
     if _has(events, EventType.READY_TO_BUY):
-        score += 3
-    if _has(events, EventType.PACKAGE_SELECTED):
+        score += 5
+    if _has(events, EventType.OFFER_ACCEPTED):
         score += 5
     if _has(events, EventType.MONEY_UNAVAILABLE):
         score -= 5
     return score
+
+
+def high_intent(events: list[CommercialEvent]) -> bool:
+    """Whether he has already said, plainly, that he wants paid content.
+
+    Nothing about conversation length is consulted, on purpose. "your bikini
+    post made me hard, I want to see what's underneath" is a different opening
+    from "hey", and treating them the same is what produced twenty ceremonial
+    messages before an offer a fan had already asked for.
+    """
+    return any(_has(events, event_type) for event_type in HIGH_INTENT_EVENTS)
+
+
+def _offer_next_unlock(
+    offer: Offer | None,
+    *,
+    goal: str,
+    reason: str,
+    may_be_explicit: bool = True,
+    replacement: bool = False,
+) -> CommercialDecision:
+    """The one forward commercial move: put the next unlock on the table."""
+    return CommercialDecision(
+        action=ActionType.OFFER_NEXT_UNLOCK,
+        goal=goal,
+        next_offer=offer,
+        mention_price=(offer.price_cents // 100 if offer else None),
+        must_not_send_media=True,
+        may_be_explicit=may_be_explicit,
+        new_status=FanStatus.OFFER_PENDING,
+        max_messages=2,
+        conversation_continuation="optional",
+        replacement_for_unavailable=replacement,
+        reason=reason,
+    )
 
 
 def decide_next_action(
@@ -119,9 +184,10 @@ def decide_next_action(
         return CommercialDecision(
             action=ActionType.RESUME_PREVIOUS_OFFER,
             goal=(
-                "money is available again; warmly resume the exact experience "
-                "he wanted before without pressure"
+                "money is available again; warmly resume the exact thing he "
+                "wanted before without pressure"
             ),
+            next_offer=state.pending_offer,
             must_not_send_media=True,
             may_be_explicit=policy.sexting_mode != SextingMode.PAID_ONLY,
             mention_previous_interest=True,
@@ -131,49 +197,50 @@ def decide_next_action(
             reason="money available lifts pause",
         )
 
-    # A package acceptance outranks a simultaneous statement that he cannot spend
-    # more. Example: "I'll take the $28 one; more money comes Friday."
-    selected = _get(events, EventType.PACKAGE_SELECTED)
-    if selected:
-        selected_set_ids = list(selected.metadata.get("set_ids") or [])
-        selected_set_id = selected.metadata.get("set_id")
-        if selected_set_id and not selected_set_ids:
-            selected_set_ids = [selected_set_id]
-        if not selected_set_ids:
-            return CommercialDecision(
-                action=ActionType.PRESENT_SESSION_OPTIONS,
-                goal="restate the exact available options once because the choice was ambiguous",
-                package_options=ctx.package_options or state.offered_packages,
-                must_not_send_media=True,
-                new_status=FanStatus.OFFER_PENDING,
-                max_messages=2,
-                conversation_continuation="required",
-                reason="package choice could not be matched",
+    # Acceptance outranks a simultaneous statement that he cannot spend more.
+    # Example: "yeah send it; more money comes Friday."
+    accepted = _get(events, EventType.OFFER_ACCEPTED)
+    if accepted:
+        accepted_set_id = accepted.metadata.get("set_id")
+        if not accepted_set_id:
+            # He said yes to something we cannot pin to an approved set. State
+            # the one offer again rather than guessing which thing he meant.
+            return _offer_next_unlock(
+                ctx.next_offer or state.pending_offer,
+                goal=(
+                    "he sounds ready; say plainly what the next thing is and "
+                    "what it costs, once"
+                ),
+                reason="acceptance could not be matched to an approved set",
             )
         if not ctx.approved_sets_available or not ctx.within_daily_caps:
             return CommercialDecision(
                 action=ActionType.CONTINUE_NORMAL_CHAT,
-                goal="acknowledge his choice without promising unavailable content",
+                goal="acknowledge him without promising unavailable content",
                 must_not_send_media=True,
                 must_not_ask_question=True,
                 max_messages=1,
                 conversation_continuation="none",
-                reason="selected package unavailable or capped",
+                reason="accepted offer unavailable or capped",
             )
+        # One meaningful acceptance is enough. Send it.
         return CommercialDecision(
-            action=ActionType.CREATE_PAID_SESSION,
-            goal="confirm the package he selected and begin the matching paid experience",
+            action=ActionType.SEND_NEXT_PPV_STEP,
+            goal=(
+                "he said yes, so this is the send: write the message that goes "
+                "with it and nothing else. Do not ask again whether he wants it, "
+                "do not restate the price, do not describe what comes after"
+            ),
             must_not_send_media=False,
             may_be_explicit=True,
-            mention_price=(selected.amount_cents // 100 if selected.amount_cents else None),
+            mention_price=(accepted.amount_cents // 100 if accepted.amount_cents else None),
             new_status=FanStatus.OFFER_SELECTED,
-            session_budget_cents=selected.amount_cents,
-            selected_package_set_id=selected_set_ids[0],
-            selected_package_set_ids=selected_set_ids,
+            session_budget_cents=accepted.amount_cents,
+            accepted_offer_set_id=str(accepted_set_id),
             must_not_ask_question=True,
             max_messages=2,
             conversation_continuation="none",
-            reason="fan selected an offered package",
+            reason="fan accepted the offer on the table",
         )
 
     if _has(events, EventType.MONEY_UNAVAILABLE):
@@ -203,19 +270,16 @@ def decide_next_action(
 
     counteroffer = _get(events, EventType.COUNTEROFFER_STATED)
     if counteroffer:
-        return CommercialDecision(
-            action=ActionType.PRESENT_SESSION_OPTIONS,
+        # His number does not buy an unapproved discount. It DOES narrow what
+        # can be offered next, which the caller has already applied as a hard
+        # ceiling when building ctx.next_offer.
+        return _offer_next_unlock(
+            ctx.next_offer or state.pending_offer,
             goal=(
-                "acknowledge his amount without promising an unapproved discount; "
-                "offer only the exact available packages"
+                "take his number seriously without inventing a discount; say "
+                "what you can actually send him at its real price"
             ),
-            package_options=ctx.package_options or state.offered_packages,
-            must_not_send_media=True,
-            may_be_explicit=True,
-            new_status=FanStatus.OFFER_PENDING,
-            max_messages=2,
-            conversation_continuation="required",
-            reason="counteroffer does not match an approved package",
+            reason="counteroffer does not match the approved price",
         )
 
     if _has(events, EventType.OFFER_DECLINED):
@@ -230,35 +294,21 @@ def decide_next_action(
             reason="offer declined without affordability pause",
         )
 
-    if state.status == FanStatus.OFFER_PENDING and state.offered_packages:
-        if _has(events, EventType.OFFER_SELECTION_AMBIGUOUS):
-            return CommercialDecision(
-                action=ActionType.PRESENT_SESSION_OPTIONS,
-                goal=(
-                    "ask one concise clarification using only the exact active "
-                    "options; do not guess which one he meant"
-                ),
-                package_options=state.offered_packages,
-                must_not_send_media=True,
-                may_be_explicit=True,
-                new_status=FanStatus.OFFER_PENDING,
-                max_messages=1,
-                conversation_continuation="required",
-                reason="pending offer selection is ambiguous",
-            )
+    if state.status == FanStatus.OFFER_PENDING and state.pending_offer:
         if _has(events, EventType.OFFER_DETAILS_REQUESTED):
             return CommercialDecision(
                 action=ActionType.RESUME_PREVIOUS_OFFER,
                 goal=(
-                    "explain or restate the exact active options in their original "
-                    "order; preserve every package, price and approved experience"
+                    "answer what he asked about the exact thing on the table; "
+                    "same content, same price, no new offer"
                 ),
-                package_options=state.offered_packages,
+                next_offer=state.pending_offer,
+                mention_price=state.pending_offer.price_cents // 100,
                 must_not_send_media=True,
                 may_be_explicit=True,
                 new_status=FanStatus.OFFER_PENDING,
                 max_messages=2,
-                conversation_continuation="required",
+                conversation_continuation="optional",
                 reason="pending offer detail request resumes exact snapshot",
             )
 
@@ -267,8 +317,8 @@ def decide_next_action(
             return CommercialDecision(
                 action=ActionType.CONTINUE_NORMAL_CHAT,
                 goal=(
-                    "the selected PPV is locked and awaiting confirmation; do not "
-                    "imply it was purchased, opened, seen, or enjoyed"
+                    "the PPV is locked and awaiting confirmation; do not imply it "
+                    "was purchased, opened, seen, or enjoyed"
                 ),
                 must_not_send_media=True,
                 may_be_explicit=False,
@@ -282,7 +332,7 @@ def decide_next_action(
             return CommercialDecision(
                 action=ActionType.SEND_NEXT_PPV_STEP,
                 goal=(
-                    "send the exact selected first step as a locked purchase-gated PPV; "
+                    "send the exact accepted unlock as a locked purchase-gated PPV; "
                     "do not call it purchased or change its content or price"
                 ),
                 must_not_send_media=False,
@@ -291,14 +341,14 @@ def decide_next_action(
                 must_not_ask_question=True,
                 max_messages=1,
                 conversation_continuation="none",
-                reason="recover unsent selected PPV",
+                reason="recover unsent accepted PPV",
             )
 
     if state.status == FanStatus.PAYMENT_PENDING:
         return CommercialDecision(
             action=ActionType.CONTINUE_NORMAL_CHAT,
             goal=(
-                "acknowledge his latest message while the selected PPV is still locked; "
+                "acknowledge his latest message while the PPV is still locked; "
                 "do not imply he purchased it, opened it, saw it, or reacted to unseen content"
             ),
             must_not_send_media=True,
@@ -307,7 +357,7 @@ def decide_next_action(
             must_not_ask_question=True,
             max_messages=1,
             conversation_continuation="none",
-            reason="selected PPV is awaiting confirmed unlock",
+            reason="PPV is awaiting confirmed unlock",
         )
 
     if state.status in {FanStatus.PAUSED_NO_BUDGET, FanStatus.PAUSED_UNTIL_PAYDAY}:
@@ -332,7 +382,7 @@ def decide_next_action(
             return CommercialDecision(
                 action=ActionType.CONTINUE_NORMAL_CHAT,
                 goal=(
-                    "the selected PPV is still locked; do not imply it was purchased, "
+                    "the PPV is still locked; do not imply it was purchased, "
                     "opened, seen, or enjoyed"
                 ),
                 must_not_send_media=True,
@@ -347,69 +397,47 @@ def decide_next_action(
             return CommercialDecision(
                 action=ActionType.CONTINUE_NORMAL_CHAT,
                 goal=(
-                    "react to the exact piece he just unlocked, keep the scene alive, "
-                    "and bridge toward the next planned step of this session without "
-                    "sending media, naming a price, or asking whether he wants more"
+                    "react to the exact piece he just unlocked and stay in it with "
+                    "him — no media, no price, and nothing about what comes next"
                 ),
                 must_not_send_media=True,
                 may_be_explicit=True,
                 must_not_ask_question=True,
                 reason="post-purchase cooldown",
             )
-        if not ctx.session_has_remaining_steps:
+        if ctx.session_has_remaining_steps:
             return CommercialDecision(
-                action=ActionType.CONTINUE_NORMAL_CHAT,
-                goal="close the completed paid experience warmly and return to natural chat",
-                must_not_send_media=True,
-                may_be_explicit=False,
-                new_status=FanStatus.IDLE,
-                max_messages=1,
-                reason="session has no remaining steps",
-            )
-        if not ctx.within_daily_caps:
-            return CommercialDecision(
-                action=ActionType.CONTINUE_NORMAL_CHAT,
-                goal="stay in the moment; daily limits are reached, so send nothing else",
-                must_not_send_media=True,
+                action=ActionType.SEND_NEXT_PPV_STEP,
+                goal="deliver the accepted unlock he has not received yet",
+                must_not_send_media=False,
                 may_be_explicit=True,
-                reason="daily cap",
+                reason="accepted unlock still undelivered",
             )
         return CommercialDecision(
-            action=ActionType.SEND_NEXT_PPV_STEP,
-            goal="continue the paid experience and deliver the next planned step",
-            must_not_send_media=False,
+            action=ActionType.CONTINUE_NORMAL_CHAT,
+            goal="stay in the moment with him; the last piece is delivered",
+            must_not_send_media=True,
             may_be_explicit=True,
-            reason="paid session active and ready for next step",
+            new_status=FanStatus.IDLE,
+            max_messages=1,
+            reason="delivered unlock complete",
         )
 
     readiness = compute_readiness(events, state, ctx)
     wants = _has(events, EventType.WANTS_EXPLICIT) or _has(events, EventType.WANTS_MEDIA)
+    sellable = ctx.approved_sets_available and ctx.within_daily_caps and bool(ctx.next_offer)
 
-    if wants and readiness >= 5 and ctx.approved_sets_available and ctx.within_daily_caps:
-        if policy.offer_two_packages and ctx.package_options and state.confirmed_budget_cents is None:
-            return CommercialDecision(
-                action=ActionType.PRESENT_SESSION_OPTIONS,
-                goal="offer the exact available packages and let him choose",
-                package_options=ctx.package_options,
-                must_not_send_media=True,
-                may_be_explicit=True,
-                new_status=FanStatus.OFFER_PENDING,
-                max_messages=2,
-                conversation_continuation="required",
-                reason=f"readiness={readiness}, no confirmed package",
-            )
-        if state.confirmed_budget_cents:
-            return CommercialDecision(
-                action=ActionType.CREATE_PAID_SESSION,
-                goal="use the confirmed amount to build the paid experience",
-                must_not_send_media=False,
-                may_be_explicit=True,
-                new_status=FanStatus.OFFER_SELECTED,
-                session_budget_cents=state.confirmed_budget_cents,
-                selected_package_set_ids=state.selected_package_set_ids,
-                selected_package_set_id=state.selected_package_set_id,
-                reason=f"readiness={readiness}, confirmed budget",
-            )
+    # The high-intent fast path. He has said what he wants; the only remaining
+    # questions are inventory, caps and price, all of which are answered above.
+    if wants and (readiness >= OFFER_READINESS_THRESHOLD or high_intent(events)) and sellable:
+        return _offer_next_unlock(
+            ctx.next_offer,
+            goal=(
+                "stay in the moment and offer him the one next thing plainly, "
+                "with its price, once"
+            ),
+            reason=f"readiness={readiness}, intent is explicit",
+        )
 
     cooldown = free_mode_on_cooldown(policy, state, ctx.now)
     if wants:
@@ -422,6 +450,12 @@ def decide_next_action(
                     may_be_explicit=True,
                     new_status=FanStatus.FREE_TEXT_SESSION,
                     reason="free text mode",
+                )
+            if sellable:
+                return _offer_next_unlock(
+                    ctx.next_offer,
+                    goal="the free allowance is used up; offer the next thing plainly",
+                    reason="free text allowance exhausted",
                 )
             return CommercialDecision(
                 action=ActionType.CONTINUE_NORMAL_CHAT,
@@ -442,20 +476,28 @@ def decide_next_action(
                     new_status=FanStatus.FREE_TEASER,
                     reason=f"teaser {state.teaser_messages_used}/{policy.teaser_max_messages}",
                 )
+            if sellable:
+                return _offer_next_unlock(
+                    ctx.next_offer,
+                    goal="the preview is over; offer him the next thing plainly",
+                    reason="teaser exhausted or cooling down",
+                )
             return CommercialDecision(
-                action=ActionType.END_TEASER_AND_OFFER,
-                goal="the preview is over; transition to the exact paid options",
-                package_options=ctx.package_options,
+                action=ActionType.CONTINUE_NORMAL_CHAT,
+                goal="keep it good without promising content that does not exist",
                 must_not_send_media=True,
                 may_be_explicit=True,
-                new_status=FanStatus.OFFER_PENDING,
-                reason="teaser exhausted or cooling down",
+                reason="teaser exhausted with nothing sellable",
             )
 
         if readiness >= 3:
             return CommercialDecision(
-                action=ActionType.ASK_ONE_QUALIFYING_QUESTION,
-                goal="ask one natural question that clarifies what experience he wants",
+                action=ActionType.DISCOVER_DESIRED_EXPERIENCE,
+                goal=(
+                    "find out what he actually wants. A question is one way to do "
+                    "that and is not required: an observation, a tease or an "
+                    "opinion that invites him to say more does the same job"
+                ),
                 must_not_send_media=True,
                 reason=f"paid only, readiness={readiness}",
             )

@@ -5,8 +5,8 @@ from datetime import datetime, timedelta, timezone
 from core.pagination import fetch_all_rows
 from core.simulation_catalog import exclude_simulation_only, run_live_catalog_query
 from core.supabase import get_supabase
-from models.commercial import CreatorPolicy, FanCommercialState, PackageOption
-from services.media_packages import build_offer_packages, usable_sets
+from models.commercial import CreatorPolicy, FanCommercialState, Offer
+from services.media_packages import build_next_offer, usable_sets
 
 
 async def get_creator_policy(creator_id: str) -> CreatorPolicy:
@@ -55,10 +55,63 @@ async def get_fan_state(fan_id: str) -> FanCommercialState:
         return FanCommercialState()
     for key in ("fan_id", "creator_id", "updated_at"):
         row.pop(key, None)
+    _adopt_legacy_offer_columns(row)
     try:
         return FanCommercialState(**row)
     except Exception:
         return FanCommercialState()
+
+
+def _adopt_legacy_offer_columns(row: dict) -> None:
+    """Read a row written before the single-offer migration.
+
+    A fan mid-conversation at deploy time still has the two-package columns
+    populated. Dropping them on the floor would silently forget a live offer, so
+    the first entry of the old snapshot becomes the pending offer and the old
+    selection columns become the acceptance. This is a one-way read: nothing
+    writes the legacy shape back, so every row self-heals on its next save.
+    """
+    if row.get("pending_offer") is None:
+        legacy = row.pop("offered_packages", None) or []
+        if isinstance(legacy, list) and legacy:
+            first = legacy[0]
+            if isinstance(first, dict):
+                set_ids = first.get("set_ids") or (
+                    [first["set_id"]] if first.get("set_id") else []
+                )
+                asset_types = first.get("asset_types") or []
+                if set_ids:
+                    row["pending_offer"] = {
+                        "offer_id": first.get("package_id")
+                        or f"offer:{set_ids[0]}",
+                        "label": first.get("label") or "private photo set",
+                        "price_cents": int(first.get("price_cents") or 0),
+                        "set_id": str(set_ids[0]),
+                        "experience": first.get("experience"),
+                        "legal_description": first.get("legal_description"),
+                        "media_count": int(first.get("media_count") or 0),
+                        "asset_type": (asset_types or ["photo_set"])[0],
+                        "content_floor_cents": first.get("content_floor_cents"),
+                        "content_ceiling_cents": first.get("content_ceiling_cents"),
+                        "price_reason_codes": list(
+                            first.get("price_reason_codes") or []
+                        ),
+                    }
+    row.pop("offered_packages", None)
+
+    legacy_set_ids = row.pop("selected_package_set_ids", None) or []
+    for legacy_key, current_key in (
+        ("selected_package_id", "accepted_offer_id"),
+        ("selected_package_set_id", "accepted_offer_set_id"),
+        ("selected_package_label", "accepted_offer_label"),
+        ("selected_package_price_cents", "accepted_offer_price_cents"),
+        ("last_session_package_id", "last_session_offer_id"),
+    ):
+        value = row.pop(legacy_key, None)
+        if row.get(current_key) in (None, "") and value not in (None, ""):
+            row[current_key] = value
+    if row.get("accepted_offer_set_id") in (None, "") and legacy_set_ids:
+        row["accepted_offer_set_id"] = str(legacy_set_ids[0])
 
 
 async def save_fan_state(
@@ -74,12 +127,15 @@ async def save_fan_state(
         "preferences_snapshot": state.preferences_snapshot,
         "confirmed_budget_cents": state.confirmed_budget_cents,
         "budget_source": state.budget_source,
-        "offered_packages": [p.model_dump(mode="json") for p in state.offered_packages],
-        "selected_package_id": state.selected_package_id,
-        "selected_package_set_id": state.selected_package_set_id,
-        "selected_package_set_ids": state.selected_package_set_ids,
-        "selected_package_label": state.selected_package_label,
-        "selected_package_price_cents": state.selected_package_price_cents,
+        "pending_offer": (
+            state.pending_offer.model_dump(mode="json")
+            if state.pending_offer is not None
+            else None
+        ),
+        "accepted_offer_id": state.accepted_offer_id,
+        "accepted_offer_set_id": state.accepted_offer_set_id,
+        "accepted_offer_label": state.accepted_offer_label,
+        "accepted_offer_price_cents": state.accepted_offer_price_cents,
         "last_offer_at": state.last_offer_at.isoformat() if state.last_offer_at else None,
         "payday_raw": state.payday_raw,
         "payday_at": state.payday_at.isoformat() if state.payday_at else None,
@@ -99,7 +155,7 @@ async def save_fan_state(
             if state.last_session_completed_at else None
         ),
         "last_session_revenue_cents": state.last_session_revenue_cents,
-        "last_session_package_id": state.last_session_package_id,
+        "last_session_offer_id": state.last_session_offer_id,
         "last_session_set_ids": state.last_session_set_ids,
         "last_session_experience": state.last_session_experience,
         "last_abandoned_ppv_at": (
@@ -184,16 +240,16 @@ async def get_approved_asset_types(creator_id: str) -> tuple[str, ...]:
     return asset_types_from_rows(row for row in rows if row.get("media_ids"))
 
 
-async def get_offerable_packages(
+async def get_next_offer(
     creator_id: str,
     fan_id: str,
     policy: CreatorPolicy,
     price_learning: dict | None = None,
     desired_experience: str | None = None,
     hard_ceiling_cents: int | None = None,
-) -> list[PackageOption]:
-    """Build up to two coherent, multi-step packages from approved vault sets."""
-    packages, _ = await get_offerable_packages_with_inventory(
+) -> Offer | None:
+    """The ONE next unlock for this fan, built from approved unsent inventory."""
+    offer, _ = await get_next_offer_with_inventory(
         creator_id,
         fan_id,
         policy,
@@ -201,22 +257,26 @@ async def get_offerable_packages(
         desired_experience=desired_experience,
         hard_ceiling_cents=hard_ceiling_cents,
     )
-    return packages
+    return offer
 
 
-async def get_offerable_packages_with_inventory(
+async def get_next_offer_with_inventory(
     creator_id: str,
     fan_id: str,
     policy: CreatorPolicy,
     price_learning: dict | None = None,
     desired_experience: str | None = None,
     hard_ceiling_cents: int | None = None,
-) -> tuple[list[PackageOption], tuple[str, ...]]:
-    """Offers plus the asset types that exist in approved, unsent inventory.
+) -> tuple[Offer | None, tuple[str, ...]]:
+    """The next offer, plus the asset types in approved, unsent inventory.
 
     The second value is what makes the inventory statement handed to the writer
     authoritative rather than inferred: it is derived from the very rows the
-    offers were built from, in the same read, so the two can never disagree.
+    offer was built from, in the same read, so the two can never disagree.
+
+    Already-purchased sets are excluded here, which is also what makes the
+    progression incremental: the next unlock is by construction something he has
+    not had yet.
     """
     def _get():
         db = get_supabase()
@@ -265,8 +325,23 @@ async def get_offerable_packages_with_inventory(
                 if media_id:
                     sent_media_ids.add(str(media_id))
 
+        # The last thing he actually unlocked. It is what makes the NEXT offer a
+        # step up in the same scene rather than an unrelated set, and it is the
+        # only reason purchase history is read here at all.
+        last_unlocked: dict | None = None
+        confirmed_purchases = 0
+        purchased_set_ids: list[str] = []
+        for row in sent_rows:
+            ppv = (row.get("media_context") or {}).get("ppv") or {}
+            if ppv.get("purchased") and ppv.get("set_id"):
+                confirmed_purchases += 1
+                purchased_set_ids.append(str(ppv["set_id"]))
+        if purchased_set_ids:
+            by_id = {str(row.get("id")): row for row in rows}
+            last_unlocked = by_id.get(purchased_set_ids[-1])
+
         fan_row = (
-            db.table("fans").select("ai_summary, preferences")
+            db.table("fans").select("ai_summary, preferences, sales_log")
             .eq("id", fan_id).single().execute()
         ).data or {}
         summary = fan_row.get("ai_summary") or {}
@@ -276,6 +351,9 @@ async def get_offerable_packages_with_inventory(
             preferred_tags.extend(str(value) for value in preferences.values() if isinstance(value, str))
         elif isinstance(preferences, list):
             preferred_tags.extend(str(value) for value in preferences)
+        confirmed_purchases = max(
+            confirmed_purchases, len(fan_row.get("sales_log") or [])
+        )
 
         available = usable_sets(rows, sent_set_ids)
         for row in available:
@@ -285,14 +363,14 @@ async def get_offerable_packages_with_inventory(
                 if str(media_id) not in sent_media_ids
             ]
         available = [row for row in available if row.get("media_ids")]
-        return available, preferred_tags
+        return available, preferred_tags, last_unlocked, confirmed_purchases
 
-    rows, preferred_tags = await asyncio.to_thread(_get)
+    rows, preferred_tags, last_unlocked, confirmed_purchases = await asyncio.to_thread(_get)
     from db.pricing_policy_queries import get_effective_price_learning_policy
     from services.inventory_authority import asset_types_from_rows
 
     pricing_policy = await get_effective_price_learning_policy(creator_id)
-    packages = build_offer_packages(
+    offer = build_next_offer(
         rows,
         policy,
         preferred_tags=preferred_tags,
@@ -300,8 +378,10 @@ async def get_offerable_packages_with_inventory(
         desired_experience=desired_experience,
         hard_ceiling_cents=hard_ceiling_cents,
         pricing_policy=pricing_policy,
+        last_unlocked=last_unlocked,
+        confirmed_purchase_count=confirmed_purchases,
     )
-    return packages, asset_types_from_rows(rows)
+    return offer, asset_types_from_rows(rows)
 
 
 async def schedule_action(

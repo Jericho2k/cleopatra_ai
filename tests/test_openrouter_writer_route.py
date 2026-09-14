@@ -119,7 +119,7 @@ def test_generic_chat_runtime_supports_openrouter(monkeypatch):
 
 def test_commercial_complex_route_still_uses_together_serverless():
     decision = select_writer_route(
-        _ctx(commercial_decision={"action": "PRESENT_SESSION_OPTIONS"})
+        _ctx(commercial_decision={"action": "OFFER_NEXT_UNLOCK"})
     )
 
     assert decision.route == WriterRoute.COMMERCIAL_COMPLEX

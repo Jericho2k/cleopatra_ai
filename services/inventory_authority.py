@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 # The two asset types the commercial layer actually produces. ``media_packages``
-# emits exactly these strings on PackageOption.asset_types and session steps.
+# emits exactly these strings on Offer.asset_type and session steps.
 ASSET_PHOTO_SET = "photo_set"
 ASSET_VIDEO = "video"
 
@@ -51,9 +51,7 @@ ASSET_VIDEO = "video"
 # because a promise made while teasing is still a promise.
 COMMERCIAL_ACTIONS = frozenset(
     {
-        "PRESENT_SESSION_OPTIONS",
-        "END_TEASER_AND_OFFER",
-        "CREATE_PAID_SESSION",
+        "OFFER_NEXT_UNLOCK",
         "SEND_NEXT_PPV_STEP",
         "RESUME_PREVIOUS_OFFER",
         "PAYDAY_REENGAGEMENT",
@@ -87,10 +85,6 @@ def human_asset_name(asset_type: str, *, plural: bool = False) -> str:
     return f"{name}s" if not name.endswith("s") else name
 
 
-def is_video_asset_type(value: Any) -> bool:
-    return str(value or "").strip().lower() == ASSET_VIDEO
-
-
 def _normalize_types(values: Iterable[Any]) -> tuple[str, ...]:
     """Deduplicate asset types, photo-first, so rendering is deterministic."""
     seen: list[str] = []
@@ -114,15 +108,15 @@ def asset_types_from_rows(rows: Iterable[dict[str, Any]]) -> tuple[str, ...]:
     )
 
 
-def asset_types_from_packages(packages: Iterable[Any]) -> tuple[str, ...]:
-    """Asset types across offer options (PackageOption or its dict form)."""
-    values: list[str] = []
-    for package in packages or []:
-        if isinstance(package, dict):
-            values.extend(package.get("asset_types") or [])
-        else:
-            values.extend(getattr(package, "asset_types", None) or [])
-    return _normalize_types(values)
+def asset_types_from_offer(offer: Any) -> tuple[str, ...]:
+    """The asset type of the one next offer (Offer or its dict form)."""
+    if not offer:
+        return ()
+    if isinstance(offer, dict):
+        value = offer.get("asset_type") or (offer.get("asset_types") or [None])[0]
+    else:
+        value = getattr(offer, "asset_type", None)
+    return _normalize_types([value] if value else [])
 
 
 def asset_types_from_session(session: dict[str, Any] | None) -> tuple[str, ...]:
@@ -151,16 +145,17 @@ def next_step_asset_type(session: dict[str, Any] | None) -> str | None:
 class MediaInventory:
     """The authoritative statement of what may be promised on this turn.
 
-    ``authorized_asset_types`` is the narrow list: what the currently authorised
-    package, selected offer or active session actually contains. It is what the
-    writer may promise. ``available_package_asset_types`` is what could still be
-    offered from the current options, and ``vault_asset_types`` what exists in
-    approved, unsent inventory at all — both are context for an honest pivot,
-    never a licence to promise.
+    ``authorized_asset_types`` is what the one current offer or the active
+    session actually contains, and is the only thing the writer may promise.
+    ``vault_asset_types`` is what exists in approved, unsent inventory at all:
+    context for an honest pivot, never a licence to promise.
+
+    There is no third list any more. There used to be, because presenting a menu
+    of two packages authorised promising everything on it; with one offer at a
+    time, "what is authorised" and "what could be offered" are the same set.
     """
 
     authorized_asset_types: tuple[str, ...] = ()
-    available_package_asset_types: tuple[str, ...] = ()
     vault_asset_types: tuple[str, ...] = ()
     next_step_asset_type: str | None = None
     video_requested: bool = False
@@ -169,14 +164,8 @@ class MediaInventory:
 
     @property
     def promisable_asset_types(self) -> tuple[str, ...]:
-        """Every type this turn is allowed to name as creator inventory.
-
-        The authorised package first; the wider current offer set counts too,
-        because presenting two options is itself an authorised promise of both.
-        """
-        return _normalize_types(
-            [*self.authorized_asset_types, *self.available_package_asset_types]
-        )
+        """Every type this turn is allowed to name as creator inventory."""
+        return _normalize_types(self.authorized_asset_types)
 
     @property
     def may_promise_video(self) -> bool:
@@ -194,7 +183,6 @@ class MediaInventory:
         """The writer-safe capability record. No cents, no ids, no row data."""
         return {
             "authorized_asset_types": list(self.authorized_asset_types),
-            "available_package_asset_types": list(self.available_package_asset_types),
             "vault_asset_types": list(self.vault_asset_types),
             "next_step_asset_type": self.next_step_asset_type,
             "promisable_asset_types": list(self.promisable_asset_types),
@@ -215,7 +203,7 @@ UNKNOWN_INVENTORY = MediaInventory(known=False, reason_codes=("inventory_unknown
 def build_media_inventory(
     *,
     decision: Any = None,
-    package_options: Sequence[Any] | None = None,
+    next_offer: Any = None,
     active_session: dict[str, Any] | None = None,
     approved_rows: Sequence[dict[str, Any]] | None = None,
     desired_experience: str | None = None,
@@ -230,20 +218,20 @@ def build_media_inventory(
 
     reason_codes: list[str] = []
 
-    decision_options: list[Any] = []
+    decision_offer: Any = None
     decision_action = ""
     if decision is not None:
         if isinstance(decision, dict):
             decision_action = str(decision.get("action") or "")
-            decision_options = list(decision.get("package_options") or [])
+            decision_offer = decision.get("next_offer")
         else:
             action = getattr(decision, "action", None)
             decision_action = str(getattr(action, "value", action) or "")
-            decision_options = list(getattr(decision, "package_options", None) or [])
+            decision_offer = getattr(decision, "next_offer", None)
 
     session_types = asset_types_from_session(active_session)
-    decision_types = asset_types_from_packages(decision_options)
-    option_types = asset_types_from_packages(package_options or [])
+    decision_types = asset_types_from_offer(decision_offer)
+    offer_types = asset_types_from_offer(next_offer)
     vault_types = asset_types_from_rows(approved_rows or [])
 
     # An active plan is the narrowest and most authoritative statement there is:
@@ -254,16 +242,12 @@ def build_media_inventory(
     elif decision_types:
         authorized = decision_types
         reason_codes.append("authorized_from_commercial_decision")
-    elif option_types:
-        authorized = option_types
-        reason_codes.append("authorized_from_offer_options")
+    elif offer_types:
+        authorized = offer_types
+        reason_codes.append("authorized_from_next_offer")
     else:
         authorized = ()
         reason_codes.append("no_authorized_media")
-
-    available = option_types or decision_types
-    if not available and session_types:
-        available = session_types
 
     requested = bool(
         wants_video(desired_experience) or wants_video(fan_message)
@@ -273,7 +257,6 @@ def build_media_inventory(
 
     inventory = MediaInventory(
         authorized_asset_types=authorized,
-        available_package_asset_types=available,
         vault_asset_types=vault_types,
         next_step_asset_type=next_step_asset_type(active_session),
         video_requested=requested,
