@@ -7764,7 +7764,21 @@ async def generate_sets(creator_id: str) -> dict:
             "metadata_version": proposal["metadata_version"],
             "status": "draft", "source": "ai",
         }
-        for field in ("base_price_cents", "min_price_cents", "max_price_cents"):
+        for field in (
+            "base_price_cents",
+            "min_price_cents",
+            "max_price_cents",
+            # Experience metadata (db/experience_director_v1.sql). Generated
+            # once here, during classification, rather than asked of the live
+            # writer — see services/scene_metadata.py.
+            "paid_sellable",
+            "scene_key",
+            "scene_premise",
+            "intensity_level",
+            "reveals",
+            "setup_line",
+            "continuation",
+        ):
             if field in proposal:
                 payload[field] = proposal[field]
         to_insert.append(payload)

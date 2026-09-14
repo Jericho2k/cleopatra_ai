@@ -132,6 +132,15 @@ class ConversationContext(BaseModel):
     # price and the approved description — never media ids, and never a tag to
     # serialise. Empty means nothing is being attached.
     ppv_delivery: dict = Field(default_factory=dict)
+    # The persistent conversational scene (services/experience_director.py),
+    # already narrowed to its writer-safe projection: no set id, no counters
+    # and no money. It decides WHEN something may happen; commercial_decision
+    # still decides whether it may happen at all.
+    scene: dict = Field(default_factory=dict)
+    # How sexual this reply may be (services/text_intimacy.py). Separate from
+    # the commercial decision on purpose — "nothing to sell this turn" is not a
+    # reason to stop talking to him like an adult.
+    text_intimacy: dict = Field(default_factory=dict)
 
     # Which AI Stack Profile is answering this turn, and which writer voice it
     # selects (ai/stack_profiles.py, ai/writer_style.py). Resolved once per turn

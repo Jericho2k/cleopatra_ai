@@ -4,7 +4,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.session_lifecycle import (
-    decrement_cooldown,
     has_pending_purchase,
     mark_step_purchased,
     mark_step_declined,
@@ -33,20 +32,26 @@ def test_send_does_not_advance_before_purchase():
     assert updated["payment_state"] == "PAYMENT_PENDING"
 
 
-def test_purchase_advances_and_starts_cooldown():
+def test_purchase_advances_without_a_message_counter():
+    """A purchase advances the plan and nothing else.
+
+    The old fixed post-purchase cooldown lived here and is gone: whether the
+    conversation has earned another offer is now a question about the SCENE
+    (services/experience_director.py), not a number stored on the session.
+    """
     sent = mark_step_sent(session())
-    updated, completed = mark_step_purchased(sent, media_id="m1", amount_cents=2000, cooldown_messages=2)
+    updated, completed = mark_step_purchased(sent, media_id="m1", amount_cents=2000)
     assert completed is False
     assert updated["current_index"] == 1
     assert updated["awaiting_purchase_index"] is None
-    assert updated["post_ppv_cooldown"] is True
-    assert updated["cooldown_messages_remaining"] == 2
     assert updated["payment_state"] == "ACTIVE"
+    assert "post_ppv_cooldown" not in updated
+    assert "cooldown_messages_remaining" not in updated
 
 
 def test_final_purchase_completes_session_and_is_idempotent():
     first = mark_step_sent(session())
-    first, _ = mark_step_purchased(first, media_id="m1", amount_cents=2000, cooldown_messages=0)
+    first, _ = mark_step_purchased(first, media_id="m1", amount_cents=2000)
     second = mark_step_sent(first)
     done, completed = mark_step_purchased(second, media_id="m3", amount_cents=4000)
     assert completed is True
@@ -58,15 +63,6 @@ def test_final_purchase_completes_session_and_is_idempotent():
     assert duplicate["revenue_cents"] == 6000
 
 
-def test_cooldown_decrements_on_fan_messages():
-    sent = mark_step_sent(session())
-    updated, _ = mark_step_purchased(sent, media_id="m1", cooldown_messages=2)
-    updated = decrement_cooldown(updated)
-    assert updated["cooldown_messages_remaining"] == 1
-    updated = decrement_cooldown(updated)
-    assert updated["post_ppv_cooldown"] is False
-
-
 def test_late_purchase_resumes_exact_abandoned_session():
     sent = mark_step_sent(session())
     abandoned = mark_step_declined(sent, reason="payment_window_expired", pause=False)
@@ -75,7 +71,6 @@ def test_late_purchase_resumes_exact_abandoned_session():
         abandoned,
         media_id="m1",
         amount_cents=2000,
-        cooldown_messages=0,
     )
     assert completed is False
     assert updated["status"] == "active"

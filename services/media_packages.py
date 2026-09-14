@@ -5,8 +5,12 @@ import re
 from typing import Any, Iterable
 
 from models.commercial import CreatorPolicy, Offer
-from models.content_pricing import DEFAULT_PRICE_STEP_CENTS
+from models.content_pricing import (
+    DEFAULT_PRICE_STEP_CENTS,
+    paid_sellable_block_reason,
+)
 from models.price_learning import PriceLearningPolicy, probe_price_cents
+from services.scene_metadata import advances_the_interaction
 from models.vault_pricing import (
     allocate_step_prices,
     cents_from_row,
@@ -173,12 +177,26 @@ def price_cents(row: dict[str, Any]) -> int:
 
 
 def usable_sets(rows: Iterable[dict[str, Any]], sent_set_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    """Approved sets this fan may actually be offered or delivered, right now.
+
+    The one chokepoint every commercial read passes through: offer construction
+    (``db.commercial_queries.get_next_offer_with_inventory``) and delivery
+    planning (``services.session_planner.plan_session_for_fan``) both start
+    here. That is why the paid-sellable boundary is enforced HERE rather than
+    as another ad-hoc category filter at each call site — teaser inventory used
+    to be filtered out of the media queries and not out of this one, so it
+    reached automatic offers through vault_sets.
+    """
     sent = sent_set_ids or set()
     result = []
     for row in rows:
         set_id = str(row.get("id") or "")
         media_ids = row.get("media_ids") or []
         if not set_id or set_id in sent or not media_ids:
+            continue
+        blocked = paid_sellable_block_reason(row)
+        if blocked:
+            print(f"[SELLABILITY] set={set_id} excluded reason={blocked}")
             continue
         copy = dict(row)
         copy["id"] = set_id
@@ -372,6 +390,7 @@ def plan_progression(
     desired_experience: str | None = None,
     preferred_tags: list[str] | None = None,
     last_unlocked: dict[str, Any] | None = None,
+    scene: dict[str, Any] | None = None,
     max_steps: int = 4,
 ) -> list[dict[str, Any]]:
     """The internal ladder: which approved sets this could walk through, in order.
@@ -410,6 +429,13 @@ def plan_progression(
                 if normalize_text(tag)
             }
             score += 2.0 * len(preferred & tags)
+        # The third question, alongside scene continuity and explicitness:
+        # does this actually advance the interaction he is having right now?
+        # A set that repeats the beat he just unlocked scores worse than one
+        # that answers the direction he has been pulling towards, even when
+        # both are equally in-scene and equally explicit.
+        if scene:
+            score += advances_the_interaction(row, scene)
         return score
 
     opener = min(
@@ -458,6 +484,7 @@ def build_next_offer(
     pricing_policy: PriceLearningPolicy | None = None,
     last_unlocked: dict[str, Any] | None = None,
     confirmed_purchase_count: int = 0,
+    scene: dict[str, Any] | None = None,
 ) -> Offer | None:
     """The ONE next unlock to put in front of this fan, or None.
 
@@ -475,6 +502,7 @@ def build_next_offer(
         desired_experience=desired_experience,
         preferred_tags=preferred_tags,
         last_unlocked=last_unlocked,
+        scene=scene,
     )
     if not ladder:
         return None

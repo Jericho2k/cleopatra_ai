@@ -297,6 +297,52 @@ def _normalize_compliment_only_interest(out: dict, text: str) -> None:
     out["commercial_interest_signal"] = "warm_compliment"
 
 
+# Words that make a number a CEILING rather than a price he agreed to. Without
+# one of these in his own message, no amount may become current_budget_limit_usd:
+# "that's all I have" is a limit, "yeah send it" is a purchase.
+_CURRENT_LIMIT_RE = re.compile(
+    r"\b(don'?t have more|can'?t spend more|can'?t do more|no more than|"
+    r"only have|only got|that'?s all i have|all i have|all i(?:'| a)?ve got|"
+    r"my limit|limit is|maximum|max)\b",
+    re.IGNORECASE,
+)
+
+
+def _states_a_current_limit(text: str) -> bool:
+    """Whether he actually said a ceiling, in words, in this message."""
+    return bool(_CURRENT_LIMIT_RE.search(text or ""))
+
+
+def _echoes_without_limit_language(
+    reported_limit: object,
+    selected_price: int,
+    text: str,
+) -> bool:
+    """A reported limit that is just the accepted price, with nothing backing it.
+
+    Only strips the echo. A genuinely different number the analyzer extracted
+    from somewhere else in the message is left alone, because that is evidence
+    this function has no basis to overrule.
+    """
+    raw = str(reported_limit or "").strip()
+    if not raw:
+        return False
+    try:
+        value = int(round(float(raw.replace("$", ""))))
+    except (TypeError, ValueError):
+        return False
+    return value == int(selected_price) and not _states_a_current_limit(text)
+
+
+def _echoes_the_accepted_price(out: dict, text: str) -> bool:
+    """A reported limit that is simply the price he accepted, with no limit words."""
+    limit = _money_cents(out.get("current_budget_limit_usd"))
+    accepted = _money_cents(out.get("selected_offer_price_usd"))
+    if limit is None or accepted is None or limit != accepted:
+        return False
+    return not _states_a_current_limit(text)
+
+
 def normalize_commercial_facts(
     result: dict,
     latest_message: str,
@@ -343,11 +389,29 @@ def normalize_commercial_facts(
         out["cannot_afford_any_offer_now"] = "false"
         out["deferred_purchase_intent"] = "false"
 
-        if re.search(
-            r"\b(don'?t have more|can'?t spend more|only have|all i have|my limit|maximum|max)\b",
-            text,
-        ):
+        # A limit needs limit WORDS. Saying yes to $30 is willingness to pay
+        # $30; it is not "$30 is all I have", and the two are stored as
+        # completely different facts (models/affordability.py).
+        if _states_a_current_limit(text):
             out["current_budget_limit_usd"] = str(selected_price)
+        elif _echoes_without_limit_language(
+            out.get("current_budget_limit_usd"), selected_price, text
+        ):
+            # The analyzer is an LLM and its prompt's worked example pairs an
+            # acceptance with a limit, so it generalises: a plain "yeah send
+            # it" comes back with current_budget_limit_usd set to the offered
+            # price. Downstream that is a HARD CEILING — it becomes
+            # affordability.current_limit_cents, then price learning's
+            # current_explicit_cap_cents, and every later offer to this fan is
+            # capped at the first price he ever paid. This is the Terry
+            # regression (AFFORDABILITY status=LIMITED_NOW limit=3000 after a
+            # $30 purchase), and it is stripped deterministically rather than
+            # trusted to prompt wording.
+            print(
+                "[COMMERCIAL EVENTS] dropped an echoed budget limit of "
+                f"${out['current_budget_limit_usd']}: acceptance is not a ceiling"
+            )
+            out["current_budget_limit_usd"] = ""
 
     # A negotiated amount that does not match an offered package is a
     # counteroffer, not package acceptance. Exact offered prices remain
@@ -386,6 +450,17 @@ def normalize_commercial_facts(
         out["budget_stated_usd"] = amount
         if re.search(r"\b(only|max|maximum|limit)\b", budget_match.group(0)):
             out["current_budget_limit_usd"] = amount
+
+    # The same echo, when the ANALYZER reported the acceptance and the regex
+    # backstop did not. "ok" is not an acceptance word, so a bare "ok" after a
+    # $30 offer reaches here with the model's accepted/limit pair intact and
+    # would otherwise slip past the check above.
+    if _echoes_the_accepted_price(out, text):
+        print(
+            "[COMMERCIAL EVENTS] dropped an echoed budget limit of "
+            f"${out['current_budget_limit_usd']}: acceptance is not a ceiling"
+        )
+        out["current_budget_limit_usd"] = ""
 
     if not str(out.get("payday_raw") or "").strip():
         payday = _find_payday(text)

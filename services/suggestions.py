@@ -5,6 +5,7 @@ Coordinates DB, stage classification, RAG, prompt building, and generation
 
 import asyncio
 from core.tasks import spawn
+from datetime import datetime, timezone
 import json
 import os
 import random
@@ -50,7 +51,10 @@ def writer_retry_policy(prompt_version: str):
         if writer_persistent_primary_retries(prompt_version)
         else LEGACY_WRITER_RETRY_POLICY
     )
-from services.commercial_orchestrator import orchestrate
+from services.commercial_orchestrator import (
+    consume_free_text_allowance,
+    orchestrate,
+)
 from models.commercial import ActionType, FanStatus
 from db.fan_intelligence_queries import get_fan_intelligence_context
 from db.commercial_queries import (
@@ -105,8 +109,15 @@ from services.price_learning import (
 )
 from services.adaptive_session_planner import plan_next_action
 from services.conversation_director import direct_conversation
+from services.experience_director import (
+    direct_experience,
+    load_scene,
+    record_unlock,
+    scene_metadata_for,
+)
+from services.commercial_policy import free_mode_on_cooldown
+from services.text_intimacy import decide_text_intimacy
 from services.session_lifecycle import (
-    decrement_cooldown,
     mark_step_declined,
     mark_step_purchased,
 )
@@ -359,6 +370,117 @@ def _fan_wants_content(message, situation):
     return False
 
 
+async def _scene_and_register(
+    *,
+    creator_id: str,
+    fan_id: str,
+    situation: dict,
+    decision_context: dict | None,
+    latest_message: str,
+    fan_profile,
+    active_session: dict | None = None,
+) -> tuple[dict, dict]:
+    """Advance the scene and decide the register, or degrade to neither.
+
+    Wrapped because both are choreography: losing them costs continuity and a
+    permissive register, and neither is worth failing a turn over. Degrading to
+    ``({}, {})`` renders no SCENE and no TEXT INTIMACY block, which leaves the
+    writer on its default voice — the safe direction, since the absent block is
+    the one that would have GRANTED the explicit register.
+    """
+    try:
+        return await _scene_and_register_inner(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            situation=situation,
+            decision_context=decision_context,
+            latest_message=latest_message,
+            fan_profile=fan_profile,
+            active_session=active_session,
+        )
+    except Exception as exc:
+        print(f"[EXPERIENCE] scene/register unavailable fan={fan_id}: {exc}")
+        return {}, {}
+
+
+async def _scene_and_register_inner(
+    *,
+    creator_id: str,
+    fan_id: str,
+    situation: dict,
+    decision_context: dict | None,
+    latest_message: str,
+    fan_profile,
+    active_session: dict | None = None,
+) -> tuple[dict, dict]:
+    """Advance the scene, then decide how sexual this reply may be.
+
+    The order matters and is the whole point of the split:
+
+    * the OFFER GATE upstream reads the scene as it stood when policy decided,
+      so a purchase cannot both create a scene and immediately be gated by it;
+    * the REGISTER reads the scene after it advanced, because "he just unlocked
+      this and is reacting to it" is exactly the state that should let the
+      creator talk about it in its own register.
+
+    Returns ``(scene_writer_context, text_intimacy_context)`` — two dicts that
+    go straight onto ConversationContext. Neither can authorize a send.
+    """
+    decision_context = decision_context or {}
+    set_id = (
+        decision_context.get("accepted_offer_set_id")
+        or ((decision_context.get("next_offer") or {}) or {}).get("set_id")
+        or (active_session or {}).get("set_id")
+    )
+    scene_metadata = await scene_metadata_for(creator_id, set_id)
+    scene = await direct_experience(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        situation=situation,
+        commercial_decision=decision_context,
+        latest_fan_message=latest_message,
+        scene_metadata=scene_metadata,
+    )
+
+    policy = await get_creator_policy(creator_id)
+    state = await get_fan_state(fan_id)
+    intimacy = decide_text_intimacy(
+        policy=policy,
+        situation=situation,
+        commercial_decision=decision_context,
+        scene=scene.to_context(),
+        fan_status=state.status,
+        teaser_messages_used=state.teaser_messages_used,
+        frozen_for_review=bool(getattr(fan_profile, "needs_human_review", False)),
+        free_mode_on_cooldown=free_mode_on_cooldown(
+            policy, state, datetime.now(timezone.utc)
+        ),
+    )
+    if intimacy.consumes_free_allowance:
+        try:
+            await consume_free_text_allowance(creator_id, fan_id)
+        except Exception as exc:
+            # Failing to bill the allowance must not send an unbilled explicit
+            # reply, so the register is dropped to flirty instead.
+            print(f"[TEXT INTIMACY] allowance write failed fan={fan_id}: {exc}")
+            intimacy = decide_text_intimacy(
+                policy=policy,
+                situation=situation,
+                commercial_decision=decision_context,
+                scene=scene.to_context(),
+                fan_status=state.status,
+                teaser_messages_used=max(
+                    state.teaser_messages_used, policy.free_text_max_messages
+                ),
+                frozen_for_review=True,
+            )
+    print(
+        f"[TEXT INTIMACY] fan={fan_id} level={intimacy.level.value} "
+        f"reason={intimacy.reason}"
+    )
+    return scene.writer_context(), intimacy.to_context()
+
+
 async def get_suggestions(
     fan_id: str,
     creator_id: str,
@@ -495,6 +617,16 @@ async def get_suggestions(
             except Exception as e:
                 print(f"[SESSION PLAN ERROR] {e}")
 
+    scene_context, text_intimacy_context = await _scene_and_register(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        situation=situation,
+        decision_context=None,
+        latest_message=fan_message,
+        fan_profile=fan_profile,
+        active_session=active_session,
+    )
+
     conversation_director = await direct_conversation(
         creator_id=creator_id,
         fan_id=fan_id,
@@ -559,6 +691,8 @@ async def get_suggestions(
         price_learning=price_learning,
         session_strategy=session_strategy,
         conversation_director=conversation_director,
+        scene=scene_context,
+        text_intimacy=text_intimacy_context,
         ai_stack_profile=stack.profile_id,
         writer_prompt_version=stack_profile.writer_prompt_version(),
     )
@@ -1178,14 +1312,6 @@ async def _debounced_auto_reply(
 
         conversation_stage = classify_stage(conversation_history, fan_profile)
 
-        # A purchased PPV starts a short text-only bridge before the next step.
-        # Sending a PPV does NOT advance the plan; only a confirmed purchase does.
-        if active_session and active_session.get("post_ppv_cooldown"):
-            active_session = decrement_cooldown(active_session)
-            await save_fan_session(fan_id, active_session)
-            remaining = active_session.get("cooldown_messages_remaining", 0)
-            print(f"[SESSION] cooldown fan={fan_id} remaining={remaining}")
-
         # Which AI brain answers this turn. Resolved once, before the first
         # model call: the analyzer, the writer and the extractor below must all
         # be the same profile, and so must the metadata persisted with the
@@ -1287,6 +1413,11 @@ async def _debounced_auto_reply(
         if commercial_enabled:
             try:
                 cap_ok, _ = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
+                # The scene AS IT STANDS, before this turn advances it. Policy
+                # asks it whether the conversation has earned a NEW offer yet;
+                # advancing first would let the same turn both create the
+                # post-unlock state and be gated by it.
+                scene_before = await load_scene(fan_id)
                 decision = await orchestrate(
                     creator_id=creator_id,
                     fan_id=fan_id,
@@ -1295,6 +1426,7 @@ async def _debounced_auto_reply(
                     within_daily_caps=cap_ok,
                     frozen_for_review=bool(getattr(fan_profile, "needs_human_review", False)),
                     active_session=active_session,
+                    scene=scene_before.to_context(),
                 )
             except Exception as e:
                 # Full Auto must fail closed. Silently reverting to the legacy
@@ -1522,6 +1654,15 @@ async def _debounced_auto_reply(
         situation["price_learning"] = price_learning
 
         decision_context = decision.model_dump(mode="json") if decision else None
+        scene_context, text_intimacy_context = await _scene_and_register(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            situation=situation,
+            decision_context=decision_context,
+            latest_message=latest_message,
+            fan_profile=fan_profile,
+            active_session=active_session,
+        )
         conversation_director = await direct_conversation(
             creator_id=creator_id,
             fan_id=fan_id,
@@ -1662,6 +1803,8 @@ async def _debounced_auto_reply(
             price_learning=price_learning,
             session_strategy=session_strategy,
             conversation_director=conversation_director,
+            scene=scene_context,
+            text_intimacy=text_intimacy_context,
             message_shape=message_shape.to_context() if message_shape else {},
             ai_stack_profile=stack.profile_id,
             writer_prompt_version=writer_prompt_version,
@@ -2359,6 +2502,23 @@ async def record_ppv_purchase(
         except Exception as exc:
             print(f"[AFFORDABILITY] purchase record failed fan={fan_id}: {exc}")
 
+        # The scene moves to AWAIT_REACTION here, at the moment the unlock
+        # actually becomes true — not on his next message. The one-step
+        # commercial session is cleared a few lines below, so by the time he
+        # replies there is nothing left to infer a purchase from.
+        try:
+            unlocked_set_id = (pending or {}).get("set_id") or (session or {}).get("set_id")
+            await record_unlock(
+                creator_id=creator_id,
+                fan_id=fan_id,
+                set_id=unlocked_set_id,
+                scene_metadata=await scene_metadata_for(creator_id, unlocked_set_id),
+            )
+        except Exception as exc:
+            # Losing the scene costs continuity on the next reply. It must
+            # never cost a recorded purchase.
+            print(f"[EXPERIENCE] unlock record failed fan={fan_id}: {exc}")
+
     if session and creator_id and pending.get("step_index") is not None:
         try:
             policy = await get_creator_policy(creator_id)
@@ -2367,7 +2527,6 @@ async def record_ppv_purchase(
                 media_id=str(media_id),
                 set_id=(pending or {}).get("set_id"),
                 amount_cents=amount_dollars * 100,
-                cooldown_messages=policy.post_purchase_cooldown_messages,
             )
             state = await get_fan_state(fan_id)
             if state.next_followup_type == "ABANDONED_PPV_FOLLOWUP":

@@ -1,4 +1,23 @@
-from models.vault_pricing import price_bounds, resolve_sequence_price
+"""Approved price bounds, and what a target is allowed to do inside them.
+
+These used to run through ``resolve_sequence_price``, which clamped a requested
+PACKAGE price into a package's summed band. Packages are gone — the fan is shown
+one unlock at a time — and nothing in production called it, so it was removed
+with the rest of the two-package machinery. The assertions are unchanged: they
+now compose the two functions it composed, ``sequence_bounds`` and
+``human_price_cents``, which is what the surviving pricing path actually uses.
+"""
+
+from models.content_pricing import human_price_cents
+from models.vault_pricing import price_bounds, sequence_bounds
+
+
+def clamp(rows, target_cents, *, step_cents):
+    """What resolve_sequence_price did, spelled out at the call site."""
+    _base, minimum, maximum = sequence_bounds(rows)
+    if maximum <= 0:
+        return 0
+    return human_price_cents(target_cents, minimum, maximum, step_cents=step_cents)
 
 
 def test_dynamic_price_is_clamped_to_approved_bounds():
@@ -9,8 +28,8 @@ def test_dynamic_price_is_clamped_to_approved_bounds():
         "dynamic_pricing_enabled": True,
     }
     assert price_bounds(row) == (3500, 2500, 4500, True)
-    assert resolve_sequence_price([row], 1800, step_cents=500) == 2500
-    assert resolve_sequence_price([row], 6000, step_cents=500) == 4500
+    assert clamp([row], 1800, step_cents=500) == 2500
+    assert clamp([row], 6000, step_cents=500) == 4500
 
 
 def test_fixed_price_ignores_learned_target():
@@ -20,7 +39,7 @@ def test_fixed_price_ignores_learned_target():
         "max_price_cents": 4500,
         "dynamic_pricing_enabled": False,
     }
-    assert resolve_sequence_price([row], 2500, step_cents=500) == 3500
+    assert clamp([row], 2500, step_cents=500) == 3500
 
 def test_legacy_row_without_a_derivable_range_is_priced_at_its_approved_value():
     """A package target is a request, not permission to reprice content.
@@ -40,8 +59,8 @@ def test_legacy_row_without_a_derivable_range_is_priced_at_its_approved_value():
         },
     ]
 
-    assert resolve_sequence_price(rows, 2800, step_cents=100) == 3500
-    assert resolve_sequence_price(rows, 9000, step_cents=100) == 3500
+    assert clamp(rows, 2800, step_cents=100) == 3500
+    assert clamp(rows, 9000, step_cents=100) == 3500
 
 
 def test_category_tag_bridges_a_legacy_row_to_its_approved_range():
@@ -54,9 +73,9 @@ def test_category_tag_bridges_a_legacy_row_to_its_approved_range():
 
     base, minimum, maximum, dynamic = price_bounds(row)
     assert (base, minimum, maximum, dynamic) == (3000, 1500, 8000, True)
-    assert resolve_sequence_price([row], 2500, step_cents=500) == 2500
-    assert resolve_sequence_price([row], 500, step_cents=500) == 1500
-    assert resolve_sequence_price([row], 20_000, step_cents=500) == 8000
+    assert clamp([row], 2500, step_cents=500) == 2500
+    assert clamp([row], 500, step_cents=500) == 1500
+    assert clamp([row], 20_000, step_cents=500) == 8000
 
 
 def test_backfilled_equal_bounds_do_not_pin_content_to_one_price():
@@ -85,5 +104,5 @@ def test_package_bounds_are_sum_of_set_bounds():
         {"base_price_cents": 1500, "min_price_cents": 1000, "max_price_cents": 2000},
         {"base_price_cents": 2500, "min_price_cents": 2000, "max_price_cents": 3500},
     ]
-    assert resolve_sequence_price(rows, 4500, step_cents=500) == 4500
-    assert resolve_sequence_price(rows, 1000, step_cents=500) == 3000
+    assert clamp(rows, 4500, step_cents=500) == 4500
+    assert clamp(rows, 1000, step_cents=500) == 3000

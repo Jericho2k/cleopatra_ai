@@ -240,26 +240,6 @@ async def get_approved_asset_types(creator_id: str) -> tuple[str, ...]:
     return asset_types_from_rows(row for row in rows if row.get("media_ids"))
 
 
-async def get_next_offer(
-    creator_id: str,
-    fan_id: str,
-    policy: CreatorPolicy,
-    price_learning: dict | None = None,
-    desired_experience: str | None = None,
-    hard_ceiling_cents: int | None = None,
-) -> Offer | None:
-    """The ONE next unlock for this fan, built from approved unsent inventory."""
-    offer, _ = await get_next_offer_with_inventory(
-        creator_id,
-        fan_id,
-        policy,
-        price_learning=price_learning,
-        desired_experience=desired_experience,
-        hard_ceiling_cents=hard_ceiling_cents,
-    )
-    return offer
-
-
 async def get_next_offer_with_inventory(
     creator_id: str,
     fan_id: str,
@@ -267,6 +247,7 @@ async def get_next_offer_with_inventory(
     price_learning: dict | None = None,
     desired_experience: str | None = None,
     hard_ceiling_cents: int | None = None,
+    scene: dict | None = None,
 ) -> tuple[Offer | None, tuple[str, ...]]:
     """The next offer, plus the asset types in approved, unsent inventory.
 
@@ -380,6 +361,7 @@ async def get_next_offer_with_inventory(
         pricing_policy=pricing_policy,
         last_unlocked=last_unlocked,
         confirmed_purchase_count=confirmed_purchases,
+        scene=scene,
     )
     return offer, asset_types_from_rows(rows)
 

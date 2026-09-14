@@ -121,7 +121,13 @@ class CreatorPolicy(BaseModel):
     # offer; the pair of "quick" and "full" budgets it replaces existed only to
     # build the two-branch menu.
     next_offer_target_cents: int = 2500
-    post_purchase_cooldown_messages: int = 2
+    # There is no post_purchase_cooldown_messages any more. A fixed "wait N
+    # messages before offering again" could not survive one-unlock sessions:
+    # the single-step plan completed on purchase and the completion branch
+    # cleared the counter on the same line that set it, so the window never
+    # actually existed in production. services/experience_director.py replaces
+    # it with a scene that outlives the commercial session and re-opens on a
+    # real conversational bridge — or immediately, if he asks for more.
     require_purchase_before_next_step: bool = True
     require_operator_ppv_approval: bool = False
     ppv_recheck_minutes: int = Field(default=20, ge=5, le=1_440)

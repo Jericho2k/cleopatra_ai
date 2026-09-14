@@ -21,7 +21,6 @@ from typing import Any, Iterable
 from models.content_pricing import (
     DEFAULT_PRICE_STEP_CENTS,
     FALLBACK_PRICE_STEP_CENTS,
-    human_price_cents,
     row_category_range_cents,
 )
 
@@ -92,29 +91,6 @@ def sequence_bounds(rows: Iterable[dict[str, Any]]) -> tuple[int, int, int]:
         minimum += item_min
         maximum += item_max
     return base, minimum, maximum
-
-
-def resolve_sequence_price(
-    rows: Iterable[dict[str, Any]],
-    target_cents: int,
-    *,
-    step_cents: int = DEFAULT_PRICE_STEP_CENTS,
-) -> int:
-    """Clamp a requested package price into the approved band, cleanly.
-
-    A target is a request, never permission: it can position the price inside
-    the band and nothing more.
-    """
-    items = list(rows)
-    if not items:
-        return max(0, int(target_cents))
-    base, minimum, maximum = sequence_bounds(items)
-    if maximum <= 0:
-        # Nothing on this package carries an approved paid value. Selling it is
-        # not a pricing decision we are allowed to make.
-        return 0
-    requested = int(target_cents or base or minimum)
-    return human_price_cents(requested, minimum, maximum, step_cents=step_cents)
 
 
 def allocate_step_prices(

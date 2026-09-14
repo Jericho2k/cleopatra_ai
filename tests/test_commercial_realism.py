@@ -522,14 +522,13 @@ def test_k_after_a_purchase_the_session_exposes_the_next_planned_step():
     session = mark_step_sent(_two_step_session())
     assert session_progress(session)["awaiting_purchase"] is True
 
-    session, completed = mark_step_purchased(session, media_id="m1", cooldown_messages=2)
+    session, completed = mark_step_purchased(session, media_id="m1")
     assert completed is False
 
     progress = session_progress(session)
     assert progress["purchased_steps"] == 1
     assert progress["total_steps"] == 2
     assert progress["has_next_step"] is True
-    assert progress["cooldown_active"] is True
     assert progress["just_purchased"]["asset_type"] == "photo_set"
     assert progress["just_purchased"]["media_count"] == 3
     assert progress["next_step"]["asset_type"] == "video"
@@ -554,7 +553,7 @@ def test_k_purchase_gating_survives_the_choreography_context():
 
 def test_k_a_finished_session_does_not_promise_more():
     session = mark_step_sent(_two_step_session())
-    session, _ = mark_step_purchased(session, media_id="m1", cooldown_messages=0)
+    session, _ = mark_step_purchased(session, media_id="m1")
     session = mark_step_sent(session)
     session, completed = mark_step_purchased(session, media_id="v1")
     assert completed is True
@@ -712,7 +711,7 @@ def test_message_shape_target_reaches_the_writer():
 
 def test_post_purchase_turn_gets_the_next_planned_step_to_bridge_to():
     session = mark_step_sent(_two_step_session())
-    session, _ = mark_step_purchased(session, media_id="m1", cooldown_messages=2)
+    session, _ = mark_step_purchased(session, media_id="m1")
     text = _prompt(active_session=session)
 
     assert "PAID SESSION CHOREOGRAPHY" in text
@@ -720,17 +719,24 @@ def test_post_purchase_turn_gets_the_next_planned_step_to_bridge_to():
     assert "he just unlocked" in text
     assert "next planned step" in text
     assert "it goes further than what he just got." in text
-    assert "bridge toward that next piece" in text
     assert "want 'more?'" not in text.lower()
 
 
-def test_a_completed_session_is_not_told_to_hint_at_more():
+def test_a_completed_session_does_not_tell_the_writer_to_close():
+    """The commercial plan being finished is not the conversation being over.
+
+    Under one-unlock sessions EVERY purchase leaves "nothing further planned",
+    so the old "close the experience warmly" line closed the conversation after
+    every single sale. What may still be SOLD is stated here; what happens next
+    conversationally belongs to the SCENE block.
+    """
     session = mark_step_sent(_two_step_session())
-    session, _ = mark_step_purchased(session, media_id="m1", cooldown_messages=0)
+    session, _ = mark_step_purchased(session, media_id="m1")
     session = mark_step_sent(session)
     session, _ = mark_step_purchased(session, media_id="v1")
     text = _prompt(active_session=session)
-    assert "close the experience warmly" in text
+    assert "close the experience warmly" not in text
+    assert "nothing further is authorised" in text
     assert "next planned step" not in text
 
 

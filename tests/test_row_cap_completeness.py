@@ -140,8 +140,8 @@ def test_the_next_offer_never_reoffers_a_set_sent_past_the_cap(monkeypatch):
         lambda rows, *_args, **_kwargs: (list(rows) or [None])[0],
     )
 
-    offer = asyncio.run(
-        commercial.get_next_offer(
+    offer, _asset_types = asyncio.run(
+        commercial.get_next_offer_with_inventory(
             creator_id=CREATOR_ID,
             fan_id=FAN_ID,
             policy=SimpleNamespace(next_offer_target_cents=2500),

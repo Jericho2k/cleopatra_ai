@@ -59,9 +59,14 @@ class FakeTable:
         self.payload = payload
         return self
 
-    def upsert(self, payload, **_k):
-        self.mode = "insert"
+    def upsert(self, payload, **kwargs):
+        # on_conflict matters: fan_experience_scenes and fan_commercial_states
+        # are one row per fan, and a fake that appends instead of replacing
+        # would hand every turn the FIRST scene ever written — i.e. it would
+        # make multi-turn choreography untestable while looking like it worked.
+        self.mode = "upsert"
         self.payload = payload
+        self.conflict = kwargs.get("on_conflict")
         return self
 
     def eq(self, column, value):
@@ -111,6 +116,34 @@ class FakeTable:
         return rows
 
     def execute(self):
+        if self.mode == "upsert":
+            rows = self.payload if isinstance(self.payload, list) else [self.payload]
+            table = self.store.tables.setdefault(self.name, [])
+            keys = [key.strip() for key in str(self.conflict or "").split(",") if key.strip()]
+            written = []
+            for row in rows:
+                row = dict(row)
+                existing = None
+                if keys:
+                    existing = next(
+                        (
+                            candidate
+                            for candidate in table
+                            if all(
+                                str(candidate.get(key)) == str(row.get(key))
+                                for key in keys
+                            )
+                        ),
+                        None,
+                    )
+                if existing is not None:
+                    existing.update(row)
+                    written.append(existing)
+                else:
+                    row.setdefault("id", f"{self.name}-{len(table) + 1}")
+                    table.append(row)
+                    written.append(row)
+            return SimpleNamespace(data=written, count=len(written))
         if self.mode == "insert":
             payload = self.payload
             rows = payload if isinstance(payload, list) else [payload]
@@ -282,6 +315,12 @@ def world(monkeypatch):
 
     monkeypatch.setattr(suggestions, "get_supabase", lambda: db)
     monkeypatch.setattr("db.queries.get_supabase", lambda: db)
+    # The Experience Director and the commercial policy/state reads behind the
+    # text-intimacy decision run for real against this fake, rather than being
+    # stubbed out: the scene is now part of what a Full Auto turn IS, and a
+    # world that fakes it away would let it silently stop working.
+    monkeypatch.setattr("db.experience_director_queries.get_supabase", lambda: db)
+    monkeypatch.setattr("db.commercial_queries.get_supabase", lambda: db)
     monkeypatch.setattr(suggestions, "analyze_situation", fake_analyze)
     monkeypatch.setattr(suggestions, "generate_replies", fake_generate)
     monkeypatch.setattr(suggestions, "select_writer_route", fake_route)

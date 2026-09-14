@@ -9,6 +9,7 @@ from core.pagination import fetch_all_rows
 from core.supabase import get_supabase
 from models.content_pricing import category_range_for_items
 from models.schemas import ExchangeExample, Fan, Message, Persona
+from services.scene_metadata import derive_set_experience
 from services.shoot_fingerprint import build_shoot_clusters, shoot_fingerprint
 from services.vault_metadata import VAULT_CLASSIFIER_VERSION, build_set_description
 
@@ -781,8 +782,18 @@ def propose_sets(vault_items, max_per_set=6, min_per_set=3, min_level=2):
                     "min_price_cents": minimum_cents,
                     "max_price_cents": maximum_cents,
                 }
+            experience = derive_set_experience(
+                location=loc,
+                outfit=outfit,
+                category=category,
+                explicit_min=min(levels),
+                explicit_max=max(levels),
+                is_video=False,
+                tags=tags,
+            )
             sets.append({
                 **bounds,
+                **experience,
                 "title": title[:80],
                 "description": build_set_description(chunk),
                 "location": loc or None,
@@ -859,7 +870,17 @@ def propose_video_ppvs(vault_items, min_level=2):
         for tag in ("video", "individual_video"):
             if tag not in tags:
                 tags.append(tag)
+        experience = derive_set_experience(
+            location=location,
+            outfit=outfit,
+            category=category,
+            explicit_min=level,
+            explicit_max=level,
+            is_video=True,
+            tags=tags,
+        )
         proposals.append({
+            **experience,
             "title": " · ".join(title_parts[:4])[:80],
             "description": build_set_description([item]),
             "location": location or None,

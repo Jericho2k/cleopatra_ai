@@ -16,6 +16,22 @@ a beat before anything else is offered.
 Everything about how far the progression could go is internal (see
 ``services/media_packages.plan_progression``). This module only ever emits the
 single next unlock.
+
+WHAT THIS MODULE NO LONGER DECIDES
+----------------------------------
+Two things were taken out of here on purpose, because they were never
+commercial questions:
+
+* **How sexual the words may be.** ``CommercialDecision.may_be_explicit`` is
+  about the media being offered or sent. ``services/text_intimacy.py`` decides
+  the register of the text, from fan intent, conversation intensity, the
+  agency's configured sexting mode and safety state. "Nothing to sell this
+  turn" is not a reason to stop talking to him like an adult.
+
+* **When, conversationally, the next offer has been earned.** That is
+  ``services/experience_director.py``, and it reaches this module as the single
+  ``ctx.experience_allows_new_offer`` flag. It can only narrow: an offer on the
+  table, an acceptance, a delivery and every pause below are unaffected by it.
 """
 from datetime import datetime, timedelta, timezone
 
@@ -63,7 +79,7 @@ class CommercialContext:
         paused_session_available: bool = False,
         session_has_pending_purchase: bool = False,
         session_has_remaining_steps: bool = False,
-        session_cooldown_active: bool = False,
+        experience_allows_new_offer: bool = True,
     ):
         self.fan_has_bought_before = fan_has_bought_before
         self.approved_sets_available = approved_sets_available
@@ -76,7 +92,11 @@ class CommercialContext:
         self.paused_session_available = paused_session_available
         self.session_has_pending_purchase = session_has_pending_purchase
         self.session_has_remaining_steps = session_has_remaining_steps
-        self.session_cooldown_active = session_cooldown_active
+        # The Experience Director's veto (services/experience_director.py).
+        # It can only ever NARROW: it gates the discovery of a NEW offer and
+        # touches nothing about an offer already on the table, an acceptance
+        # already made, or a delivery already authorised.
+        self.experience_allows_new_offer = experience_allows_new_offer
 
 
 def _has(events: list[CommercialEvent], event_type: EventType) -> bool:
@@ -393,18 +413,6 @@ def decide_next_action(
                 conversation_continuation="none",
                 reason="legacy paid-session state self-healed to payment pending",
             )
-        if ctx.session_cooldown_active:
-            return CommercialDecision(
-                action=ActionType.CONTINUE_NORMAL_CHAT,
-                goal=(
-                    "react to the exact piece he just unlocked and stay in it with "
-                    "him — no media, no price, and nothing about what comes next"
-                ),
-                must_not_send_media=True,
-                may_be_explicit=True,
-                must_not_ask_question=True,
-                reason="post-purchase cooldown",
-            )
         if ctx.session_has_remaining_steps:
             return CommercialDecision(
                 action=ActionType.SEND_NEXT_PPV_STEP,
@@ -430,6 +438,21 @@ def decide_next_action(
     # The high-intent fast path. He has said what he wants; the only remaining
     # questions are inventory, caps and price, all of which are answered above.
     if wants and (readiness >= OFFER_READINESS_THRESHOLD or high_intent(events)) and sellable:
+        if not ctx.experience_allows_new_offer:
+            # He has already unlocked something in this scene and the scene
+            # still owes him interaction. This is not a timer: the Experience
+            # Director lifts it the moment the dialogue produces a bridge, and
+            # immediately if he asks for more himself.
+            return CommercialDecision(
+                action=ActionType.CONTINUE_NORMAL_CHAT,
+                goal=(
+                    "stay in the scene with him and answer what he actually "
+                    "said about what he just unlocked — no new offer, no price, "
+                    "and nothing about what might come next"
+                ),
+                must_not_send_media=True,
+                reason="scene has not produced a bridge since the last unlock",
+            )
         return _offer_next_unlock(
             ctx.next_offer,
             goal=(
@@ -451,7 +474,7 @@ def decide_next_action(
                     new_status=FanStatus.FREE_TEXT_SESSION,
                     reason="free text mode",
                 )
-            if sellable:
+            if sellable and ctx.experience_allows_new_offer:
                 return _offer_next_unlock(
                     ctx.next_offer,
                     goal="the free allowance is used up; offer the next thing plainly",
@@ -476,7 +499,7 @@ def decide_next_action(
                     new_status=FanStatus.FREE_TEASER,
                     reason=f"teaser {state.teaser_messages_used}/{policy.teaser_max_messages}",
                 )
-            if sellable:
+            if sellable and ctx.experience_allows_new_offer:
                 return _offer_next_unlock(
                     ctx.next_offer,
                     goal="the preview is over; offer him the next thing plainly",
