@@ -17,6 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+from ai.stack_profiles import PROFILE_IDS
 from core import tenancy
 
 
@@ -139,10 +140,13 @@ def test_the_owner_can_read_every_profile(client):
 
     assert response.status_code == 200
     body = response.json()
-    assert {row["profile_id"] for row in body["profiles"]} == {
-        "cleo_legacy_v1",
-        "cleo_v2",
-    }
+    # The registry is served from ai/stack_profiles.py rather than restated
+    # here, so adding a profile makes it selectable without touching a second
+    # list. The two frozen ones are asserted by name because a comparison
+    # baseline disappearing is exactly the regression worth catching.
+    served = {row["profile_id"] for row in body["profiles"]}
+    assert served == set(PROFILE_IDS)
+    assert {"cleo_legacy_v1", "cleo_v2"} <= served
     assert body["environment_profile"] == "cleo_v2"
     assert body["environment_variable"] == "AI_STACK_PROFILE"
 

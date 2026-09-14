@@ -7,10 +7,17 @@ from datetime import datetime
 from ai.prompt_blocks import cacheable_system_blocks
 from ai.voice_calibration import render_voice_calibration
 from ai.writer_style import (
+    candidate_count as writer_candidate_count,
     content_rules as writer_content_rules,
+    default_communication_style as writer_default_communication_style,
     emoji_rules as writer_emoji_rules,
+    enforces_message_shape as writer_enforces_message_shape,
+    layered_style_pressure as writer_layered_style_pressure,
+    normalize_reply_mode,
     normalize_writer_prompt_version,
+    output_format_instruction as writer_output_format_instruction,
     response_instructions as writer_response_instructions,
+    role_framing as writer_role_framing,
     voice_rules as writer_voice_rules,
 )
 from services.session_lifecycle import session_progress
@@ -221,8 +228,20 @@ def _render_price_learning(price_learning: dict) -> str:
     return "PRICE LEARNING (internal, evidence-backed):\n- " + "\n- ".join(lines)
 
 
-def _render_conversation_director(conversation_director: dict) -> str:
-    """Render persistent progression separately from commercial authority."""
+def _render_conversation_director(
+    conversation_director: dict,
+    *,
+    candidates: int = 3,
+    dictates_style: bool = True,
+) -> str:
+    """Render persistent progression separately from commercial authority.
+
+    ``candidates`` is how many replies this turn is asking for, so the block
+    cannot tell a Full Auto writer producing one reply to apply a move "in all 3
+    options". ``dictates_style`` is off for writer versions that keep sentence-level
+    style in one place: the director still states what has to happen this turn,
+    it just stops also prescribing how to phrase it.
+    """
     if not conversation_director:
         return ""
 
@@ -241,16 +260,27 @@ def _render_conversation_director(conversation_director: dict) -> str:
         lines.append("do not repeat the most recent conversational move or wording")
 
     if conversation_director.get("question_due"):
-        lines.append(
-            "MANDATORY: all 3 reply options must contain exactly one natural, "
-            "context-specific question"
-        )
-        lines.append(
-            "React first and wrap the question inside a personal or playful response; "
-            "never output a bare interview-style question"
-        )
+        if candidates == 1:
+            lines.append(
+                "MANDATORY: the reply must contain exactly one natural, "
+                "context-specific question"
+            )
+        else:
+            lines.append(
+                f"MANDATORY: all {candidates} reply options must contain exactly one "
+                "natural, context-specific question"
+            )
+        if dictates_style:
+            lines.append(
+                "React first and wrap the question inside a personal or playful response; "
+                "never output a bare interview-style question"
+            )
     if conversation_director.get("must_not_ask_question"):
-        lines.append("MANDATORY: do not ask a question in any reply option")
+        lines.append(
+            "MANDATORY: do not ask a question in this reply"
+            if candidates == 1
+            else "MANDATORY: do not ask a question in any reply option"
+        )
 
     if conversation_director.get("offer_eligible"):
         lines.append(
@@ -260,7 +290,13 @@ def _render_conversation_director(conversation_director: dict) -> str:
 
     lines.extend(
         [
-            "Follow this progression move in all 3 options; auto mode may send option 1.",
+            (
+                "Follow this progression move in the reply you write; it is the "
+                "message that gets sent."
+                if candidates == 1
+                else f"Follow this progression move in all {candidates} options; "
+                "auto mode may send option 1."
+            ),
             "The director controls pacing, never pricing or package authorization.",
         ]
     )
@@ -270,7 +306,17 @@ def _render_conversation_director(conversation_director: dict) -> str:
 def _render_expression_guidance(
     conversation_director: dict,
     session_strategy: dict,
+    *,
+    dictates_style: bool = True,
 ) -> str:
+    """Style pressure derived from the director and the session planner.
+
+    ``dictates_style=False`` reduces this to the one thing in it that is not
+    style: on a safety or paused turn, do not perform warmth. Everything else
+    here is a second, third and fourth statement of what the writer voice block
+    already says, and stacking them is how a prompt ends up arguing with itself
+    about whether a plain reply is allowed.
+    """
     # Keep natural chat emotionally alive without forcing canned banter.
     phase = str(conversation_director.get("phase") or "").upper()
     director_action = str(conversation_director.get("action") or "").upper()
@@ -283,6 +329,9 @@ def _render_expression_guidance(
             "- Keep the tone grounded and appropriate; do not force flirtation, emojis, "
             "or playful energy."
         )
+
+    if not dictates_style:
+        return ""
 
     lines = [
         "Natural does not mean neutral, formal, or customer-service-like.",
@@ -396,6 +445,11 @@ def _render_message_shape(message_shape: dict) -> str:
     model to "vary" produces one rhythm it then repeats forever. Auto enforces
     it after generation by merging, never by splitting, so a shape the writer
     disagrees with costs naturalness only at the seams.
+
+    Not every writer version wants this. ``writer_v3`` opts out and is never
+    handed a count at all (see ``enforces_message_shape``), which is why this
+    function is called conditionally rather than deleted: the frozen profiles
+    still depend on it, and they are the comparison baseline.
     """
     if not message_shape:
         return ""
@@ -493,14 +547,32 @@ def build_prompt(
     ctx: ConversationContext,
     *,
     prompt_version: str | None = None,
+    reply_mode: str | None = None,
 ) -> list[dict]:
     """Assemble the writer prompt for one turn.
 
     ``prompt_version`` selects the writer voice (ai/writer_style.py). It comes
     from the turn's AI Stack Profile; omitting it keeps the frozen ``writer_v1``
     voice, which is what every existing caller and test expects.
+
+    ``reply_mode`` says what the turn is FOR: ``auto`` sends the reply as-is,
+    ``assisted`` offers an operator a list to pick from. It changes the prompt
+    only for a writer version that distinguishes them (``writer_v3``), so every
+    existing caller keeps the three-option prompt it has today.
     """
     fan = ctx.fan_profile
+
+    # Resolved first, because several blocks below are assembled differently
+    # depending on which writer voice is answering and how many replies this
+    # turn will actually use. Everything else in this prompt — persona, legend,
+    # inventory, the commercial decision and every deterministic instruction —
+    # is shared application state and is identical under every profile.
+    writer_version = normalize_writer_prompt_version(
+        prompt_version or getattr(ctx, "writer_prompt_version", None)
+    )
+    mode = normalize_reply_mode(reply_mode)
+    candidates = writer_candidate_count(writer_version, mode)
+    style_layers = writer_layered_style_pressure(writer_version)
     stage = ctx.conversation_stage
     persona = ctx.creator_persona
     situation = ctx.situation or {}
@@ -513,12 +585,21 @@ def build_prompt(
     price_learning_block = _render_price_learning(price_learning)
     conversation_director = getattr(ctx, "conversation_director", None) or {}
     conversation_director_block = _render_conversation_director(
-        conversation_director
+        conversation_director,
+        candidates=candidates,
+        dictates_style=style_layers,
     )
     session_strategy = getattr(ctx, "session_strategy", None) or {}
     session_strategy_block = _render_session_strategy(session_strategy)
+    # A writer version that does not use the deterministic shape policy is not
+    # told a bubble count even if one was computed upstream: the whole point is
+    # that the model decides whether this turn is one message or a few.
     message_shape = getattr(ctx, "message_shape", None) or {}
-    message_shape_block = _render_message_shape(message_shape)
+    message_shape_block = (
+        _render_message_shape(message_shape)
+        if writer_enforces_message_shape(writer_version)
+        else ""
+    )
     media_inventory = getattr(ctx, "media_inventory", None) or {}
     media_inventory_block = _render_media_inventory(media_inventory)
     session_choreography_block = _render_session_choreography(
@@ -527,6 +608,7 @@ def build_prompt(
     expression_guidance_block = _render_expression_guidance(
         conversation_director,
         session_strategy,
+        dictates_style=style_layers,
     )
     learned_by_key: dict[str, list] = {}
     for learned_fact in fan_intelligence.get("facts") or []:
@@ -537,7 +619,9 @@ def build_prompt(
             learned_by_key.setdefault(key, []).append(learned_fact.get("value"))
 
     character = getattr(persona, "character", "") or "Confident, playful Eastern European creator."
-    comm_style = getattr(persona, "communication_style", "") or "Short casual texts, mirrors energy."
+    comm_style = getattr(persona, "communication_style", "") or (
+        writer_default_communication_style(writer_version)
+    )
     example_phrases = getattr(persona, "example_phrases", "") or ""
     voice_calibration = render_voice_calibration(persona)
     upsell_style = getattr(persona, "upsell_style", "") or ""
@@ -627,12 +711,17 @@ def build_prompt(
         label for key, label in _detail_fields if not _detail_known(key)
     ]
     missing_details_block = ""
-    if missing_details:
+    if missing_details and style_layers:
         missing_details_block = (
             "\nStill unknown about him: " + ", ".join(missing_details[:4]) + ". "
             "When the moment genuinely fits (not mid-scene, not when he's worked up), weave in ONE "
             "curious getting-to-know-you question about one of these. Max one per message, spaced out, "
             "never like a checklist. Money topics (payday) only if money comes up naturally."
+        )
+    elif missing_details:
+        # Stated as a fact about what is unknown, not as a question quota.
+        missing_details_block = (
+            "\nStill unknown about him: " + ", ".join(missing_details[:4]) + "."
         )
 
     mood = situation.get("fan_mood", "")
@@ -697,7 +786,47 @@ def build_prompt(
             "Regular spender. Relaxed and confident. Tease before any offer. Never resell bought content."
         ),
     }
-    stage_instruction = stage_instructions.get(stage, "")
+    # The same seven stages, said once. The V1/V2 wording above repeats the
+    # question philosophy, the "match his energy" framing and the reaction
+    # procedure that the writer voice block already covers; under a voice that
+    # states those once, a second copy here is just another thing to contradict.
+    v3_stage_instructions = {
+        StageType.COLD_OPEN: (
+            "First contact. Warm, curious, not desperate. No selling."
+        ),
+        StageType.WARMING_UP: (
+            "Getting to know him. Use what he has told you. You can mention "
+            "your content naturally if it fits."
+        ),
+        StageType.FLIRTING: (
+            "Flirting. If he escalates you can escalate with him and give "
+            "something real back rather than deflecting."
+        ),
+        StageType.PRE_UPSELL: (
+            "Good connection. If it fits, you can mention you have something "
+            "exclusive. No budget-fishing."
+        ),
+        StageType.UPSELL_ACTIVE: (
+            "He's interested in content. Make the offer clear and fair."
+        ),
+        StageType.OBJECTION: (
+            "He's hesitating. No pressure. A smaller option or letting it go "
+            "warmly are both fine."
+        ),
+        StageType.RETENTION: (
+            "Gone quiet. Re-engage with something genuine from your history. "
+            "Don't open with selling."
+        ),
+        StageType.HIGH_VALUE: (
+            "Regular spender. Relaxed and confident. Never resell content he "
+            "already bought."
+        ),
+    }
+    stage_instruction = (
+        stage_instructions.get(stage, "")
+        if style_layers
+        else v3_stage_instructions.get(stage, "")
+    )
 
     rag_section = ""
     if ctx.similar_exchanges:
@@ -716,7 +845,8 @@ def build_prompt(
     if recent_creator:
         avoid_block = "\nYOU ALREADY SAID THESE, DO NOT REPEAT OR ECHO THEM:\n"
         avoid_block += "\n".join(f"- {m}" for m in recent_creator)
-        avoid_block += "\nWrite something completely different."
+        if style_layers:
+            avoid_block += "\nWrite something completely different."
 
     latest_fan_msg = None
     if ctx.conversation_history:
@@ -744,30 +874,39 @@ def build_prompt(
 
     # Build examples block from persona
     examples_block = ""
+    greeting_header = (
+        "HOW YOU OPEN CONVERSATIONS (match this energy exactly):"
+        if style_layers
+        else "HOW YOU OPEN CONVERSATIONS:"
+    )
+    flirt_header = (
+        "HOW YOU FLIRT (match this rhythm and vocabulary):"
+        if style_layers
+        else "HOW YOU FLIRT:"
+    )
     if persona.example_greetings:
-        examples_block += "HOW YOU OPEN CONVERSATIONS (match this energy exactly):\n"
+        examples_block += greeting_header + "\n"
         examples_block += "\n".join(f'"{g}"' for g in persona.example_greetings[:3])
         examples_block += "\n\n"
     if persona.example_flirts:
-        examples_block += "HOW YOU FLIRT (match this rhythm and vocabulary):\n"
+        examples_block += flirt_header + "\n"
         examples_block += "\n".join(f'"{f}"' for f in persona.example_flirts[:3])
         examples_block += "\n\n"
 
     current_day = datetime.now().strftime("%A, %B %d")  # e.g. "Tuesday, May 12"
 
-    # The writer voice for this turn. Everything else in this prompt is the same
-    # under every AI stack profile: persona, legend, inventory, the commercial
-    # decision and every deterministic instruction are shared application state,
-    # not a property of the writer version.
-    writer_version = normalize_writer_prompt_version(
-        prompt_version or getattr(ctx, "writer_prompt_version", None)
-    )
     voice_rules = writer_voice_rules(writer_version)
     emoji_rules = writer_emoji_rules(writer_version)
     content_rules = writer_content_rules(writer_version)
-    response_instructions = writer_response_instructions(writer_version)
+    response_instructions = writer_response_instructions(writer_version, mode)
+    output_format = writer_output_format_instruction(writer_version, mode)
+    role_framing = writer_role_framing(
+        writer_version,
+        fan_name=fan_name,
+        creator_display_name=creator_display_name,
+    )
 
-    system_prompt = f"""You are {fan_name}'s favorite creator. Your name is {creator_display_name}.
+    system_prompt = f"""{role_framing}
 {crisis_block}
 TODAY IS: {current_day} — never mention a different day or date.
 {legend_block}
@@ -966,8 +1105,7 @@ Fan just said: "{fan_message}"
 
 {message_shape_block}
 
-Return ONLY a JSON array of 3 strings. No markdown.
-["reply 1", "reply 2", "reply 3"]"""
+{output_format}"""
 
     sent_ppv = ctx.sent_ppv or []
     sent_ids = {s["media_id"] for s in sent_ppv}

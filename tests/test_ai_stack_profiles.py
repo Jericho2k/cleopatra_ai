@@ -17,6 +17,7 @@ from ai import stack_profiles
 from ai.stack_profiles import (
     CLEO_LEGACY_V1,
     CLEO_V2,
+    CLEO_V3,
     DEFAULT_PROFILE_ID,
     PROFILE_IDS,
     STAGE_FAN_INTELLIGENCE,
@@ -30,7 +31,7 @@ from ai.stack_profiles import (
     get_profile,
     normalize_profile_id,
 )
-from ai.writer_style import WRITER_V1, WRITER_V2
+from ai.writer_style import WRITER_V1, WRITER_V2, WRITER_V3
 
 
 # --- the frozen legacy stack ------------------------------------------------
@@ -131,16 +132,76 @@ def test_v2_does_not_repoint_the_analyzer_extractor_or_summary():
         )
 
 
-def test_the_safety_writer_stays_off_openrouter_in_both_profiles():
+def test_the_safety_writer_stays_off_openrouter_in_every_profile():
     # A crisis turn is not commercial expression, and keeping it on a second
     # provider means one incident cannot take every writer down at once.
-    assert CLEO_V2.stage(STAGE_WRITER_SAFETY).resolved_primary()[0] == "together"
-    assert CLEO_LEGACY_V1.stage(STAGE_WRITER_SAFETY).resolved_primary()[0] == "together"
+    for profile in (CLEO_LEGACY_V1, CLEO_V2, CLEO_V3):
+        assert profile.stage(STAGE_WRITER_SAFETY).resolved_primary()[0] == "together"
+
+
+# --- cleo_v3: V2's models, a different prompt -------------------------------
+
+
+def test_v3_changes_the_writer_prompt_and_nothing_about_the_routing():
+    """The prompt is the variable under test, so nothing else may move.
+
+    If V3 reads better than V2 in the Simulator, that has to be attributable to
+    ``writer_v3``. One re-pointed model here and it is not.
+    """
+    for stage_name in STAGE_ORDER:
+        v2 = CLEO_V2.stage(stage_name)
+        v3 = CLEO_V3.stage(stage_name)
+        assert v3.resolved_primary() == v2.resolved_primary(), stage_name
+        assert v3.resolved_fallback() == v2.resolved_fallback(), stage_name
+        assert v3.reasoning == v2.reasoning is False, stage_name
+        assert v3.output_mode == v2.output_mode, stage_name
+        assert v3.resolved_max_tokens() == v2.resolved_max_tokens(), stage_name
+        assert v3.temperature == v2.temperature, stage_name
+
+    for stage_name in (
+        STAGE_WRITER_DEFAULT,
+        STAGE_WRITER_COMMERCIAL,
+        STAGE_WRITER_SAFETY,
+    ):
+        assert CLEO_V2.stage(stage_name).prompt_version == WRITER_V2
+        assert CLEO_V3.stage(stage_name).prompt_version == WRITER_V3
+
+    assert CLEO_V3.writer_prompt_version() == WRITER_V3
+
+
+def test_v3_does_not_repoint_the_analyzer_extractor_or_summary():
+    for stage_name in (
+        STAGE_SITUATION_ANALYZER,
+        STAGE_FAN_INTELLIGENCE,
+        STAGE_FAN_SUMMARY,
+    ):
+        assert CLEO_V3.stage(stage_name) == CLEO_V2.stage(stage_name)
+
+
+def test_v3_is_pinned_against_the_legacy_escape_hatches(monkeypatch):
+    monkeypatch.setenv("WRITER_DEFAULT_MODEL", "someone/else")
+    monkeypatch.setenv("EXTRACTOR_MODEL", "someone/else-too")
+
+    assert CLEO_V3.stage(STAGE_WRITER_DEFAULT).resolved_primary() == (
+        "openrouter",
+        "moonshotai/kimi-k2.6",
+    )
+    assert CLEO_V3.stage(STAGE_FAN_INTELLIGENCE).resolved_primary() == (
+        "together",
+        "openai/gpt-oss-120b",
+    )
+
+
+def test_v3_is_selectable_and_the_default_is_still_the_frozen_profile():
+    assert "cleo_v3" in PROFILE_IDS
+    assert normalize_profile_id("cleo_v3") == "cleo_v3"
+    assert get_profile("cleo_v3") is CLEO_V3
+    assert DEFAULT_PROFILE_ID == "cleo_legacy_v1"
 
 
 def test_reasoning_is_off_on_every_writer_target():
     """A reasoning writer returns content=null, which the parser sees as junk."""
-    for profile in (CLEO_LEGACY_V1, CLEO_V2):
+    for profile in (CLEO_LEGACY_V1, CLEO_V2, CLEO_V3):
         for stage_name in (
             STAGE_WRITER_DEFAULT,
             STAGE_WRITER_COMMERCIAL,

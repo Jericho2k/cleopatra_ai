@@ -50,7 +50,7 @@ and is the same under every profile, because it describes the conversation
 rather than the brain answering it. Only which model each route points at, and
 which writer voice it uses, varies.
 
-## The two shipped profiles
+## The shipped profiles
 
 ### `cleo_legacy_v1`
 
@@ -100,6 +100,50 @@ symmetry is how a comparison stops being a comparison.
 `cleo_v2`'s stages are pinned: the writer/analyzer/extractor environment
 variables do not re-point them.
 
+### `cleo_v3`
+
+| Stage | Provider / model | Fallback | Prompt | Reasoning |
+| --- | --- | --- | --- | --- |
+| situation_analyzer | anthropic / claude-haiku-4-5-20251001 | — | analyzer_v1 | off |
+| writer_default | openrouter / moonshotai/kimi-k2.6 | together / Qwen/Qwen3.7-Plus | writer_v3 | off |
+| writer_commercial | openrouter / moonshotai/kimi-k2.6 | together / Qwen/Qwen3.7-Plus | writer_v3 | off |
+| writer_safety | together / Qwen/Qwen3.7-Plus | — | writer_v3 | off |
+| fan_intelligence | together / openai/gpt-oss-120b | — | fan_intelligence_v1 | off |
+| fan_summary | together / meta-llama/Llama-3.3-70B-Instruct-Turbo | — | fan_summary_v1 | off |
+
+**The routing is identical to `cleo_v2`, deliberately.** V3 tests one
+hypothesis: that the writer was being micromanaged rather than
+under-instructed. A model change here would make "V2 reads worse than V3"
+unanswerable, so every provider, model, fallback and reasoning setting is the
+same and the prompt is the only variable.
+
+What differs is `writer_v3` (`ai/writer_style.py`) and the machinery it opts
+out of:
+
+| | `cleo_v2` | `cleo_v3` |
+| --- | --- | --- |
+| Full Auto output | 3 options, option 1 sent | **1 reply**, that reply sent |
+| Assisted output | 3 options | 3 options (unchanged — an operator picks) |
+| Bubble count | chosen by `services/message_shape.py`, enforced by merging after generation | **the model decides**; only a commercial `max_messages` cap still merges |
+| Fan's writing style | "match his energy", persona default "Short casual texts, mirrors energy." | **never mirrored.** She adapts to mood and intimacy, not to his slang, spelling, punctuation or emoji habits |
+| Role framing | "You are {fan}'s favorite creator." | "You are the creator replying to a fan in private messages on a paid creator platform." |
+| Personal facts | "never invent current-life facts" | ordinary details (colour, food, music, a hobby) **may be improvised, and are then persisted as canon**. Identity — name, age, origin, location, job, background, meeting in person — never is |
+| Style layers | writer voice + stage instruction + director + expression calibration all prescribe phrasing | style lives in the writer voice; the other blocks state what must HAPPEN, not how it should sound |
+| Static writer prompt | ~9 KB | ~2.5 KB |
+
+Improvised facts are written back through the **existing** creator legend
+(`creators.legend`, `db/queries.update_creator_legend`) by
+`services/creator_canon.py`, after the message has actually been sent — from
+Full Auto after delivery, and from Assisted in `POST /reply`. There is no second
+memory system and no new table. The merge is first-established-wins per topic,
+and protected identity keys are never passed to it at all, so improvisation can
+neither fill in nor overwrite a configured name, age, origin, job or background.
+
+Everything commercial is untouched: inventory authority, approved content,
+pricing, purchase state, PPV and session logic, affordability evidence, safety
+boundaries and simulation isolation are shared application state under V3
+exactly as under V1 and V2.
+
 ## Resolution
 
 ```
@@ -145,8 +189,14 @@ something else wrote it there.
 
 1. Add it to `PROFILES` in `ai/stack_profiles.py`, with a `StageSpec` for every
    entry in `STAGE_ORDER`.
-2. Add its identifier to the CHECK constraints in
-   `db/ai_stack_profile_v1.sql` (a follow-up migration, since the constraints
-   are `NOT VALID` and additive).
+2. Add its identifier to the CHECK constraints on `creators.ai_stack_profile`
+   and `fans.ai_stack_profile`, as a follow-up migration that drops and
+   recreates them — `db/ai_stack_profile_v3.sql` is the worked example — and
+   list it in `db/migration_order.txt`.
+   `tests/test_schema_pipeline.py::test_every_registered_ai_stack_profile_is_writable`
+   fails if the registry and the constraint disagree.
+
+The dashboard needs no change: both profile pickers render whatever
+`GET /ai-stack/profiles` returns.
 
 The friction is intentional. This decides what every fan is answered by.

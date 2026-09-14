@@ -23,7 +23,12 @@ Which MODEL each route points at is a property of the turn's AI Stack Profile
     expression, and keeping it on a second provider means one OpenRouter
     incident cannot take every writer down at once.
 
-Provider diversity is deliberate in both profiles. The constants below remain
+``cleo_v3``
+    The same targets as ``cleo_v2``, every one of them, with ``writer_v3`` in
+    place of ``writer_v2``. Routing is held fixed on purpose so that comparing
+    V2 against V3 in the Simulator compares two prompts and nothing else.
+
+Provider diversity is deliberate in every profile. The constants below remain
 the canonical default targets and are read by the availability check and the
 smoke script.
 """
