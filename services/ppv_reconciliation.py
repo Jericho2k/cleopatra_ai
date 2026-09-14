@@ -362,13 +362,15 @@ async def _finalize_abandonment(
             pause=False,
         )
         # Preserve the exact plan for a delayed platform unlock. Auto mode treats
-        # an abandoned snapshot as non-executable and may replace it only after a
-        # new explicit package selection.
+        # an abandoned snapshot as non-executable and may replace it only after
+        # the fan accepts a new offer.
         await save_fan_session(fan_id, session)
 
     policy = await get_creator_policy(creator_id)
     state = await get_fan_state(fan_id)
-    state.status = FanStatus.OFFER_PENDING if state.offered_packages else FanStatus.IDLE
+    state.status = (
+        FanStatus.OFFER_PENDING if state.pending_offer is not None else FanStatus.IDLE
+    )
     state.last_declined_price_cents = int(round(expected_price * 100))
     state.last_abandoned_ppv_at = now
     state.last_abandoned_media_id = media_id or None
@@ -385,7 +387,7 @@ async def _finalize_abandonment(
         payload = abandoned_ppv_payload(
             pending,
             desired_experience=state.desired_experience,
-            selected_package_id=state.selected_package_id,
+            accepted_offer_id=state.accepted_offer_id,
         )
         dedupe_key = f"abandoned-ppv:{fan_id}:{reference}"
         state.next_followup_at = execute_at

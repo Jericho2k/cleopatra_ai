@@ -209,9 +209,13 @@ def test_v3_full_auto_asks_the_writer_for_exactly_one_reply(auto_world, spy_tran
     run_turn()
 
     assert calls["writer"][-1]["max_candidates"] == 1
+    assert calls["writer"][-1]["output_contract"] == "auto_messages"
     prompt = writer_prompt(calls)
     assert "Write ONE reply." in prompt
-    assert "Return ONLY a JSON array containing exactly one string" in prompt
+    # The Full Auto contract is one reply in its own bubbles, not an array of
+    # alternatives with a cardinality of one.
+    assert '{"messages": ["first message", "second message"]}' in prompt
+    assert "These are not alternatives" in prompt
     assert "Write 3 reply options" not in prompt
     assert "JSON array of 3 strings" not in prompt
     assert "auto mode may send option 1" not in prompt
@@ -226,6 +230,7 @@ def test_the_frozen_profiles_still_ask_for_three_options(
     run_turn()
 
     assert calls["writer"][-1]["max_candidates"] == 3
+    assert calls["writer"][-1]["output_contract"] == "candidates"
     prompt = writer_prompt(calls)
     assert "Write 3 reply options" in prompt
     assert "Return ONLY a JSON array of 3 strings" in prompt

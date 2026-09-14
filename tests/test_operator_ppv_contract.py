@@ -223,7 +223,7 @@ def test_auto_prepared_approval_keeps_exact_media_and_price():
     ).read_text(encoding="utf-8")
     assert "create_ppv_approval_request(" in source
     assert "media_ids=media_ids" in source
-    assert "price_cents=int(round(price * 100))" in source
+    assert "price_cents=ppv_delivery.price_cents" in source
     assert "if approval_policy.require_operator_ppv_approval" in source
 
 

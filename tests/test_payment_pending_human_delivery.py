@@ -13,7 +13,7 @@ from models.commercial import (
     EventType,
     FanCommercialState,
     FanStatus,
-    PackageOption,
+    Offer,
 )
 from models.conversation_director import (
     ConversationPhase,
@@ -26,34 +26,33 @@ from services.commercial_policy import CommercialContext, decide_next_action
 from services.human_delivery import AvailabilityMode, build_delivery_schedule
 
 
-def selected_event() -> CommercialEvent:
+def accepted_event() -> CommercialEvent:
     return CommercialEvent(
-        type=EventType.PACKAGE_SELECTED,
+        type=EventType.OFFER_ACCEPTED,
         amount_cents=3000,
-        metadata={"package_id": "pkg", "set_id": "set-1", "set_ids": ["set-1"]},
+        metadata={"offer_id": "offer:set-1", "set_id": "set-1"},
     )
 
 
-def package() -> PackageOption:
-    return PackageOption(
-        package_id="pkg",
-        label="quick private session",
+def offer() -> Offer:
+    return Offer(
+        offer_id="offer:set-1",
+        label="private photo set",
         price_cents=3000,
         set_id="set-1",
-        set_ids=["set-1"],
         experience="shower",
         legal_description="shower",
     )
 
 
-def test_selection_enters_offer_selected_not_paid_session():
+def test_acceptance_enters_offer_selected_not_paid_session():
     decision = decide_next_action(
         CreatorPolicy(),
-        FanCommercialState(status=FanStatus.OFFER_PENDING, offered_packages=[package()]),
-        [selected_event()],
-        CommercialContext(package_options=[package()]),
+        FanCommercialState(status=FanStatus.OFFER_PENDING, pending_offer=offer()),
+        [accepted_event()],
+        CommercialContext(next_offer=offer()),
     )
-    assert decision.action == ActionType.CREATE_PAID_SESSION
+    assert decision.action == ActionType.SEND_NEXT_PPV_STEP
     assert decision.new_status == FanStatus.OFFER_SELECTED
 
 
@@ -106,9 +105,13 @@ def test_offer_selected_with_unsent_session_recovers_exact_locked_step():
     assert decision.must_not_send_media is False
 
 
-def test_create_session_strategy_is_not_misclassified_as_delivery():
+def test_acceptance_strategy_is_not_misclassified_as_paid_delivery():
     strategy = derive_session_strategy(
-        commercial_decision={"action": "CREATE_PAID_SESSION", "package_options": [package().model_dump()]},
+        commercial_decision={
+            "action": "SEND_NEXT_PPV_STEP",
+            "new_status": "OFFER_SELECTED",
+            "next_offer": offer().model_dump(),
+        },
         active_session={"status": "active", "current_index": 0, "awaiting_purchase_index": None, "plan": [{}]},
     )
     assert strategy.phase == "OFFER_SELECTED"
@@ -144,8 +147,8 @@ def test_awaiting_unlock_strategy_is_hold_not_delivery():
 
 def test_director_calls_selection_and_pending_unlock_payment_pending():
     selection = advance_conversation_director(
-        commercial_decision={"action": "CREATE_PAID_SESSION"},
-        active_session={"status": "active", "awaiting_purchase_index": None},
+        commercial_decision={"action": "SEND_NEXT_PPV_STEP"},
+        active_session={"status": "active", "awaiting_purchase_index": 0},
         fan_turn_count=4,
         creator_turn_count=3,
     )

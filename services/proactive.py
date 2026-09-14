@@ -129,9 +129,9 @@ async def send_proactive_message(
         # is meant to accomplish — it does not choose to sell or send media.
         prompt[1]["content"] += (
             f"\n\nPROACTIVE MESSAGE — YOUR GOAL FOR THIS MESSAGE:\n{goal}\n"
-            "Write ONE short message (two at most). Do NOT include any [PPV:...] tag. "
-            "Do not mention a price. This must feel like you thought of him, not like a "
-            "scheduled campaign."
+            "Write ONE short message (two at most). Nothing is attached to it: "
+            "do not say you are sending anything and do not mention a price. This "
+            "must feel like you thought of him, not like a scheduled campaign."
         )
 
         replies = await generate_replies(
@@ -150,8 +150,9 @@ async def send_proactive_message(
         if not text:
             return False
 
-    # Strip any PPV tag the model may have emitted anyway — proactive messages
-    # never carry media.
+    # Strip any delivery tag the model may have emitted anyway. It is not a
+    # control surface anywhere any more (services/ppv_turn.py), and a proactive
+    # message never carries media, so this only keeps the string out of the chat.
     import re
     text = re.sub(r"\[PPV:[^\]]*\]", "", text).strip()
     if not text:

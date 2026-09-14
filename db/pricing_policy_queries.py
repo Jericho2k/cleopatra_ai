@@ -257,24 +257,3 @@ async def get_agency_scope_id(creator_id: str) -> str | None:
         return None
 
 
-async def set_agency_scope_membership(creator_id: str, agency_scope_id: str | None) -> None:
-    """Place a creator in an agency pricing scope, or remove it from one."""
-
-    def _write() -> None:
-        (
-            get_supabase().table("creator_pricing_scope_memberships")
-            .upsert(
-                {
-                    "creator_id": str(creator_id),
-                    "agency_scope_id": (
-                        str(agency_scope_id) if agency_scope_id else None
-                    ),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                },
-                on_conflict="creator_id",
-            )
-            .execute()
-        )
-
-    await asyncio.to_thread(_write)
-    clear_price_learning_policy_cache(creator_id)

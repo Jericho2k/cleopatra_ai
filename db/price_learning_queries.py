@@ -45,36 +45,6 @@ def _default_policy() -> PriceLearningPolicy:
     )
 
 
-async def get_price_learning_policy(creator_id: str) -> PriceLearningPolicy:
-    def _get() -> dict[str, Any] | None:
-        response = (
-            get_supabase()
-            .table("creator_price_learning_policies")
-            .select("*")
-            .eq("creator_id", creator_id)
-            .limit(1)
-            .execute()
-        )
-        return (response.data or [None])[0]
-
-    try:
-        row = await asyncio.to_thread(_get)
-    except Exception as exc:
-        print(f"[PRICE LEARNING] policy read failed creator={creator_id}: {exc}")
-        return _default_policy()
-    if not row:
-        return _default_policy()
-    payload = dict(row)
-    payload.pop("creator_id", None)
-    payload.pop("updated_at", None)
-    try:
-        return PriceLearningPolicy.model_validate(
-            {**_default_policy().model_dump(), **payload}
-        )
-    except Exception:
-        return _default_policy()
-
-
 async def get_price_learning_profile(fan_id: str) -> PriceLearningProfile:
     def _get() -> dict[str, Any] | None:
         response = (

@@ -137,41 +137,25 @@ _UGLY_MONEY_RE = re.compile(r"\$\d+\.00\b")
 
 def _prompt_text(**context_overrides) -> str:
     from ai.prompt_builder import build_prompt
-    from models.commercial import ActionType, CommercialDecision, PackageOption
+    from models.commercial import ActionType, CommercialDecision, Offer
     from models.schemas import ConversationContext, Fan, Message, Persona, StageType
 
     decision = CommercialDecision(
-        action=ActionType.PRESENT_SESSION_OPTIONS,
-        goal="present the approved options",
+        action=ActionType.OFFER_NEXT_UNLOCK,
+        goal="offer him the one next thing",
         mention_price=30,
-        package_options=[
-            PackageOption(
-                package_id="package:quick:a",
-                label="quick private session",
-                price_cents=3000,
-                set_ids=["a", "b"],
-                experience="bedroom, black lingerie",
-                legal_description="bedroom, black lingerie",
-                step_count=2,
-                media_count=5,
-                asset_types=["photo_set", "photo_set"],
-                content_floor_cents=1500,
-                content_ceiling_cents=8000,
-            ),
-            PackageOption(
-                package_id="package:full:a",
-                label="full private session",
-                price_cents=6500,
-                set_ids=["a", "b", "c"],
-                experience="bedroom, black lingerie, toy",
-                legal_description="bedroom, black lingerie, toy",
-                step_count=3,
-                media_count=9,
-                asset_types=["photo_set", "photo_set", "photo_set"],
-                content_floor_cents=2000,
-                content_ceiling_cents=12000,
-            ),
-        ],
+        next_offer=Offer(
+            offer_id="offer:a",
+            label="private photo set",
+            price_cents=3000,
+            set_id="a",
+            experience="bedroom, black lingerie",
+            legal_description="bedroom, black lingerie",
+            media_count=5,
+            asset_type="photo_set",
+            content_floor_cents=1500,
+            content_ceiling_cents=8000,
+        ),
     )
 
     context = dict(

@@ -9,6 +9,7 @@ from core.tasks import spawn
 import json
 import os
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -1283,6 +1284,46 @@ async def api_auth_middleware(request, call_next):
             return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
 
     return await call_next(request)
+
+
+@app.middleware("http")
+async def _unhandled_error_middleware(request: Request, call_next):
+    """Turn an unhandled route exception into a CORS-visible JSON 500.
+
+    Without this, an exception that escapes a route is answered by Starlette's
+    outermost ServerErrorMiddleware, whose response never passes back through
+    the CORS middleware below. The browser therefore sees a response with no
+    Access-Control-Allow-Origin, blocks it, and rejects the fetch with the
+    opaque TypeError "Failed to fetch" — which is exactly what the Simulator
+    surfaced while the backend had already logged a full traceback nobody could
+    correlate with it.
+
+    This middleware is registered BEFORE the CORS middleware, so CORS wraps it
+    and the JSON body actually reaches the client. The body stays deliberately
+    thin — a stable error id and the exception type — because an ordinary agency
+    account must not learn anything about internals from a crash. The id is what
+    ties it to the traceback in the logs.
+    """
+    try:
+        return await call_next(request)
+    except Exception as exc:  # noqa: BLE001 - deliberate catch-all boundary
+        error_id = uuid.uuid4().hex[:12]
+        print(
+            f"[UNHANDLED ERROR] id={error_id} path={request.url.path} "
+            f"type={type(exc).__name__} error={exc}"
+        )
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={
+                "detail": (
+                    "The server failed to handle this request. Quote error "
+                    f"{error_id} when reporting it."
+                ),
+                "error_id": error_id,
+                "error_type": type(exc).__name__,
+            },
+        )
 
 
 # Keep CORS outside the authentication middleware so browser clients can read
@@ -6784,12 +6825,36 @@ async def simulate_inbound(
         f"[SIMULATION] inbound creator={creator_id} fan={fan_id} "
         f"platform_fan={fan.get('platform_fan_id')} fast={body.fast}"
     )
-    return await run_simulated_inbound(
-        fan_id=fan_id,
-        creator_id=creator_id,
-        message=body.message,
-        fast=body.fast,
-    )
+    try:
+        return await run_simulated_inbound(
+            fan_id=fan_id,
+            creator_id=creator_id,
+            message=body.message,
+            fast=body.fast,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # The caller here is an allowlisted owner running a diagnostic tool, and
+        # the whole point of the tool is to find out what broke. A generic 500
+        # told them nothing, and — because an unhandled exception's response
+        # never passed through CORS — the browser reduced it further to "Failed
+        # to fetch". Full traceback to the logs, the exception type and a
+        # correlating id to the owner, no internals in the body.
+        error_id = uuid.uuid4().hex[:12]
+        print(
+            f"[SIMULATION ERROR] id={error_id} creator={creator_id} fan={fan_id} "
+            f"type={type(exc).__name__} error={exc}"
+        )
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"The simulated turn failed inside the backend "
+                f"({type(exc).__name__}). Quote error {error_id} to find the "
+                "full traceback in the server logs."
+            ),
+        ) from exc
 
 
 async def _require_simulation_catalog_access(

@@ -13,8 +13,15 @@ import time
 import uuid
 
 
-from ai.generator import generate_replies
+from ai.generator import (
+    CONTRACT_AUTO_MESSAGES,
+    CONTRACT_CANDIDATES,
+    LEGACY_WRITER_RETRY_POLICY,
+    PERSISTENT_PRIMARY_RETRY_POLICY,
+    generate_replies,
+)
 from ai.writer_router import select_writer_route
+from services.ppv_turn import plan_ppv_step_delivery, strip_ppv_tags
 from ai.stack_profiles import STAGE_FAN_SUMMARY, get_profile
 from openai import AsyncOpenAI
 from core.config import get_settings
@@ -26,7 +33,23 @@ from ai.writer_style import (
     candidate_count as writer_candidate_count,
     enforces_message_shape as writer_enforces_message_shape,
     persists_improvised_facts as writer_persists_improvised_facts,
+    persistent_primary_retries as writer_persistent_primary_retries,
+    uses_auto_messages_contract as writer_uses_auto_messages_contract,
 )
+
+
+def writer_retry_policy(prompt_version: str):
+    """The retry plan this writer version's primary model gets.
+
+    V3 makes Kimi the real primary: four attempts spaced by the configured
+    schedule before Qwen is reached at all. V1 and V2 keep the frozen two-then-
+    fallback plan, because they are the comparison baseline.
+    """
+    return (
+        PERSISTENT_PRIMARY_RETRY_POLICY
+        if writer_persistent_primary_retries(prompt_version)
+        else LEGACY_WRITER_RETRY_POLICY
+    )
 from services.commercial_orchestrator import orchestrate
 from models.commercial import ActionType, FanStatus
 from db.fan_intelligence_queries import get_fan_intelligence_context
@@ -557,6 +580,9 @@ async def get_suggestions(
         prompt,
         creator_persona,
         max_candidates=writer_candidate_count(route.prompt_version, MODE_ASSISTED),
+        output_contract=CONTRACT_CANDIDATES,
+        retry_policy=writer_retry_policy(route.prompt_version),
+        profile_id=stack.profile_id,
         telemetry_context={
             "creator_id": creator_id,
             "fan_id": fan_id,
@@ -860,7 +886,6 @@ def _build_turn_inventory(
         authorized = session_types or tuple(vault_asset_types)
         return MediaInventory(
             authorized_asset_types=authorized,
-            available_package_asset_types=authorized,
             vault_asset_types=tuple(vault_asset_types) or session_types,
             next_step_asset_type=next_step_asset_type(active_session),
             video_requested=video_requested,
@@ -875,16 +900,13 @@ def _build_turn_inventory(
         )
 
     authorized = tuple(getattr(decision, "authorized_asset_types", None) or ())
-    available = tuple(getattr(decision, "available_package_asset_types", None) or ())
     vault = tuple(getattr(decision, "vault_asset_types", None) or ())
-    # An active plan is narrower than any offer snapshot: it names the exact
-    # steps that will be delivered, so it wins.
+    # An active plan is narrower than the offer snapshot: it names the exact
+    # step that will be delivered, so it wins.
     if session_types:
         authorized = session_types
-        available = session_types
     return MediaInventory(
         authorized_asset_types=authorized,
-        available_package_asset_types=available,
         vault_asset_types=vault,
         next_step_asset_type=next_step_asset_type(active_session),
         video_requested=video_requested,
@@ -925,7 +947,7 @@ async def _recover_or_downgrade_plan(
 
     failure_class = classify_plan_status(status)
     had_contract = bool(
-        decision is not None and getattr(decision, "selected_package_set_ids", None)
+        decision is not None and getattr(decision, "accepted_offer_set_id", None)
     )
     print(
         f"[SESSION] plan-session status={status} fan={fan_id} "
@@ -963,13 +985,15 @@ async def _recover_or_downgrade_plan(
         return None, decision, AUTO_OUTCOME_PLAN_UNRECOVERABLE
 
     if recovery.present_replacement:
-        decision.action = ActionType.PRESENT_SESSION_OPTIONS
-        decision.package_options = list(recovery.replacement_packages or [])
+        replacement = recovery.replacement_offer
+        decision.action = ActionType.OFFER_NEXT_UNLOCK
+        decision.next_offer = replacement
         decision.must_not_send_media = True
-        decision.mention_price = None
+        decision.mention_price = (
+            replacement.price_cents // 100 if replacement is not None else None
+        )
         decision.session_budget_cents = None
-        decision.selected_package_set_id = None
-        decision.selected_package_set_ids = []
+        decision.accepted_offer_set_id = None
         decision.replacement_for_unavailable = True
         decision.new_status = FanStatus.OFFER_PENDING
         decision.goal = (
@@ -978,26 +1002,19 @@ async def _recover_or_downgrade_plan(
             "talk — and offer what is actually there now."
         )
         decision.reason = f"plan_recovery:{recovery.reason}"
-        from services.inventory_authority import asset_types_from_packages
+        from services.inventory_authority import asset_types_from_offer
 
-        decision.authorized_asset_types = list(
-            asset_types_from_packages(decision.package_options)
-        )
-        decision.available_package_asset_types = list(
-            decision.authorized_asset_types
-        )
+        decision.authorized_asset_types = list(asset_types_from_offer(replacement))
         return None, decision, None
 
     if recovery.continue_without_offer:
         decision.action = ActionType.CONTINUE_NORMAL_CHAT
-        decision.package_options = []
+        decision.next_offer = None
         decision.must_not_send_media = True
         decision.mention_price = None
         decision.session_budget_cents = None
-        decision.selected_package_set_id = None
-        decision.selected_package_set_ids = []
+        decision.accepted_offer_set_id = None
         decision.authorized_asset_types = []
-        decision.available_package_asset_types = []
         decision.new_status = FanStatus.IDLE
         decision.goal = (
             "Keep the conversation warm and going. Do not offer, promise or "
@@ -1285,11 +1302,13 @@ async def _debounced_auto_reply(
                 print(f"[COMMERCIAL ERROR] fan={fan_id}: {e} — auto reply aborted")
                 return
 
-        # With commercial v2 enabled, only CREATE_PAID_SESSION may start a plan.
-        # PRESENT_SESSION_OPTIONS, PAUSE_* and ordinary chat must never invoke the
-        # legacy content planner. When the flag is off, preserve old behavior.
+        # With commercial v2 enabled, only an acceptance may start a plan.
+        # OFFER_NEXT_UNLOCK, PAUSE_* and ordinary chat must never invoke the
+        # content planner. When the flag is off, preserve old behavior.
         should_plan = (
-            decision is not None and decision.action == ActionType.CREATE_PAID_SESSION
+            decision is not None
+            and decision.action == ActionType.SEND_NEXT_PPV_STEP
+            and bool(decision.accepted_offer_set_id)
         ) if commercial_enabled else (
             not _selling_locked(fan_profile)
             and _fan_wants_content(latest_message, situation)
@@ -1308,8 +1327,8 @@ async def _debounced_auto_reply(
                     plan_data = await plan_session_for_fan(
                         creator_id,
                         fan_id,
-                        selected_set_ids=(decision.selected_package_set_ids if decision else None),
-                        selected_price_cents=(decision.session_budget_cents if decision else None),
+                        accepted_set_id=(decision.accepted_offer_set_id if decision else None),
+                        accepted_price_cents=(decision.session_budget_cents if decision else None),
                     )
                     plan_status = str(plan_data.get("status") or "")
                     if plan_status == "ok":
@@ -1452,7 +1471,7 @@ async def _debounced_auto_reply(
                     print(f"[SESSION] fan={fan_id} affordability pause ({decision.action.value})")
                 except Exception as exc:
                     print(f"[DECLINE LOCK ERROR] fan={fan_id} error={exc}")
-            elif decision.action in {ActionType.CREATE_PAID_SESSION, ActionType.RESUME_PREVIOUS_OFFER}:
+            elif decision.action in {ActionType.SEND_NEXT_PPV_STEP, ActionType.RESUME_PREVIOUS_OFFER}:
                 try:
                     await clear_fan_decline_lock(fan_id)
                 except Exception as exc:
@@ -1465,10 +1484,10 @@ async def _debounced_auto_reply(
                     state = await get_fan_state(fan_id)
                     state.status = FanStatus.IDLE
                     state.confirmed_budget_cents = None
-                    state.selected_package_id = None
-                    state.selected_package_set_id = None
-                    state.selected_package_set_ids = []
-                    state.selected_package_price_cents = None
+                    state.pending_offer = None
+                    state.accepted_offer_id = None
+                    state.accepted_offer_set_id = None
+                    state.accepted_offer_price_cents = None
                     await save_fan_state(fan_id, creator_id, state)
         else:
             # Legacy behavior is retained only when Commercial v2 is disabled.
@@ -1552,8 +1571,7 @@ async def _debounced_auto_reply(
                 turn_key=latest_message,
                 max_messages=commercial_max_messages,
                 is_ppv_delivery=bool(
-                    getattr(decision, "action", None)
-                    in {ActionType.CREATE_PAID_SESSION, ActionType.SEND_NEXT_PPV_STEP}
+                    getattr(decision, "action", None) is ActionType.SEND_NEXT_PPV_STEP
                 ),
                 **extra,
             )
@@ -1581,6 +1599,38 @@ async def _debounced_auto_reply(
             situation=situation,
             fan_message=latest_message,
         )
+        # What this turn will ATTACH, decided here from the persisted session
+        # plan rather than parsed back out of the writer's prose. The writer is
+        # told only that it is attached; it cannot cause, prevent, reprice or
+        # mis-address a delivery (services/ppv_turn.py).
+        legacy_send_now = False
+        if not commercial_enabled and active_session:
+            # The exact trigger the legacy prompt used, evaluated deterministically:
+            # not paused for affordability, and either he just said yes or the
+            # session has been open for three of his messages.
+            selling_paused = bool(
+                getattr(fan_profile, "sale_paused_at", None)
+            ) and purchase_signal != "money_available"
+            fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
+            msgs_since_session = fan_msg_count - int(
+                active_session.get("started_at_fan_msg_count", 0) or 0
+            )
+            legacy_send_now = (not selling_paused) and (
+                msgs_since_session >= 3 or purchase_signal == "ready_to_buy"
+            )
+
+        ppv_delivery = plan_ppv_step_delivery(
+            decision=decision if commercial_enabled else None,
+            active_session=active_session,
+            legacy_send_now=legacy_send_now,
+        )
+        if ppv_delivery is not None:
+            print(
+                f"[PPV DELIVERY] fan={fan_id} attaching media={ppv_delivery.media_ids} "
+                f"price_cents={ppv_delivery.price_cents} "
+                f"set={ppv_delivery.set_id} step={ppv_delivery.step_index}"
+            )
+
         print(
             f"[INVENTORY] fan={fan_id} "
             f"authorized={','.join(media_inventory.authorized_asset_types) or 'none'} "
@@ -1602,6 +1652,9 @@ async def _debounced_auto_reply(
             sent_ppv=sent_ppv,
             active_session=active_session,
             media_inventory=media_inventory.to_context(),
+            ppv_delivery=(
+                ppv_delivery.writer_context() if ppv_delivery is not None else {}
+            ),
             commercial_decision=decision.model_dump(mode="json") if decision else None,
             fan_intelligence=fan_intelligence,
             buyer_lifecycle=buyer_lifecycle,
@@ -1621,11 +1674,16 @@ async def _debounced_auto_reply(
             f"reason={route.reason} primary={route.primary_target.model} "
             f"fallback={(route.fallback_target.model if route.fallback_target else 'none')}"
         )
-        # Full Auto sends exactly one message, so under a writer version that
-        # understands the distinction it asks for exactly one. Asking for three
-        # options and discarding two was never the design; it was V1's assisted
-        # prompt reused on a path that has no operator to choose between them.
+        # Full Auto sends exactly one message. Under a writer version that
+        # understands the distinction it asks for exactly one REPLY, in the
+        # bubbles that reply naturally has — not for candidates, of which there
+        # are none here because there is no operator to choose between them.
         auto_candidates = writer_candidate_count(route.prompt_version, MODE_AUTO)
+        auto_contract = (
+            CONTRACT_AUTO_MESSAGES
+            if writer_uses_auto_messages_contract(route.prompt_version, MODE_AUTO)
+            else CONTRACT_CANDIDATES
+        )
         prompt = build_prompt(
             ctx, prompt_version=route.prompt_version, reply_mode=MODE_AUTO
         )
@@ -1634,6 +1692,9 @@ async def _debounced_auto_reply(
                 prompt,
                 creator_persona,
                 max_candidates=auto_candidates,
+                output_contract=auto_contract,
+                retry_policy=writer_retry_policy(route.prompt_version),
+                profile_id=stack.profile_id,
                 telemetry_context={
                     "creator_id": creator_id,
                     "fan_id": fan_id,
@@ -1701,6 +1762,27 @@ async def _debounced_auto_reply(
         )
         if link_repaired:
             print(f"[PPV LANGUAGE] repaired delivery-link phrasing fan={fan_id}")
+
+        # The tag is no longer a control surface. A writer that still emits one
+        # is not obeyed, and the string never reaches the fan.
+        reply, tag_stripped = strip_ppv_tags(reply)
+        if tag_stripped:
+            print(
+                f"[PPV DELIVERY] fan={fan_id} stripped a writer-emitted delivery "
+                "tag; attachment is decided by commercial state, not by copy"
+            )
+        if not reply:
+            print(f"[AUTO REPLY] nothing left to send after sanitising fan={fan_id}")
+            if outcome_sink is not None:
+                outcome_sink["outcome"] = AUTO_OUTCOME_WRITER_FAILED
+            return
+
+        if ppv_delivery is not None:
+            # Paid media is one message: its text and its attachment travel
+            # together. Merging here is what makes "the text cannot claim a
+            # delivery that failed" true by construction — there is no separate
+            # text message that could already have left.
+            reply = apply_message_shape(reply, 1)
 
         if shape_enforced:
             # Re-resolve the shape now that the copy exists: a reply that turned
@@ -1854,51 +1936,27 @@ async def _debounced_auto_reply(
                 if not await _pause(inter_delay, phase=f"before_part_{i + 1}"):
                     return
 
-            ppv_match = re.search(r"\[PPV:([^:]+):(\d+(?:\.\d+)?)\]", part)
-            if ppv_match and commercial_enabled and (
-                decision is None
-                or decision.action not in {ActionType.CREATE_PAID_SESSION, ActionType.SEND_NEXT_PPV_STEP}
-            ):
-                print(f"[COMMERCIAL GUARD] stripped unauthorized PPV fan={fan_id} action={getattr(decision, 'action', None)}")
-                ppv_match = None
-                part = re.sub(r"\[PPV:[^\]]+\]", "", part).strip()
-            if ppv_match:
+            # Deterministic delivery. ``ppv_delivery`` was decided from the
+            # persisted session plan BEFORE the writer ran, so this branch is
+            # entered because commercial state says so — never because a model
+            # managed to serialise a magic string into free text.
+            is_ppv_part = ppv_delivery is not None
+            if is_ppv_part:
                 delivery_reference = uuid.uuid4().hex
-                text_out = part[: ppv_match.start()].strip()
-                media_id = ppv_match.group(1)
-                price = float(ppv_match.group(2))
-
-                # If a session is active, send the whole bundle, not just the tagged id.
-                media_ids = [media_id]
-                if active_session:
-                    plan = active_session.get("plan", [])
-                    idx = int(active_session.get("current_index", 0) or 0)
-                    if idx < len(plan) and plan[idx].get("media_ids"):
-                        # The stored plan is authoritative. The writer may emit a
-                        # delivery command, but it cannot alter media or price.
-                        media_ids = plan[idx]["media_ids"]
-                        media_id = media_ids[0]
-                        price = float(plan[idx].get("price") or price)
-
-                current_step = None
-                if active_session:
-                    plan = active_session.get("plan", [])
-                    idx = int(active_session.get("current_index", 0) or 0)
-                    if 0 <= idx < len(plan):
-                        current_step = plan[idx]
-                ppv_media_context = {
-                    "ppv": {
-                        "media_ids": media_ids,
-                        "media_id": media_id,
-                        "price": price,
-                        "price_cents": int(round(price * 100)),
-                        "access_type": "ppv",
-                        "set_id": (current_step or {}).get("set_id"),
-                        "step_index": (active_session or {}).get("current_index"),
-                        "payment_reference": delivery_reference,
-                        "source": "auto",
-                    }
-                }
+                text_out = part
+                media_ids = list(ppv_delivery.media_ids)
+                media_id = ppv_delivery.media_id
+                price = ppv_delivery.price
+                current_step = (
+                    ((active_session or {}).get("plan") or [None] * (ppv_delivery.step_index + 1))[
+                        ppv_delivery.step_index
+                    ]
+                    if active_session
+                    else None
+                )
+                ppv_media_context = ppv_delivery.media_context(
+                    payment_reference=delivery_reference
+                )
 
                 approval_policy = await get_creator_policy(creator_id)
                 if approval_policy.require_operator_ppv_approval:
@@ -1908,21 +1966,21 @@ async def _debounced_auto_reply(
                         fan_id=fan_id,
                         message_content=text_out,
                         media_ids=media_ids,
-                        price_cents=int(round(price * 100)),
-                        set_id=(current_step or {}).get("set_id"),
-                        step_index=(active_session or {}).get("current_index"),
+                        price_cents=ppv_delivery.price_cents,
+                        set_id=ppv_delivery.set_id,
+                        step_index=ppv_delivery.step_index,
                         approved_experience=(
                             state_for_approval.desired_experience
-                            or state_for_approval.selected_package_label
+                            or state_for_approval.accepted_offer_label
                         ),
                     )
                     print(
                         f"[PPV APPROVAL] fan={fan_id} request={approval.get('id')} "
-                        f"media={media_ids} price_cents={int(round(price * 100))}"
+                        f"media={media_ids} price_cents={ppv_delivery.price_cents}"
                     )
                     return
             else:
-                text_out = re.sub(r"\[PPV:[^\]]+\]", "", part).strip()
+                text_out = part
                 ppv_media_context = None
 
             # Platform acceptance is authoritative. Never create a local sent
@@ -1937,7 +1995,7 @@ async def _debounced_auto_reply(
                 or not apifansly_enabled()
             ) and not local_test_delivery:
                 print(f"[AUTO DELIVERY ERROR] fan={fan_id}: no live delivery route")
-                if ppv_match:
+                if is_ppv_part:
                     await freeze_fan_for_review(fan_id, "ppv_delivery_route_missing")
                 return
 
@@ -1946,13 +2004,13 @@ async def _debounced_auto_reply(
             try:
                 if local_test_delivery:
                     platform_message_id = (
-                        f"local-test:{delivery_reference}" if ppv_match else None
+                        f"local-test:{delivery_reference}" if is_ppv_part else None
                     )
                     print(
                         f"[AUTO TEST DELIVERY] fan={fan_id} "
-                        f"kind={'ppv' if ppv_match else 'text'} accepted=true"
+                        f"kind={'ppv' if is_ppv_part else 'text'} accepted=true"
                     )
-                elif ppv_match and contains_simulation_media(media_ids):
+                elif is_ppv_part and contains_simulation_media(media_ids):
                     # Belt and braces alongside services/ppv_delivery.py: this
                     # branch builds its own platform call, so it enforces the
                     # same invariant rather than trusting that planning already
@@ -1965,7 +2023,7 @@ async def _debounced_auto_reply(
                     )
                     await freeze_fan_for_review(fan_id, "simulation_media_on_live_route")
                     return
-                elif ppv_match:
+                elif is_ppv_part:
                     ppv_content = text_out if text_out else random.choice([
                         "here it is 😏",
                         "just for you...",
@@ -1999,7 +2057,7 @@ async def _debounced_auto_reply(
             except Exception as exc:
                 record_stage("fansly_send_ms", (time.perf_counter() - send_started) * 1000)
                 print(f"[AUTO DELIVERY ERROR] fan={fan_id}: {exc}")
-                if ppv_match:
+                if is_ppv_part:
                     await freeze_fan_for_review(fan_id, "ppv_send_failed")
                 return
             record_stage("fansly_send_ms", (time.perf_counter() - send_started) * 1000)
@@ -2010,7 +2068,7 @@ async def _debounced_auto_reply(
                 stack_marker = message_ai_stack_metadata(
                     route, profile_id=stack.profile_id
                 )
-                if ppv_match:
+                if is_ppv_part:
                     await save_ppv_message_receipt(
                         fan_id=fan_id,
                         creator_id=creator_id,
@@ -2032,7 +2090,7 @@ async def _debounced_auto_reply(
                 if local_test_delivery:
                     print(
                         f"[AUTO TEST DELIVERY] fan={fan_id} "
-                        f"kind={'ppv' if ppv_match else 'text'} message_persisted=true"
+                        f"kind={'ppv' if is_ppv_part else 'text'} message_persisted=true"
                     )
             except Exception as exc:
                 # Delivery already happened. Freeze rather than retrying and
@@ -2041,7 +2099,7 @@ async def _debounced_auto_reply(
                 print(f"[AUTO PERSIST ERROR] fan={fan_id}: {exc}")
                 return
 
-            if ppv_match:
+            if is_ppv_part:
                 try:
                     from datetime import datetime, timedelta, timezone
 
@@ -2380,11 +2438,11 @@ async def record_ppv_purchase(
         # session lifecycle.
         state = await get_fan_state(fan_id)
         state.status = FanStatus.IDLE
-        state.selected_package_id = None
-        state.selected_package_set_id = None
-        state.selected_package_set_ids = []
-        state.selected_package_label = None
-        state.selected_package_price_cents = None
+        state.pending_offer = None
+        state.accepted_offer_id = None
+        state.accepted_offer_set_id = None
+        state.accepted_offer_label = None
+        state.accepted_offer_price_cents = None
         await save_fan_state(fan_id, creator_id, state)
 
     if creator_id and not already_recorded:

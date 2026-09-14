@@ -17,7 +17,7 @@ def test_director_discovery_controls_noncommercial_strategy():
 
     assert result.goal == SessionGoal.QUALIFY
     assert result.next_action == NextBestAction.ASK_ONE_QUESTION
-    assert result.must_ask_question is True
+    assert result.must_ask_question is False
 
 
 def test_director_soft_offer_seeds_content_without_inventing_offer():

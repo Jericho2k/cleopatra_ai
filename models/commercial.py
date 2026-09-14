@@ -33,22 +33,21 @@ class FanStatus(str, Enum):
 class EventType(str, Enum):
     """Typed observations extracted from the fan's message.
 
-    These intentionally separate package acceptance, present affordability and a
-    future payday. A fan can accept a cheaper package *and* mention payday in the
-    same message; that must not collapse into a generic decline.
+    These intentionally separate offer acceptance, present affordability and a
+    future payday. A fan can accept the offer *and* mention payday in the same
+    message; that must not collapse into a generic decline.
     """
 
     WANTS_EXPLICIT = "WANTS_EXPLICIT"
     WANTS_MEDIA = "WANTS_MEDIA"
-    MONEY_UNAVAILABLE = "MONEY_UNAVAILABLE"  # cannot buy any available option now
+    MONEY_UNAVAILABLE = "MONEY_UNAVAILABLE"  # cannot buy what is on the table now
     MONEY_AVAILABLE = "MONEY_AVAILABLE"
     PAYDAY_MENTIONED = "PAYDAY_MENTIONED"
     BUDGET_STATED = "BUDGET_STATED"  # voluntarily states an amount available now
     BUDGET_LIMIT_STATED = "BUDGET_LIMIT_STATED"  # accepts/limits current spend to X
-    COUNTEROFFER_STATED = "COUNTEROFFER_STATED"  # explicit negotiated amount, not an offered package
-    PACKAGE_SELECTED = "PACKAGE_SELECTED"
+    COUNTEROFFER_STATED = "COUNTEROFFER_STATED"  # explicit negotiated amount below the offer
+    OFFER_ACCEPTED = "OFFER_ACCEPTED"
     OFFER_DETAILS_REQUESTED = "OFFER_DETAILS_REQUESTED"
-    OFFER_SELECTION_AMBIGUOUS = "OFFER_SELECTION_AMBIGUOUS"
     OFFER_DECLINED = "OFFER_DECLINED"
     DEFERRED_PURCHASE = "DEFERRED_PURCHASE"
     READY_TO_BUY = "READY_TO_BUY"
@@ -61,31 +60,29 @@ class CommercialEvent(BaseModel):
     raw_expression: str = ""
     confidence: float = 1.0
     amount_cents: int | None = None
-    package_position: Literal["first", "second"] | None = None
     metadata: dict = Field(default_factory=dict)
 
 
-class PackageOption(BaseModel):
-    """A real package backed by one or more approved vault sets.
+class Offer(BaseModel):
+    """ONE next paid unlock, backed by exactly one approved vault set.
 
-    ``set_id`` is retained for backward compatibility and points to the first
-    step. ``set_ids`` is authoritative for multi-step sessions.
+    There is deliberately no plural here and no notion of position. The fan is
+    never shown a menu, never told how many further steps might follow, and
+    never quoted a session total: he sees the next thing and its price. What
+    might come after it is internal choreography (services/media_packages.py
+    plans it from the same approved rows) and is not part of this object,
+    precisely so it cannot leak into the prompt.
     """
 
-    package_id: str
+    offer_id: str
     label: str
     price_cents: int
-    set_id: str | None = None
-    set_ids: list[str] = Field(default_factory=list)
+    set_id: str
     experience: str | None = None
     legal_description: str | None = None
 
-    # How the offer is actually structured, so the writer can describe it
-    # honestly. A price presented for "3 photos" must not be delivered as two
-    # locked steps without the fan having been told it is a multi-part session.
-    step_count: int = 1
     media_count: int = 0
-    asset_types: list[str] = Field(default_factory=list)
+    asset_type: str = "photo_set"
 
     # Provenance of the price. Approved content bounds first, fan probe second.
     content_floor_cents: int | None = None
@@ -93,12 +90,17 @@ class PackageOption(BaseModel):
     price_reason_codes: list[str] = Field(default_factory=list)
 
     @property
-    def is_multi_step(self) -> bool:
-        return self.step_count > 1
+    def set_ids(self) -> list[str]:
+        """The delivery path plans in step lists; one offer is one step."""
+        return [self.set_id]
+
+    @property
+    def asset_types(self) -> list[str]:
+        return [self.asset_type]
 
     @property
     def includes_video(self) -> bool:
-        return "video" in self.asset_types
+        return self.asset_type == "video"
 
 
 class CreatorPolicy(BaseModel):
@@ -112,11 +114,13 @@ class CreatorPolicy(BaseModel):
     payday_reengagement_enabled: bool = True
     payday_send_hour_local: int = 18
     timezone: str = "UTC"
-    offer_two_packages: bool = True
-    quick_package_target_cents: int = 2500
-    full_package_target_cents: int = 6000
-    session_min_steps: int = 2
-    session_max_steps: int = 4
+    # How much approved content the NEXT unlock should be sized around. It is a
+    # content-size hint, not a price: the price comes from the approved range of
+    # the set that ends up chosen and from where this fan should be probed
+    # inside it. There is exactly one of these because there is exactly one next
+    # offer; the pair of "quick" and "full" budgets it replaces existed only to
+    # build the two-branch menu.
+    next_offer_target_cents: int = 2500
     post_purchase_cooldown_messages: int = 2
     require_purchase_before_next_step: bool = True
     require_operator_ppv_approval: bool = False
@@ -157,16 +161,17 @@ class FanCommercialState(BaseModel):
 
     # CONFIRMED only. We never store or optimize against an inferred spend ceiling.
     confirmed_budget_cents: int | None = None
-    budget_source: str | None = None  # fan_explicit | package_selected
+    budget_source: str | None = None  # fan_explicit | offer_accepted
 
-    # Exact ordered offer snapshot. While OFFER_PENDING this list is immutable
-    # except when a brand-new approved offer is intentionally presented.
-    offered_packages: list[PackageOption] = Field(default_factory=list)
-    selected_package_id: str | None = None
-    selected_package_set_id: str | None = None
-    selected_package_set_ids: list[str] = Field(default_factory=list)
-    selected_package_label: str | None = None
-    selected_package_price_cents: int | None = None
+    # The exact offer currently on the table, or None. Singular: the fan is
+    # shown one next unlock, so there is one snapshot to hold him to, and no
+    # ordinal for him to pick from. While OFFER_PENDING it is immutable except
+    # when a brand-new approved offer is intentionally presented.
+    pending_offer: Offer | None = None
+    accepted_offer_id: str | None = None
+    accepted_offer_set_id: str | None = None
+    accepted_offer_label: str | None = None
+    accepted_offer_price_cents: int | None = None
     last_offer_at: datetime | None = None
 
     payday_raw: str | None = None
@@ -179,7 +184,7 @@ class FanCommercialState(BaseModel):
     free_session_ended_at: datetime | None = None
     last_session_completed_at: datetime | None = None
     last_session_revenue_cents: int = 0
-    last_session_package_id: str | None = None
+    last_session_offer_id: str | None = None
     last_session_set_ids: list[str] = Field(default_factory=list)
     last_session_experience: str | None = None
     last_abandoned_ppv_at: datetime | None = None
@@ -195,15 +200,21 @@ class FanCommercialState(BaseModel):
 
 
 class ActionType(str, Enum):
-    """What the policy engine decides. The generator only expresses these."""
+    """What the policy engine decides. The generator only expresses these.
+
+    There is one commercial forward move — ``OFFER_NEXT_UNLOCK`` — and one
+    delivery move — ``SEND_NEXT_PPV_STEP``. The three actions they replace
+    (``PRESENT_SESSION_OPTIONS``, ``END_TEASER_AND_OFFER`` and
+    ``CREATE_PAID_SESSION``) all existed to run the same menu: present two
+    branches, wait for a choice, confirm the choice, then ask again before
+    sending. Acceptance now moves straight to delivery.
+    """
 
     CONTINUE_NORMAL_CHAT = "CONTINUE_NORMAL_CHAT"
     CONTINUE_FREE_TEXT = "CONTINUE_FREE_TEXT"
     START_FREE_TEASER = "START_FREE_TEASER"
-    END_TEASER_AND_OFFER = "END_TEASER_AND_OFFER"
-    ASK_ONE_QUALIFYING_QUESTION = "ASK_ONE_QUALIFYING_QUESTION"
-    PRESENT_SESSION_OPTIONS = "PRESENT_SESSION_OPTIONS"
-    CREATE_PAID_SESSION = "CREATE_PAID_SESSION"
+    DISCOVER_DESIRED_EXPERIENCE = "DISCOVER_DESIRED_EXPERIENCE"
+    OFFER_NEXT_UNLOCK = "OFFER_NEXT_UNLOCK"
     SEND_NEXT_PPV_STEP = "SEND_NEXT_PPV_STEP"
     PAUSE_NO_BUDGET = "PAUSE_NO_BUDGET"
     PAUSE_UNTIL_PAYDAY = "PAUSE_UNTIL_PAYDAY"
@@ -226,14 +237,16 @@ class CommercialDecision(BaseModel):
     must_not_send_media: bool = True
     may_be_explicit: bool = False
     mention_price: int | None = None
-    package_options: list[PackageOption] = Field(default_factory=list)
+    # The ONE next unlock this decision may talk about, or None. Never a list:
+    # the fan is not choosing between branches, and a decision that carried two
+    # was the thing that produced "quick $60 or full $140?".
+    next_offer: Offer | None = None
     mention_previous_interest: bool = False
     tone: str = ""
     new_status: FanStatus | None = None
     schedule_payday_followup: bool = False
     session_budget_cents: int | None = None
-    selected_package_set_id: str | None = None
-    selected_package_set_ids: list[str] = Field(default_factory=list)
+    accepted_offer_set_id: str | None = None
 
     must_not_ask_question: bool = False
     max_messages: int | None = None
@@ -241,18 +254,16 @@ class CommercialDecision(BaseModel):
 
     # Authoritative media capabilities for this turn. The writer is TOLD what
     # exists; it never infers it from a tag, a title or the fan's request.
-    # ``authorized`` is what this decision itself authorises, ``available`` what
-    # the current offer set could still contain, ``vault`` what exists in
-    # approved unsent inventory at all.
+    # ``authorized`` is what this decision itself authorises, ``vault`` what
+    # exists in approved unsent inventory at all.
     authorized_asset_types: list[str] = Field(default_factory=list)
-    available_package_asset_types: list[str] = Field(default_factory=list)
     vault_asset_types: list[str] = Field(default_factory=list)
 
     # Set when the fan explicitly asked for a media type that is not available.
     # A deterministic pivot, never a stall and never a fabricated promise.
     unavailable_asset_type_requested: str | None = None
 
-    # Set when the exact package the fan accepted can no longer be delivered and
+    # Set when the exact offer the fan accepted can no longer be delivered and
     # a replacement is being presented instead of silently substituted.
     replacement_for_unavailable: bool = False
 

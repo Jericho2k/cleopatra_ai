@@ -20,9 +20,7 @@ from typing import Iterable
 # Cleopatra-controlled content. Only these turns are sanitized.
 DELIVERY_ACTIONS = frozenset(
     {
-        "PRESENT_SESSION_OPTIONS",
-        "END_TEASER_AND_OFFER",
-        "CREATE_PAID_SESSION",
+        "OFFER_NEXT_UNLOCK",
         "SEND_NEXT_PPV_STEP",
         "RESUME_PREVIOUS_OFFER",
         "PAYDAY_REENGAGEMENT",

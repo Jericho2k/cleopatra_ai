@@ -2,20 +2,20 @@
 
 The production trace this pins down::
 
-    action=CREATE_PAID_SESSION
+    action=SEND_NEXT_PPV_STEP
     [SESSION] plan-session status=selected_set_unavailable
     [SIMULATION] outcome=no_send
 
 The same fan message, retried seconds later, planned a valid $30 set. Nothing
 about that turn was a decision to stay silent: the commercial layer had decided
-to sell, and a stale package snapshot in the middle of the pipeline turned that
+to sell, and a stale offer snapshot in the middle of the pipeline turned that
 decision into silence — reported to the operator as the product working.
 
 Two invariants are tested here, and they pull in opposite directions, which is
 exactly why both need pinning:
 
 * a recoverable failure is repaired and the turn continues;
-* a package the fan ACCEPTED by name and price is never silently swapped for a
+* an offer the fan ACCEPTED by name and price is never silently swapped for a
   different one, however good the replacement is. He is shown it instead.
 """
 
@@ -33,7 +33,7 @@ from models.commercial import (
     CreatorPolicy,
     FanCommercialState,
     FanStatus,
-    PackageOption,
+    Offer,
 )
 from services import session_plan_recovery
 from services.session_plan_recovery import (
@@ -49,15 +49,13 @@ def run(coro):
     return asyncio.run(coro)
 
 
-def package(package_id: str, price_cents: int, *set_ids: str) -> PackageOption:
-    return PackageOption(
-        package_id=package_id,
-        label="quick private session",
+def offer(offer_id: str, price_cents: int, set_id: str) -> Offer:
+    return Offer(
+        offer_id=offer_id,
+        label="private photo set",
         price_cents=price_cents,
-        set_id=set_ids[0] if set_ids else None,
-        set_ids=list(set_ids),
-        asset_types=["photo_set" for _ in set_ids],
-        step_count=len(set_ids) or 1,
+        set_id=set_id,
+        asset_type="photo_set",
     )
 
 
@@ -111,16 +109,15 @@ def test_only_contract_invalidating_statuses_re_present():
 def wired(monkeypatch):
     """Stub the four collaborators recovery uses, and record every state write."""
     state = FanCommercialState(status=FanStatus.OFFER_SELECTED)
-    state.selected_package_id = "package:quick:gone"
-    state.selected_package_set_ids = ["gone"]
-    state.selected_package_set_id = "gone"
-    state.selected_package_price_cents = 3000
+    state.accepted_offer_id = "offer:gone"
+    state.accepted_offer_set_id = "gone"
+    state.accepted_offer_price_cents = 3000
     state.confirmed_budget_cents = 3000
 
     store: dict = {
         "state": state,
         "saved": [],
-        "packages": [package("package:quick:fresh", 3000, "fresh-1", "fresh-2")],
+        "offer": offer("offer:fresh-1", 3000, "fresh-1"),
         "plan_results": [{"status": "ok", "session": {"status": "active", "plan": [{}]}}],
         "plan_calls": [],
     }
@@ -135,18 +132,15 @@ def wired(monkeypatch):
         store["saved"].append(
             {
                 "status": saved_state.status,
-                "selected_package_id": saved_state.selected_package_id,
-                "selected_package_set_ids": list(saved_state.selected_package_set_ids),
+                "accepted_offer_id": saved_state.accepted_offer_id,
+                "accepted_offer_set_id": saved_state.accepted_offer_set_id,
                 "confirmed_budget_cents": saved_state.confirmed_budget_cents,
-                "offered_packages": list(saved_state.offered_packages),
+                "pending_offer": saved_state.pending_offer,
             }
         )
 
-    async def fake_get_packages(*_args, **_kwargs):
-        return list(store["packages"]), ("photo_set",)
-
-    def fake_select(packages, _price_learning, max_options=2):
-        return list(packages)[:max_options]
+    async def fake_get_next_offer(*_args, **_kwargs):
+        return store["offer"], ("photo_set",)
 
     async def fake_plan(_creator_id, _fan_id, **kwargs):
         store["plan_calls"].append(kwargs)
@@ -156,9 +150,8 @@ def wired(monkeypatch):
     monkeypatch.setattr("db.commercial_queries.get_creator_policy", fake_get_creator_policy)
     monkeypatch.setattr("db.commercial_queries.save_fan_state", fake_save_fan_state)
     monkeypatch.setattr(
-        "db.commercial_queries.get_offerable_packages_with_inventory", fake_get_packages
+        "db.commercial_queries.get_next_offer_with_inventory", fake_get_next_offer
     )
-    monkeypatch.setattr("services.price_learning.select_recommended_packages", fake_select)
     monkeypatch.setattr("services.session_planner.plan_session_for_fan", fake_plan)
     return store
 
@@ -179,7 +172,7 @@ def test_a_generic_stale_plan_is_replanned_and_the_turn_continues(wired):
     assert recovery.present_replacement is False
     assert recovery.session is not None
     # It replanned against the freshly computed package, not the stale snapshot.
-    assert wired["plan_calls"][0]["selected_set_ids"] == ["fresh-1", "fresh-2"]
+    assert wired["plan_calls"][0]["accepted_set_id"] == "fresh-1"
 
 
 def test_the_stale_selection_is_cleared_before_anything_else_reads_it(wired):
@@ -191,14 +184,11 @@ def test_the_stale_selection_is_cleared_before_anything_else_reads_it(wired):
             had_accepted_contract=False,
         )
     )
-    # Whatever else happened, the dead package id is gone from persisted state.
-    assert all(
-        saved["selected_package_id"] != "package:quick:gone"
-        for saved in wired["saved"]
-    )
+    # Whatever else happened, the dead offer id is gone from persisted state.
+    assert all(saved["accepted_offer_id"] != "offer:gone" for saved in wired["saved"])
 
 
-def test_an_accepted_package_is_re_presented_never_substituted(wired):
+def test_an_accepted_offer_is_re_offered_never_substituted(wired):
     """He said yes to a specific thing at a specific price. A different thing at
     that price is a substitution he never agreed to."""
     recovery = run(
@@ -214,9 +204,7 @@ def test_an_accepted_package_is_re_presented_never_substituted(wired):
     assert recovery.present_replacement is True
     assert recovery.accepted_contract_lost is True
     assert recovery.turn_may_continue is True
-    assert [p.package_id for p in recovery.replacement_packages] == [
-        "package:quick:fresh"
-    ]
+    assert recovery.replacement_offer.offer_id == "offer:fresh-1"
     # Nothing was planned, and the accepted budget no longer stands.
     assert wired["plan_calls"] == []
     assert wired["saved"][-1]["status"] is FanStatus.OFFER_PENDING
@@ -224,7 +212,7 @@ def test_an_accepted_package_is_re_presented_never_substituted(wired):
 
 
 def test_no_replacement_inventory_continues_the_conversation_without_an_offer(wired):
-    wired["packages"] = []
+    wired["offer"] = None
 
     recovery = run(
         recover_session_plan(

@@ -66,8 +66,7 @@ def _purchase_intent_signal(
         or offer_response == "accepted"
         or action
         in {
-            "PRESENT_SESSION_OPTIONS",
-            "CREATE_PAID_SESSION",
+            "OFFER_NEXT_UNLOCK",
             "SEND_NEXT_PPV_STEP",
             "RESUME_PREVIOUS_OFFER",
         }

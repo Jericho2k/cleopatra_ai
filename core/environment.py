@@ -72,10 +72,6 @@ def is_development() -> bool:
     return app_env() == DEVELOPMENT
 
 
-def is_test() -> bool:
-    return app_env() == TEST
-
-
 def is_production() -> bool:
     return app_env() == PRODUCTION
 

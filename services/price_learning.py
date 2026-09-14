@@ -17,7 +17,6 @@ from db.price_learning_queries import (
 from models.price_learning import (
     PriceLearningProfile,
     derive_price_learning_profile,
-    select_recommended_packages,
 )
 from services.affordability import get_affordability_context
 from services.fan_lifecycle import get_fan_lifecycle_context
@@ -119,5 +118,4 @@ __all__ = [
     "get_price_learning_context",
     "price_learning_enabled",
     "refresh_price_learning",
-    "select_recommended_packages",
 ]

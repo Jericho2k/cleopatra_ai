@@ -208,11 +208,11 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
             "desired_experience": commercial_json.get("desired_experience"),
             "confirmed_budget_cents": commercial_json.get("confirmed_budget_cents"),
             "budget_source": commercial_json.get("budget_source"),
-            "offered_packages": commercial_json.get("offered_packages") or [],
-            "selected_package_id": commercial_json.get("selected_package_id"),
-            "selected_package_label": commercial_json.get("selected_package_label"),
-            "selected_package_price_cents": commercial_json.get(
-                "selected_package_price_cents"
+            "pending_offer": commercial_json.get("pending_offer"),
+            "accepted_offer_id": commercial_json.get("accepted_offer_id"),
+            "accepted_offer_label": commercial_json.get("accepted_offer_label"),
+            "accepted_offer_price_cents": commercial_json.get(
+                "accepted_offer_price_cents"
             ),
             "last_offer_at": commercial_json.get("last_offer_at"),
             "last_declined_price_cents": commercial_json.get(

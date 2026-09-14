@@ -21,15 +21,6 @@ def adaptive_planner_enabled() -> bool:
     }
 
 
-async def get_adaptive_session_context(fan_id: str) -> dict[str, Any]:
-    if not adaptive_planner_enabled():
-        return {}
-    row = await get_session_strategy(fan_id)
-    if not row:
-        return {}
-    return {key: value for key, value in row.items() if key not in {"fan_id", "creator_id", "created_at"}}
-
-
 async def plan_next_action(
     *,
     creator_id: str,

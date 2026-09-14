@@ -13,8 +13,12 @@ session, and conversation stage into one explainable next-best action.
 - `writer_goal`: concise instruction for the writer
 - `writer_avoid`: forbidden tactics for this turn
 - `approved_offer_ids` / `approved_offer_prices_cents`: copied only from the
-  commercial decision
+  commercial decision. Lists by storage shape, never by content: there is one
+  next offer, so they hold at most one entry each
 - `selected_offer_price_cents`: exact approved amount, when one exists
+- `must_ask_question`: retained on the model for the stored shape, and never set
+  by the pipeline. "Ask exactly one question" is how the creator turns into an
+  interviewer; the outcome it wanted is stated as a `writer_goal` instead
 - `route_hint`: default, commercial_complex, or safety_sensitive
 - `reason_codes`: explainability and audit
 
@@ -27,7 +31,7 @@ environment safety fallback
 → fan price-learning range
 → current affordability
 → approved vault-set boundaries
-→ final approved package price
+→ the one next offer's approved price
 ```
 
 The later UI should edit `price_learning_policy_scopes.settings`; Railway values

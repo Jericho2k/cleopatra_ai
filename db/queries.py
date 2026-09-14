@@ -137,26 +137,6 @@ async def create_fan(creator_id: str, platform_fan_id: str, display_name: str) -
     return await asyncio.to_thread(_create)
 
 
-async def update_fan_spend(fan_id: str, total_spent: int, spend_tier: str) -> None:
-    def _update():
-        get_supabase().table("fans").update({"total_spent": total_spent, "spend_tier": spend_tier}).eq("id", fan_id).execute()
-
-    await asyncio.to_thread(_update)
-
-
-async def increment_fan_total_spent(fan_id: str, amount: int) -> None:
-    def _update():
-        get_supabase().rpc(
-            "increment_fan_spent",
-            {
-                "fan_id_input": fan_id,
-                "amount_input": amount,
-            },
-        ).execute()
-
-    await asyncio.to_thread(_update)
-
-
 async def get_sent_ppv(fan_id: str) -> list[dict]:
     """Return list of PPV media already sent to this fan with purchase status.
 
@@ -498,24 +478,6 @@ async def update_message_media_context(message_id: str, media_context: dict) -> 
         )
 
     await asyncio.to_thread(_update)
-
-
-async def get_creator_fansly_account_id(creator_id: str) -> str | None:
-    def _get():
-        r = (
-            get_supabase()
-            .table("creators")
-            .select("fansly_account_id")
-            .eq("id", creator_id)
-            .limit(1)
-            .execute()
-        )
-        if not r.data:
-            return None
-        v = r.data[0].get("fansly_account_id")
-        return str(v) if v is not None else None
-
-    return await asyncio.to_thread(_get)
 
 
 async def get_creator_persona(creator_id: str) -> Persona | None:

@@ -33,7 +33,7 @@ class DirectorAction(str, Enum):
     BUILD_TENSION = "BUILD_TENSION"
     SEED_PREMIUM_CONTENT = "SEED_PREMIUM_CONTENT"
     PIVOT_ENERGY = "PIVOT_ENERGY"
-    PRESENT_APPROVED_OPTIONS = "PRESENT_APPROVED_OPTIONS"
+    OFFER_NEXT_UNLOCK = "OFFER_NEXT_UNLOCK"
     HANDLE_OBJECTION = "HANDLE_OBJECTION"
     WAIT_FOR_PAYMENT = "WAIT_FOR_PAYMENT"
     CONTINUE_PAID_SESSION = "CONTINUE_PAID_SESSION"
@@ -54,8 +54,14 @@ class ConversationDirectorState(BaseModel):
     engagement_score: int = 0
     qualification_complete: bool = False
     offer_eligible: bool = False
+    #: The DISCOVER_PREFERENCE objective is live. Named "question_due" for the
+    #: stored shape's sake; it does NOT mean the reply must contain a question.
+    #: Finding out what he wants is the outcome, and a question is only one way
+    #: of getting there.
     question_due: bool = False
     must_not_ask_question: bool = False
+    #: He has already said plainly that he wants content. No warm-up is owed.
+    direct_interest: bool = False
     transition_reason: str = "new_conversation"
     director_version: int = 1
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -75,6 +81,7 @@ class ConversationDirectorState(BaseModel):
             "offer_eligible": self.offer_eligible,
             "question_due": self.question_due,
             "must_not_ask_question": self.must_not_ask_question,
+            "direct_interest": self.direct_interest,
             "transition_reason": self.transition_reason,
             "director_version": self.director_version,
             "updated_at": self.updated_at.isoformat(),
@@ -194,13 +201,10 @@ def advance_conversation_director(
             ConversationPhase.PAYMENT_PENDING,
             ConversationPhase.PAID_SESSION,
         }
-        or (
-            phase == ConversationPhase.SOFT_OFFER
-            and engagement_score >= 55
-            and fan_turn_count >= 5
-        ),
+        or (phase == ConversationPhase.SOFT_OFFER and (direct_interest or engagement_score >= 45)),
         question_due=action == DirectorAction.DISCOVER_PREFERENCE,
         must_not_ask_question=must_not_ask,
+        direct_interest=direct_interest,
     )
 
 
@@ -214,15 +218,19 @@ def _choose_noncommercial_move(
     qualification_complete: bool,
     engagement_score: int,
 ) -> tuple[ConversationPhase, DirectorAction, str]:
-    if fan_turn_count <= 1:
-        return ConversationPhase.OPENING, DirectorAction.RESPOND_AND_OPEN, "opening_turn"
-
-    if direct_interest and fan_turn_count >= 3:
+    # Direct interest is checked FIRST and without a turn count. A fan who opens
+    # with "your bikini post made me hard, I want to see what's underneath" has
+    # already told us where the conversation is; walking him through OPENING →
+    # RAPPORT → QUALIFY → TENSION anyway is the state machine talking to itself.
+    if direct_interest:
         return (
             ConversationPhase.SOFT_OFFER,
             DirectorAction.SEED_PREMIUM_CONTENT,
-            "active_interest_without_authorized_offer",
+            "explicit_interest_no_warmup_required",
         )
+
+    if fan_turn_count <= 1:
+        return ConversationPhase.OPENING, DirectorAction.RESPOND_AND_OPEN, "opening_turn"
 
     if prev_phase in {None, ConversationPhase.OPENING}:
         if warm_signal:
@@ -267,7 +275,7 @@ def _choose_noncommercial_move(
         )
 
     if prev_phase == ConversationPhase.TENSION:
-        if prev_turns >= 2 and fan_turn_count >= 6 and engagement_score >= 55:
+        if prev_turns >= 1 or engagement_score >= 45:
             return (
                 ConversationPhase.SOFT_OFFER,
                 DirectorAction.SEED_PREMIUM_CONTENT,
@@ -315,7 +323,7 @@ def _authoritative_state(
         return ConversationPhase.SAFETY, DirectorAction.HAND_OFF, "crisis_or_handoff", True
     if commercial_action in {"PAUSE_NO_BUDGET", "PAUSE_UNTIL_PAYDAY"}:
         return ConversationPhase.PAUSED, DirectorAction.PAUSE_SELLING, "commercial_pause", True
-    if commercial_action == "CREATE_PAID_SESSION" or (
+    if (
         active_session.get("status") == "active"
         and active_session.get("awaiting_purchase_index") is not None
     ):
@@ -332,14 +340,10 @@ def _authoritative_state(
             "confirmed_paid_session",
             False,
         )
-    if commercial_action in {
-        "PRESENT_SESSION_OPTIONS",
-        "END_TEASER_AND_OFFER",
-        "RESUME_PREVIOUS_OFFER",
-    }:
+    if commercial_action in {"OFFER_NEXT_UNLOCK", "RESUME_PREVIOUS_OFFER"}:
         return (
             ConversationPhase.OFFER,
-            DirectorAction.PRESENT_APPROVED_OPTIONS,
+            DirectorAction.OFFER_NEXT_UNLOCK,
             "commercial_policy_authorized_offer",
             False,
         )
@@ -419,6 +423,7 @@ def _build_state(
     offer_eligible: bool,
     question_due: bool,
     must_not_ask_question: bool,
+    direct_interest: bool = False,
 ) -> ConversationDirectorState:
     return ConversationDirectorState(
         phase=phase,
@@ -434,6 +439,7 @@ def _build_state(
         offer_eligible=offer_eligible,
         question_due=question_due,
         must_not_ask_question=must_not_ask_question,
+        direct_interest=direct_interest,
         transition_reason=reason,
     )
 

@@ -202,18 +202,149 @@ _SELF_PREFERENCE_MARKERS: tuple[str, ...] = (
     "i never",
 )
 
-_SYSTEM_PROMPT = """You extract ordinary personal facts that a CREATOR has just stated about herself in a chat message she sent to a fan.
+_SYSTEM_PROMPT = """You extract DURABLE, ORDINARY personal facts that a CREATOR has just stated about herself in a chat message she sent to a fan.
 
 Return ONLY valid JSON, no markdown:
 {"facts": [{"topic": "favorite color", "value": "dark green"}]}
 
+A fact qualifies only if it would still be true next month, in a different conversation, with a different person.
+
+EXTRACT (stable taste and habit):
+- favorite color: dark green
+- favorite food: sushi
+- music taste: r&b
+- coffee: prefers iced coffee
+- hobby: drawing
+
+NEVER EXTRACT (transient feeling, flirtation, or something about THIS fan):
+- "likes knowing what gets your attention"
+- "likes making you hard"
+- "feels naughty tonight"
+- "wants to tease this fan"
+- "thinks this fan is cute"
+- "is excited right now"
+Those are things she is saying to him right now, not things she is. Flirting is not a fact.
+
 Rules:
-- Only facts the CREATOR stated about HERSELF in her message. Never anything about the fan, and never anything the fan said.
+- Only facts the CREATOR stated about HERSELF. Never anything about the fan, never anything the fan said, and never anything about how she feels about him.
 - Only ordinary, harmless preferences and opinions: a favourite colour, a food, a drink, music, a film or show, a book, a hobby, a pet, a small like or dislike.
 - NEVER extract her name, age, where she is from, where she lives, her job, her studies, her background, her family or relationship status, whether she can meet anyone, prices, or anything about the platform or her account. Those are not yours to record.
-- "topic" is a short lowercase noun phrase naming what the fact is about ("favorite color", "coffee", "music taste"). "value" is what she said, in a few words.
+- NEVER extract a current mood, arousal, energy, or anything qualified by "right now", "tonight" or "today".
+- "topic" is a short lowercase noun phrase naming what the fact is about ("favorite color", "coffee", "music taste"). It is never a sentence and never starts with a verb. "value" is what she said, in a few words.
 - If she stated no such fact, return {"facts": []}. An empty list is the correct answer far more often than not.
 """
+
+
+# Words that make a "fact" something she is doing in this conversation rather
+# than something she is. This is the deterministic half of the filter, and it is
+# the half that matters: the model produced
+# "interest in attention: likes knowing what gets your attention" as a durable
+# creator fact, and no amount of prompt wording makes that impossible.
+_TRANSIENT_MARKERS: tuple[str, ...] = (
+    "right now",
+    "tonight",
+    "today",
+    "at the moment",
+    "currently",
+    "this evening",
+    "mood",
+    "feeling",
+    "feels",
+    "horny",
+    "turned on",
+    "aroused",
+    "wet",
+    "hard",
+    "excited",
+    "naughty",
+    "playful mood",
+    "in the mood",
+    "attention",
+    "tease",
+    "teasing",
+    "flirt",
+    "flirting",
+    "seduce",
+    "spoil",
+    "chat",
+    "chatting",
+    "message",
+    "messaging",
+    "texting",
+    "talking to",
+)
+
+# Words that make a "fact" about a relationship with THIS fan. A creator legend
+# is one thing shared by every conversation she has; anything true only of one
+# fan has no business in it.
+_RELATIONAL_MARKERS: tuple[str, ...] = (
+    "you",
+    "your",
+    "yours",
+    "u",
+    "ur",
+    "him",
+    "his",
+    "he",
+    "fan",
+    "fans",
+    "subscriber",
+    "guys",
+    "men",
+)
+
+# A topic that begins with one of these is a sentence about what she is doing,
+# not a noun phrase naming a durable preference.
+_STATEMENT_OPENERS: tuple[str, ...] = (
+    "likes",
+    "like",
+    "loves",
+    "love",
+    "wants",
+    "want",
+    "enjoys",
+    "enjoy",
+    "feels",
+    "feel",
+    "thinks",
+    "think",
+    "is",
+    "was",
+    "being",
+    "knowing",
+    "making",
+    "getting",
+    "having",
+)
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z']+", str(text or "").lower())
+
+
+def is_transient_or_relational(topic: str, value: str) -> bool:
+    """True when this "fact" is flirtation, a current feeling, or about one fan.
+
+    Checked on the topic AND the value, because the model splits the same
+    non-fact across both: topic "interest in attention", value "likes knowing
+    what gets your attention".
+    """
+    blob = f"{topic} {value}".lower()
+    words = set(_words(blob))
+
+    if any(marker in words for marker in _RELATIONAL_MARKERS):
+        return True
+    for marker in _TRANSIENT_MARKERS:
+        if " " in marker:
+            if marker in blob:
+                return True
+        elif marker in words:
+            return True
+
+    topic_words = _words(topic)
+    if topic_words and topic_words[0] in _STATEMENT_OPENERS:
+        return True
+    return False
 
 # Rendered form of one soft fact, and how it is read back apart again.
 _ENTRY_SEPARATOR = ": "
@@ -303,6 +434,8 @@ def new_legend_entries(
         if not topic or not value:
             continue
         if is_protected_topic(topic):
+            continue
+        if is_transient_or_relational(topic, value):
             continue
         if topic in known:
             continue

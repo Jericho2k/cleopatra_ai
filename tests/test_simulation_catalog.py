@@ -293,7 +293,7 @@ def test_the_auto_delivery_branch_refuses_simulation_media():
         Path(__file__).resolve().parents[1] / "services" / "suggestions.py"
     ).read_text(encoding="utf-8")
 
-    assert "elif ppv_match and contains_simulation_media(media_ids):" in source
+    assert "elif is_ppv_part and contains_simulation_media(media_ids):" in source
     assert "simulation_media_on_live_route" in source
 
 

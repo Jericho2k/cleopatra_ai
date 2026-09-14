@@ -36,12 +36,11 @@ class NextBestAction(str, Enum):
     BUILD_TENSION = "BUILD_TENSION"
     SEED_PREMIUM_CONTENT = "SEED_PREMIUM_CONTENT"
     PIVOT_ENERGY = "PIVOT_ENERGY"
-    PRESENT_APPROVED_OPTIONS = "PRESENT_APPROVED_OPTIONS"
+    OFFER_NEXT_UNLOCK = "OFFER_NEXT_UNLOCK"
     ACCEPT_NO_AND_RESET = "ACCEPT_NO_AND_RESET"
     HOLD_PRICE = "HOLD_PRICE"
     PAUSE_SELLING = "PAUSE_SELLING"
     RESUME_PREVIOUS_OFFER = "RESUME_PREVIOUS_OFFER"
-    CREATE_PAID_SESSION = "CREATE_PAID_SESSION"
     SEND_NEXT_STEP = "SEND_NEXT_STEP"
     POST_SESSION_FOLLOWUP = "POST_SESSION_FOLLOWUP"
 
@@ -52,6 +51,11 @@ class SessionStrategy(BaseModel):
     next_action: NextBestAction = NextBestAction.CONTINUE_CHAT
     writer_goal: str = "continue naturally and preserve rapport"
     writer_avoid: list[str] = Field(default_factory=list)
+    #: An OBJECTIVE, never a sentence-level instruction. Nothing in the pipeline
+    #: sets it any more: "ask exactly one question" is how the creator turns
+    #: into an interviewer, and the outcome it wanted — learning what he wants —
+    #: is stated as a writer_goal instead. Kept on the model because the stored
+    #: strategy context and its audit rows are a persisted shape.
     must_ask_question: bool = False
     must_not_ask_question: bool = False
     max_messages: int | None = None
@@ -158,29 +162,6 @@ def derive_session_strategy(
             **shared,
         )
 
-    if action == "CREATE_PAID_SESSION":
-        return SessionStrategy(
-            goal=SessionGoal.CLOSE,
-            phase="OFFER_SELECTED",
-            next_action=NextBestAction.CREATE_PAID_SESSION,
-            writer_goal=(
-                "confirm the exact approved selection and start only the purchase-gated "
-                "offer flow; do not describe it as already purchased"
-            ),
-            writer_avoid=[
-                "claiming payment is confirmed",
-                "renegotiation",
-                "different package",
-                "different price",
-                "extra qualification",
-            ],
-            must_not_ask_question=True,
-            max_messages=2,
-            route_hint="commercial_complex",
-            reason_codes=["approved_offer_selected", "selection_is_not_purchase"],
-            **shared,
-        )
-
     if (
         active_session.get("status") == "active"
         and active_session.get("awaiting_purchase_index") is not None
@@ -215,19 +196,20 @@ def derive_session_strategy(
             phase="OFFER_SELECTED",
             next_action=NextBestAction.SEND_NEXT_STEP,
             writer_goal=(
-                "send the exact selected step as a locked purchase-gated PPV; "
-                "do not describe it as already purchased or delivered"
+                "he already said yes; write the message the unlock arrives with "
+                "and nothing else. Do not describe it as already purchased"
             ),
             writer_avoid=[
                 "claiming payment is confirmed",
+                "asking again whether he wants it",
                 "reaction to unseen content",
-                "different package",
+                "different content",
                 "different price",
             ],
             must_not_ask_question=True,
             max_messages=1,
             route_hint="commercial_complex",
-            reason_codes=["recovered_selected_ppv", "selection_is_not_purchase"],
+            reason_codes=["offer_accepted", "acceptance_is_not_purchase"],
             **shared,
         )
 
@@ -247,28 +229,39 @@ def derive_session_strategy(
             **shared,
         )
 
-    if action in {"PRESENT_SESSION_OPTIONS", "END_TEASER_AND_OFFER"}:
+    if action == "OFFER_NEXT_UNLOCK":
         return SessionStrategy(
             goal=SessionGoal.PRESENT_OFFER,
             phase="OFFER",
-            next_action=NextBestAction.PRESENT_APPROVED_OPTIONS,
-            writer_goal="present only the approved options clearly and let the fan choose",
-            writer_avoid=["invented bundle", "invented price", "hidden discount", "third option"],
-            must_ask_question=True,
+            next_action=NextBestAction.OFFER_NEXT_UNLOCK,
+            writer_goal=(
+                "stay in the moment and name the one next thing and its price once"
+            ),
+            writer_avoid=[
+                "invented bundle",
+                "invented price",
+                "hidden discount",
+                "a second option",
+                "a menu",
+                "what comes after this",
+                "a session total",
+            ],
             max_messages=2,
             route_hint="commercial_complex",
-            reason_codes=["commercial_policy_requests_approved_options"],
+            reason_codes=["commercial_policy_authorized_one_offer"],
             **shared,
         )
 
-    if action == "ASK_ONE_QUALIFYING_QUESTION":
+    if action == "DISCOVER_DESIRED_EXPERIENCE":
         return SessionStrategy(
             goal=SessionGoal.QUALIFY,
             phase="QUALIFICATION",
             next_action=NextBestAction.ASK_ONE_QUESTION,
-            writer_goal="ask one natural question that reveals the desired experience",
+            writer_goal=(
+                "learn what he actually wants — a question is one way, an "
+                "observation or a tease that invites him to say more is another"
+            ),
             writer_avoid=["multiple questions", "price pitch", "premature PPV", "interview tone"],
-            must_ask_question=True,
             max_messages=2,
             reason_codes=["commercial_policy_requests_qualification"],
             **shared,
@@ -291,15 +284,15 @@ def derive_session_strategy(
             return SessionStrategy(
                 goal=SessionGoal.PRESENT_OFFER,
                 phase="OFFER",
-                next_action=NextBestAction.PRESENT_APPROVED_OPTIONS,
+                next_action=NextBestAction.OFFER_NEXT_UNLOCK,
                 writer_goal=(
-                    "explain or restate the exact persisted approved options in their "
-                    "original order"
+                    "answer him about the exact thing already on the table, at the "
+                    "price it already has"
                 ),
                 writer_avoid=[
-                    "new package",
-                    "new price",
-                    "reordered options",
+                    "a different thing",
+                    "a new price",
+                    "a second option",
                     "invented content",
                     "rapport reset",
                 ],
@@ -361,8 +354,8 @@ def derive_session_strategy(
                 phase=director_phase or "QUALIFICATION",
                 next_action=NextBestAction.ASK_ONE_QUESTION,
                 writer_goal=(
-                    "react first, then ask exactly one playful context-specific "
-                    "question that reveals what he liked or wants"
+                    "react first, then give him something that reveals what he "
+                    "liked or wants — a guess, a tease, an opinion, or a question"
                 ),
                 writer_avoid=[
                     "multiple questions",
@@ -370,7 +363,6 @@ def derive_session_strategy(
                     "price pitch",
                     "repeating the previous tease",
                 ],
-                must_ask_question=True,
                 max_messages=2,
                 route_hint="default",
                 **director_shared,
@@ -502,7 +494,6 @@ def derive_session_strategy(
             next_action=NextBestAction.ASK_ONE_QUESTION,
             writer_goal="learn one useful preference while keeping the exchange playful",
             writer_avoid=["interview", "price pitch", "generic menu", "multiple questions"],
-            must_ask_question=True,
             reason_codes=["first_purchase_discovery"],
             **shared,
         )
@@ -541,20 +532,19 @@ def derive_session_strategy(
 
 
 def _approved_offers(decision: dict[str, Any]) -> tuple[list[str], list[int]]:
-    ids: list[str] = []
-    prices: list[int] = []
-    for raw in decision.get("package_options") or []:
-        if hasattr(raw, "model_dump"):
-            raw = raw.model_dump(mode="json")
-        if not isinstance(raw, dict):
-            continue
-        package_id = str(raw.get("package_id") or "")
-        if package_id:
-            ids.append(package_id)
-        price = _int_or_none(raw.get("price_cents"))
-        if price is not None:
-            prices.append(price)
-    return ids, prices
+    """The ONE approved offer this decision carries, as id and price lists.
+
+    Still lists because the strategy context and its audit rows are a stored
+    shape; there is never more than one entry in them.
+    """
+    raw = decision.get("next_offer")
+    if hasattr(raw, "model_dump"):
+        raw = raw.model_dump(mode="json")
+    if not isinstance(raw, dict):
+        return [], []
+    ids = [str(raw.get("offer_id"))] if raw.get("offer_id") else []
+    price = _int_or_none(raw.get("price_cents"))
+    return ids, ([price] if price is not None else [])
 
 
 def _enum_value(value: Any) -> str:

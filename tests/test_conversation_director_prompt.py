@@ -1,7 +1,7 @@
 from ai.prompt_builder import _render_conversation_director
 
 
-def test_director_prompt_enforces_one_question_and_repetition_guard():
+def test_director_prompt_states_the_discovery_objective_not_a_forced_question():
     rendered = _render_conversation_director(
         {
             "phase": "QUALIFY",
@@ -15,6 +15,8 @@ def test_director_prompt_enforces_one_question_and_repetition_guard():
     )
 
     lowered = rendered.lower()
-    assert "exactly one natural" in lowered
-    assert "all 3 reply options" in lowered
+    # An objective. "MANDATORY: ask exactly one question" is what turned the
+    # creator into an interviewer.
+    assert "find out more about what he actually wants" in lowered
+    assert "mandatory" not in lowered
     assert "do not repeat" in lowered

@@ -13,15 +13,15 @@ CONTENT VALUE / APPROVED PRICE BOUNDS      models/content_pricing.py, models/vau
 FAN-SPECIFIC PRICE POSITION / PROBE        models/price_learning.py
             |
             v
-ACTUAL APPROVED OFFER                      services/media_packages.py
+THE ONE NEXT APPROVED OFFER                services/media_packages.build_next_offer
             |
             v
-PER-STEP PPV PRICES                        models/vault_pricing.allocate_step_prices
+ITS SINGLE PPV PRICE                       models/vault_pricing.allocate_step_prices
 ```
 
 Each layer may only narrow the one above it. A fan-specific recommendation says
 *where inside* an approved range to price; it never moves content out of its
-range, and a package target never repriced content in the first place.
+range, and the content budget never repriced content in the first place.
 
 ## 2. Terms
 
@@ -84,42 +84,52 @@ value that no clean price can express (an approved fixed $17 stays $17). An
 agency that deliberately sets a 1-cent grid gets cent-level prices; nobody gets
 them by accident.
 
-## 6. Multi-step sessions
+## 6. One unlock, one price
 
-`allocate_step_prices(total, rows, step_cents=...)` returns per-step prices that
-simultaneously:
+A sold unlock is exactly one approved set. `allocate_step_prices(total, rows,
+step_cents=...)` still runs — with one row — so the price is verified to sit
+inside that set's own approved bounds and on the human price grid before the
+offer is ever presented. When it cannot, `build_next_offer` skips that rung and
+`plan_session_for_fan` returns `no_valid_allocation` rather than inventing a
+distribution.
 
-* stay inside each step's own approved bounds,
-* sit on a human price grid,
-* sum to **exactly** the sold total.
-
-When those cannot all hold it returns `None`. `package_from_sequence` runs the
-allocation *before* an offer is presented, so an unsellable structure never
-reaches the fan; `plan_session_for_fan` returns `no_valid_allocation` rather
-than inventing a distribution. The old weighted division always produced *a*
-number, which is how $25 became $10.63 + $14.37.
-
-A package covering more than one set is presented to the writer as a total for
-N parts, so "3 pics for $25" cannot describe a two-step session.
+This replaces the multi-part prepaid session. A price is never a total split
+across deliveries, so the failure it used to produce — $25 becoming $10.63 +
+$14.37 — has no shape left to occur in.
 
 ## 7. Photo -> video progression
 
-Default order for a generic offer: photo tease -> stronger photo -> video ->
-premium video. `build_offer_packages` builds openers from photo sets only and
-lets the premium package end on a coherent clip (`choose_video_finale`, which
-weights scene continuity above raw explicitness).
+`plan_progression` orders the INTERNAL ladder: photo tease -> stronger photo ->
+a coherent clip as the payoff (`choose_video_finale`, which weights scene
+continuity above raw explicitness). Only its first rung becomes an offer;
+the rest is choreography and is never quoted, counted or promised to the fan.
 
-Overrides: an explicit request for video (`wants_video`), a vault with only
-videos, and an already-selected package — all of which win immediately.
+Overrides: an explicit request for video (`wants_video`) and a vault with only
+videos both win immediately.
 
-## 8. Session choreography
+## 8. Incremental progression
 
-`session_progress(session)` gives the writer exact, writer-safe state: the step
-just purchased, the next planned step, and whether the scene, outfit, asset type
-or explicitness continues or escalates. The writer bridges from one to the next
-instead of waiting to be asked for more. Nothing here authorizes a send —
-purchase gating still decides that, and the cooldown turn is explicitly
-`must_not_send_media`.
+The fan sees the next unlock and its price. He is never told a session total,
+how many further pieces exist, or that a sequence exists at all.
+
+After a confirmed purchase the conversation returns to being a conversation for
+`post_purchase_cooldown_messages` turns (`must_not_send_media`, no price, no
+"want more?"). Only then may a NEXT offer be built — from approved unsent
+inventory, escalating from the piece he just unlocked, at a price probed from
+its own range and from his confirmed purchase evidence
+(`purchase_probe_bonus_bps`).
+
+`session_progress(session)` still gives the writer exact, writer-safe state
+about what he just unlocked. Nothing here authorizes a send — purchase gating
+decides that.
+
+## 8a. Delivery is deterministic
+
+`services/ppv_turn.plan_ppv_step_delivery` decides the media, the price and the
+asset type from the persisted plan BEFORE the writer runs. The writer is told
+only that something is attached and writes the message it arrives with; a
+`[PPV:...]` tag in free text is stripped rather than obeyed. Text and attachment
+go out as one message, so copy can never claim a delivery that failed.
 
 ## 9. Platform semantics
 
@@ -130,12 +140,18 @@ the word "link" are left alone.
 
 ## 10. Message shape
 
-`services/message_shape` decides the bubble count outside the model, because
-Full Auto sends option 1 verbatim and a model's chosen rhythm otherwise becomes
-the creator's whole personality. A 12-turn cycle gives ~67% single, ~25% double
-and ~8% triple; the position is keyed off the message being answered, since the
-visible history is capped and a counter derived from it would freeze. The
-policy only ever *merges* bubbles — it never splits a sentence to hit a target.
+`services/message_shape` decides the bubble count outside the model for
+`writer_v1` and `writer_v2`, because those versions send option 1 verbatim and a
+model's chosen rhythm otherwise becomes the creator's whole personality. A
+12-turn cycle gives ~67% single, ~25% double and ~8% triple; the position is
+keyed off the message being answered, since the visible history is capped and a
+counter derived from it would freeze. The policy only ever *merges* bubbles — it
+never splits a sentence to hit a target.
+
+`writer_v3` opts out: its Full Auto contract is one reply returned as
+`{"messages": [...]}`, whose entries are the bubbles that reply is actually sent
+in. A commercial `max_messages` cap still merges, and a turn that attaches paid
+media is always merged to one message.
 
 ## 11. Configuration
 
@@ -148,6 +164,15 @@ the category bridge is applied at read time. New dials, all optional:
 | `PRICE_LEARNING_EFFORTLESS_PURCHASE_STREAK` | `2` | Confirmed purchases before repeat-buyer uplift applies. |
 | `PRICE_LEARNING_CUSTOMER_PRICE_STEP_CENTS` | `500` | Customer-facing price grid. |
 | `PRICE_LEARNING_POLICY_CACHE_SECONDS` | `60` | In-process TTL for scoped pricing settings. |
+| `WRITER_PRIMARY_RETRY_ATTEMPTS` | `4` | Attempts against the profile's primary writer before any fallback (`cleo_v3` only). |
+| `WRITER_PRIMARY_RETRY_WAIT_SECONDS` | `5,30,60` | Waits before primary attempts 2, 3 and 4. |
+
+`db/incremental_offer_v1.sql` drops the two-package policy dials
+(`offer_two_packages`, `quick_package_target_cents`, `full_package_target_cents`,
+`session_min_steps`, `session_max_steps`) and the ordered offer snapshot
+(`fan_commercial_states.offered_packages` and the `selected_package_*` columns),
+backfilling the single `pending_offer` and `accepted_offer_*` columns from them
+first.
 
 The same keys are overridable per agency and per creator through
 `price_learning_policy_scopes.settings`.

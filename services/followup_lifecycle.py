@@ -122,27 +122,19 @@ def offer_reference(state: FanCommercialState) -> str:
     """Identify one immutable offer presentation without exposing vault IDs."""
     offered_at = as_utc(state.last_offer_at)
     material = [offered_at.isoformat() if offered_at else ""]
-    for package in state.offered_packages:
-        material.extend(
-            [
-                package.package_id,
-                str(package.price_cents),
-                ",".join(package.set_ids or ([package.set_id] if package.set_id else [])),
-            ]
-        )
+    offer = state.pending_offer
+    if offer is not None:
+        material.extend([offer.offer_id, str(offer.price_cents), offer.set_id])
     return hashlib.sha256("|".join(material).encode("utf-8")).hexdigest()[:24]
 
 
 def pending_offer_payload(state: FanCommercialState) -> dict[str, Any]:
     """Freeze the exact approved offer wording/context for a later follow-up."""
-    packages = [package.model_dump(mode="json") for package in state.offered_packages]
-    experiences = list(
-        dict.fromkeys(
-            str(package.experience or package.legal_description or "").strip()
-            for package in state.offered_packages
-            if str(package.experience or package.legal_description or "").strip()
-        )
-    )
+    offer = state.pending_offer
+    offer_json = offer.model_dump(mode="json") if offer is not None else None
+    experiences = [
+        str(offer.experience or offer.legal_description or "").strip()
+    ] if offer is not None and str(offer.experience or offer.legal_description or "").strip() else []
     desired = str(state.desired_experience or "").strip()
     primary = ""
     desired_words = {
@@ -165,7 +157,7 @@ def pending_offer_payload(state: FanCommercialState) -> dict[str, Any]:
         "desired_experience": desired,
         "primary_experience": primary,
         "approved_experiences": experiences,
-        "offered_packages": packages,
+        "pending_offer": offer_json,
     }
 
 
@@ -177,7 +169,7 @@ def pending_offer_expiry_obligation(
 ) -> FollowupObligation | None:
     if (
         state.status != FanStatus.OFFER_PENDING
-        or not state.offered_packages
+        or state.pending_offer is None
         or as_utc(state.last_offer_at) is None
     ):
         return None
@@ -202,7 +194,7 @@ def expire_pending_offer_state(
 ) -> tuple[FanCommercialState, FollowupObligation | None, bool]:
     """Expire only the exact offer snapshot named by the durable action."""
     output = state.model_copy(deep=True)
-    if output.status != FanStatus.OFFER_PENDING or not output.offered_packages:
+    if output.status != FanStatus.OFFER_PENDING or output.pending_offer is None:
         return output, None, False
     if str(payload.get("offer_reference") or "") != offer_reference(output):
         return output, None, False
@@ -211,12 +203,11 @@ def expire_pending_offer_state(
     preserved = pending_offer_payload(output)
     preserved["expired_at"] = expired_at.isoformat()
     output.status = FanStatus.IDLE
-    output.offered_packages = []
-    output.selected_package_id = None
-    output.selected_package_set_id = None
-    output.selected_package_set_ids = []
-    output.selected_package_label = None
-    output.selected_package_price_cents = None
+    output.pending_offer = None
+    output.accepted_offer_id = None
+    output.accepted_offer_set_id = None
+    output.accepted_offer_label = None
+    output.accepted_offer_price_cents = None
 
     obligation = None
     if policy.abandoned_offer_followup_enabled:
@@ -271,7 +262,7 @@ def complete_session_state(
     output.status = FanStatus.IDLE
     output.last_session_completed_at = completed_at
     output.last_session_revenue_cents = int(session.get("revenue_cents", 0) or 0)
-    output.last_session_package_id = session.get("commercial_package_id")
+    output.last_session_offer_id = session.get("commercial_offer_id")
     output.last_session_set_ids = list(session.get("set_ids") or [])
     output.last_session_experience = (
         output.desired_experience
@@ -280,12 +271,11 @@ def complete_session_state(
     )
     output.confirmed_budget_cents = None
     output.budget_source = None
-    output.offered_packages = []
-    output.selected_package_id = None
-    output.selected_package_set_id = None
-    output.selected_package_set_ids = []
-    output.selected_package_label = None
-    output.selected_package_price_cents = None
+    output.pending_offer = None
+    output.accepted_offer_id = None
+    output.accepted_offer_set_id = None
+    output.accepted_offer_label = None
+    output.accepted_offer_price_cents = None
 
     obligation = None
     if policy.post_session_followup_enabled:
@@ -317,7 +307,7 @@ def abandoned_ppv_payload(
     pending: dict[str, Any],
     *,
     desired_experience: str | None,
-    selected_package_id: str | None,
+    accepted_offer_id: str | None,
 ) -> dict[str, Any]:
     return {
         "payment_reference": pending_reference(pending),
@@ -326,5 +316,5 @@ def abandoned_ppv_payload(
         "price_cents": int(round(float(pending.get("price") or 0) * 100)),
         "sent_at": pending.get("sent_at"),
         "desired_experience": desired_experience or "",
-        "selected_package_id": selected_package_id,
+        "accepted_offer_id": accepted_offer_id,
     }

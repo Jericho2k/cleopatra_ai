@@ -54,10 +54,6 @@ class MessageShape:
         return {"target_bubbles": self.target_bubbles, "reason": self.reason}
 
 
-def bubble_count(text: str) -> int:
-    return max(1, len([part for part in str(text or "").split("|") if part.strip()]))
-
-
 def recent_bubble_counts(messages: Iterable[Any], *, limit: int = 6) -> list[int]:
     """Bubble counts of the most recent creator turns, oldest first.
 

@@ -14,10 +14,10 @@ def test_non_matching_offer_amount_becomes_counteroffer():
         and event.amount_cents == 2500
         for event in events
     )
-    assert not any(event.type == EventType.PACKAGE_SELECTED for event in events)
+    assert not any(event.type == EventType.OFFER_ACCEPTED for event in events)
 
 
-def test_matching_offer_amount_remains_package_selection():
+def test_matching_offer_amount_remains_offer_acceptance():
     result = normalize_commercial_facts(
         {},
         "can we do the $28 one?",
@@ -25,7 +25,7 @@ def test_matching_offer_amount_remains_package_selection():
     )
     events = extract_events(result)
     assert any(
-        event.type == EventType.PACKAGE_SELECTED
+        event.type == EventType.OFFER_ACCEPTED
         and event.amount_cents == 2800
         for event in events
     )

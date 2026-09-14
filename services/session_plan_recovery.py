@@ -2,7 +2,7 @@
 
 Production evidence this exists for::
 
-    action=CREATE_PAID_SESSION
+    action=SEND_NEXT_PPV_STEP
     [SESSION] plan-session status=selected_set_unavailable
     [SIMULATION] outcome=no_send
 
@@ -34,11 +34,11 @@ The four classes
 The contract boundary
 ---------------------
 Recovery may silently replace content the fan has not yet agreed to. It may NOT
-silently replace a package he accepted by name and price: that is a different
-product at the same price, and he never said yes to it. When the accepted
-contract is unavailable the turn downgrades to presenting the valid replacement,
-so the fan is told and asked, and the commercial state stops claiming a
-selection that cannot be delivered.
+silently replace the offer he accepted by name and price: that is a different
+product at the same price, and he never said yes to it. When the accepted offer
+is unavailable the turn downgrades to offering the valid replacement, so the fan
+is told, and the commercial state stops claiming an acceptance that cannot be
+delivered.
 """
 
 from __future__ import annotations
@@ -62,14 +62,17 @@ class PlanFailureClass(str, Enum):
 #   inventory may still support a different, honestly presented package.
 # no_valid_allocation — the accepted total cannot be split across these steps
 #   without inventing a price. A different step count usually can be.
-# missing_confirmed_budget — the planner was called without a contract. That is
-#   a caller bug, and recomputing options is exactly the repair.
+# missing_confirmed_budget — the planner was called without a price. That is a
+#   caller bug, and recomputing the next offer is exactly the repair.
+# missing_accepted_offer — the planner was called without a set. Same class:
+#   the fan state no longer names something sellable, so rebuild it.
 # no_sets — there is genuinely nothing approved and unsent left for this fan.
 _CLASSIFICATION: dict[str, PlanFailureClass] = {
     "selected_set_unavailable": PlanFailureClass.RECOVERABLE,
     "no_coherent_sequence": PlanFailureClass.RECOVERABLE,
     "no_valid_allocation": PlanFailureClass.RECOVERABLE,
     "missing_confirmed_budget": PlanFailureClass.RECOVERABLE,
+    "missing_accepted_offer": PlanFailureClass.RECOVERABLE,
     "no_sets": PlanFailureClass.IMPOSSIBLE,
 }
 
@@ -122,7 +125,7 @@ class PlanRecovery:
     status: str
     failure_class: PlanFailureClass
     session: dict | None = None
-    replacement_packages: list = None  # list[PackageOption]
+    replacement_offer: object | None = None  # Offer
     present_replacement: bool = False
     continue_without_offer: bool = False
     accepted_contract_lost: bool = False
@@ -162,11 +165,10 @@ async def recover_session_plan(
     from db.commercial_queries import (
         get_creator_policy,
         get_fan_state,
-        get_offerable_packages_with_inventory,
+        get_next_offer_with_inventory,
         save_fan_state,
     )
     from models.commercial import FanStatus
-    from services.price_learning import select_recommended_packages
     from services.session_planner import plan_session_for_fan
 
     failure_class = classify_plan_status(status)
@@ -181,17 +183,16 @@ async def recover_session_plan(
     state = await get_fan_state(fan_id)
     policy = await get_creator_policy(creator_id)
 
-    # Clear the stale snapshot before anything else reads it. A selection that
-    # cannot be delivered is not a selection.
-    state.selected_package_id = None
-    state.selected_package_set_id = None
-    state.selected_package_set_ids = []
-    state.selected_package_label = None
-    state.selected_package_price_cents = None
+    # Clear the stale snapshot before anything else reads it. An acceptance that
+    # cannot be delivered is not an acceptance.
+    state.accepted_offer_id = None
+    state.accepted_offer_set_id = None
+    state.accepted_offer_label = None
+    state.accepted_offer_price_cents = None
     if state.status == FanStatus.OFFER_SELECTED:
         state.status = FanStatus.OFFER_PENDING
 
-    packages, _vault_types = await get_offerable_packages_with_inventory(
+    offer, _vault_types = await get_next_offer_with_inventory(
         creator_id,
         fan_id,
         policy,
@@ -199,14 +200,9 @@ async def recover_session_plan(
         desired_experience=desired_experience or None,
         hard_ceiling_cents=hard_ceiling_cents,
     )
-    packages = select_recommended_packages(
-        packages,
-        price_learning or {},
-        max_options=2 if policy.offer_two_packages else 1,
-    )
 
-    if not packages:
-        state.offered_packages = []
+    if offer is None:
+        state.pending_offer = None
         state.status = FanStatus.IDLE
         state.confirmed_budget_cents = None
         await save_fan_state(fan_id, creator_id, state)
@@ -218,66 +214,62 @@ async def recover_session_plan(
             reason="no_replacement_inventory",
         )
 
-    state.offered_packages = packages
+    state.pending_offer = offer
 
     if had_accepted_contract and invalidates_accepted_contract(status):
         # He said yes to a specific thing at a specific price. Delivering a
         # different thing at that price — even a better one — is a substitution
-        # he never agreed to. Present it and let him choose again.
+        # he never agreed to. Offer it plainly instead.
         state.status = FanStatus.OFFER_PENDING
         state.confirmed_budget_cents = None
         await save_fan_state(fan_id, creator_id, state)
         return PlanRecovery(
             status=status,
             failure_class=failure_class,
-            replacement_packages=packages,
+            replacement_offer=offer,
             present_replacement=True,
             accepted_contract_lost=True,
             reason="accepted_contract_unavailable",
         )
 
     # Nothing was accepted yet (or the failure was not contract-invalidating):
-    # plan the best current package and carry on with the turn as decided.
-    chosen = packages[0]
-    state.selected_package_id = chosen.package_id
-    set_ids = list(chosen.set_ids or ([chosen.set_id] if chosen.set_id else []))
-    state.selected_package_set_id = set_ids[0] if set_ids else None
-    state.selected_package_set_ids = set_ids
-    state.selected_package_label = chosen.label
-    state.selected_package_price_cents = chosen.price_cents
-    state.confirmed_budget_cents = chosen.price_cents
+    # plan the current next unlock and carry on with the turn as decided.
+    state.accepted_offer_id = offer.offer_id
+    state.accepted_offer_set_id = offer.set_id
+    state.accepted_offer_label = offer.label
+    state.accepted_offer_price_cents = offer.price_cents
+    state.confirmed_budget_cents = offer.price_cents
     state.status = FanStatus.OFFER_SELECTED
     await save_fan_state(fan_id, creator_id, state)
 
     replan = await plan_session_for_fan(
         creator_id,
         fan_id,
-        selected_set_ids=set_ids,
-        selected_price_cents=chosen.price_cents,
+        accepted_set_id=offer.set_id,
+        accepted_price_cents=offer.price_cents,
     )
     if replan.get("status") == "ok":
         return PlanRecovery(
             status=status,
             failure_class=failure_class,
             session=replan.get("session"),
-            replacement_packages=packages,
+            replacement_offer=offer,
             reason="replanned_from_current_inventory",
         )
 
     # One attempt, then stop. A recovery loop that keeps re-planning against the
     # same inventory would burn the turn instead of answering the fan.
     state.status = FanStatus.OFFER_PENDING
-    state.selected_package_id = None
-    state.selected_package_set_id = None
-    state.selected_package_set_ids = []
-    state.selected_package_price_cents = None
+    state.accepted_offer_id = None
+    state.accepted_offer_set_id = None
+    state.accepted_offer_price_cents = None
     state.confirmed_budget_cents = None
     await save_fan_state(fan_id, creator_id, state)
     return PlanRecovery(
         status=str(replan.get("status") or status),
         failure_class=failure_class,
-        replacement_packages=packages,
+        replacement_offer=offer,
         present_replacement=True,
         accepted_contract_lost=had_accepted_contract,
-        reason="replan_failed_presenting_options",
+        reason="replan_failed_presenting_replacement",
     )

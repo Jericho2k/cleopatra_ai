@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
-from models.commercial import CreatorPolicy, FanCommercialState, FanStatus, PackageOption
+from models.commercial import CreatorPolicy, FanCommercialState, FanStatus, Offer
 from services import commercial_orchestrator
 from services.followup_lifecycle import (
     expire_pending_offer_state,
@@ -24,22 +24,13 @@ def pending_state() -> FanCommercialState:
         status=FanStatus.OFFER_PENDING,
         desired_experience="shower",
         last_offer_at=OFFERED_AT,
-        offered_packages=[
-            PackageOption(
-                package_id="pkg-quick",
-                label="quick shower",
-                price_cents=4500,
-                set_ids=["set-shower-1"],
-                experience="shower, wet, teasing",
-            ),
-            PackageOption(
-                package_id="pkg-full",
-                label="full shower",
-                price_cents=7000,
-                set_ids=["set-shower-1", "set-shower-2"],
-                experience="shower, wet, explicit progression",
-            ),
-        ],
+        pending_offer=Offer(
+            offer_id="offer:set-shower-1",
+            label="private photo set",
+            price_cents=4500,
+            set_id="set-shower-1",
+            experience="shower, wet, teasing",
+        ),
     )
 
 
@@ -53,12 +44,9 @@ def test_pending_offer_expiry_preserves_exact_approved_snapshot():
     assert obligation is not None
     assert obligation.action_type == "OFFER_EXPIRY"
     assert obligation.execute_at == datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
-    assert [p["package_id"] for p in obligation.payload["offered_packages"]] == [
-        "pkg-quick",
-        "pkg-full",
-    ]
+    assert obligation.payload["pending_offer"]["offer_id"] == "offer:set-shower-1"
     assert obligation.payload["primary_experience"] == "shower, wet, teasing"
-    assert "set-shower-1" in obligation.payload["offered_packages"][0]["set_ids"]
+    assert obligation.payload["pending_offer"]["set_id"] == "set-shower-1"
 
 
 def test_exact_pending_offer_expires_then_schedules_followup():
@@ -80,16 +68,13 @@ def test_exact_pending_offer_expires_then_schedules_followup():
 
     assert changed is True
     assert expired.status == FanStatus.IDLE
-    assert expired.offered_packages == []
+    assert expired.pending_offer is None
     assert expired.last_offer_at == OFFERED_AT
     assert expired.next_followup_type == "ABANDONED_OFFER_FOLLOWUP"
     assert followup is not None
     assert followup.execute_at == datetime(2026, 7, 20, 6, 0, tzinfo=timezone.utc)
     assert followup.payload["primary_experience"] == "shower, wet, teasing"
-    assert [p["package_id"] for p in followup.payload["offered_packages"]] == [
-        "pkg-quick",
-        "pkg-full",
-    ]
+    assert followup.payload["pending_offer"]["offer_id"] == "offer:set-shower-1"
 
 
 def test_stale_expiry_cannot_clear_a_newer_offer():
@@ -109,7 +94,7 @@ def test_stale_expiry_cannot_clear_a_newer_offer():
     assert changed is False
     assert followup is None
     assert output.status == FanStatus.OFFER_PENDING
-    assert len(output.offered_packages) == 2
+    assert output.pending_offer is not None
 
 
 def test_fan_return_cancels_abandoned_offer_followup(monkeypatch):
@@ -188,7 +173,7 @@ def test_fan_return_refreshes_still_pending_offer_expiry(monkeypatch):
     assert scheduled[0]["action_type"] == "OFFER_EXPIRY"
     assert scheduled[0]["execute_at"] == datetime(2026, 7, 19, 18, 0, tzinfo=timezone.utc)
     assert saved[0][2].last_offer_at == returned_at
-    assert saved[0][2].offered_packages[0].package_id == "pkg-quick"
+    assert saved[0][2].pending_offer.offer_id == "offer:set-shower-1"
 
 
 def test_offer_expiry_worker_persists_followup_before_queue_repair(monkeypatch):

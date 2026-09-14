@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from models.commercial import CreatorPolicy, FanCommercialState, FanStatus, PackageOption
+from models.commercial import CreatorPolicy, FanCommercialState, FanStatus, Offer
 from services.followup_lifecycle import (
     abandoned_ppv_payload,
     complete_session_state,
@@ -98,7 +98,7 @@ def test_followup_payloads_preserve_only_the_authoritative_snapshot():
     session_payload = post_session_payload(
         {
             "completed_at": NOW.isoformat(),
-            "commercial_package_id": "pkg-1",
+            "commercial_offer_id": "offer-1",
             "set_ids": ["set-1", "set-2"],
             "scene_key": "shower",
             "revenue_cents": 7000,
@@ -113,7 +113,7 @@ def test_followup_payloads_preserve_only_the_authoritative_snapshot():
     abandoned = abandoned_ppv_payload(
         pending(),
         desired_experience="shower",
-        selected_package_id="pkg-1",
+        accepted_offer_id="offer-1",
     )
     assert abandoned["price_cents"] == 4500
     assert abandoned["desired_experience"] == "shower"
@@ -124,17 +124,17 @@ def test_completed_session_clears_active_offer_and_persists_followup_obligation(
         status=FanStatus.PAID_SESSION_ACTIVE,
         desired_experience="shower",
         confirmed_budget_cents=7000,
-        selected_package_id="pkg-1",
-        selected_package_set_ids=["set-1", "set-2"],
-        offered_packages=[
-            PackageOption(package_id="pkg-1", label="full", price_cents=7000)
-        ],
+        accepted_offer_id="offer-1",
+        accepted_offer_set_id="set-1",
+        pending_offer=Offer(
+            offer_id="offer-1", label="private photo set", price_cents=7000, set_id="set-1"
+        ),
     )
     completed, obligation = complete_session_state(
         state,
         {
             "completed_at": NOW.isoformat(),
-            "commercial_package_id": "pkg-1",
+            "commercial_offer_id": "offer-1",
             "set_ids": ["set-1", "set-2"],
             "scene_key": "ignored because desired experience is authoritative",
             "revenue_cents": 7000,
@@ -146,7 +146,8 @@ def test_completed_session_clears_active_offer_and_persists_followup_obligation(
     )
     assert completed.status == FanStatus.IDLE
     assert completed.confirmed_budget_cents is None
-    assert completed.offered_packages == []
+    assert completed.pending_offer is None
+    assert completed.accepted_offer_id is None
     assert completed.last_session_experience == "shower"
     assert completed.next_followup_type == "POST_SESSION_FOLLOWUP"
     assert obligation is not None

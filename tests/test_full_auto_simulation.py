@@ -401,7 +401,7 @@ def test_real_analyzer_commercial_and_writer_are_invoked(world, spy, monkeypatch
 
         return SimpleNamespace(
             action=ActionType.CONTINUE_NORMAL_CHAT,
-            selected_package_set_ids=None,
+            accepted_offer_set_id=None,
             session_budget_cents=None,
             model_dump=lambda mode=None: {"action": "CONTINUE_NORMAL_CHAT"},
         )
@@ -608,22 +608,47 @@ def ppv_world(world, monkeypatch):
     db, calls = world
     monkeypatch.setenv("COMMERCIAL_LAYER_ENABLED", "true")
 
+    # The writer writes ORDINARY TEXT. What is attached, at what price, comes
+    # from the persisted plan below — the writer cannot cause, reprice or
+    # mis-address a delivery, and no tag appears anywhere in this fixture.
     async def ppv_reply(prompt, persona, **kwargs):
         calls["writer"].append({"prompt": prompt, **kwargs})
-        return ["here it is [PPV:media-77:35.00]"]
+        return ["here it is"]
+
+    session = {
+        "status": "active",
+        "current_index": 0,
+        "awaiting_purchase_index": None,
+        "plan": [
+            {
+                "step_number": 1,
+                "step_count": 1,
+                "media_ids": ["media-77"],
+                "media_id": "media-77",
+                "price": 35.0,
+                "price_cents": 3500,
+                "set_id": "set-77",
+                "asset_type": "photo_set",
+                "description": "bedroom bundle (4 pcs)",
+                "sent": False,
+                "purchased": False,
+            }
+        ],
+    }
 
     async def fake_orchestrate(**kwargs):
         from models.commercial import ActionType
 
         return SimpleNamespace(
             action=ActionType.SEND_NEXT_PPV_STEP,
-            selected_package_set_ids=None,
+            accepted_offer_set_id=None,
             session_budget_cents=None,
             model_dump=lambda mode=None: {"action": "SEND_NEXT_PPV_STEP"},
         )
 
     from models.commercial import CreatorPolicy
 
+    monkeypatch.setattr(suggestions, "get_fan_session", lambda _f: _value(session))
     monkeypatch.setattr(suggestions, "generate_replies", ppv_reply)
     monkeypatch.setattr(suggestions, "orchestrate", fake_orchestrate)
     monkeypatch.setattr(suggestions, "_within_daily_caps", lambda *_a, **_k: _value((True, "")))
@@ -907,7 +932,7 @@ def test_one_simulated_inbound_runs_full_auto_exactly_once(world, spy, monkeypat
 
         return SimpleNamespace(
             action=ActionType.CONTINUE_NORMAL_CHAT,
-            selected_package_set_ids=None,
+            accepted_offer_set_id=None,
             session_budget_cents=None,
             model_dump=lambda mode=None: {"action": "CONTINUE_NORMAL_CHAT"},
         )
@@ -1186,26 +1211,22 @@ def test_live_timing_is_untouched(world, spy, capsys):
 
 
 def _photo_only_decision(action=None):
-    from models.commercial import ActionType, CommercialDecision, PackageOption
+    from models.commercial import ActionType, CommercialDecision, Offer
 
     return CommercialDecision(
-        action=action or ActionType.PRESENT_SESSION_OPTIONS,
-        goal="present the approved options",
-        package_options=[
-            PackageOption(
-                package_id="package:quick:a",
-                label="quick private session",
-                price_cents=3000,
-                set_ids=["a", "b"],
-                experience="bedroom, black lingerie",
-                legal_description="bedroom, black lingerie",
-                step_count=2,
-                media_count=5,
-                asset_types=["photo_set", "photo_set"],
-            )
-        ],
+        action=action or ActionType.OFFER_NEXT_UNLOCK,
+        goal="offer him the one next thing",
+        next_offer=Offer(
+            offer_id="offer:a",
+            label="private photo set",
+            price_cents=3000,
+            set_id="a",
+            experience="bedroom, black lingerie",
+            legal_description="bedroom, black lingerie",
+            media_count=5,
+            asset_type="photo_set",
+        ),
         authorized_asset_types=["photo_set"],
-        available_package_asset_types=["photo_set"],
         vault_asset_types=["photo_set"],
         unavailable_asset_type_requested="video",
     )
@@ -1295,7 +1316,6 @@ def test_an_authorised_video_is_still_allowed_through(world, spy, monkeypatch):
     async def fake_orchestrate(**_kwargs):
         decision = _photo_only_decision()
         decision.authorized_asset_types = ["photo_set", "video"]
-        decision.available_package_asset_types = ["photo_set", "video"]
         decision.vault_asset_types = ["photo_set", "video"]
         decision.unavailable_asset_type_requested = None
         return decision
@@ -1326,31 +1346,30 @@ def test_an_authorised_video_is_still_allowed_through(world, spy, monkeypatch):
 # --- a recoverable plan failure is not a no-send ----------------------------
 
 
-def test_a_stale_package_recovers_instead_of_sending_nothing(world, spy, monkeypatch):
-    """The exact production trace: CREATE_PAID_SESSION, selected_set_unavailable,
+def test_a_stale_offer_recovers_instead_of_sending_nothing(world, spy, monkeypatch):
+    """The exact production trace: SEND_NEXT_PPV_STEP, selected_set_unavailable,
     outcome=no_send — with the same message succeeding on the next attempt."""
-    from models.commercial import ActionType, PackageOption
+    from models.commercial import ActionType, Offer
     from services import session_plan_recovery
 
     monkeypatch.setenv("COMMERCIAL_LAYER_ENABLED", "true")
     db, calls = world
 
     async def fake_orchestrate(**_kwargs):
-        decision = _photo_only_decision(action=ActionType.CREATE_PAID_SESSION)
-        decision.selected_package_set_ids = ["gone-1"]
+        decision = _photo_only_decision(action=ActionType.SEND_NEXT_PPV_STEP)
+        decision.accepted_offer_set_id = "gone-1"
         decision.session_budget_cents = 3000
         return decision
 
     async def stale_plan(*_args, **_kwargs):
         return {"status": "selected_set_unavailable", "session": None, "missing_set_ids": ["gone-1"]}
 
-    replacement = PackageOption(
-        package_id="package:quick:fresh",
-        label="quick private session",
+    replacement = Offer(
+        offer_id="offer:fresh-1",
+        label="private photo set",
         price_cents=3000,
-        set_ids=["fresh-1", "fresh-2"],
-        asset_types=["photo_set", "photo_set"],
-        step_count=2,
+        set_id="fresh-1",
+        asset_type="photo_set",
     )
 
     async def fake_recover(**kwargs):
@@ -1359,7 +1378,7 @@ def test_a_stale_package_recovers_instead_of_sending_nothing(world, spy, monkeyp
         return session_plan_recovery.PlanRecovery(
             status="selected_set_unavailable",
             failure_class=session_plan_recovery.PlanFailureClass.RECOVERABLE,
-            replacement_packages=[replacement],
+            replacement_offer=replacement,
             present_replacement=True,
             accepted_contract_lost=True,
             reason="accepted_contract_unavailable",
@@ -1399,8 +1418,8 @@ def test_an_unrecoverable_plan_reports_itself_rather_than_a_no_send(
     db, calls = world
 
     async def fake_orchestrate(**_kwargs):
-        decision = _photo_only_decision(action=ActionType.CREATE_PAID_SESSION)
-        decision.selected_package_set_ids = ["gone-1"]
+        decision = _photo_only_decision(action=ActionType.SEND_NEXT_PPV_STEP)
+        decision.accepted_offer_set_id = "gone-1"
         decision.session_budget_cents = 3000
         return decision
 

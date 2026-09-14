@@ -99,3 +99,53 @@ def _stub_health(monkeypatch, operational_health):
         "current_model_availability",
         lambda: {"status": "healthy", "checked_at": None},
     )
+
+
+# ---------------------------------------------------------------------------
+# An unhandled exception must be READABLE by the browser
+# ---------------------------------------------------------------------------
+#
+# Starlette answers an exception that escapes a route from its OUTERMOST
+# middleware, so that response never passes back through the CORS layer. The
+# browser therefore sees a response with no Access-Control-Allow-Origin, blocks
+# it, and rejects the fetch with the opaque TypeError "Failed to fetch" — which
+# is precisely what the Simulator surfaced while the backend had already logged
+# a traceback nobody could correlate with it.
+
+
+def test_an_unhandled_route_error_is_a_cors_visible_json_500(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import main
+
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("DASHBOARD_API_SECRET", "test-dashboard-secret")
+
+    async def fake_user(_authorization):
+        return "operator-1"
+
+    monkeypatch.setattr(main, "authenticated_dashboard_user", fake_user, raising=False)
+    monkeypatch.setattr("core.auth.authenticated_dashboard_user", fake_user)
+
+    @main.app.get("/__boom_for_test")
+    async def _boom():  # pragma: no cover - exercised through the client
+        raise KeyError("a genuinely unexpected failure")
+
+    client = TestClient(app=main.app, raise_server_exceptions=False)
+    response = client.get(
+        "/__boom_for_test",
+        headers={"X-API-Key": "test-dashboard-secret", "Origin": "http://localhost:3000"},
+    )
+
+    assert response.status_code == 500
+    # The half that made it invisible: without this header the browser refuses
+    # to hand the body to the page at all.
+    assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
+
+    body = response.json()
+    assert body["error_type"] == "KeyError"
+    assert body["error_id"]
+    assert body["error_id"] in body["detail"]
+    # ...and nothing about internals reaches an ordinary agency account.
+    assert "a genuinely unexpected failure" not in body["detail"]
+    assert "Traceback" not in response.text

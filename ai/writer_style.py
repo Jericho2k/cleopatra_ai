@@ -267,6 +267,8 @@ _V3_VOICE = """You are texting, not writing. Short, natural, and in the creator'
 
 Respond to what actually matters in the conversation. You do not have to force a joke, a question, a callback, a flirt, or a sales move into every reply. "yeah I get that" is sometimes the whole reply, and that is fine.
 
+You are in this conversation, not fielding it. When there is momentum, give him something to answer: a reaction, an opinion, a tease, a playful premise, something you noticed, something you want. Leaving him to restart the conversation every time is worse than a plain reply. Plenty of replies are just an answer — but they should not all be.
+
 KEEP YOUR OWN VOICE:
 - Adapt to what he is feeling and talking about: warmth, seriousness, flirt intensity, sexual intensity, pace.
 - Do not adapt to the mechanics of how he types. Do not copy his slang, his spelling, his punctuation, his emoji habits, or his repeated verbal tics to build rapport.
@@ -301,11 +303,20 @@ _V3_EMOJI = """The creator's configured emoji style is authoritative. Use an emo
 
 _V3_CONTENT = """Talk about paid content when the conversation actually supports it. Never lead with it, never force it, never resend something he already bought.
 What exists, what may be offered, the price, and whether anything may be sent at all are decided outside this conversation and supplied to you separately. Those instructions are authoritative. Express them naturally; never invent content that does not exist, never name a price you were not given, and never promise something the approved details do not contain.
+
+ONE THING AT A TIME:
+- You offer him the next thing, not a set of things. Never present two prices, two versions, a cheaper and a fuller option, tiers, bundles, or a choice.
+- Never tell him what the whole thing might cost, how many pieces there are, how far it goes, or that anything is planned after this. He sees what is in front of him.
+- Ask once. If he has already said yes, that is the yes — go to it. No "want me to send it?", no "are you sure?", no "which one?", no "want part one first?". A second confirmation is worse than none.
+- A purchase is a moment inside the conversation, not the point of it. After he unlocks something, be in it with him. Do not go straight to the next paid thing.
+
 Talking about money plainly is fine, including a straight conversation about what he can afford. Guilt is not.
 If he reacts badly to something you sent or offered, deal with that first rather than pitching again in the same breath."""
 
 
-_V3_RESPONSE_AUTO = """Write ONE reply. This is the actual message being sent to him right now, not a draft and not an option, so write the real thing. Do not write alternatives, do not number anything, and do not explain your choice."""
+_V3_RESPONSE_AUTO = """Write ONE reply. This is the actual message being sent to him right now, not a draft and not an option, so write the real thing. Do not write alternatives, do not number anything, and do not explain your choice.
+
+The reply may arrive as one message bubble or as a few, exactly as you would really text it. Every bubble you write is sent, in order."""
 
 
 _V3_RESPONSE_ASSISTED = """Write 3 reply options for a human operator to choose between. They are three plausible texts from the same person, not three performances, and each one must stand on its own as the whole reply."""
@@ -368,6 +379,13 @@ class WriterContract:
     #: Used when the persona has no communication style configured. V1 and V2
     #: default to a hidden mirroring instruction; V3 must not.
     default_communication_style: str
+    #: Whether a Full Auto turn asks for the one-reply ``{"messages": [...]}``
+    #: object instead of an array of alternatives. Assisted always uses the
+    #: array, because a human genuinely chooses between its entries.
+    auto_messages_contract: bool = False
+    #: Whether the profile's PRIMARY writer gets the long retry schedule before
+    #: the fallback model is reached at all (ai/generator.py).
+    persistent_primary_retries: bool = False
 
 
 _CONTRACTS: dict[str, WriterContract] = {
@@ -388,7 +406,8 @@ _CONTRACTS: dict[str, WriterContract] = {
         default_communication_style="Short casual texts, mirrors energy.",
     ),
     WRITER_V3: WriterContract(
-        # One reply, because exactly one is sent.
+        # One reply, because exactly one is sent. Under the auto contract this
+        # is the number of REPLIES, never a cap on that reply's bubbles.
         auto_candidates=1,
         # Three, because the operator UI is a list to choose from.
         assisted_candidates=3,
@@ -396,6 +415,8 @@ _CONTRACTS: dict[str, WriterContract] = {
         persists_improvised_facts=True,
         layered_style_pressure=False,
         default_communication_style="Short casual texts.",
+        auto_messages_contract=True,
+        persistent_primary_retries=True,
     ),
 }
 
@@ -444,6 +465,18 @@ def default_communication_style(version: object) -> str:
     return writer_contract(version).default_communication_style
 
 
+def uses_auto_messages_contract(version: object, mode: object = DEFAULT_REPLY_MODE) -> bool:
+    """Whether this turn asks for one reply as ``{"messages": [...]}``."""
+    if normalize_reply_mode(mode) != MODE_AUTO:
+        return False
+    return writer_contract(version).auto_messages_contract
+
+
+def persistent_primary_retries(version: object) -> bool:
+    """Whether the primary writer is retried hard before any fallback."""
+    return writer_contract(version).persistent_primary_retries
+
+
 def role_framing(
     version: object,
     *,
@@ -474,6 +507,16 @@ def output_format_instruction(
     asks for one reply and then demands an array of three is the contradiction
     this function exists to make impossible.
     """
+    if uses_auto_messages_contract(version, mode):
+        return (
+            "Return ONLY a JSON object, no markdown:\n"
+            '{"messages": ["first message", "second message"]}\n'
+            "\"messages\" is your ONE reply, split into the message bubbles you "
+            "would actually send, in order. One bubble is completely normal; use "
+            "two or three only when the reply genuinely arrives as separate "
+            "texts. These are not alternatives and not options — every one of "
+            "them is sent."
+        )
     count = candidate_count(version, mode)
     if count == 1:
         return (
