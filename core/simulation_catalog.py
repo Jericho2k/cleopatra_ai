@@ -7,10 +7,12 @@ nothing else:
 *Live planning excludes simulation-only rows.* Every read that can end in a PPV
 being offered or delivered applies :func:`exclude_simulation_only`.
 
-*The owner simulator may include them.* It runs inside
-``core.apifansly_gate.simulation_scope()``, which is already the process-wide
-statement "this turn cannot reach the platform". Reusing it means the inclusion
-rule and the no-remote-calls rule are the same fact, and cannot drift apart.
+*Only the OWNER simulator may include them.* An owner turn opens
+``core.apifansly_gate.simulation_scope(include_mirrored_catalog=True)``; an
+agency turn opens the same scope without it. Both are equally unable to reach
+the platform — that is what the scope itself means — but only the owner's turn
+sees mirrored cross-tenant rows. An agency simulates against the creator's own
+authorized vault and sets, which is the same inventory live planning uses.
 
 The rewritten media id
 ----------------------
@@ -37,7 +39,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from core.apifansly_gate import simulation_active
+from core.apifansly_gate import mirrored_catalog_active
 
 SIMULATION_ONLY_COLUMN = "simulation_only"
 
@@ -58,8 +60,14 @@ T = TypeVar("T")
 
 
 def simulation_catalog_visible() -> bool:
-    """Whether this execution context may see owner-only test content."""
-    return simulation_active()
+    """Whether this execution context may see mirrored owner test content.
+
+    True only inside an OWNER simulated turn. An agency's simulated turn is a
+    simulation too — it still cannot reach the platform — but it plans against
+    its own creator's approved vault only, so mirrored rows stay filtered out
+    of it exactly as they are out of live planning.
+    """
+    return mirrored_catalog_active()
 
 
 def is_simulation_media_id(media_id: Any) -> bool:

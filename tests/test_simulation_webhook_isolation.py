@@ -403,5 +403,5 @@ def test_the_simulator_registers_its_message_before_running_the_turn():
     ).read_text(encoding="utf-8")
 
     mark_at = source.index("mark_simulation_owned_message(fan_message_id)")
-    turn_at = source.index("with simulation_scope():")
+    turn_at = source.index("with simulation_scope(")
     assert mark_at < turn_at

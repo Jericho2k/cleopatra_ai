@@ -722,8 +722,12 @@ async def test_qwen_client_follows_modal_result_redirects(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_main_uses_local_classifier_without_anthropic(monkeypatch):
-    async def load_visual(item, *, is_video):
-        return jpeg_bytes(), "image", "test"
+    async def load_visual(item, *, is_video, client=None, manual=False, account_id=""):
+        return main.VaultVisual(
+            source="image",
+            retrieval_method="direct_cdn",
+            image=jpeg_bytes(),
+        )
 
     async def classify(*args, **kwargs):
         return {

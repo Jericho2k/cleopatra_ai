@@ -1,34 +1,53 @@
-"""Owner-only local Full Auto simulation: who may use it, and on which fans.
+"""Who may use the Full Auto simulator, and what each tier may reach.
 
 The simulator runs the *real* Full Auto pipeline with delivery transport and
-human-like waiting replaced by local persistence. That makes it a privileged
-capability, not a product feature: it writes creator messages that the ordinary
-dashboard renders, and it exercises commercial state transitions. It must
-therefore be invisible and inaccessible to every ordinary agency tenant.
+human-like waiting replaced by local persistence. It writes creator messages
+that the ordinary dashboard renders, and it exercises commercial state
+transitions — against ``test_`` fans only, and never against the platform.
 
-Access requires ALL of:
+There are TWO tiers, and keeping them apart is the whole point of this module.
 
-1. ``AUTO_SIMULATION_ENABLED=true``;
-2. an authenticated Supabase dashboard user (``request.state.dashboard_user_id``);
-3. that user's UUID listed in ``AUTO_SIMULATION_ALLOWED_USER_IDS``;
-4. the normal creator tenancy check (``core.tenancy``);
-5. the fan belonging to that creator;
-6. ``fans.platform_fan_id`` starting with ``test_``.
+AGENCY TIER — "may I simulate my own creators?"
+    Any authenticated dashboard operator, when the deployment has the simulator
+    switched on. It is scoped entirely by the ordinary tenancy model: an agency
+    may simulate the creators it is already assigned, against ``test_`` fans of
+    those creators, using those creators' own approved vault.
 
-Requirements 1-3 live here. 4-6 are enforced by the route, reusing the existing
-tenancy helpers rather than inventing a parallel authorization model.
+    Requires ALL of:
+
+    1. ``AUTO_SIMULATION_ENABLED=true``;
+    2. ``AUTO_SIMULATION_AGENCY_ACCESS`` not explicitly disabled;
+    3. an authenticated Supabase dashboard user
+       (``request.state.dashboard_user_id``);
+    4. the normal creator tenancy check (``core.tenancy``);
+    5. the fan belonging to that creator;
+    6. ``fans.platform_fan_id`` starting with ``test_``.
+
+OWNER TIER — "may I reach ACROSS tenants?"
+    The platform owner only, named by UUID in
+    ``AUTO_SIMULATION_ALLOWED_USER_IDS``. This tier exists for exactly one
+    capability: the cross-tenant catalog mirror, which reads another tenant's
+    vault METADATA in order to build a realistic test catalog on a creator the
+    owner already holds. Source discovery (``/simulation/catalog/sources``),
+    mirroring, un-mirroring and mirrored-media preview across tenants are owner
+    only, and an agency account cannot learn that they exist.
+
+Requirements 1-3 and the owner check live here. 4-6 are enforced by the route,
+reusing the existing tenancy helpers rather than inventing a parallel
+authorization model.
 
 Two deliberate choices:
 
-*No development bypass.* Unlike ``core.auth``, an unset allowlist is not relaxed
-under ``APP_ENV=development``. The relaxed branch in ``core.tenancy`` exists so
-local work is not blocked by an unconfigured tenancy table; there is no
-equivalent need here, and a dev bypass would be one misread variable away from
-handing the simulator to a production tenant.
+*No development bypass.* Unlike ``core.auth``, an unset owner allowlist is not
+relaxed under ``APP_ENV=development``. The relaxed branch in ``core.tenancy``
+exists so local work is not blocked by an unconfigured tenancy table; there is
+no equivalent need here, and a dev bypass would be one misread variable away
+from handing the cross-tenant mirror to a production tenant.
 
 *Failures are indistinguishable.* Every rejection is the same 404 the tenancy
-layer raises, so a caller cannot probe which of the six conditions it failed,
-and cannot learn that another tenant's creator or fan exists.
+layer raises, so a caller cannot probe which condition it failed, cannot learn
+that another tenant's creator or fan exists, and — for the owner tier — cannot
+discover that a cross-tenant capability exists at all.
 """
 from __future__ import annotations
 
@@ -42,6 +61,7 @@ from core.auth import dashboard_user_id
 
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "enabled"}
+_FALSE_VALUES = {"0", "false", "no", "off", "disabled"}
 
 # The prefix that marks a fan as safe to simulate against. A real Fansly fan
 # must never become eligible merely because somebody knows its UUID.
@@ -62,12 +82,36 @@ def not_found() -> HTTPException:
 
 
 def simulation_enabled() -> bool:
-    """Whether the deployment has switched the simulator on at all."""
+    """Whether the deployment has switched the simulator on at all.
+
+    The master switch for BOTH tiers. Off means nobody simulates, owner
+    included.
+    """
     return str(os.environ.get("AUTO_SIMULATION_ENABLED", "")).strip().lower() in _TRUE_VALUES
 
 
-def allowed_simulation_user_ids() -> frozenset[str]:
-    """Supabase auth UUIDs permitted to simulate. Empty means nobody.
+def agency_simulation_enabled() -> bool:
+    """Whether ordinary agency operators may use the simulator.
+
+    Defaults to ON whenever the simulator itself is on: an agency testing its
+    own creators against its own test fans is the product feature, and it is
+    bounded by the same tenancy model as every other creator route.
+    ``AUTO_SIMULATION_AGENCY_ACCESS=false`` narrows the simulator back to the
+    owner allowlist without switching the whole feature off — an escape hatch,
+    not the normal configuration.
+    """
+    raw = str(os.environ.get("AUTO_SIMULATION_AGENCY_ACCESS", "")).strip().lower()
+    if not raw:
+        return True
+    return raw not in _FALSE_VALUES
+
+
+def simulation_owner_user_ids() -> frozenset[str]:
+    """Supabase auth UUIDs holding the OWNER tier. Empty means nobody.
+
+    Owner is not "may simulate" — an ordinary agency operator may do that. It
+    is "may reach across tenants", which today means the catalog mirror and
+    nothing else.
 
     Parsed rather than compared as a raw string so whitespace, a trailing comma
     or a pasted newline cannot silently deny a correctly configured owner —
@@ -81,29 +125,90 @@ def allowed_simulation_user_ids() -> frozenset[str]:
     )
 
 
+# The historical name for the owner allowlist, kept because the environment
+# variable it reads is unchanged and operator tooling refers to it.
+allowed_simulation_user_ids = simulation_owner_user_ids
+
+
+def user_is_platform_operator(user_id: str | None) -> bool:
+    """Whether this account is the platform owner, independent of any feature.
+
+    Deliberately does NOT require ``AUTO_SIMULATION_ENABLED``. The allowlist
+    names a PERSON, not a feature: switching the simulator off must not also
+    remove that person's operator diagnostics from unrelated surfaces like the
+    Vault. ``user_is_simulation_owner`` is the same identity AND the simulator
+    being on, and is what the mirror routes require.
+    """
+    if not user_id:
+        return False
+    return str(user_id).strip().lower() in simulation_owner_user_ids()
+
+
+def user_is_simulation_owner(user_id: str | None) -> bool:
+    """The OWNER tier: enabled, authenticated, and named in the allowlist.
+
+    Deliberately independent of ``agency_simulation_enabled``: narrowing the
+    simulator back to owners must never also remove the owner's own access.
+    """
+    return simulation_enabled() and user_is_platform_operator(user_id)
+
+
+def request_is_platform_operator(request: Request) -> bool:
+    """Whether the caller of this request is the platform owner."""
+    return user_is_platform_operator(dashboard_user_id(request))
+
+
 def user_may_simulate(user_id: str | None) -> bool:
-    """Requirements 1-3, with no side effects, so the capability endpoint and
-    the mutation endpoint can never disagree about who is allowed."""
+    """The AGENCY tier: requirements 1-3, with no side effects.
+
+    No side effects so the capability endpoint and the mutation endpoints can
+    never disagree about who is allowed. An owner always satisfies this too —
+    the owner tier is strictly additional authority, never a different door.
+
+    This function says nothing about WHICH creators the caller may simulate.
+    That is the ordinary tenancy check, applied by the route, and it is what
+    keeps one agency out of another's creators.
+    """
     if not simulation_enabled():
         return False
     if not user_id:
         return False
-    return str(user_id).strip().lower() in allowed_simulation_user_ids()
+    if agency_simulation_enabled():
+        return True
+    return user_is_simulation_owner(user_id)
 
 
 def request_may_simulate(request: Request) -> bool:
-    """Requirements 1-3 for the caller of this request."""
+    """The agency tier for the caller of this request."""
     return user_may_simulate(dashboard_user_id(request))
 
 
+def request_is_simulation_owner(request: Request) -> bool:
+    """The owner tier for the caller of this request."""
+    return user_is_simulation_owner(dashboard_user_id(request))
+
+
 async def require_simulation_user(request: Request) -> str:
-    """FastAPI dependency for requirements 1-3. Returns the allowed user id.
+    """FastAPI dependency for the AGENCY tier. Returns the caller's user id.
 
     Deliberately does NOT reveal which condition failed, and never logs or
     returns the allowlist.
     """
     user_id = dashboard_user_id(request)
     if not user_may_simulate(user_id):
+        raise not_found()
+    return str(user_id)
+
+
+async def require_simulation_owner(request: Request) -> str:
+    """FastAPI dependency for the OWNER tier. Returns the owner's user id.
+
+    Guards every cross-tenant capability. An agency account gets the same 404
+    the rest of the simulator uses, so it cannot discover that a cross-tenant
+    capability exists, nor probe for creator ids through one.
+    """
+    user_id = dashboard_user_id(request)
+    if not user_is_simulation_owner(user_id):
         raise not_found()
     return str(user_id)
 
@@ -141,7 +246,7 @@ def exclude_simulation_fans(query: object) -> object:
 
 
 def is_simulation_fan_row(row: object) -> bool:
-    """Whether one ``fans`` row is an owner test fan.
+    """Whether one ``fans`` row is a simulator test fan.
 
     The in-Python counterpart, for data that has already been read (a browser
     query, a cached list) rather than a query being built.
@@ -173,6 +278,9 @@ def is_simulation_fan_row(row: object) -> bool:
 # ``media_context`` is existing JSON metadata on ``messages``, so no migration
 # is involved.
 
+# A stable value persisted in ``messages.media_context``. It predates the
+# agency tier and is deliberately NOT renamed: existing rows carry it, and the
+# webhook must keep recognising them.
 SIMULATION_SOURCE = "owner_auto_simulator"
 
 
@@ -182,7 +290,7 @@ def simulation_message_marker() -> dict:
 
 
 def is_simulation_message(media_context: object) -> bool:
-    """Whether one message row was written by the owner-only simulator.
+    """Whether one message row was written by the simulator.
 
     Accepts whatever the Supabase webhook happens to deliver for a ``jsonb``
     column — a decoded mapping, the raw JSON text, or JSON text that was itself

@@ -12,6 +12,7 @@ import time
 import traceback
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -108,6 +109,7 @@ from services.apifansly import (
     sent_message_id,
     usage_category as apifansly_usage_category,
     usage_snapshot as apifansly_usage_snapshot,
+    VAULT_MEDIA_DOWNLOAD_OPERATION,
 )
 from services.auto_audience import AutoAudiencePolicy
 from services.fansly_poller import FanslyPoller
@@ -149,10 +151,35 @@ from services.vault_sync import (
     vault_sync_cooldown,
 )
 from services.video_frames import (
+    ExtractedFrames,
     FrameSettings,
     build_contact_sheet,
     extract_frames,
     ffmpeg_available,
+)
+from services.video_semantics import (
+    DEFAULT_FRAMES_PER_SHEET,
+    DEFAULT_MAX_SHEETS,
+    chronological_batches,
+    combine_batch_observations,
+    commercial_role,
+    describe_video_record,
+    observation_from_classification,
+)
+from services.media_cost_guard import (
+    REASON_UNKNOWN_SIZE as MEDIA_GUARD_REASON_UNKNOWN,
+    DownloadDecision,
+    auto_download_limits,
+    estimated_credits_for_bytes,
+    evaluate_download,
+    parse_content_length,
+)
+from services.vault_classification_state import (
+    STATUS_COMPLETE as CLASSIFICATION_STATUS_COMPLETE,
+    STATUS_PARTIAL as CLASSIFICATION_STATUS_PARTIAL,
+    STATUS_PENDING as CLASSIFICATION_STATUS_PENDING,
+    media_identity_key,
+    select_items_for_classification,
 )
 from services.vault_metadata import (
     VAULT_CLASSIFIER_VERSION,
@@ -191,6 +218,22 @@ _VAULT_SYNC_ACTIVE_STATUSES = {"queued", "running", "categorizing_new"}
 # interrupted run look like a live one. It is only ever compared for equality.
 _PROCESS_ID = uuid.uuid4().hex
 _protected_video_download_gate = asyncio.Semaphore(1)
+
+# How the classified pixels were obtained. Stable strings: they are persisted on
+# every row, reported in telemetry, and read by the operator surface, so they
+# are a contract rather than log prose. The order is the cost order.
+RETRIEVAL_PLATFORM_THUMBNAIL = "platform_thumbnail"
+RETRIEVAL_DIRECT_CDN = "direct_cdn"
+RETRIEVAL_DIRECT_FRAMES = "direct_video_frames"
+RETRIEVAL_REFRESHED_URL = "refreshed_signed_url"
+RETRIEVAL_APIFANSLY_DOWNLOAD = "apifansly_media_download"
+
+# How a sampled video is broken into contact sheets. Four frames per sheet is a
+# 2x2 grid at ~440px a cell, which is the largest number of moments that
+# survives being one image; more than that and the model describes a mosaic.
+# The sheet ceiling bounds VLM calls per video regardless of frame count.
+_VIDEO_FRAMES_PER_SHEET = DEFAULT_FRAMES_PER_SHEET
+_VIDEO_MAX_SHEETS = DEFAULT_MAX_SHEETS
 _active_chat_binding_retry_after: dict[str, float] = {}
 _active_chat_binding_tasks: dict[str, asyncio.Task] = {}
 _ACTIVE_CHAT_BINDING_RETRY_SECONDS = 15 * 60
@@ -3421,7 +3464,48 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
 
 
 def _classification_update_payload(result: dict) -> dict:
+    """The columns one classification writes.
+
+    The persistence columns travel with every write, because they are what the
+    next sync reads to decide this row is finished work and must be skipped. A
+    result that omitted them would be re-classified forever.
+
+    A PENDING result — deeper analysis refused on cost — writes only those
+    persistence columns. It must not touch content_category, price or
+    explicitness: there is no evidence for them, and overwriting a previous
+    classification with blanks would lose real metadata to a cost decision.
+    """
+    if result.get("pending"):
+        return {
+            "classification_status": result["classification_status"],
+            "classification_skip_reason": result.get(
+                "classification_skip_reason", ""
+            ),
+            "classification_media_key": result.get("classification_media_key", ""),
+            "classification_retrieval_method": "",
+            "classification_media_bytes": 0,
+            "classification_media_credits": 0.0,
+            "classification_frames_sampled": 0,
+            "classification_metadata": result.get("classification_metadata", {}),
+        }
     return {
+        "classification_status": result.get(
+            "classification_status", CLASSIFICATION_STATUS_COMPLETE
+        ),
+        "classification_skip_reason": result.get("classification_skip_reason", ""),
+        "classification_media_key": result.get("classification_media_key", ""),
+        "classification_retrieval_method": result.get(
+            "classification_retrieval_method", ""
+        ),
+        "classification_media_bytes": int(
+            result.get("classification_media_bytes") or 0
+        ),
+        "classification_media_credits": float(
+            result.get("classification_media_credits") or 0.0
+        ),
+        "classification_frames_sampled": int(
+            result.get("classification_frames_sampled") or 0
+        ),
         "content_category": result["content_category"],
         "ai_description": result["ai_description"],
         "price_min": result["price_min"],
@@ -3467,37 +3551,195 @@ class VaultVisualAccessError(RuntimeError):
     """The classifier could not obtain a usable visual for a vault item."""
 
 
+class VaultMediaCostRefusal(VaultVisualAccessError):
+    """Deeper analysis was possible but too expensive to perform automatically.
+
+    Distinct from its parent because it is not a failure. Nothing is broken,
+    nothing needs fixing, and retrying will deterministically refuse again: the
+    asset is simply larger than an automatic run may transfer. The item is
+    recorded as ``pending`` with the reason, rather than being repeatedly
+    re-attempted as if it had errored.
+    """
+
+    def __init__(self, decision: DownloadDecision) -> None:
+        super().__init__(decision.operator_message())
+        self.decision = decision
+
+
+# ---------------------------------------------------------------------------
+# Obtaining the pixels — and what that is allowed to cost
+# ---------------------------------------------------------------------------
+#
+# Retrieval is ordered by COST, cheapest first, and the only expensive option is
+# last and guarded:
+#
+#   1. direct CDN access to the signed asset          free
+#      - for a video this is an ffmpeg range sample: the decoder seeks to each
+#        offset and reads only the bytes that frame needs, so a 12-frame sample
+#        of a 250 MB clip moves a few megabytes, not 250
+#   2. a refreshed signed URL, then (1) again          one metadata call
+#   3. the existing platform thumbnail                 free
+#   4. the API Fansly protected-media proxy            2 CREDITS PER MEGABYTE
+#
+# Step 4 is the one that used to happen silently. It now requires a policy
+# decision from services.media_cost_guard, taken BEFORE any byte moves, from a
+# size probed for free at the CDN.
+#
+# For a video, step 3 comes before step 4 deliberately. A thumbnail yields a
+# real, honest, partial classification for nothing; paying ~500 credits to
+# upgrade it is not a decision a background job gets to make on its own. The
+# result is marked ``partial`` and says so, and an operator who wants the deep
+# scan can ask for it explicitly — the manual tier has its own, larger ceiling.
+#
+# For a still image the order is 1, 2, 4: there is no thumbnail to fall back to
+# that is not the image itself, and a photo's worst case is single-digit
+# megabytes rather than a quarter of a gigabyte.
+
+
+@dataclass
+class VaultVisual:
+    """The pixels to classify, plus how they were obtained and what it cost."""
+
+    source: str
+    retrieval_method: str
+    image: bytes = b""
+    frames: list[bytes] = dataclass_field(default_factory=list)
+    offsets_seconds: list[float] = dataclass_field(default_factory=list)
+    duration_seconds: float = 0.0
+    media_bytes: int = 0
+    status: str = CLASSIFICATION_STATUS_COMPLETE
+    skip_reason: str = ""
+    skip_message: str = ""
+
+    @property
+    def estimated_credits(self) -> float:
+        return round(estimated_credits_for_bytes(self.media_bytes), 3)
+
+
+async def _probe_media_size(visual_url: str, *, client) -> int | None:
+    """What the CDN says this asset weighs, or None.
+
+    Costs nothing: both attempts go straight to the signed CDN URL, not through
+    the billed proxy. HEAD first; a signed CDN that refuses HEAD will usually
+    still answer a one-byte range GET with a Content-Range naming the total,
+    which is the cheapest honest way to learn a size.
+    """
+    for attempt in ("head", "range"):
+        try:
+            if attempt == "head":
+                response = await client.head(visual_url, timeout=15)
+            else:
+                response = await client.get(
+                    visual_url,
+                    timeout=15,
+                    headers={"Range": "bytes=0-0"},
+                )
+        except Exception:
+            continue
+        if response.status_code >= 400:
+            continue
+        size = parse_content_length(response.headers)
+        if size and size > 0:
+            return size
+    return None
+
+
+async def _download_direct_cdn(visual_url: str, *, client) -> tuple[bytes, str]:
+    """Fetch the signed asset straight from the CDN. Returns (bytes, status)."""
+    try:
+        response = await client.get(visual_url, timeout=25)
+    except Exception as exc:
+        return b"", type(exc).__name__
+    status = f"http_{response.status_code}_{len(response.content)}b"
+    if response.status_code == 200 and len(response.content) > 1000:
+        return bytes(response.content), status
+    return b"", status
+
+
+async def _guarded_proxy_download(
+    visual_url: str,
+    *,
+    client,
+    manual: bool,
+    is_video: bool,
+    account_id: str = "",
+) -> tuple[bytes, DownloadDecision]:
+    """The billed path, taken only when the guard allows it.
+
+    Returns ``(b"", decision)`` when refused, so the caller can record exactly
+    why deeper analysis did not happen rather than reporting a generic failure.
+    A still image may proceed on an unreadable size; a video may not.
+    """
+    size = await _probe_media_size(visual_url, client=client)
+    decision = evaluate_download(
+        content_length_bytes=size,
+        manual=manual,
+        allow_unknown_size=not is_video,
+    )
+    if not decision.allowed:
+        print(
+            f"[VAULT MEDIA GUARD] refused reason={decision.reason} "
+            f"manual={manual} video={is_video} "
+            f"size_mb={decision.estimated_megabytes} "
+            f"credits={decision.estimated_credits:.1f}"
+        )
+        return b"", decision
+
+    # Attributed to the vault so the credits land in the right bucket, and to
+    # the creator's account so "who caused this" is answerable.
+    with apifansly_usage_category(CATEGORY_VAULT):
+        content = await apifansly_download_media(
+            visual_url,
+            client=client,
+            account_id=account_id or None,
+            operation=VAULT_MEDIA_DOWNLOAD_OPERATION,
+        )
+    print(
+        f"[VAULT MEDIA GUARD] downloaded bytes={len(content)} "
+        f"credits={estimated_credits_for_bytes(len(content)):.1f} "
+        f"manual={manual} video={is_video}"
+    )
+    return content, decision
+
+
 async def _download_visual_candidate(
     visual_url: str,
     *,
     client,
-) -> tuple[bytes, str]:
-    """Try the CDN directly, then the managed protected-media endpoint."""
-    direct_status = "not_attempted"
+    manual: bool = False,
+    is_video: bool = False,
+    account_id: str = "",
+) -> tuple[bytes, str, int]:
+    """One still image, by the cheapest route that works.
+
+    Returns ``(bytes, retrieval_method, billed_bytes)``. ``billed_bytes`` is
+    zero for every free path and is what the per-item cost telemetry records.
+    """
+    content, direct_status = await _download_direct_cdn(visual_url, client=client)
+    if content:
+        return content, RETRIEVAL_DIRECT_CDN, 0
+
+    if not is_fansly_cdn_url(visual_url):
+        raise VaultVisualAccessError(
+            f"The media source could not be downloaded ({direct_status})."
+        )
+
     try:
-        response = await client.get(visual_url, timeout=25)
-        direct_status = f"http_{response.status_code}_{len(response.content)}b"
-        if response.status_code == 200 and len(response.content) > 1000:
-            return bytes(response.content), "direct_cdn"
+        downloaded, decision = await _guarded_proxy_download(
+            visual_url,
+            client=client,
+            manual=manual,
+            is_video=is_video,
+            account_id=account_id,
+        )
     except Exception as exc:
-        direct_status = f"{type(exc).__name__}"
-
-    if is_fansly_cdn_url(visual_url):
-        try:
-            content = await apifansly_download_media(
-                visual_url,
-                client=client,
-            )
-            return content, "apifansly_media_download"
-        except Exception as exc:
-            raise VaultVisualAccessError(
-                "The protected Fansly media could not be downloaded "
-                f"(direct={direct_status}; proxy={type(exc).__name__})."
-            ) from exc
-
-    raise VaultVisualAccessError(
-        f"The media source could not be downloaded ({direct_status})."
-    )
+        raise VaultVisualAccessError(
+            "The protected Fansly media could not be downloaded "
+            f"(direct={direct_status}; proxy={type(exc).__name__})."
+        ) from exc
+    if not downloaded:
+        raise VaultVisualAccessError(decision.operator_message())
+    return downloaded, RETRIEVAL_APIFANSLY_DOWNLOAD, len(downloaded)
 
 
 async def _refresh_vault_item_urls(item: dict) -> dict | None:
@@ -3525,43 +3767,46 @@ async def _refresh_vault_item_urls(item: dict) -> dict | None:
     import httpx
 
     cursor = None
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        for _ in range(100):
-            entries, cursor = await apifansly_list_vault_album_media(
-                account_id,
-                album_id,
-                cursor=cursor,
-                limit=50,
-                client=client,
-            )
-            for entry in entries:
-                media = entry.get("media") if isinstance(entry, dict) else None
-                if not isinstance(media, dict):
-                    continue
-                candidate_id = str(
-                    entry.get("mediaId") or media.get("id") or ""
+    # A metadata listing, not a media transfer: attributed to the vault so the
+    # cost of refreshing links is visible next to the cost of classifying.
+    with apifansly_usage_category(CATEGORY_VAULT):
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            for _ in range(100):
+                entries, cursor = await apifansly_list_vault_album_media(
+                    account_id,
+                    album_id,
+                    cursor=cursor,
+                    limit=50,
+                    client=client,
                 )
-                if candidate_id != media_id:
-                    continue
-                url, thumbnail_url = _vault_media_visual_urls(media)
-                if not url:
-                    return None
-                updates = {
-                    "url": url,
-                    "thumbnail_url": thumbnail_url or None,
-                    "mimetype": media.get("mimetype") or item.get("mimetype"),
-                    "filename": media.get("filename") or item.get("filename"),
-                }
-                await asyncio.to_thread(
-                    lambda: db.table("creator_vault_media")
-                    .update(updates)
-                    .eq("id", item["id"])
-                    .eq("creator_id", creator_id)
-                    .execute()
-                )
-                return {**item, **updates}
-            if not cursor:
-                break
+                for entry in entries:
+                    media = entry.get("media") if isinstance(entry, dict) else None
+                    if not isinstance(media, dict):
+                        continue
+                    candidate_id = str(
+                        entry.get("mediaId") or media.get("id") or ""
+                    )
+                    if candidate_id != media_id:
+                        continue
+                    url, thumbnail_url = _vault_media_visual_urls(media)
+                    if not url:
+                        return None
+                    updates = {
+                        "url": url,
+                        "thumbnail_url": thumbnail_url or None,
+                        "mimetype": media.get("mimetype") or item.get("mimetype"),
+                        "filename": media.get("filename") or item.get("filename"),
+                    }
+                    await asyncio.to_thread(
+                        lambda: db.table("creator_vault_media")
+                        .update(updates)
+                        .eq("id", item["id"])
+                        .eq("creator_id", creator_id)
+                        .execute()
+                    )
+                    return {**item, **updates}
+                if not cursor:
+                    break
     return None
 
 
@@ -3577,14 +3822,13 @@ def _write_temp_video(content: bytes) -> str:
         return temporary.name
 
 
-async def _video_classifier_image(
-    video_url: str,
-    *,
-    client,
-) -> tuple[bytes, str]:
-    """Return a chronological keyframe sheet and a retrieval audit label."""
-    import os
+async def _sample_video_frames(video_url: str) -> ExtractedFrames:
+    """Duration-aware keyframes straight from the signed URL. Costs nothing.
 
+    This is the path that should serve essentially every video: ffmpeg range
+    requests move a few megabytes to sample a clip of any length, and the
+    result is real chronological coverage rather than a poster frame.
+    """
     settings = FrameSettings.from_env()
     if not settings.enabled:
         raise VaultVisualAccessError(
@@ -3594,57 +3838,23 @@ async def _video_classifier_image(
         raise VaultVisualAccessError(
             "Video-frame analysis is unavailable because FFmpeg is missing."
         )
+    return await extract_frames(video_url, settings=settings)
 
-    direct = await extract_frames(video_url, settings=settings)
-    if len(direct.frames) >= 2:
-        sheet, count = await asyncio.to_thread(
-            build_contact_sheet,
-            direct.frames,
-        )
-        if count >= 2 and sheet:
-            return sheet, f"video_frames_{count}_direct_cdn"
 
-    if not is_fansly_cdn_url(video_url):
-        raise VaultVisualAccessError(
-            "The video could not provide at least two readable keyframes."
-        )
+async def _sample_downloaded_video(content: bytes) -> ExtractedFrames:
+    """Keyframes from an already-transferred file. Serialised on purpose."""
+    import os as _os
 
-    # Protected videos occasionally reject direct ffmpeg range requests. The
-    # documented API Fansly proxy is a bounded fallback, serialized to avoid
-    # loading several large clips into the Railway container at once.
+    settings = FrameSettings.from_env()
     async with _protected_video_download_gate:
-        content = await apifansly_download_media(
-            video_url,
-            client=client,
-            timeout=max(settings.timeout_seconds * 2, 60),
-        )
-        temporary_path = await asyncio.to_thread(
-            _write_temp_video,
-            content,
-        )
+        temporary_path = await asyncio.to_thread(_write_temp_video, content)
         try:
-            protected = await extract_frames(
-                temporary_path,
-                settings=settings,
-            )
+            return await extract_frames(temporary_path, settings=settings)
         finally:
             try:
-                await asyncio.to_thread(os.unlink, temporary_path)
+                await asyncio.to_thread(_os.unlink, temporary_path)
             except FileNotFoundError:
                 pass
-    if len(protected.frames) < 2:
-        raise VaultVisualAccessError(
-            "The protected video could not provide at least two readable keyframes."
-        )
-    sheet, count = await asyncio.to_thread(
-        build_contact_sheet,
-        protected.frames,
-    )
-    if count < 2 or not sheet:
-        raise VaultVisualAccessError(
-            "The extracted video frames were blank or unreadable."
-        )
-    return sheet, f"video_frames_{count}_apifansly_download"
 
 
 async def _load_vault_visual(
@@ -3652,64 +3862,41 @@ async def _load_vault_visual(
     *,
     is_video: bool,
     client=None,
-) -> tuple[bytes, str, str]:
-    """Return image bytes, evidence source, and retrieval method."""
+    manual: bool = False,
+    account_id: str = "",
+) -> VaultVisual:
+    """Obtain something classifiable, by the cheapest route that works."""
     import httpx
-
-    source = "video_thumbnail" if is_video else "image"
-    visual_url = str(
-        (item.get("thumbnail_url") if is_video else item.get("url")) or ""
-    )
-    first_error: Exception | None = None
 
     owns_client = client is None
     if owns_client:
         client = httpx.AsyncClient(follow_redirects=True)
     try:
         if is_video:
-            video_errors: list[Exception] = []
-            video_url = str(item.get("url") or "")
-            if video_url:
-                try:
-                    content, method = await _video_classifier_image(
-                        video_url,
-                        client=client,
-                    )
-                    return content, "video_frames", method
-                except Exception as exc:
-                    video_errors.append(exc)
-
-            try:
-                refreshed_video = await _refresh_vault_item_urls(item)
-            except Exception as exc:
-                refreshed_video = None
-                video_errors.append(exc)
-            refreshed_url = str((refreshed_video or {}).get("url") or "")
-            if refreshed_url and refreshed_url != video_url:
-                try:
-                    content, method = await _video_classifier_image(
-                        refreshed_url,
-                        client=client,
-                    )
-                    return content, "video_frames", method + "_after_refresh"
-                except Exception as exc:
-                    video_errors.append(exc)
-
-            detail = str(video_errors[-1]) if video_errors else (
-                "Fansly did not provide the original video URL."
+            return await _load_video_visual(
+                item,
+                client=client,
+                manual=manual,
+                account_id=account_id,
             )
-            raise VaultVisualAccessError(
-                "This video was left unclassified because multiple real "
-                f"keyframes could not be extracted. {detail}"
-            ) from (video_errors[-1] if video_errors else None)
 
+        visual_url = str(item.get("url") or "")
+        first_error: Exception | None = None
         if visual_url:
             try:
-                content, method = await _download_visual_candidate(
+                content, method, billed = await _download_visual_candidate(
                     visual_url,
                     client=client,
+                    manual=manual,
+                    is_video=False,
+                    account_id=account_id,
                 )
-                return content, source, method
+                return VaultVisual(
+                    source="image",
+                    retrieval_method=method,
+                    image=content,
+                    media_bytes=billed,
+                )
             except Exception as exc:
                 first_error = exc
 
@@ -3717,42 +3904,279 @@ async def _load_vault_visual(
             refreshed = await _refresh_vault_item_urls(item)
         except Exception as exc:
             refreshed = None
-            refresh_error = exc
+            refresh_error: Exception | None = exc
         else:
             refresh_error = None
 
-        if refreshed:
-            refreshed_url = str(
-                (
-                    refreshed.get("thumbnail_url")
-                    if is_video
-                    else refreshed.get("url")
-                )
-                or ""
+        refreshed_url = str((refreshed or {}).get("url") or "")
+        if refreshed_url:
+            content, method, billed = await _download_visual_candidate(
+                refreshed_url,
+                client=client,
+                manual=manual,
+                is_video=False,
+                account_id=account_id,
             )
-            if refreshed_url:
-                content, method = await _download_visual_candidate(
-                    refreshed_url,
-                    client=client,
-                )
-                return content, source, method + "_after_refresh"
+            return VaultVisual(
+                source="image",
+                retrieval_method=(
+                    RETRIEVAL_REFRESHED_URL
+                    if method == RETRIEVAL_DIRECT_CDN
+                    else method
+                ),
+                image=content,
+                media_bytes=billed,
+            )
 
-        if is_video and not visual_url:
-            reason = (
-                "Fansly did not provide an image thumbnail for this video. "
-                "The item was left unclassified rather than guessed from its filename."
-            )
-        else:
-            reason = (
-                "The protected media link is unavailable or expired. "
-                "Reconnect the creator's API Fansly account or sync the vault to "
-                "refresh signed media links, then retry."
-            )
-        cause = refresh_error or first_error
-        raise VaultVisualAccessError(reason) from cause
+        raise VaultVisualAccessError(
+            "The media could not be read. Its signed link is unavailable or "
+            "expired; the next vault sync refreshes those links automatically."
+        ) from (refresh_error or first_error)
     finally:
         if owns_client:
             await client.aclose()
+
+
+async def _load_video_visual(
+    item: dict,
+    *,
+    client,
+    manual: bool,
+    account_id: str,
+) -> VaultVisual:
+    """A video's pixels, in strict cost order. See the note above this section."""
+    errors: list[str] = []
+    # The guard's verdict, kept so a refusal can be reported with its real cost
+    # rather than as a generic "could not read this video".
+    last_decision: DownloadDecision | None = None
+    refusals: list[DownloadDecision] = []
+
+    # 1. Direct range sampling of the stored signed URL. Free, and the path
+    #    that should serve essentially every video.
+    video_url = str(item.get("url") or "")
+    if video_url:
+        try:
+            sampled = await _sample_video_frames(video_url)
+            if len(sampled.frames) >= 2:
+                return VaultVisual(
+                    source="video_frames",
+                    retrieval_method=RETRIEVAL_DIRECT_FRAMES,
+                    frames=sampled.frames,
+                    offsets_seconds=sampled.offsets_seconds,
+                    duration_seconds=sampled.duration_seconds,
+                )
+            errors.append(f"direct sampling produced {len(sampled.frames)} frames")
+        except Exception as exc:
+            errors.append(f"direct sampling {type(exc).__name__}")
+
+    # 2. A refreshed signed URL, then range sampling again. One metadata call.
+    refreshed_url = ""
+    try:
+        refreshed = await _refresh_vault_item_urls(item)
+        refreshed_url = str((refreshed or {}).get("url") or "")
+        if refreshed_url and refreshed_url != video_url:
+            sampled = await _sample_video_frames(refreshed_url)
+            if len(sampled.frames) >= 2:
+                return VaultVisual(
+                    source="video_frames",
+                    retrieval_method=RETRIEVAL_REFRESHED_URL,
+                    frames=sampled.frames,
+                    offsets_seconds=sampled.offsets_seconds,
+                    duration_seconds=sampled.duration_seconds,
+                )
+            errors.append("refreshed sampling produced too few frames")
+        if refreshed:
+            item = {**item, **refreshed}
+    except Exception as exc:
+        errors.append(f"refresh {type(exc).__name__}")
+
+    thumbnail_url = str(item.get("thumbnail_url") or "")
+
+    # 3/4. The order here is the whole point of the media-cost guard.
+    #
+    # Automatic: the free thumbnail first. A partial classification for nothing
+    # beats a complete one for 500 credits that nobody asked for.
+    #
+    # Manual: the operator explicitly asked for deep analysis and the manual
+    # ceiling is theirs to spend, so the guarded download is tried first and
+    # the thumbnail is the fallback.
+    if manual:
+        deep = await _video_deep_scan(
+            item,
+            client=client,
+            manual=True,
+            account_id=account_id,
+            errors=errors,
+            refusals=refusals,
+        )
+        if deep is not None:
+            return deep
+        thumbnail = await _video_thumbnail_visual(
+            thumbnail_url,
+            client=client,
+            manual=manual,
+            account_id=account_id,
+            skip_reason=MEDIA_GUARD_REASON_UNKNOWN,
+            skip_message=(
+                "Deep video scan could not be completed, so the thumbnail was "
+                "classified instead."
+            ),
+            errors=errors,
+        )
+        if thumbnail is not None:
+            return thumbnail
+    else:
+        decision = None
+        if thumbnail_url:
+            # Establish what a deep scan WOULD have cost, so the partial result
+            # can say why it stopped. The probe is a free CDN request.
+            probe_url = str(item.get("url") or "")
+            if probe_url and is_fansly_cdn_url(probe_url):
+                size = await _probe_media_size(probe_url, client=client)
+                decision = evaluate_download(
+                    content_length_bytes=size,
+                    manual=False,
+                    allow_unknown_size=False,
+                )
+                last_decision = decision
+            thumbnail = await _video_thumbnail_visual(
+                thumbnail_url,
+                client=client,
+                manual=manual,
+                account_id=account_id,
+                skip_reason=(
+                    decision.reason if decision else MEDIA_GUARD_REASON_UNKNOWN
+                ),
+                skip_message=(
+                    decision.operator_message()
+                    if decision
+                    else (
+                        "Deep video scan skipped to avoid a high "
+                        "media-transfer cost."
+                    )
+                ),
+                errors=errors,
+            )
+            if thumbnail is not None:
+                return thumbnail
+
+        # No usable thumbnail. The guarded download is the last option, and it
+        # proceeds only for an asset whose size is known and small.
+        deep = await _video_deep_scan(
+            item,
+            client=client,
+            manual=False,
+            account_id=account_id,
+            errors=errors,
+            refusals=refusals,
+        )
+        if deep is not None:
+            return deep
+
+    # Nothing free worked and the billed path was refused on cost. That is a
+    # policy outcome with a number attached, not a fault, so it is reported as
+    # one: the item is left pending with the reason, and no credits are spent.
+    refused = refusals[-1] if refusals else last_decision
+    if refused is not None and not refused.allowed:
+        raise VaultMediaCostRefusal(refused)
+
+    detail = "; ".join(errors[-3:]) or "no readable source"
+    raise VaultVisualAccessError(
+        "This video could not be classified: no keyframes and no thumbnail "
+        f"could be read ({detail}). It was left unclassified rather than "
+        "guessed from its filename."
+    )
+
+
+async def _video_thumbnail_visual(
+    thumbnail_url: str,
+    *,
+    client,
+    manual: bool,
+    account_id: str,
+    skip_reason: str,
+    skip_message: str,
+    errors: list[str],
+) -> VaultVisual | None:
+    """The platform thumbnail, as a deliberately PARTIAL classification."""
+    if not thumbnail_url:
+        return None
+    try:
+        content, method, billed = await _download_visual_candidate(
+            thumbnail_url,
+            client=client,
+            manual=manual,
+            # A thumbnail is a still image whatever it depicts, so it is the
+            # image tier of the guard that applies to it, not the video tier.
+            is_video=False,
+            account_id=account_id,
+        )
+    except Exception as exc:
+        errors.append(f"thumbnail {type(exc).__name__}")
+        return None
+    return VaultVisual(
+        source="video_thumbnail",
+        retrieval_method=(
+            RETRIEVAL_PLATFORM_THUMBNAIL if billed == 0 else method
+        ),
+        image=content,
+        media_bytes=billed,
+        status=CLASSIFICATION_STATUS_PARTIAL,
+        skip_reason=skip_reason,
+        skip_message=skip_message,
+    )
+
+
+async def _video_deep_scan(
+    item: dict,
+    *,
+    client,
+    manual: bool,
+    account_id: str,
+    errors: list[str],
+    refusals: list[DownloadDecision],
+) -> VaultVisual | None:
+    """Transfer the original through the billed proxy, if the guard allows.
+
+    Returns None when the guard refuses or the transfer fails, so the caller
+    falls through to the next option rather than failing the whole item.
+    """
+    video_url = str(item.get("url") or "")
+    if not video_url or not is_fansly_cdn_url(video_url):
+        return None
+    try:
+        content, decision = await _guarded_proxy_download(
+            video_url,
+            client=client,
+            manual=manual,
+            is_video=True,
+            account_id=account_id,
+        )
+    except Exception as exc:
+        errors.append(f"proxy {type(exc).__name__}")
+        return None
+    if not content:
+        errors.append(f"guard {decision.reason}")
+        refusals.append(decision)
+        return None
+
+    billed = len(content)
+    try:
+        sampled = await _sample_downloaded_video(content)
+    except Exception as exc:
+        errors.append(f"downloaded sampling {type(exc).__name__}")
+        return None
+    if len(sampled.frames) < 2:
+        errors.append("downloaded sampling produced too few frames")
+        return None
+    return VaultVisual(
+        source="video_frames",
+        retrieval_method=RETRIEVAL_APIFANSLY_DOWNLOAD,
+        frames=sampled.frames,
+        offsets_seconds=sampled.offsets_seconds,
+        duration_seconds=sampled.duration_seconds,
+        media_bytes=billed,
+    )
 
 
 def _prepare_classifier_image(visual_bytes: bytes) -> bytes:
@@ -3769,55 +4193,249 @@ def _prepare_classifier_image(visual_bytes: bytes) -> bytes:
     return buffer.getvalue()
 
 
+def _pending_classification_payload(item: dict, decision: DownloadDecision) -> dict:
+    """What is written when deeper analysis was refused on cost.
+
+    Deliberately carries NO content category, explicitness or price. Those
+    would be guesses, and a guessed category becomes sellable set metadata. The
+    row records that it was looked at, what it would have cost, and why it
+    stopped — which is an honest answer and a reversible one: a later manual
+    re-analysis, or a sync where direct sampling succeeds, replaces it.
+    """
+    return {
+        "id": item.get("id", ""),
+        "pending": True,
+        "classification_status": CLASSIFICATION_STATUS_PENDING,
+        "classification_skip_reason": decision.reason,
+        "classification_media_key": media_identity_key(item),
+        "classification_retrieval_method": "",
+        "classification_media_bytes": 0,
+        "classification_media_credits": 0.0,
+        "classification_frames_sampled": 0,
+        "classification_metadata": {
+            "analysis_skipped": {
+                "reason": decision.reason,
+                "message": decision.operator_message(),
+                "estimated_megabytes": decision.estimated_megabytes,
+                "estimated_credits": round(decision.estimated_credits, 2),
+            }
+        },
+    }
+
+
+async def _classify_video_batches(
+    visual: VaultVisual,
+    *,
+    item: dict,
+    allow_core_qwen_fallback: bool,
+    force_qwen: bool,
+) -> tuple[dict, dict, dict, dict]:
+    """Classify a video as several chronological batches, then combine them.
+
+    Returns ``(primary_classification, shoot_fingerprint, local_visual,
+    video_record)``.
+
+    The primary classification is the batch with the highest explicitness,
+    because that is what decides the CATEGORY and therefore the approved price
+    range: a clip that ends explicit is an explicit clip, and pricing it from
+    its clothed opening would be wrong in the direction that loses money and
+    mis-sells content. Everything about how the clip MOVES lives in the video
+    record, which is merged over the primary result below.
+
+    The shoot fingerprint comes from the first batch's sheet, so same-shoot
+    grouping keys off the opening frames — the part most likely to share
+    setting and styling with the stills from the same session.
+    """
+    batches = chronological_batches(
+        visual.frames,
+        visual.offsets_seconds,
+        frames_per_sheet=_VIDEO_FRAMES_PER_SHEET,
+        max_sheets=_VIDEO_MAX_SHEETS,
+    )
+    album_title = str(item.get("album_title") or "")
+    filename = str(item.get("filename") or "")
+
+    sheets: list[tuple[Any, bytes, int]] = []
+    for batch in batches:
+        sheet, used = await asyncio.to_thread(build_contact_sheet, batch.frames)
+        if sheet and used >= 1:
+            sheets.append((batch, sheet, used))
+    if not sheets:
+        raise VaultVisualAccessError(
+            "The extracted video frames were blank or unreadable."
+        )
+
+    first_fingerprint = await build_shoot_fingerprint(sheets[0][1])
+    local_visual = first_fingerprint.get("local") or {}
+
+    results: list[tuple[Any, dict, int]] = []
+    for batch, sheet, used in sheets:
+        classified = await classify_vault_image(
+            sheet,
+            is_video=True,
+            album_title=album_title,
+            filename=filename,
+            local_visual=local_visual,
+            allow_core_qwen_fallback=allow_core_qwen_fallback,
+            force_qwen=force_qwen,
+        )
+        results.append((batch, classified, used))
+
+    observations = [
+        observation_from_classification(
+            classified,
+            batch=batch,
+            frames_used=used,
+        )
+        for batch, classified, used in results
+    ]
+    record = combine_batch_observations(
+        observations,
+        duration_seconds=visual.duration_seconds,
+    )
+
+    # The batch that decides category and price: the most explicit one.
+    primary_index = max(
+        range(len(results)),
+        key=lambda index: (
+            int(results[index][1].get("explicitness") or 0),
+            observations[index].nudity_rank,
+        ),
+    )
+    primary = dict(results[primary_index][1])
+
+    # Facts that belong to the WHOLE clip replace the single batch's view of
+    # them. Anything the record could not determine leaves the primary batch's
+    # value alone rather than blanking it.
+    prose = describe_video_record(record)
+    if prose:
+        primary["description"] = prose
+        primary["description_complete"] = True
+    for key, value in (
+        ("scene_location", record.get("setting")),
+        ("good_for", commercial_role(record)),
+    ):
+        if value:
+            primary[key] = value
+    if record.get("progression"):
+        # The outfit field becomes the progression when there is one, because
+        # "clothed → lingerie → nude" is the truthful answer to "what is the
+        # wardrobe in this video" and a single state is not.
+        primary["scene_outfit"] = " → ".join(record["progression"][:4])
+    for key, source_key in (
+        ("props", "props"),
+        ("sexual_activity", "activities"),
+        ("visible_anatomy", "visible_anatomy"),
+    ):
+        values = record.get(source_key) or []
+        if values:
+            merged = list(primary.get(key) or [])
+            for value in values:
+                if not any(str(value).lower() == str(k).lower() for k in merged):
+                    merged.append(value)
+            primary[key] = merged
+    if record.get("tags"):
+        merged_tags = list(primary.get("tags") or [])
+        for tag in record["tags"]:
+            if not any(str(tag).lower() == str(k).lower() for k in merged_tags):
+                merged_tags.append(tag)
+        primary["tags"] = merged_tags
+
+    provider_metadata = dict(primary.get("_provider_metadata") or {})
+    provider_metadata["video_batches"] = len(results)
+    provider_metadata["video_frames_sampled"] = sum(used for _, _, used in results)
+    provider_metadata["video_duration_seconds"] = round(
+        float(visual.duration_seconds or 0.0), 2
+    )
+    primary["_provider_metadata"] = provider_metadata
+
+    shoot_fingerprint = first_fingerprint
+    print(
+        f"[VIDEO SEMANTICS] item={item.get('id', '')} "
+        f"duration={record.get('duration_label')} "
+        f"frames={record.get('sampled_frames')} batches={len(results)} "
+        f"progression={'→'.join(record.get('progression') or []) or 'none'} "
+        f"changes={len(record.get('scene_changes') or [])}"
+    )
+    return primary, shoot_fingerprint, local_visual, record
+
+
 async def _categorize_single_item(
     item: dict,
     *,
     allow_core_qwen_fallback: bool = True,
     force_qwen: bool = False,
     visual_client=None,
+    manual: bool = False,
+    account_id: str = "",
 ) -> dict:
     """Classify one vault item into the versioned provider-neutral contract.
 
-    Images are resized before upload to control vision-token cost.  Videos use
-    their real platform thumbnail rather than guessing from a filename.  A
-    provider/fetch/parse failure is raised so the retry loop can leave the item
-    stale instead of permanently saving an empty ``other`` classification.
+    Images are resized before upload to control vision-token cost. A video is
+    sampled across its whole duration and classified in small chronological
+    batches, which are then folded into one video-level semantic record — see
+    ``_classify_video_batches``. A provider/fetch/parse failure is raised so the
+    retry loop can leave the item stale instead of permanently saving an empty
+    ``other`` classification.
+
+    ``manual`` marks an operator-initiated re-analysis, which the media-cost
+    guard allows a larger transfer budget and permits to attempt a deep video
+    scan ahead of the thumbnail.
     """
     mimetype = str(item.get("mimetype") or "").lower()
     item_id = item.get("id", "")
     is_video = mimetype.startswith("video") if mimetype else False
 
     try:
-        if visual_client is None:
-            visual_bytes, source, fetch_method = await _load_vault_visual(
-                item,
-                is_video=is_video,
-            )
-        else:
-            visual_bytes, source, fetch_method = await _load_vault_visual(
+        try:
+            visual = await _load_vault_visual(
                 item,
                 is_video=is_video,
                 client=visual_client,
+                manual=manual,
+                account_id=account_id,
             )
+        except VaultMediaCostRefusal as refusal:
+            # A policy outcome, not a fault: record why and spend nothing.
+            print(
+                f"[CATEGORIZE PENDING] item={item_id} "
+                f"reason={refusal.decision.reason} "
+                f"would_cost_credits={refusal.decision.estimated_credits:.0f}"
+            )
+            return _pending_classification_payload(item, refusal.decision)
+        source = visual.source
+        fetch_method = visual.retrieval_method
 
-        # Classification does not need original-resolution media.  Normalizing
-        # every asset to a compact JPEG makes cost predictable and also handles
-        # thumbnails whose declared MIME type is missing or inaccurate.
-        classifier_image = await asyncio.to_thread(
-            _prepare_classifier_image,
-            visual_bytes,
-        )
-        shoot_fingerprint = await build_shoot_fingerprint(classifier_image)
-        local_visual = shoot_fingerprint.get("local") or {}
-        data = await classify_vault_image(
-            classifier_image,
-            is_video=is_video,
-            album_title=str(item.get("album_title") or ""),
-            filename=str(item.get("filename") or ""),
-            local_visual=local_visual,
-            allow_core_qwen_fallback=allow_core_qwen_fallback,
-            force_qwen=force_qwen,
-        )
+        video_record: dict[str, Any] = {}
+        if visual.frames:
+            data, shoot_fingerprint, local_visual, video_record = (
+                await _classify_video_batches(
+                    visual,
+                    item=item,
+                    allow_core_qwen_fallback=allow_core_qwen_fallback,
+                    force_qwen=force_qwen,
+                )
+            )
+        else:
+            # Classification does not need original-resolution media.
+            # Normalizing every asset to a compact JPEG makes cost predictable
+            # and also handles thumbnails whose declared MIME type is missing
+            # or inaccurate.
+            classifier_image = await asyncio.to_thread(
+                _prepare_classifier_image,
+                visual.image,
+            )
+            shoot_fingerprint = await build_shoot_fingerprint(classifier_image)
+            local_visual = shoot_fingerprint.get("local") or {}
+            data = await classify_vault_image(
+                classifier_image,
+                is_video=is_video,
+                album_title=str(item.get("album_title") or ""),
+                filename=str(item.get("filename") or ""),
+                local_visual=local_visual,
+                allow_core_qwen_fallback=allow_core_qwen_fallback,
+                force_qwen=force_qwen,
+            )
         model = str(data.pop("_classification_model", "nudenet-3.4.2"))
         provider_metadata = dict(data.pop("_provider_metadata", {}) or {})
         provider = str(provider_metadata.get("provider") or "local_nudenet")
@@ -3909,17 +4527,42 @@ async def _categorize_single_item(
             "fetch_method": fetch_method,
             "classifier_provider": provider,
             "provider_details": provider_metadata,
+            # What the retrieval cost, per item, so vault media spend is
+            # attributable to an asset rather than inferred from a total.
+            "retrieval": {
+                "method": visual.retrieval_method,
+                "media_bytes": visual.media_bytes,
+                "estimated_credits": visual.estimated_credits,
+                "frames_sampled": len(visual.frames),
+                "duration_seconds": round(float(visual.duration_seconds or 0), 2),
+            },
         })
+        if video_record:
+            # The whole-clip semantic record: progression, setting, beginning /
+            # middle / ending, meaningful changes and their timestamps.
+            metadata["video"] = video_record
+        if visual.skip_reason:
+            metadata["analysis_skipped"] = {
+                "reason": visual.skip_reason,
+                "message": visual.skip_message,
+            }
         print(
             f"[SHOOT FINGERPRINT] item={item_id} "
             f"status={shoot_fingerprint.get('status')} "
             f"palette={local_visual.get('palette_names') or []}"
         )
+        # A video-level record is a better description than the per-image
+        # prose builder can produce, because only it knows the clip moved.
+        description = (
+            describe_video_record(video_record)
+            if video_record
+            else media_description(metadata, source=source)
+        ) or media_description(metadata, source=source)
 
         return {
             "id": item_id,
             "content_category": category,
-            "ai_description": media_description(metadata, source=source),
+            "ai_description": description,
             "price_min": price_info["min"],
             "price_max": price_info["max"],
             "explicitness": explicitness,
@@ -3934,6 +4577,13 @@ async def _categorize_single_item(
             "classification_source": source,
             "classification_confidence": confidence,
             "classification_metadata": metadata,
+            "classification_status": visual.status,
+            "classification_skip_reason": visual.skip_reason,
+            "classification_media_key": media_identity_key(item),
+            "classification_retrieval_method": visual.retrieval_method,
+            "classification_media_bytes": visual.media_bytes,
+            "classification_media_credits": visual.estimated_credits,
+            "classification_frames_sampled": len(visual.frames),
             "classified_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -4072,6 +4722,32 @@ async def _count_uncategorized(creator_id: str) -> int:
         .execute()
     )
     return r.count or 0
+
+
+async def _count_classification_status(creator_id: str, status: str) -> int:
+    """How many of this creator's rows are in one classification state.
+
+    Used for the two states an operator can act on: ``partial`` (classified
+    from a thumbnail because a deep video scan would have cost too much) and
+    ``pending`` (not classified at all, for the same reason).
+    """
+    db = get_supabase()
+    try:
+        result = await asyncio.to_thread(
+            lambda: db.table("creator_vault_media")
+            .select("id", count="exact", head=True)
+            .eq("creator_id", creator_id)
+            .eq("classification_status", status)
+            .execute()
+        )
+        return result.count or 0
+    except Exception as exc:
+        # The column arrives with db/vault_classification_persistence_v1.sql. A
+        # backend deployed ahead of its migration reports zero rather than
+        # failing the whole overview, which is true by construction: without
+        # the column no row can be in that state.
+        print(f"[VAULT] classification_status unavailable ({status}): {exc}")
+        return 0
 
 
 async def _count_stale_classifications(creator_id: str) -> int:
@@ -4356,6 +5032,16 @@ async def vault_categorization_overview(creator_id: str) -> dict:
         "vault_gate": VAULT_GATE.snapshot(),
         "uncategorized": await _count_uncategorized(creator_id),
         "stale_classifications": await _count_stale_classifications(creator_id),
+        # Items where the media-cost guard stopped short of a deep video scan.
+        # Surfaced so an operator can see the trade being made rather than
+        # wondering why some videos read thinner than others.
+        "partial_classifications": await _count_classification_status(
+            creator_id, CLASSIFICATION_STATUS_PARTIAL
+        ),
+        "pending_classifications": await _count_classification_status(
+            creator_id, CLASSIFICATION_STATUS_PENDING
+        ),
+        "auto_media_download_limits": auto_download_limits().to_dict(),
         "stale_approved_classifications": len(stale_approved),
         "video_frame_upgrades": len(
             await _video_frame_upgrade_media_ids(creator_id)
@@ -4459,12 +5145,38 @@ async def _run_vault_categorization_job(
         state = _categorize_state.get(creator_id)
         if isinstance(state, dict):
             state["status"] = "running"
-        await _run_vault_categorization(
-            creator_id,
-            item_ids=item_ids,
-            mark_initial=mark_initial,
-            upgrade_legacy=upgrade_legacy,
+        # Every provider call this run makes — link refreshes and any guarded
+        # media download alike — is attributed to the vault, so the existing
+        # credit telemetry can answer "what did classification cost?" without a
+        # second accounting system.
+        with apifansly_usage_category(CATEGORY_VAULT):
+            await _run_vault_categorization(
+                creator_id,
+                item_ids=item_ids,
+                mark_initial=mark_initial,
+                upgrade_legacy=upgrade_legacy,
+            )
+
+
+async def _creator_apifansly_account_id(creator_id: str) -> str:
+    """The creator's platform account id, for credit attribution.
+
+    Best effort: a failed read costs attribution on the usage snapshot, never
+    the classification run itself.
+    """
+    try:
+        row = await asyncio.to_thread(
+            lambda: get_supabase()
+            .table("creators")
+            .select("apifansly_account_id")
+            .eq("id", creator_id)
+            .single()
+            .execute()
         )
+        return str((row.data or {}).get("apifansly_account_id") or "")
+    except Exception as exc:
+        print(f"[CATEGORIZE] account attribution unavailable {creator_id}: {exc}")
+        return ""
 
 
 async def _run_vault_categorization(
@@ -4480,7 +5192,12 @@ async def _run_vault_categorization(
         target_ids = normalize_media_ids(item_ids)
         select_fields = (
             "id, creator_id, media_id, fansly_media_id, album_id, "
-            "url, thumbnail_url, mimetype, filename, album_title"
+            "url, thumbnail_url, mimetype, filename, album_title, "
+            # Read so services.vault_classification_state can decide, per row,
+            # whether this is finished work. Without these the run would either
+            # re-spend on everything or never retry a partial result.
+            "content_category, classified_at, classification_version, "
+            "classification_status, classification_media_key"
         )
         if target_ids:
             # URL-safe chunks also make the exact new-media contract explicit.
@@ -4534,10 +5251,44 @@ async def _run_vault_categorization(
                     break
                 from_idx += page_size
 
+        mode = "new" if target_ids else ("upgrade" if upgrade_legacy else "initial")
+
+        # The persistence gate. A row with a successful classification at the
+        # current version is finished work and is dropped here, so an ordinary
+        # daily sync spends nothing re-deriving answers it already has. An
+        # explicit confirmed upgrade is the one path allowed to reprocess on a
+        # version bump alone.
+        candidates = len(all_items)
+        all_items, selection_reasons = select_items_for_classification(
+            all_items,
+            classifier_version=VAULT_CLASSIFIER_VERSION,
+            allow_version_upgrade=upgrade_legacy,
+            operator_requested=upgrade_legacy,
+        )
         total = len(all_items)
         _categorize_state[creator_id]["total"] = total
-        mode = "new" if target_ids else ("upgrade" if upgrade_legacy else "initial")
-        print(f"[CATEGORIZE] creator={creator_id} mode={mode} items={total}")
+        _categorize_state[creator_id]["skipped_already_classified"] = max(
+            candidates - total, 0
+        )
+        _categorize_state[creator_id]["selection_reasons"] = selection_reasons
+        print(
+            f"[CATEGORIZE] creator={creator_id} mode={mode} items={total} "
+            f"candidates={candidates} reasons={selection_reasons}"
+        )
+        if not total:
+            _categorize_state[creator_id].update({
+                "status": "done",
+                "done": 0,
+                "errors": 0,
+                "nothing_to_do": True,
+            })
+            print(
+                f"[CATEGORIZE] creator={creator_id} nothing to do — "
+                f"{candidates} candidate rows are already classified"
+            )
+            return
+
+        account_id = await _creator_apifansly_account_id(creator_id)
 
         import time
         import httpx
@@ -4550,6 +5301,8 @@ async def _run_vault_categorization(
         provider_failures = 0
         qwen_fallbacks = 0
         semantic_failures = 0
+        cost_deferred = 0
+        media_bytes_spent = 0
         semantic_enabled = bool(
             os.environ.get("VAULT_SEMANTIC_BASE_URL", "").strip()
         )
@@ -4644,6 +5397,16 @@ async def _run_vault_categorization(
                 "errors": errors,
                 "qwen_fallbacks": qwen_fallbacks,
                 "semantic_failures": semantic_failures,
+                # What this run actually spent at the billed media proxy, and
+                # how many items stopped short rather than spend it.
+                "cost_deferred": cost_deferred,
+                "media_bytes": media_bytes_spent,
+                "media_credits": round(
+                    estimated_credits_for_bytes(media_bytes_spent)
+                    if media_bytes_spent
+                    else 0.0,
+                    2,
+                ),
                 "elapsed_seconds": round(elapsed),
                 "items_per_minute": round(rate * 60, 1),
                 "estimated_seconds_remaining": eta,
@@ -4661,6 +5424,7 @@ async def _run_vault_categorization(
         async def worker(visual_client) -> None:
             nonlocal completed, errors, provider_failures
             nonlocal qwen_fallbacks, semantic_failures, abort_reason
+            nonlocal cost_deferred, media_bytes_spent
             while True:
                 item = await next_item()
                 if item is None:
@@ -4670,6 +5434,7 @@ async def _run_vault_categorization(
                         item,
                         allow_core_qwen_fallback=allow_core_qwen_fallback,
                         visual_client=visual_client,
+                        account_id=account_id,
                     )
                 except Exception as error:
                     errors += 1
@@ -4685,6 +5450,11 @@ async def _run_vault_categorization(
                             )
                     continue
 
+                if result.get("pending"):
+                    # Refused on media cost. Persisted so the operator can see
+                    # it, counted separately so a run does not report a cost
+                    # decision as a classification.
+                    cost_deferred += 1
                 provider_details = (
                     (result.get("classification_metadata") or {})
                     .get("provider_details") or {}
@@ -4693,6 +5463,9 @@ async def _run_vault_categorization(
                     qwen_fallbacks += 1
                 if provider_details.get("semantic_status") == "fallback":
                     semantic_failures += 1
+                media_bytes_spent += int(
+                    result.get("classification_media_bytes") or 0
+                )
 
                 # on_conflict targets the primary key, so this is an update of
                 # an existing row. creator_id and media_id travel with it so the
@@ -4732,7 +5505,10 @@ async def _run_vault_categorization(
         print(
             f"[CATEGORIZE] done={done}/{total} errors={errors} "
             f"qwen_fallbacks={qwen_fallbacks} "
-            f"semantic_failures={semantic_failures}"
+            f"semantic_failures={semantic_failures} "
+            f"cost_deferred={cost_deferred} "
+            f"media_mb={media_bytes_spent / (1024 * 1024):.1f} "
+            f"media_credits={estimated_credits_for_bytes(media_bytes_spent):.1f}"
         )
 
         if abort_reason:
@@ -4845,6 +5621,7 @@ async def _categorize_single_item_with_retry(
     *,
     allow_core_qwen_fallback: bool = True,
     visual_client=None,
+    account_id: str = "",
 ) -> dict:
     """Wrap _categorize_single_item with exponential backoff on 429."""
     for attempt in range(max_retries):
@@ -4853,6 +5630,7 @@ async def _categorize_single_item_with_retry(
                 item,
                 allow_core_qwen_fallback=allow_core_qwen_fallback,
                 visual_client=visual_client,
+                account_id=account_id,
             )
         except Exception as e:
             message = str(e).lower()
@@ -4868,6 +5646,7 @@ async def _categorize_single_item_with_retry(
         item,
         allow_core_qwen_fallback=allow_core_qwen_fallback,
         visual_client=visual_client,
+        account_id=account_id,
     )
 
 
@@ -4921,7 +5700,15 @@ async def recategorize_item(item_id: str) -> dict:
     )
 
     try:
-        result = await _categorize_single_item(item, force_qwen=True)
+        # Manual, operator-initiated, and already capped at a few per day: the
+        # media-cost guard grants this path its larger ceiling and lets it try
+        # a deep video scan ahead of the thumbnail.
+        result = await _categorize_single_item(
+            item,
+            force_qwen=True,
+            manual=True,
+            account_id=await _creator_apifansly_account_id(creator_id),
+        )
     except VaultVisualAccessError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except VaultClassifierError as exc:
@@ -6625,15 +7412,26 @@ async def enrich_fan_endpoint(fan_id: str) -> dict:
     return {"status": "ok"}
 
 
-# --- Owner-only Full Auto simulator ----------------------------------------
+# --- The Full Auto simulator ------------------------------------------------
 #
-# Private to allowlisted Supabase accounts. Every route below is invisible and
-# inaccessible to ordinary agency tenants, and every rejection is the same 404
-# the tenancy layer uses, so a caller cannot probe which condition it failed or
-# learn that another tenant's creator or fan exists.
+# Two tiers, defined in core.simulation and enforced here.
 #
-# The frontend hides the simulator using GET /simulation-capabilities, but that
-# is convenience only: nothing below trusts the client.
+# AGENCY — any authenticated operator, when the deployment has the simulator on.
+# Scoped entirely by ordinary creator tenancy: an agency simulates the creators
+# it already holds, against ``test_`` fans of those creators, planning against
+# those creators' own approved vault. No route below widens tenancy for it.
+#
+# OWNER — the allowlisted platform owner, additionally permitted the CROSS-TENANT
+# catalog mirror (source discovery, mirroring, un-mirroring, and mirrored-media
+# preview whose provenance points at another tenant). Those routes are guarded
+# by ``require_simulation_owner``; an agency account gets the same 404 as
+# everything else and cannot learn the capability exists.
+#
+# Every rejection is that one 404, so a caller cannot probe which condition it
+# failed or learn that another tenant's creator or fan exists.
+#
+# The frontend hides what an account may not use via GET /simulation-capabilities,
+# but that is convenience only: nothing below trusts the client.
 
 
 class SimulateInboundRequest(BaseModel):
@@ -6675,11 +7473,16 @@ async def _require_simulatable_fan(
 ) -> dict:
     """All six simulation preconditions, in order, with one shared rejection.
 
-    1-3 (flag, authenticated user, allowlist) come from core.simulation;
-    4 and 5 reuse the ordinary tenancy helper, so the simulator is subject to
-    exactly the same tenancy model as every other creator route rather than a
-    parallel one; 6 is the ``test_`` platform-fan boundary, enforced here on
-    every simulation mutation so knowing a real fan's UUID is never enough.
+    1-3 (master switch, agency access, authenticated user) come from
+    core.simulation; 4 and 5 reuse the ordinary tenancy helper, so the simulator
+    is subject to exactly the same tenancy model as every other creator route
+    rather than a parallel one; 6 is the ``test_`` platform-fan boundary,
+    enforced here on every simulation mutation so knowing a real fan's UUID is
+    never enough.
+
+    Identical for an agency operator and for the owner. Owner authority adds
+    cross-tenant MIRROR capability, never cross-tenant simulation: nobody
+    simulates a creator they are not assigned.
     """
     from core.simulation import is_simulatable_fan, not_found, require_simulation_user
 
@@ -6708,14 +7511,33 @@ async def _require_simulatable_fan(
 
 @app.get("/simulation-capabilities")
 async def simulation_capabilities(request: Request) -> dict:
-    """What privileged local tooling this authenticated account may use.
+    """What local tooling this authenticated account may use.
 
-    Returns a boolean and nothing else. It never exposes the allowlist, the
-    environment variables, any user id, or why another user is not allowed.
+    Three booleans about the CALLER and nothing else. It never exposes the
+    allowlist, the environment variables, any user id, or why another user is
+    not allowed.
+
+    ``auto_simulation``     may open the simulator at all (agency tier).
+    ``simulation_mirror``   may use the cross-tenant catalog mirror (owner).
+    ``operator_diagnostics`` may see low-level retrieval/cost detail in
+                            otherwise ordinary operator surfaces. Owner tier,
+                            because it is diagnostic noise for an agency rather
+                            than a second security boundary — the data it
+                            reveals is the caller's own creators' either way.
     """
-    from core.simulation import request_may_simulate
+    from core.simulation import (
+        request_is_platform_operator,
+        request_is_simulation_owner,
+        request_may_simulate,
+    )
 
-    return {"auto_simulation": bool(request_may_simulate(request))}
+    return {
+        "auto_simulation": bool(request_may_simulate(request)),
+        "simulation_mirror": bool(request_is_simulation_owner(request)),
+        # Identity, not a feature switch: turning the simulator off must not
+        # also strip the owner's diagnostics from unrelated surfaces.
+        "operator_diagnostics": bool(request_is_platform_operator(request)),
+    }
 
 
 def _read_simulation_test_fans(db, creator_ids: list[str]):
@@ -6764,6 +7586,12 @@ async def simulation_creators(request: Request) -> dict:
 
     Scoped by the caller's ordinary creator assignments, then filtered to
     ``test_`` fans, so the simulator's pickers cannot enumerate real fans.
+
+    This is the only creator listing the simulator has, and it is the same for
+    an agency and for the owner: both see exactly the creators they are
+    assigned. Being the platform owner is not a global read of the creators
+    table — the cross-tenant listing is ``/simulation/catalog/sources``, which
+    answers a different question and grants nothing here.
     """
     from core.simulation import TEST_FAN_PREFIX, require_simulation_user
 
@@ -6852,12 +7680,18 @@ async def simulate_inbound(
     Deliberately unaffected by APIFANSLY_ENABLED: the whole point is that this
     works while the connector is off, because it never touches it.
     """
+    from core.simulation import request_is_simulation_owner
     from services.suggestions import run_simulated_inbound
 
     fan = await _require_simulatable_fan(request, creator_id, fan_id)
+    # Only an owner's turn may plan against mirrored cross-tenant test rows.
+    # An agency's turn plans against this creator's own approved vault and
+    # sets — the same inventory live planning would use.
+    mirrored = request_is_simulation_owner(request)
     print(
         f"[SIMULATION] inbound creator={creator_id} fan={fan_id} "
-        f"platform_fan={fan.get('platform_fan_id')} fast={body.fast}"
+        f"platform_fan={fan.get('platform_fan_id')} fast={body.fast} "
+        f"mirrored_catalog={mirrored}"
     )
     try:
         return await run_simulated_inbound(
@@ -6865,6 +7699,7 @@ async def simulate_inbound(
             creator_id=creator_id,
             message=body.message,
             fast=body.fast,
+            include_mirrored_catalog=mirrored,
         )
     except HTTPException:
         raise
@@ -6896,7 +7731,7 @@ async def _require_simulation_catalog_access(
     source_creator_id: str,
     target_creator_id: str,
 ) -> None:
-    """Owner-only, with deliberately different rules for source and target.
+    """OWNER tier, with deliberately different rules for source and target.
 
     The two sides of a mirror are not the same kind of thing, and requiring the
     same authorization for both was the bug this asymmetry fixes.
@@ -6926,14 +7761,22 @@ async def _require_simulation_catalog_access(
       the source's platform media ids never become deliverable under the
       target.
 
-    The allowlist still decides WHO, and every rejection is the same 404 the
+    The owner allowlist decides WHO, and every rejection is the same 404 the
     rest of the simulator uses, so an agency account cannot discover that this
     capability exists or probe for creator ids with it.
+
+    This is the ONE capability the owner tier exists for. Since the simulator
+    itself became available to ordinary agency operators, passing the agency
+    check is emphatically not enough here: an agency operator legitimately
+    holds its own creators, so tenancy on the TARGET succeeds for it, and the
+    owner allowlist is the only thing standing between it and another tenant's
+    vault. ``require_simulation_owner`` — not ``require_simulation_user`` — is
+    therefore the whole boundary.
     """
-    from core.simulation import not_found, require_simulation_user
+    from core.simulation import not_found, require_simulation_owner
     from services.simulation_catalog import mirror_source_exists
 
-    await require_simulation_user(request)
+    await require_simulation_owner(request)
 
     allowed = await _creator_ids_for_user_cached(request)
     if str(target_creator_id) not in allowed:
@@ -6953,19 +7796,25 @@ async def list_simulation_catalog_sources(request: Request) -> dict:
     """Creators whose vault may be COPIED FROM. Owner only, cross-tenant.
 
     Deliberately separate from ``/simulation/creators``, which answers a
-    different question — who the owner may simulate AS — and stays
-    tenancy-scoped. A creator appearing here gains nothing: it does not enter
-    the simulator selector, it creates no assignment, and the only thing it
-    enables is being named as the SOURCE of a mirror whose target the caller
-    must ordinarily hold.
+    different question — who the caller may simulate AS — and stays
+    tenancy-scoped for everybody. A creator appearing here gains nothing: it
+    does not enter the simulator selector, it creates no assignment, and the
+    only thing it enables is being named as the SOURCE of a mirror whose target
+    the caller must ordinarily hold.
+
+    This route enumerates EVERY creator in the deployment, across tenants, so
+    it is the sharpest edge in the simulator and is owner-gated accordingly.
+    An agency operator — who may now use the simulator perfectly legitimately —
+    gets the same 404 an unauthenticated caller does, and therefore cannot
+    learn that other tenants exist, let alone name one as a mirror source.
 
     Returns the minimum the picker needs: id, display name, and whether there is
     real approved content worth mirroring. Nothing about the account itself.
     """
-    from core.simulation import require_simulation_user
+    from core.simulation import require_simulation_owner
     from services.simulation_catalog import list_mirror_source_creators
 
-    await require_simulation_user(request)
+    await require_simulation_owner(request)
     try:
         sources = await list_mirror_source_creators()
     except Exception as exc:
@@ -6985,7 +7834,7 @@ async def mirror_simulation_catalog(
     body: SimulationCatalogMirrorRequest,
     request: Request,
 ) -> dict:
-    """Refresh the target creator's owner-only TEST catalog from a source vault.
+    """Refresh the target creator's TEST catalog from a source vault. Owner only.
 
     Mirrored rows are marked ``simulation_only`` and carry rewritten ``sim:``
     media ids, so they are visible to the simulator, excluded from live package
@@ -7146,11 +7995,16 @@ async def create_simulation_test_fan(
     body: SimulationTestFanRequest,
     request: Request,
 ) -> dict:
-    """Create a clean, persistent simulation fan. Owner only.
+    """Create a clean, persistent simulation fan under a creator you hold.
 
     The platform id is generated server-side and always carries the ``test_``
     prefix, so this control cannot produce a fan the rest of the system would
     treat as real. Nothing about a Fansly account is touched.
+
+    Agency operators may do this for their own creators: a ``test_`` fan is
+    exactly the isolation boundary that makes simulating safe, so being able to
+    create one is part of the agency tier rather than an owner privilege. The
+    ordinary tenancy check below is what keeps it to creators the caller holds.
     """
     from core.simulation import require_simulation_user
     from services.simulation_workspace import (
@@ -7198,13 +8052,13 @@ async def run_simulation_action_now(
 ) -> dict:
     """Fire one pending scheduled action immediately, through the real handler.
 
-    Owner only, test fans only. This is how delayed behaviour — payday
+    Simulator users, own creators, test fans only. This is how delayed behaviour — payday
     re-engagement, post-session follow-up, re-engagement after silence — is
     tested without waiting days and without a fake clock: the production
     revalidation, planner, writer and state transitions all run, inside
     ``simulation_scope()``, so no platform call is possible.
     """
-    from core.simulation import not_found
+    from core.simulation import not_found, request_is_simulation_owner
     from services.simulation_workspace import (
         NotASimulationFan,
         SimulationWorkspaceError,
@@ -7217,6 +8071,7 @@ async def run_simulation_action_now(
             creator_id=creator_id,
             fan_id=fan_id,
             action_id=action_id,
+            include_mirrored_catalog=request_is_simulation_owner(request),
         )
     except NotASimulationFan as exc:
         raise not_found() from exc
@@ -7230,21 +8085,34 @@ async def read_simulation_media_previews(
     body: SimulationMediaPreviewRequest,
     request: Request,
 ) -> dict:
-    """Owner-only display URLs for mirrored ``sim:`` test media.
+    """Display URLs for mirrored ``sim:`` test media on a creator you hold.
 
     Resolved through the mirror's provenance from the SOURCE creator's vault.
     Nothing is written, and the source's platform media id is never copied onto
     this creator's catalog, so a previewable row does not become a deliverable
     one: simulation preview access and live delivery authority stay separate.
+
+    Open to any simulator user for their own creators, but the SOURCE side is
+    tiered. The owner resolves any provenance, because resolving a mirror they
+    created is what the mirror is for. Everyone else resolves only provenance
+    pointing at a vault they already hold, so a cross-tenant mirror renders as
+    nothing rather than becoming a way to read another tenant's media through a
+    creator of one's own.
     """
-    from core.simulation import require_simulation_user
+    from core.simulation import request_is_simulation_owner, require_simulation_user
     from services.simulation_catalog import resolve_simulation_media_previews
 
     await require_simulation_user(request)
     await require_creator_path_access(request, creator_id)
+    allowed_sources = (
+        None
+        if request_is_simulation_owner(request)
+        else await _creator_ids_for_user_cached(request)
+    )
     media = await resolve_simulation_media_previews(
         creator_id=creator_id,
         media_ids=list(body.media_ids or []),
+        allowed_source_creator_ids=allowed_sources,
     )
     return {"media": media}
 
@@ -7256,7 +8124,7 @@ async def update_simulation_fan_ai_stack(
     body: AIStackOverrideRequest,
     request: Request,
 ) -> dict:
-    """Pin one TEST fan to an AI Stack Profile. Owner only.
+    """Pin one TEST fan to an AI Stack Profile. Simulator users, own creators.
 
     This is what lets "Test Fan A -> cleo_legacy_v1" and "Test Fan B -> cleo_v2"
     run under the same creator and be compared turn for turn. The route refuses
@@ -7476,13 +8344,20 @@ async def update_pricing_policy(
     }
 
 
-# --- Owner-only AI Stack administration ------------------------------------
+# --- AI Stack administration ------------------------------------------------
 #
 # The whole conversational AI configuration is a named profile
-# (ai/stack_profiles.py). These routes let the owner read what each profile
-# actually means and pin one creator to one. They are owner-only for the same
-# reason the simulator is: choosing which brain answers every fan of a creator
-# is an operational capability, not an agency product feature.
+# (ai/stack_profiles.py). These routes let an operator read what each profile
+# actually means and pin one creator to one.
+#
+# They share the simulator's gate, which is what "AI stack selection is part of
+# the simulator" has always meant here — so as the simulator opened to agency
+# operators, so did these, for the creators those operators already hold.
+# That is deliberate: comparing profiles turn for turn is the reason to
+# simulate at all, and a profile choice is scoped to one creator by the
+# ordinary tenancy check below. ``/ai-stack/profiles`` itself is the registry
+# of what may be chosen — deployment configuration, the same for every tenant
+# and containing nothing about any creator, fan or sale.
 #
 # There is deliberately no way to submit a provider or model string. The only
 # thing a client may send is a stable profile identifier, which is validated
@@ -7532,7 +8407,7 @@ async def update_creator_ai_stack(
     body: AIStackOverrideRequest,
     request: Request,
 ) -> dict:
-    """Persist (or clear) this creator's AI Stack Profile override. Owner only.
+    """Persist (or clear) this creator's AI Stack Profile override.
 
     Persistent and creator-scoped rather than session-scoped, because Full Auto
     answers asynchronously from a worker where no browser session exists.

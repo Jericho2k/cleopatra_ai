@@ -1,9 +1,12 @@
-"""The workspace endpoints: owner only, test fans only, and no real-fan reach.
+"""The workspace endpoints: own creators, test fans only, no real-fan reach.
 
 The simulator runs the real pipeline with delivery replaced by local
-persistence, which makes every one of these a privileged capability rather than
-a product feature. Each test removes exactly one condition and asserts the same
-indistinguishable 404 the rest of the simulator uses.
+persistence. Since the simulator opened to ordinary agency operators, the
+workspace is theirs too — for the creators they already hold, and for ``test_``
+fans of those creators. What is NOT theirs is anything cross-tenant.
+
+Each test removes exactly one condition and asserts the same indistinguishable
+404 the rest of the simulator uses.
 """
 from __future__ import annotations
 
@@ -133,7 +136,34 @@ def test_the_owner_can_create_a_test_fan(client, store):
     assert fan["simulation"] is True
 
 
-def test_an_agency_account_cannot_create_a_test_fan(client, store):
+def test_an_agency_account_creates_a_test_fan_under_its_own_creator(client, store):
+    """A ``test_`` fan IS the isolation boundary, so being able to make one for
+    a creator you hold is part of the agency tier rather than a privilege."""
+    response = client.post(
+        "/simulation/test-fans",
+        headers=headers(AGENCY),
+        json={"creator_id": "creator-1"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert store.inserts[-1]["creator_id"] == "creator-1"
+    assert store.inserts[-1]["platform_fan_id"].startswith("test_")
+
+
+def test_an_agency_account_cannot_create_a_test_fan_elsewhere(client, store):
+    """Widening WHO may simulate never widened WHICH creators they may touch."""
+    response = client.post(
+        "/simulation/test-fans",
+        headers=headers(AGENCY),
+        json={"creator_id": "creator-2"},
+    )
+
+    assert response.status_code == 404
+    assert store.inserts == []
+
+
+def test_nobody_creates_a_test_fan_when_the_feature_is_off(client, store, monkeypatch):
+    monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "false")
     response = client.post(
         "/simulation/test-fans",
         headers=headers(AGENCY),
@@ -190,18 +220,36 @@ def test_state_and_run_now_refuse_a_real_fan(client):
     assert run_now.status_code == 404
 
 
-def test_an_agency_account_reaches_none_of_the_workspace(client):
+def test_an_agency_account_reaches_the_workspace_for_its_own_creator(client):
+    """Not 404. The agency holds creator-1, and fan-test is its test fan."""
     responses = [
         client.get(
             "/creator/creator-1/fan/fan-test/simulation-state", headers=headers(AGENCY)
         ),
         client.post(
-            "/creator/creator-1/fan/fan-test/simulation-actions/a1/run-now",
+            "/creator/creator-1/simulation-media-previews",
+            headers=headers(AGENCY),
+            json={"media_ids": ["sim:abc:1"]},
+        ),
+    ]
+
+    assert [response.status_code for response in responses] == [200, 200]
+
+
+def test_an_agency_account_reaches_none_of_another_tenants_workspace(client):
+    """creator-2 is another tenant's. Every surface answers the same 404."""
+    responses = [
+        client.get(
+            "/creator/creator-2/fan/fan-other/simulation-state",
+            headers=headers(AGENCY),
+        ),
+        client.post(
+            "/creator/creator-2/fan/fan-other/simulation-actions/a1/run-now",
             headers=headers(AGENCY),
             json={},
         ),
         client.post(
-            "/creator/creator-1/simulation-media-previews",
+            "/creator/creator-2/simulation-media-previews",
             headers=headers(AGENCY),
             json={"media_ids": ["sim:abc:1"]},
         ),

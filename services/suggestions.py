@@ -2974,6 +2974,7 @@ async def run_simulated_inbound(
     creator_id: str,
     message: str,
     fast: bool = True,
+    include_mirrored_catalog: bool = False,
 ) -> dict:
     """Persist one fan message and run the real Full Auto turn it triggers.
 
@@ -2986,6 +2987,11 @@ async def run_simulated_inbound(
     braces for the ``test_`` fan branches above — it is the hard invariant. The
     transport refuses every API Fansly request made by this task or by anything
     it spawns, so "zero remote calls" holds even for a code path nobody audited.
+
+    ``include_mirrored_catalog`` decides only what this turn may PLAN against.
+    An agency's turn leaves it False and plans against the creator's own
+    approved vault and sets; an owner's turn may set it and additionally see
+    mirrored cross-tenant test rows. Neither value permits a remote call.
     """
     # Marked as an owner simulation event so the production Supabase database
     # webhook on messages INSERT — which POSTs /generate-suggestions — ignores
@@ -3009,7 +3015,7 @@ async def run_simulated_inbound(
     history_before = await get_conversation_history(fan_id)
     creator_ids_before = {row["id"] for row in await _recent_creator_message_rows(fan_id)}
 
-    with simulation_scope():
+    with simulation_scope(include_mirrored_catalog=include_mirrored_catalog):
         # Fan intelligence learning is part of the real inbound pipeline, so the
         # simulated turn runs it too. Awaited rather than spawned, so the
         # simulation scope is still active while it runs and the caller's

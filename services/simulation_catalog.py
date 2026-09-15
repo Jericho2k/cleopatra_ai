@@ -371,12 +371,22 @@ async def resolve_simulation_media_previews(
     *,
     creator_id: str,
     media_ids: list[str],
+    allowed_source_creator_ids: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Display URLs for mirrored test media, resolved through provenance.
 
     Returns one entry per requested id. An id that is not a mirrored row of this
     creator resolves to nulls rather than raising: the caller is rendering a
     chat, and one unresolvable thumbnail must not fail the request.
+
+    ``allowed_source_creator_ids`` bounds which SOURCE vaults this resolution
+    may read. ``None`` means unrestricted and is the owner tier: resolving a
+    mirror the owner created is the point of the mirror. An agency caller
+    passes its own assigned creator ids, so it can see a preview only when the
+    pixels come from a vault it already holds — a mirror somebody else pointed
+    at another tenant resolves to nulls for it rather than rendering that
+    tenant's media. The restriction is applied to the PROVENANCE, before any
+    source vault is read, so a disallowed source is never queried at all.
     """
     wanted = [str(value).strip() for value in media_ids if str(value or "").strip()]
     wanted = list(dict.fromkeys(wanted))
@@ -427,6 +437,14 @@ async def resolve_simulation_media_previews(
         source_media = str(row.get("source_media_id") or "").strip()
         mirrored_id = str(row.get("media_id") or "").strip()
         if not (source_creator and source_media and mirrored_id):
+            continue
+        if (
+            allowed_source_creator_ids is not None
+            and source_creator not in allowed_source_creator_ids
+        ):
+            # A cross-tenant mirror, and this caller is not the owner. Resolve
+            # it to nulls: the row stays plannable inside the simulation, but
+            # its pixels belong to a vault this caller does not hold.
             continue
         by_source.setdefault(source_creator, {})[source_media] = mirrored_id
         resolved[mirrored_id]["mimetype"] = row.get("mimetype")

@@ -1,64 +1,14 @@
-import io
+"""Which vault rows an explicit video re-analysis targets.
+
+The sampling curve itself — how many frames a duration deserves and where they
+land — lives in tests/test_video_sampling_policy.py, which replaced the
+fixed-four-frame assertions this file used to carry.
+"""
 from types import SimpleNamespace
 
 import pytest
-from PIL import Image
 
 import main
-from services.video_frames import (
-    DEFAULT_FRAME_COUNT,
-    FrameSettings,
-    build_contact_sheet,
-    frame_sample_offsets,
-)
-
-
-def jpeg_bytes(colour: tuple[int, int, int]) -> bytes:
-    image = Image.new("RGB", (160, 240), colour)
-    buffer = io.BytesIO()
-    image.save(buffer, format="JPEG")
-    return buffer.getvalue()
-
-
-def test_offsets_are_spread_across_the_clip_and_trim_the_edges():
-    offsets = frame_sample_offsets(100.0, 4)
-    assert len(offsets) == 4
-    assert offsets == sorted(offsets)
-    assert offsets[0] > 5.0
-    assert offsets[-1] < 95.0
-
-
-def test_unknown_duration_still_attempts_multiple_real_moments():
-    assert frame_sample_offsets(0.0, 4) == [0.5, 2.0, 5.0, 10.0]
-    assert frame_sample_offsets("not a number", 2) == [0.5, 2.0]
-
-
-def test_short_clips_never_produce_duplicate_or_out_of_range_offsets():
-    offsets = frame_sample_offsets(0.4, DEFAULT_FRAME_COUNT)
-    assert len(offsets) == len(set(offsets))
-    assert all(0.0 <= offset <= 0.4 for offset in offsets)
-
-
-def test_contact_sheet_preserves_multiple_non_blank_frames():
-    sheet, count = build_contact_sheet([
-        jpeg_bytes((220, 40, 80)),
-        jpeg_bytes((40, 180, 220)),
-        jpeg_bytes((180, 120, 220)),
-        jpeg_bytes((220, 180, 80)),
-    ])
-    image = Image.open(io.BytesIO(sheet))
-    assert count == 4
-    assert image.size == (896, 896)
-
-
-def test_frame_settings_are_bounded(monkeypatch):
-    monkeypatch.setenv("VIDEO_FRAME_COUNT", "999")
-    monkeypatch.setenv("VIDEO_FRAME_TIMEOUT", "1")
-    monkeypatch.setenv("VIDEO_FRAME_MAX_DIMENSION", "99999")
-    settings = FrameSettings.from_env()
-    assert settings.frame_count == 8
-    assert settings.timeout_seconds == 10
-    assert settings.max_dimension == 1440
 
 
 @pytest.mark.asyncio

@@ -296,6 +296,7 @@ async def run_scheduled_action_now(
     creator_id: str,
     fan_id: str,
     action_id: str,
+    include_mirrored_catalog: bool = False,
 ) -> dict[str, Any]:
     """Fire one pending action immediately, through the production handler.
 
@@ -306,6 +307,10 @@ async def run_scheduled_action_now(
     differences are that the wait is skipped and that the whole thing runs
     inside ``simulation_scope()``, which refuses every API Fansly request made
     by this task or anything it spawns.
+
+    ``include_mirrored_catalog`` matches the inbound path: it widens only what
+    the action may plan against, never what it may reach, and an agency's run
+    leaves it False so the action plans against the creator's own vault.
     """
     from workers.scheduled_actions import _resolve_action
 
@@ -362,7 +367,7 @@ async def run_scheduled_action_now(
         f"[SIMULATION] run-now creator={creator_id} fan={fan_id} "
         f"action={action_id} type={action_type}"
     )
-    with simulation_scope():
+    with simulation_scope(include_mirrored_catalog=include_mirrored_catalog):
         outcome = await _resolve_action(claimed, sent_counter=sent_counter)
 
     print(

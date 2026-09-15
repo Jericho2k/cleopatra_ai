@@ -1,13 +1,18 @@
 """Who may administer the AI stack, and what a client is allowed to send.
 
-Choosing which brain answers every fan of a creator is an operational
-capability, not an agency product feature, so these routes are gated by the same
-owner allowlist as the simulator. An ordinary agency account must neither see
-the controls nor successfully call the endpoints.
+These routes share the simulator's gate, which is what "AI stack selection is
+part of the simulator" means here — so as the simulator opened to agency
+operators, so did these, for the creators those operators already hold.
+Comparing profiles turn for turn is the reason to simulate at all.
 
-The second property is just as important: there is no way for any client — owner
-included — to submit a provider or a model. The only thing that crosses the wire
-is a stable profile identifier, validated against the backend registry.
+Two boundaries survive that widening and are what this file asserts:
+
+* a profile choice reaches ONE creator, decided by the ordinary tenancy check.
+  An operator cannot read or pin a creator it is not assigned, and a fan-level
+  pin still requires a ``test_`` fan of that creator;
+* there is no way for any client — owner included — to submit a provider or a
+  model. The only thing that crosses the wire is a stable profile identifier,
+  validated against the backend registry.
 """
 from __future__ import annotations
 
@@ -151,8 +156,21 @@ def test_the_owner_can_read_every_profile(client):
     assert body["environment_variable"] == "AI_STACK_PROFILE"
 
 
-def test_an_agency_account_cannot_see_the_registry(client):
+def test_an_agency_account_sees_the_registry_it_must_choose_from(client):
+    """The registry is deployment configuration — the same list for every
+    tenant, naming no creator, fan or sale — and an operator cannot pick a
+    profile without being able to read what the choices are."""
+    response = client.get("/ai-stack/profiles", headers=headers(AGENCY))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["profiles"]
+
+
+def test_the_registry_disappears_when_the_simulator_is_off(client, monkeypatch):
+    monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "false")
+
     assert client.get("/ai-stack/profiles", headers=headers(AGENCY)).status_code == 404
+    assert client.get("/ai-stack/profiles", headers=headers(OWNER)).status_code == 404
 
 
 def test_the_registry_never_returns_an_api_key(client):
@@ -165,10 +183,24 @@ def test_the_registry_never_returns_an_api_key(client):
 # --- who may change a creator's brain --------------------------------------
 
 
-def test_an_agency_account_cannot_read_or_mutate_a_creator_override(client, store):
-    assert client.get("/creator/creator-1/ai-stack", headers=headers(AGENCY)).status_code == 404
+def test_an_agency_account_may_set_its_own_creators_override(client, store):
+    assert client.get("/creator/creator-1/ai-stack", headers=headers(AGENCY)).status_code == 200
     response = client.put(
         "/creator/creator-1/ai-stack",
+        headers=headers(AGENCY),
+        json={"ai_stack_profile": "cleo_legacy_v1"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert store.creators["creator-1"]["ai_stack_profile"] == "cleo_legacy_v1"
+
+
+def test_an_agency_account_cannot_reach_another_tenants_creator(client, store):
+    """The widening was about WHO may use these routes, never about WHICH
+    creators they reach. Tenancy is untouched and still decides."""
+    assert client.get("/creator/creator-2/ai-stack", headers=headers(AGENCY)).status_code == 404
+    response = client.put(
+        "/creator/creator-2/ai-stack",
         headers=headers(AGENCY),
         json={"ai_stack_profile": "cleo_legacy_v1"},
     )
@@ -267,29 +299,45 @@ def test_a_real_fan_cannot_be_pinned_at_all(client, store):
     assert store.fans["fan-real"]["ai_stack_profile"] is None
 
 
-def test_an_agency_account_cannot_pin_even_a_test_fan(client, store):
+def test_an_agency_account_may_pin_its_own_test_fan(client, store):
     response = client.put(
         "/creator/creator-1/fan/fan-test/ai-stack",
         headers=headers(AGENCY),
         json={"ai_stack_profile": "cleo_legacy_v1"},
     )
 
+    assert response.status_code == 200, response.text
+    assert store.fans["fan-test"]["ai_stack_profile"] == "cleo_legacy_v1"
+
+
+def test_an_agency_account_cannot_pin_a_real_fan(client, store):
+    """The ``test_`` boundary is unchanged for every tier."""
+    response = client.put(
+        "/creator/creator-1/fan/fan-real/ai-stack",
+        headers=headers(AGENCY),
+        json={"ai_stack_profile": "cleo_legacy_v1"},
+    )
+
     assert response.status_code == 404
-    assert store.fans["fan-test"]["ai_stack_profile"] is None
+    assert store.fans["fan-real"]["ai_stack_profile"] is None
 
 
 def test_every_refusal_is_the_same_indistinguishable_404(client):
-    """An agency must not be able to tell "not allowed" from "does not exist"."""
+    """A caller must not be able to tell "not allowed" from "does not exist"."""
     responses = [
-        client.get("/ai-stack/profiles", headers=headers(AGENCY)),
-        client.get("/creator/creator-1/ai-stack", headers=headers(AGENCY)),
+        client.get("/creator/creator-2/ai-stack", headers=headers(AGENCY)),
         client.put(
-            "/creator/creator-1/ai-stack",
+            "/creator/creator-2/ai-stack",
             headers=headers(AGENCY),
             json={"ai_stack_profile": "cleo_v2"},
         ),
         client.put(
-            "/creator/creator-1/fan/fan-test/ai-stack",
+            "/creator/creator-1/fan/fan-real/ai-stack",
+            headers=headers(AGENCY),
+            json={"ai_stack_profile": "cleo_v2"},
+        ),
+        client.put(
+            "/creator/creator-1/fan/fan-missing/ai-stack",
             headers=headers(AGENCY),
             json={"ai_stack_profile": "cleo_v2"},
         ),

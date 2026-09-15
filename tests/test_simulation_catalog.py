@@ -307,14 +307,35 @@ def test_contains_simulation_media_recognises_a_mixed_batch():
 
 
 # ---------------------------------------------------------------------------
-# 3. Live planning excludes it; the simulator includes it
+# 3. Live planning excludes it; the OWNER simulator includes it
 # ---------------------------------------------------------------------------
 
 
-def test_live_planning_filters_the_catalog_and_the_simulator_does_not():
+def test_live_planning_filters_the_catalog_and_the_owner_simulator_does_not():
     assert simulation_catalog_visible() is False
-    with simulation_scope():
+    with simulation_scope(include_mirrored_catalog=True):
         assert simulation_catalog_visible() is True
+
+
+def test_an_agency_simulation_does_not_see_mirrored_content():
+    """Being inside a simulation is not the same fact as being the owner.
+
+    An agency's simulated turn is every bit as unable to reach the platform —
+    that is what the scope means — but it plans against its own creator's
+    approved vault, so mirrored cross-tenant rows stay filtered out of it
+    exactly as they are out of live planning.
+    """
+    with simulation_scope():
+        assert simulation_catalog_visible() is False
+
+
+def test_the_mirrored_flag_never_survives_its_scope():
+    with simulation_scope(include_mirrored_catalog=True):
+        assert simulation_catalog_visible() is True
+        with simulation_scope():
+            assert simulation_catalog_visible() is False
+        assert simulation_catalog_visible() is True
+    assert simulation_catalog_visible() is False
 
 
 def test_the_live_filter_is_applied_outside_a_simulation(db):
@@ -336,9 +357,16 @@ def test_the_live_filter_is_applied_outside_a_simulation(db):
         "the target creator's own vault is untouched by the filter"
     )
 
-    with simulation_scope():
+    with simulation_scope(include_mirrored_catalog=True):
         simulated = run_live_catalog_query(build, label="test.simulated")
     assert any(row.get("simulation_only") for row in simulated.data)
+
+    # ...and an agency's simulation reads exactly what live planning reads.
+    applied.clear()
+    with simulation_scope():
+        agency = run_live_catalog_query(build, label="test.agency_simulated")
+    assert applied == [True]
+    assert all(row.get("simulation_only") is not True for row in agency.data)
 
 
 def test_a_missing_column_degrades_instead_of_failing_the_read(db, capsys):
