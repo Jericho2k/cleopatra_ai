@@ -97,6 +97,12 @@ retire_post_purchase_cooldown_v1.sql
 # new creator-owned table) before tenant_isolation_v1.sql.
 fan_history_backfill_v1.sql
 
+# Vault classification persistence: status, media-identity key, retrieval
+# provenance and per-item billed media cost. Must run AFTER vault_metadata_v2.sql
+# (whose classification_version and classified_at it reads in its backfill) and,
+# being additive columns on a creator-owned table, before tenant_isolation_v1.
+vault_classification_persistence_v1.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each

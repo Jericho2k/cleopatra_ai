@@ -1,13 +1,23 @@
-"""Who may reach the owner-only Full Auto simulator, and who may not.
+"""Who may reach the Full Auto simulator, at which tier, and who may not.
 
-The security boundary is the backend. The dashboard hides the simulator using
-GET /simulation-capabilities, but hiding is convenience: every test here calls
-the backend directly, the way an ordinary agency account with a valid session
+The security boundary is the backend. The dashboard hides what an account may
+not use via GET /simulation-capabilities, but hiding is convenience: every test
+here calls the backend directly, the way an agency account with a valid session
 could.
 
-Six conditions must all hold. Each test removes exactly one and asserts the same
-indistinguishable 404, so a caller can never learn which condition it failed, nor
-that another tenant's creator or fan exists.
+TWO TIERS.
+
+*Agency* — any authenticated operator, when the deployment has the simulator on.
+Scoped entirely by ordinary creator tenancy.
+
+*Owner* — additionally permitted the CROSS-TENANT catalog mirror, and nothing
+else. ``AUTO_SIMULATION_ALLOWED_USER_IDS`` names that tier.
+
+Six conditions must hold for the agency tier, and a seventh (the owner
+allowlist) for the mirror. Each test removes exactly one and asserts the same
+indistinguishable 404, so a caller can never learn which condition it failed,
+nor that another tenant's creator or fan exists, nor that a cross-tenant
+capability exists at all.
 """
 from __future__ import annotations
 
@@ -163,72 +173,164 @@ def _simulate(client, user, creator="creator-1", fan="fan-test"):
 
 
 def test_nobody_can_simulate_when_the_feature_is_off(client, monkeypatch):
+    """The master switch governs BOTH tiers. Off means off for the owner too."""
     monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "false")
     assert _simulate(client, OWNER).status_code == 404
-    assert (
-        client.get("/simulation-capabilities", headers=_headers(OWNER)).json()
-        == {"auto_simulation": False}
-    )
+    assert _simulate(client, AGENCY).status_code == 404
+    assert client.get(
+        "/simulation-capabilities", headers=_headers(OWNER)
+    ).json() == {
+        "auto_simulation": False,
+        "simulation_mirror": False,
+        # Identity, not a feature: the allowlist names a PERSON, and switching
+        # the simulator off must not strip that person's diagnostics from
+        # unrelated surfaces such as the Vault.
+        "operator_diagnostics": True,
+    }
+    assert client.get(
+        "/simulation-capabilities", headers=_headers(AGENCY)
+    ).json()["operator_diagnostics"] is False
 
 
-def test_allowlist_alone_is_not_enough(monkeypatch):
+def test_the_owner_allowlist_alone_is_not_enough(monkeypatch):
     monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "false")
     monkeypatch.setenv("AUTO_SIMULATION_ALLOWED_USER_IDS", OWNER)
     assert simulation.user_may_simulate(OWNER) is False
+    assert simulation.user_is_simulation_owner(OWNER) is False
 
 
-def test_enabled_alone_is_not_enough(monkeypatch):
+def test_an_empty_owner_allowlist_still_lets_an_agency_simulate(monkeypatch):
+    """The allowlist names the OWNER tier, not the right to simulate. With it
+    empty, nobody may mirror across tenants and everybody may still simulate
+    their own creators."""
     monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "true")
     monkeypatch.setenv("AUTO_SIMULATION_ALLOWED_USER_IDS", "")
-    assert simulation.user_may_simulate(OWNER) is False
-    assert simulation.allowed_simulation_user_ids() == frozenset()
+    assert simulation.simulation_owner_user_ids() == frozenset()
+    assert simulation.user_is_simulation_owner(OWNER) is False
+    assert simulation.user_may_simulate(OWNER) is True
+    assert simulation.user_may_simulate(AGENCY) is True
+
+
+def test_an_unauthenticated_caller_is_never_a_simulator_user(monkeypatch):
+    monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "true")
+    assert simulation.user_may_simulate(None) is False
+    assert simulation.user_may_simulate("") is False
+    assert simulation.user_is_simulation_owner(None) is False
+
+
+def test_agency_access_can_be_narrowed_back_to_the_owner(monkeypatch):
+    """The escape hatch: restrict the simulator without switching it off. It
+    must never also lock the owner out."""
+    monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "true")
+    monkeypatch.setenv("AUTO_SIMULATION_ALLOWED_USER_IDS", OWNER)
+    monkeypatch.setenv("AUTO_SIMULATION_AGENCY_ACCESS", "false")
+    assert simulation.user_may_simulate(AGENCY) is False
+    assert simulation.user_may_simulate(OWNER) is True
+    assert simulation.user_is_simulation_owner(OWNER) is True
+
+
+def test_agency_access_is_on_by_default(monkeypatch):
+    monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "true")
+    monkeypatch.delenv("AUTO_SIMULATION_AGENCY_ACCESS", raising=False)
+    assert simulation.agency_simulation_enabled() is True
+    assert simulation.user_may_simulate(AGENCY) is True
 
 
 def test_there_is_no_development_bypass(monkeypatch):
-    """core.auth and core.tenancy relax under APP_ENV=development. This must
-    not, or one misread variable hands the simulator to a production tenant."""
+    """core.auth and core.tenancy relax under APP_ENV=development. The OWNER
+    tier must not, or one misread variable hands the cross-tenant mirror to a
+    production tenant."""
     monkeypatch.setenv("APP_ENV", "development")
     monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "true")
     monkeypatch.setenv("AUTO_SIMULATION_ALLOWED_USER_IDS", "")
-    assert simulation.user_may_simulate(None) is False
-    assert simulation.user_may_simulate(OWNER) is False
+    assert simulation.user_is_simulation_owner(None) is False
+    assert simulation.user_is_simulation_owner(OWNER) is False
 
 
 def test_blank_allowlist_entries_never_match_a_blank_user(monkeypatch):
     monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "true")
     monkeypatch.setenv("AUTO_SIMULATION_ALLOWED_USER_IDS", " , ,, ")
-    assert simulation.allowed_simulation_user_ids() == frozenset()
-    assert simulation.user_may_simulate("") is False
-    assert simulation.user_may_simulate(" ") is False
+    assert simulation.simulation_owner_user_ids() == frozenset()
+    assert simulation.user_is_simulation_owner("") is False
+    assert simulation.user_is_simulation_owner(" ") is False
 
 
-def test_allowlist_tolerates_whitespace_and_case(monkeypatch):
+def test_the_owner_allowlist_tolerates_whitespace_and_case(monkeypatch):
     monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "true")
     monkeypatch.setenv(
         "AUTO_SIMULATION_ALLOWED_USER_IDS", f"  {OWNER.upper()} ,\n{AGENCY}  ,"
     )
-    assert simulation.user_may_simulate(OWNER) is True
-    assert simulation.user_may_simulate(OWNER.upper()) is True
-    assert simulation.user_may_simulate(OTHER_TENANT) is False
+    assert simulation.user_is_simulation_owner(OWNER) is True
+    assert simulation.user_is_simulation_owner(OWNER.upper()) is True
+    assert simulation.user_is_simulation_owner(OTHER_TENANT) is False
 
 
-# --- 11, 12, 13: allowlist and capability -----------------------------------
+# --- 11, 12, 13: the two tiers, as the capability endpoint reports them ------
 
 
-def test_enabled_but_not_allowlisted_is_rejected(client):
-    assert _simulate(client, AGENCY).status_code == 404
+def test_an_ordinary_agency_account_may_simulate_its_own_creator(client, monkeypatch):
+    """The point of this sprint. AGENCY is not on the owner allowlist and holds
+    creator-1, so the simulated turn runs."""
+    called: list[dict] = []
+
+    async def fake_run(**kwargs):
+        called.append(kwargs)
+        return {
+            "status": "ok",
+            "simulation": True,
+            "fan_message_id": "m1",
+            "creator_messages": [],
+        }
+
+    monkeypatch.setattr("services.suggestions.run_simulated_inbound", fake_run)
+    response = _simulate(client, AGENCY)
+
+    assert response.status_code == 200, response.text
+    assert called[0]["creator_id"] == "creator-1"
 
 
-def test_allowlisted_user_sees_capability_true(client):
+def test_an_agency_turn_never_plans_against_mirrored_content(client, monkeypatch):
+    """An agency simulates against the creator's OWN approved vault. The
+    mirrored cross-tenant catalog is not part of its turn, and the flag that
+    decides that is set by the backend from the caller's tier — never by the
+    client."""
+    called: list[dict] = []
+
+    async def fake_run(**kwargs):
+        called.append(kwargs)
+        return {
+            "status": "ok",
+            "simulation": True,
+            "fan_message_id": "m1",
+            "creator_messages": [],
+        }
+
+    monkeypatch.setattr("services.suggestions.run_simulated_inbound", fake_run)
+    _simulate(client, AGENCY)
+    _simulate(client, OWNER)
+
+    assert called[0]["include_mirrored_catalog"] is False
+    assert called[1]["include_mirrored_catalog"] is True
+
+
+def test_the_owner_sees_every_capability(client):
     response = client.get("/simulation-capabilities", headers=_headers(OWNER))
     assert response.status_code == 200
-    assert response.json() == {"auto_simulation": True}
+    assert response.json() == {
+        "auto_simulation": True,
+        "simulation_mirror": True,
+        "operator_diagnostics": True,
+    }
 
 
-def test_ordinary_agency_account_sees_capability_false(client):
+def test_an_agency_account_may_simulate_but_never_mirror(client):
     response = client.get("/simulation-capabilities", headers=_headers(AGENCY))
     assert response.status_code == 200
-    assert response.json() == {"auto_simulation": False}
+    assert response.json() == {
+        "auto_simulation": True,
+        "simulation_mirror": False,
+        "operator_diagnostics": False,
+    }
 
 
 def test_capability_response_leaks_nothing(client):
@@ -236,7 +338,9 @@ def test_capability_response_leaks_nothing(client):
     for user in (OWNER, AGENCY):
         body = client.get("/simulation-capabilities", headers=_headers(user)).text
         assert set(client.get("/simulation-capabilities", headers=_headers(user)).json()) == {
-            "auto_simulation"
+            "auto_simulation",
+            "simulation_mirror",
+            "operator_diagnostics",
         }
         assert OWNER not in body
         assert AGENCY not in body
@@ -252,20 +356,43 @@ def test_unauthenticated_caller_has_no_capability(client):
     # token is required, so this is a 401 before the route is reached.
     assert response.status_code in (200, 401)
     if response.status_code == 200:
-        assert response.json() == {"auto_simulation": False}
+        assert response.json() == {
+            "auto_simulation": False,
+            "simulation_mirror": False,
+            "operator_diagnostics": False,
+        }
 
 
 # --- 16: tenancy ------------------------------------------------------------
 
 
-def test_wrong_tenant_is_rejected(client):
-    """OTHER_TENANT is allowlisted for nothing and assigned to creator-2."""
-    assert _simulate(client, OTHER_TENANT, creator="creator-2", fan="fan-other").status_code == 404
+def test_a_tenant_may_simulate_only_its_own_creator(client, monkeypatch):
+    """OTHER_TENANT holds creator-2 and may simulate it — and nothing else.
+
+    This is the tenancy boundary doing the whole job now that the allowlist no
+    longer gates the simulator: each tenant reaches its own creator and gets
+    the same indistinguishable 404 for anybody else's.
+    """
+    async def fake_run(**kwargs):
+        return {
+            "status": "ok",
+            "simulation": True,
+            "fan_message_id": "m1",
+            "creator_messages": [],
+        }
+
+    monkeypatch.setattr("services.suggestions.run_simulated_inbound", fake_run)
+
+    own = _simulate(client, OTHER_TENANT, creator="creator-2", fan="fan-other")
+    assert own.status_code == 200, own.text
+
+    assert _simulate(client, OTHER_TENANT, creator="creator-1", fan="fan-test").status_code == 404
 
 
 def test_allowlisted_owner_cannot_cross_tenants(client, monkeypatch):
     """Being the product owner does not create a global admin bypass: the
-    ordinary creator assignment still decides."""
+    ordinary creator assignment still decides. Owner authority is the
+    cross-tenant MIRROR and nothing else."""
     response = _simulate(client, OWNER, creator="creator-2", fan="fan-other")
     assert response.status_code == 404
     assert response.json() == {"detail": "Resource not found"}
@@ -304,10 +431,10 @@ def test_test_fan_is_accepted(client, monkeypatch):
 
 
 def test_every_rejection_is_indistinguishable(client, monkeypatch):
-    """A caller must not be able to tell 'not allowlisted' from 'wrong tenant'
-    from 'not a test fan' from 'does not exist'."""
+    """A caller must not be able to tell 'wrong tenant' from 'not a test fan'
+    from 'does not exist'."""
     bodies = set()
-    bodies.add(_simulate(client, AGENCY).text)
+    bodies.add(_simulate(client, AGENCY, creator="creator-2", fan="fan-other").text)
     bodies.add(_simulate(client, OWNER, fan="fan-real").text)
     bodies.add(_simulate(client, OWNER, fan="fan-other").text)
     bodies.add(_simulate(client, OWNER, creator="creator-2", fan="fan-other").text)
@@ -343,7 +470,29 @@ def test_test_fan_boundary_applies_to_every_simulation_mutation(client, path, pa
         ("simulate-decline", {}),
     ],
 )
-def test_non_allowlisted_user_is_rejected_on_every_mutation(client, path, payload):
+def test_another_tenants_fan_is_rejected_on_every_mutation(client, path, payload):
+    """fan-other belongs to creator-2, which AGENCY does not hold. Every
+    mutation re-checks tenancy rather than trusting the first one that did."""
+    response = client.post(
+        f"/creator/creator-2/fan/fan-other/{path}",
+        headers=_headers(AGENCY),
+        json=payload if payload is not None else {},
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        ("simulate-inbound", {"message": "hi"}),
+        ("simulate-purchase", None),
+        ("simulate-decline", {}),
+    ],
+)
+def test_every_mutation_disappears_when_the_feature_is_off(
+    client, monkeypatch, path, payload
+):
+    monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "false")
     response = client.post(
         f"/creator/creator-1/fan/fan-test/{path}",
         headers=_headers(AGENCY),
@@ -435,8 +584,17 @@ class _Listing:
         return _Query(self, name)
 
 
-def test_creator_listing_is_owner_only_and_test_fans_only(client, monkeypatch):
-    assert client.get("/simulation/creators", headers=_headers(AGENCY)).status_code == 404
+def test_creator_listing_is_tenancy_scoped_and_test_fans_only(client, monkeypatch):
+    """The same listing for both tiers: each caller's own assigned creators.
+
+    Being the owner is NOT a global read of the creators table — that is
+    /simulation/catalog/sources, which is a different route with a different
+    guard.
+    """
+    listing = _Listing()
+    monkeypatch.setattr(main, "get_supabase", lambda: listing)
+    agency_body = client.get("/simulation/creators", headers=_headers(AGENCY)).json()
+    assert [row["id"] for row in agency_body["creators"]] == ["creator-1"]
 
     listing = _Listing()
     monkeypatch.setattr(main, "get_supabase", lambda: listing)

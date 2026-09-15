@@ -44,6 +44,17 @@ REASON_SIMULATION = "apifansly_simulation"
 
 _SIMULATION: ContextVar[bool] = ContextVar("apifansly_simulation", default=False)
 
+# Whether THIS simulated turn may plan against mirrored cross-tenant test
+# content. Separate from ``_SIMULATION`` because they answer different
+# questions: "no remote call may escape" is true of every simulated turn, while
+# "another tenant's mirrored vault metadata is in scope" is true only of an
+# owner's turn. An agency's simulation plans against its own creator's approved
+# vault and nothing else, so this defaults to False and is opted into by the
+# owner path alone.
+_SIMULATION_MIRRORED: ContextVar[bool] = ContextVar(
+    "apifansly_simulation_mirrored", default=False
+)
+
 
 class ApiFanslyDisabledError(RuntimeError):
     """A remote API Fansly call was refused before it reached the network.
@@ -76,21 +87,37 @@ def apifansly_enabled() -> bool:
 
 
 def simulation_active() -> bool:
-    """Whether the current task is inside an owner-only Full Auto simulation."""
+    """Whether the current task is inside a Full Auto simulation."""
     return bool(_SIMULATION.get())
 
 
+def mirrored_catalog_active() -> bool:
+    """Whether the current simulated turn may see mirrored cross-tenant content.
+
+    False outside a simulation, and false inside an agency simulation. Only an
+    owner turn that explicitly opted in answers True.
+    """
+    return bool(_SIMULATION.get() and _SIMULATION_MIRRORED.get())
+
+
 @contextmanager
-def simulation_scope() -> Iterator[None]:
+def simulation_scope(*, include_mirrored_catalog: bool = False) -> Iterator[None]:
     """Refuse every remote API Fansly call for the duration of this block.
 
     Applies to the current task and to anything it spawns, because both
     ``asyncio.create_task`` and ``asyncio.to_thread`` copy the active context.
+
+    ``include_mirrored_catalog`` widens what the turn may PLAN against, never
+    what it may reach: no value of it permits a remote call. It defaults to
+    False so a caller that forgets to think about it gets the narrow, own-vault
+    behaviour an agency must have, and the owner path opts in explicitly.
     """
     token = _SIMULATION.set(True)
+    mirrored_token = _SIMULATION_MIRRORED.set(bool(include_mirrored_catalog))
     try:
         yield
     finally:
+        _SIMULATION_MIRRORED.reset(mirrored_token)
         _SIMULATION.reset(token)
 
 

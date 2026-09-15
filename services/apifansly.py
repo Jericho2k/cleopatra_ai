@@ -638,6 +638,52 @@ def background_history_allowed() -> bool:
     return not background_history_budget_state()["exhausted"]
 
 
+# The operation name every vault media transfer is recorded under, so the vault
+# view below can separate "we moved media bytes" from "we listed an album".
+VAULT_MEDIA_DOWNLOAD_OPERATION = "vault protected media download"
+
+
+def vault_classification_usage(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """What vault sync and classification cost, and how much of it was media.
+
+    Derived from the SAME events every other figure in the snapshot is derived
+    from — this is a view, not a second accounting system. It exists because
+    the three questions an operator actually asks about vault spend ("how much
+    did classification cost", "how much of that was media transfer", "which
+    creator caused it") are each one filter away from the event stream and
+    nobody should have to do that arithmetic by hand.
+    """
+    vault_events = [
+        event for event in events if event.get("category") == CATEGORY_VAULT
+    ]
+    media_events = [
+        event for event in vault_events if int(event.get("media_bytes") or 0) > 0
+    ]
+    media_bytes = sum(int(event.get("media_bytes") or 0) for event in media_events)
+    media_credits = sum(float(event.get("credits") or 0.0) for event in media_events)
+    total_credits = sum(float(event.get("credits") or 0.0) for event in vault_events)
+    return {
+        "calls": len(vault_events),
+        "estimated_credits": round(total_credits, 3),
+        # The number this sprint exists to keep small.
+        "media_downloads": len(media_events),
+        "media_bytes": media_bytes,
+        "media_megabytes": round(media_bytes / float(CREDIT_BYTES_PER_MB), 2),
+        "media_credits": round(media_credits, 3),
+        # Everything that was NOT a media transfer: album listings, link
+        # refreshes. This is the part that should dominate a healthy deployment.
+        "metadata_credits": round(total_credits - media_credits, 3),
+        "media_share": (
+            round(media_credits / total_credits, 3) if total_credits else 0.0
+        ),
+        "by_account": _breakdown(vault_events, "account_id", fallback="unbound"),
+        "media_by_account": _breakdown(
+            media_events, "account_id", fallback="unbound"
+        ),
+        "by_operation": _breakdown(vault_events, "operation", fallback="unknown"),
+    }
+
+
 def usage_snapshot() -> dict[str, Any]:
     """Return the current process's rolling 24-hour API usage summary.
 
@@ -690,6 +736,9 @@ def usage_snapshot() -> dict[str, Any]:
             sorted(Counter(event["event"] for event in webhook_events).items())
         ),
         "background_history_budget": background_history_budget_state(),
+        # Vault sync and classification, split into metadata and media
+        # transfer, and attributed per account.
+        "vault_classification": vault_classification_usage(events),
         "credit_model": {
             "request_credits": 1,
             "response_bytes_per_extra_credit": CREDIT_RESPONSE_BYTES_PER_CREDIT,
@@ -1378,11 +1427,24 @@ async def download_media(
     *,
     client: httpx.AsyncClient | None = None,
     timeout: float = 45,
+    account_id: str | None = None,
+    operation: str = "protected media download",
 ) -> bytes:
     """Download a protected Fansly CDN asset through the documented proxy.
 
     Unlike the regular API helpers, this endpoint returns binary content rather
     than the usual JSON envelope.
+
+    THE EXPENSIVE ONE. Metered at 2 credits per megabyte transferred, so a
+    250 MB video is ~500 credits on one call. Callers on an automatic path must
+    take a policy decision before reaching here — see
+    ``services.media_cost_guard``; this function deliberately enforces no limit
+    of its own, because a transport that silently truncated a download would be
+    worse than one that is simply not called.
+
+    ``account_id`` attributes the spend to a creator's account in the usage
+    snapshot, which is what makes "which creator caused these credits?"
+    answerable rather than a guess.
     """
     require_apifansly_available("API Fansly protected media download")
     if not is_fansly_cdn_url(cdn_url):
@@ -1403,7 +1465,8 @@ async def download_media(
     # ``response.content`` here is free: the transport already buffered it.
     raise_for_response(
         response,
-        operation="protected media download",
+        operation=operation,
+        account_id=account_id,
         media_bytes=len(response.content or b""),
     )
     content_type = str(response.headers.get("content-type") or "").lower()
