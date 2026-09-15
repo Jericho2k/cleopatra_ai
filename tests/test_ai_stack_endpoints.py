@@ -13,6 +13,12 @@ Two boundaries survive that widening and are what this file asserts:
 * there is no way for any client — owner included — to submit a provider or a
   model. The only thing that crosses the wire is a stable profile identifier,
   validated against the backend registry.
+
+And one the widening added: an agency operator is told a profile's id and its
+display name, and nothing about what it routes to. Provider names, model
+identifiers, fallback chains, stage routing, prompt versions and generation
+configuration are platform-owner diagnostics, redacted on the RESPONSE rather
+than merely left unrendered by the dashboard.
 """
 from __future__ import annotations
 
@@ -345,3 +351,241 @@ def test_every_refusal_is_the_same_indistinguishable_404(client):
 
     assert [response.status_code for response in responses] == [404, 404, 404, 404]
     assert {response.json()["detail"] for response in responses} == {"Resource not found"}
+
+
+# --- what each tier is TOLD about a profile ---------------------------------
+#
+# The simulator opened to agency operators, and with it the AI stack selector.
+# Selecting a stack needs a stable id and a display name. It does not need the
+# platform's supply chain, and an agency must not receive it: no provider, no
+# model identifier, no fallback chain, no stage routing, no prompt version and
+# no generation configuration.
+#
+# Enforced on the RESPONSE (services/ai_stack_visibility.py), because a field
+# the dashboard declines to render has still been delivered to the browser.
+
+# Every internal identity that appears somewhere in the registry. Asserted as
+# substrings of the whole serialised body, so a leak through a key nobody
+# thought of — a new stage field, a summary rewritten to name a model — fails
+# this test rather than shipping.
+ROUTING_IDENTITIES = (
+    "openrouter",
+    "together",
+    "anthropic",
+    "kimi",
+    "qwen",
+    "moonshotai",
+    "glm",
+    "llama",
+    "claude",
+    "gpt-oss",
+    "writer_v1",
+    "writer_v2",
+    "writer_v3",
+    "analyzer_v1",
+)
+
+
+def test_an_agency_account_gets_profile_ids_and_display_names_only(client):
+    body = client.get("/ai-stack/profiles", headers=headers(AGENCY)).json()
+
+    # The same registry, in the same order, with the same ids: an agency picks
+    # from exactly what the owner does.
+    assert [row["id"] for row in body["profiles"]] == list(PROFILE_IDS)
+    # And nothing else at all. Asserted as an exact key set rather than a list
+    # of absences, so a field added to the public view later has to be a
+    # deliberate decision made here.
+    assert all(set(row) == {"id", "name"} for row in body["profiles"])
+    assert {"cleo_v3": "Cleo V3"}.items() <= {
+        row["id"]: row["name"] for row in body["profiles"]
+    }.items()
+    assert body["diagnostics"] is False
+    # The deployment default is a profile id — product-level in exactly the way
+    # the ids above are. The NAME of the variable behind it is not.
+    assert body["environment_profile"] == "cleo_v2"
+    assert "environment_variable" not in body
+
+
+def test_an_agency_account_cannot_obtain_routing_through_the_registry(client):
+    raw = client.get("/ai-stack/profiles", headers=headers(AGENCY)).text.lower()
+
+    for identity in ROUTING_IDENTITIES:
+        assert identity not in raw, f"agency registry leaked {identity!r}"
+    for field in ("provider", "model", "fallback", "stages", "prompt_version"):
+        assert field not in raw, f"agency registry leaked {field!r}"
+
+
+def test_the_owner_still_gets_the_full_diagnostics(client):
+    body = client.get("/ai-stack/profiles", headers=headers(OWNER)).json()
+
+    assert body["diagnostics"] is True
+    assert body["environment_variable"] == "AI_STACK_PROFILE"
+    by_id = {row["profile_id"]: row for row in body["profiles"]}
+    assert set(by_id) == set(PROFILE_IDS)
+
+    v3 = by_id["cleo_v3"]
+    assert v3["summary"]
+    writer = next(row for row in v3["stages"] if row["stage"] == "writer_default")
+    assert writer["provider"] == "openrouter"
+    assert writer["model"] == "moonshotai/kimi-k2.6"
+    assert writer["fallback_provider"] == "together"
+    assert writer["fallback_model"] == "Qwen/Qwen3.7-Plus"
+    assert writer["prompt_version"] == "writer_v3"
+    # Every stage, not just the writer: the owner's view is the whole stack.
+    assert len(v3["stages"]) == 7
+
+
+def test_an_agency_account_can_still_select_cleo_v3(client, store):
+    """The reduced representation must remain a working selector.
+
+    The id an agency reads out of the registry is the id it sends back, and the
+    backend validates it against the same registry. Nothing about redacting the
+    routing changes what may be chosen.
+    """
+    listed = client.get("/ai-stack/profiles", headers=headers(AGENCY)).json()
+    chosen = next(row for row in listed["profiles"] if row["name"] == "Cleo V3")
+
+    creator = client.put(
+        "/creator/creator-1/ai-stack",
+        headers=headers(AGENCY),
+        json={"ai_stack_profile": chosen["id"]},
+    )
+    assert creator.status_code == 200, creator.text
+    assert store.creators["creator-1"]["ai_stack_profile"] == "cleo_v3"
+    assert creator.json()["effective"]["ai_stack_profile"] == "cleo_v3"
+
+    # And the Simulator's own control — pinning one test fan to a stack.
+    fan = client.put(
+        "/creator/creator-1/fan/fan-test/ai-stack",
+        headers=headers(AGENCY),
+        json={"ai_stack_profile": chosen["id"]},
+    )
+    assert fan.status_code == 200, fan.text
+    assert store.fans["fan-test"]["ai_stack_profile"] == "cleo_v3"
+
+    # Confirming the choice back to the agency names the profile and still not
+    # what it routes to.
+    assert fan.json()["ai_stack_profile"] == "cleo_v3"
+    assert "kimi" not in fan.text.lower()
+
+
+def test_the_agency_registry_is_not_simply_the_owners_with_keys_hidden(client):
+    """Same profiles, different depth — asserted against each other."""
+    owner = client.get("/ai-stack/profiles", headers=headers(OWNER)).json()
+    agency = client.get("/ai-stack/profiles", headers=headers(AGENCY)).json()
+
+    assert [row["id"] for row in agency["profiles"]] == [
+        row["profile_id"] for row in owner["profiles"]
+    ]
+    assert [row["name"] for row in agency["profiles"]] == [
+        row["label"] for row in owner["profiles"]
+    ]
+
+
+# --- the same boundary on the turn a simulated message came back from -------
+
+
+def test_an_agency_turn_reports_the_profile_and_not_the_model(
+    client, monkeypatch
+):
+    """The durable marker on a creator message names the model that wrote it.
+
+    Persisted deliberately (services.suggestions.message_ai_stack_metadata) so
+    "which brain produced this?" is answerable months later from the row alone.
+    It is diagnostics, so it is redacted on the way out to an agency — and the
+    rest of the message's media_context, which is ordinary product state, is
+    not touched.
+    """
+    from services import suggestions
+
+    async def fake_turn(**_kwargs):
+        return {
+            "status": "ok",
+            "simulation": True,
+            "fan_message_id": "fan-message-1",
+            "outcome": "replied",
+            "creator_messages": [
+                {
+                    "id": "message-1",
+                    "role": "creator",
+                    "content": "hey you",
+                    "sent_at": None,
+                    "media_context": {
+                        "ppv": {"media_ids": ["media-1"], "price_cents": 2500},
+                        "ai_stack": {
+                            "profile": "cleo_v3",
+                            "route": "commercial_complex",
+                            "prompt_version": "writer_v3",
+                            "provider": "openrouter",
+                            "model": "moonshotai/kimi-k2.6",
+                        },
+                    },
+                }
+            ],
+        }
+
+    monkeypatch.setattr(suggestions, "run_simulated_inbound", fake_turn)
+
+    agency = client.post(
+        "/creator/creator-1/fan/fan-test/simulate-inbound",
+        headers=headers(AGENCY),
+        json={"message": "hi", "fast": True},
+    )
+    assert agency.status_code == 200, agency.text
+    context = agency.json()["creator_messages"][0]["media_context"]
+    assert context["ai_stack"] == {"profile": "cleo_v3"}
+    # Untouched: this is a stack-routing boundary, not a general scrubber.
+    assert context["ppv"] == {"media_ids": ["media-1"], "price_cents": 2500}
+    assert "kimi" not in agency.text.lower()
+    assert "openrouter" not in agency.text.lower()
+
+    owner = client.post(
+        "/creator/creator-1/fan/fan-test/simulate-inbound",
+        headers=headers(OWNER),
+        json={"message": "hi", "fast": True},
+    )
+    assert owner.status_code == 200, owner.text
+    owner_marker = owner.json()["creator_messages"][0]["media_context"]["ai_stack"]
+    assert owner_marker["provider"] == "openrouter"
+    assert owner_marker["model"] == "moonshotai/kimi-k2.6"
+    assert owner_marker["route"] == "commercial_complex"
+    assert owner_marker["prompt_version"] == "writer_v3"
+
+
+# --- and on the health banner, which named the failing model in prose -------
+
+
+def test_model_health_gives_an_agency_the_verdict_without_the_supply_chain(
+    client, monkeypatch
+):
+    monkeypatch.setattr(
+        main,
+        "current_model_availability",
+        lambda: {
+            "status": "degraded",
+            "checked_at": "2026-09-15T00:00:00+00:00",
+            "detail": "Configured model unavailable: openrouter:moonshotai/kimi-k2.6.",
+            "models": [
+                {
+                    "role": "ordinary_writer",
+                    "provider": "openrouter",
+                    "model": "moonshotai/kimi-k2.6",
+                    "available": False,
+                }
+            ],
+        },
+    )
+
+    agency = client.get("/model-runtime-health", headers=headers(AGENCY)).json()
+    # It still learns that replies are degraded, and when that was checked.
+    assert agency["status"] == "degraded"
+    assert agency["checked_at"] == "2026-09-15T00:00:00+00:00"
+    assert agency["models"] == []
+    assert "kimi" not in agency["detail"].lower()
+    assert "openrouter" not in agency["detail"].lower()
+    # The analyzer counters name no provider or model and are unredacted.
+    assert agency["analyzer"]["window_hours"] == 1
+
+    owner = client.get("/model-runtime-health", headers=headers(OWNER)).json()
+    assert owner["models"][0]["model"] == "moonshotai/kimi-k2.6"
+    assert "kimi" in owner["detail"].lower()

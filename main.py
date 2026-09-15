@@ -7680,7 +7680,11 @@ async def simulate_inbound(
     Deliberately unaffected by APIFANSLY_ENABLED: the whole point is that this
     works while the connector is off, because it never touches it.
     """
-    from core.simulation import request_is_simulation_owner
+    from core.simulation import (
+        request_is_platform_operator,
+        request_is_simulation_owner,
+    )
+    from services.ai_stack_visibility import public_message_rows
     from services.suggestions import run_simulated_inbound
 
     fan = await _require_simulatable_fan(request, creator_id, fan_id)
@@ -7688,19 +7692,32 @@ async def simulate_inbound(
     # An agency's turn plans against this creator's own approved vault and
     # sets — the same inventory live planning would use.
     mirrored = request_is_simulation_owner(request)
+    # Each creator message carries the durable "which brain wrote this" marker
+    # in its media_context, and that marker names the provider, the model, the
+    # writer route and the prompt version. Diagnostics, so the platform owner
+    # keeps all of it and an agency is told the profile alone.
+    diagnostics = request_is_platform_operator(request)
     print(
         f"[SIMULATION] inbound creator={creator_id} fan={fan_id} "
         f"platform_fan={fan.get('platform_fan_id')} fast={body.fast} "
         f"mirrored_catalog={mirrored}"
     )
     try:
-        return await run_simulated_inbound(
+        turn = await run_simulated_inbound(
             fan_id=fan_id,
             creator_id=creator_id,
             message=body.message,
             fast=body.fast,
             include_mirrored_catalog=mirrored,
         )
+        if not diagnostics:
+            turn = {
+                **turn,
+                "creator_messages": public_message_rows(
+                    turn.get("creator_messages")
+                ),
+            }
+        return turn
     except HTTPException:
         raise
     except Exception as exc:
@@ -8366,20 +8383,39 @@ async def update_pricing_policy(
 
 @app.get("/ai-stack/profiles")
 async def read_ai_stack_profiles(request: Request) -> dict:
-    """Every registered profile, fully resolved, plus the deployment default."""
-    from ai.stack_profiles import (
-        PROFILE_ENV_VAR,
-        describe_profiles,
-        environment_profile_id,
-    )
-    from core.simulation import require_simulation_user
+    """The registry a caller may choose from, at the detail it may see.
+
+    Two answers, one route. An agency operator gets the product-level identity
+    of every profile — ``{"id": "cleo_v3", "name": "Cleo V3"}`` — which is
+    exactly what the Simulator's dropdown needs and the whole of what an agency
+    is told. The platform owner additionally gets the routing: every stage's
+    provider, model, fallback, prompt version and generation settings.
+
+    The reduction happens HERE, on the response, not in the dashboard. A field
+    a client is not supposed to have must not be in the body it receives; see
+    services/ai_stack_visibility.py for why and for what counts as which.
+    """
+    from ai.stack_profiles import PROFILE_ENV_VAR, environment_profile_id
+    from core.simulation import request_is_platform_operator, require_simulation_user
+    from services.ai_stack_visibility import registry_view
 
     await require_simulation_user(request)
-    return {
-        "profiles": describe_profiles(),
+    diagnostics = request_is_platform_operator(request)
+    body: dict = {
+        "profiles": registry_view(diagnostics=diagnostics),
+        # A profile id, which is product-level in exactly the way the ids in
+        # ``profiles`` are: it says which stack answers by default, not what
+        # that stack is made of.
         "environment_profile": environment_profile_id(),
-        "environment_variable": PROFILE_ENV_VAR,
+        # Told plainly, so a client never has to infer the shape it got from
+        # which keys happen to be present.
+        "diagnostics": diagnostics,
     }
+    if diagnostics:
+        # The name of the deployment variable is operator configuration; an
+        # agency has nothing to do with it and is not shown it.
+        body["environment_variable"] = PROFILE_ENV_VAR
+    return body
 
 
 @app.get("/creator/{creator_id}/ai-stack")
@@ -8943,12 +8979,27 @@ async def health_ready(response: Response, request: Request = None) -> dict:
 
 
 @app.get("/model-runtime-health")
-async def model_runtime_health() -> dict:
-    """Expose cached provider-model availability without spending AI tokens."""
+async def model_runtime_health(request: Request) -> dict:
+    """Cached writer availability, without spending AI tokens.
+
+    Every authenticated operator needs the verdict — an agency whose replies
+    are degraded should see that in the health banner. Only the platform owner
+    needs the supply chain behind it: the cached document names each configured
+    provider and model, and ``detail`` names them again in prose, so an agency
+    gets the status, the timestamp and a generic sentence instead.
+
+    The analyzer counters are deliberately unredacted: they are numbers of
+    degraded analyses by reason code, and name no provider or model.
+    """
+    from core.simulation import request_is_platform_operator
+    from services.ai_stack_visibility import public_model_health
     from services.analyzer_telemetry import analyzer_health
 
+    health = current_model_availability()
+    if not request_is_platform_operator(request):
+        health = public_model_health(health)
     return {
-        **current_model_availability(),
+        **health,
         # REL-001 — degraded-analysis counts, so an analyzer incident is
         # countable without reading logs.
         "analyzer": analyzer_health(hours=1),
