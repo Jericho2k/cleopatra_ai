@@ -27,8 +27,6 @@ def normalize_session(session: dict[str, Any] | None) -> dict[str, Any] | None:
     result.setdefault("plan", [])
     result.setdefault("current_index", 0)
     result.setdefault("awaiting_purchase_index", None)
-    result.setdefault("post_ppv_cooldown", False)
-    result.setdefault("cooldown_messages_remaining", 0)
     result.setdefault("revenue_cents", 0)
     if "payment_state" not in result:
         if result.get("status") == "completed":
@@ -73,16 +71,6 @@ def has_pending_purchase(session: dict[str, Any] | None) -> bool:
     return 0 <= int(idx) < len(plan) and not bool(plan[int(idx)].get("purchased"))
 
 
-def is_cooldown_active(session: dict[str, Any] | None) -> bool:
-    normalized = normalize_session(session)
-    return bool(
-        normalized
-        and normalized.get("status") == "active"
-        and normalized.get("post_ppv_cooldown")
-        and int(normalized.get("cooldown_messages_remaining", 0) or 0) > 0
-    )
-
-
 def mark_step_sent(
     session: dict[str, Any],
     *,
@@ -119,12 +107,19 @@ def mark_step_purchased(
     media_id: str | None = None,
     set_id: str | None = None,
     amount_cents: int | None = None,
-    cooldown_messages: int = 2,
 ) -> tuple[dict[str, Any], bool]:
     """Mark one sent step purchased and advance only now.
 
     Returns ``(updated_session, completed)``. Repeated purchase webhooks are
     idempotent and do not double-count revenue.
+
+    There is no longer a post-purchase message counter here. It could not
+    survive the move to one-unlock sessions — a single-step plan COMPLETES on
+    the purchase, and the completion branch cleared the counter on the same
+    line that set it, so the "wait N messages" window was unreachable in
+    production. What replaced it is ``services/experience_director.py``, which
+    keeps a scene across the session boundary and lifts the block when the
+    dialogue actually produces a bridge rather than when a number runs out.
     """
     result = normalize_session(session)
     if result is None:
@@ -155,13 +150,9 @@ def mark_step_purchased(
         result["status"] = "completed"
         result["payment_state"] = "COMPLETED"
         result["completed_at"] = result.get("completed_at") or utc_now_iso()
-        result["post_ppv_cooldown"] = False
-        result["cooldown_messages_remaining"] = 0
     else:
         result["status"] = "active"
         result["payment_state"] = "ACTIVE"
-        result["post_ppv_cooldown"] = cooldown_messages > 0
-        result["cooldown_messages_remaining"] = max(0, int(cooldown_messages))
     result["updated_at"] = utc_now_iso()
     return result, completed
 
@@ -186,8 +177,6 @@ def mark_step_declined(
     result["payment_state"] = "PAUSED" if pause else "ABANDONED"
     result["end_reason"] = reason
     result["ended_at"] = utc_now_iso()
-    result["post_ppv_cooldown"] = False
-    result["cooldown_messages_remaining"] = 0
     return result
 
 
@@ -200,18 +189,6 @@ def resume_session(session: dict[str, Any]) -> dict[str, Any]:
     result["status"] = "active"
     result["payment_state"] = "OFFER_SELECTED"
     result["resumed_at"] = utc_now_iso()
-    result["updated_at"] = utc_now_iso()
-    return result
-
-
-def decrement_cooldown(session: dict[str, Any]) -> dict[str, Any]:
-    result = normalize_session(session)
-    if result is None or not result.get("post_ppv_cooldown"):
-        return result or {}
-    remaining = max(0, int(result.get("cooldown_messages_remaining", 0) or 0) - 1)
-    result["cooldown_messages_remaining"] = remaining
-    if remaining == 0:
-        result["post_ppv_cooldown"] = False
     result["updated_at"] = utc_now_iso()
     return result
 
@@ -282,10 +259,6 @@ def session_progress(session: dict[str, Any] | None) -> dict[str, Any]:
         "total_steps": len(plan),
         "purchased_steps": purchased_count,
         "awaiting_purchase": has_pending_purchase(normalized),
-        "cooldown_active": is_cooldown_active(normalized),
-        "cooldown_messages_remaining": int(
-            normalized.get("cooldown_messages_remaining", 0) or 0
-        ),
         "has_next_step": bool(upcoming),
     }
     if purchased:

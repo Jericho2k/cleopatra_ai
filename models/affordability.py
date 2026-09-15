@@ -9,6 +9,17 @@ This module intentionally keeps these concepts separate:
 - future liquidity such as payday.
 
 Nothing in this model represents estimated wealth or a permanent spending ceiling.
+
+THE ONE RULE THAT KEEPS PURCHASES FROM BECOMING CEILINGS
+--------------------------------------------------------
+Buying something at $30 is evidence of willingness to pay AT LEAST $30. It is
+never evidence of a $30 limit, and it never becomes ``current_limit_cents`` —
+only an explicit current statement ("$30 max", "that's all I have right now")
+may do that, through CURRENT_LIMIT_STATED or COUNTEROFFER_STATED. Everything
+downstream reads ``current_limit_cents`` as a hard ceiling
+(``services/commercial_orchestrator._current_hard_ceiling``,
+``models/price_learning.probe_price_cents``), so one wrong write there silently
+caps a fan forever.
 """
 
 from __future__ import annotations
@@ -220,6 +231,14 @@ def apply_affordability_event(
         output.last_confirmed_purchase_at = now
         output.temporary_constraint = False
         output.constraint_until = None
+        # The pending selection is RESOLVED. Leaving it behind is what pinned
+        # price learning: a selection is authoritative while it is pending, so
+        # models/price_learning.derive_price_learning_profile returns
+        # mode=EXACT at exactly that amount — and with the selection never
+        # cleared, the amount he just successfully paid became the exact price
+        # of everything that came after it. A purchase is a lower bound on what
+        # he will pay, not a quotation for the next thing.
+        output.latest_offer_selected_cents = None
 
     output.updated_at = now
     output.status = _derive_status(output)

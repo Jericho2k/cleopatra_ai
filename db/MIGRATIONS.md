@@ -4,7 +4,7 @@ Audit reference: **DB-000**, **SEC-003**, **REL-002**.
 
 ## The problem this documents
 
-`db/` contains 18 additive migrations — `ALTER TABLE` and `CREATE INDEX`. It
+`db/` contains additive migrations — `ALTER TABLE` and `CREATE INDEX`. It
 contains no `CREATE TABLE` for `creators`, `fans`, `messages`, `suggestions`,
 `chatter_creators`, `scheduled_actions`, `fan_lists`, `fan_list_members`,
 `ppv_offers`, `vault_sets`, `creator_vault_media`, or the
@@ -79,6 +79,33 @@ is expressed as `GRANT ... (column)`).
 `migration_order.txt`, in that order, and
 `tests/test_browser_least_privilege.py` asserts no creator-owned table is left
 with a `FOR ALL` policy for `authenticated`.
+
+## Drift: a column the application WRITES but the schema does not have
+
+This is the failure mode `db/conversation_director_direct_interest_v1.sql`
+exists for, and it is worth stating because it is silent.
+
+`models/conversation_director.ConversationDirectorState.to_context()` has always
+included `direct_interest`, and
+`services/conversation_director.save_conversation_director` upserts that WHOLE
+dict. PostgREST rejects the entire row when one key has no column — it is not a
+partial write — and the caller logs "persistence failed" and swallows it. The
+production symptom is therefore not an error anybody sees: it is a persistent
+feature quietly behaving as if it were stateless, recomputing from scratch on
+every turn.
+
+Two things guard it now:
+
+- `tests/test_schema_pipeline.py::test_the_director_can_persist_every_field_it_computes`
+  asserts the general rule — every key the director writes is a column — rather
+  than the one column that was missing.
+- `scripts/production_preflight.py` FAILS (not warns) on any column the
+  application unconditionally writes that a target database lacks.
+
+Note also what this migration deliberately did NOT do: edit
+`conversation_director_v1.sql` to add the column. That file has already been
+applied to production. Editing it would fix a fresh database and leave every
+existing deployment exactly as broken — which is the drift, not the fix.
 
 ## Applying a migration to production
 
@@ -418,3 +445,85 @@ declared it `NOT NULL`. The fixture was more permissive than production, so the
 mirror's deliberate `NULL` passed CI and failed live. The fixture now matches
 production, and the relaxation lives in this migration — so the schema-pipeline
 test exercises the real sequence rather than a schema that never existed.
+
+## Applying this sprint's migrations (drift repair + Experience Director)
+
+Four files, in this order, then the RLS pair. Every one is additive or a drop of
+a dead column, and all are idempotent.
+
+```bash
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 \
+  -f db/conversation_director_direct_interest_v1.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/message_platform_identity_v1.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/experience_director_v1.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/retire_post_purchase_cooldown_v1.sql
+
+# experience_director_v1 creates a creator-owned table, so the pair must be
+# re-run. NEVER one without the other (SEC-001).
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/tenant_isolation_v1.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/browser_least_privilege_v1.sql
+```
+
+### 1. `conversation_director_direct_interest_v1.sql` — drift repair
+
+Adds `fan_conversation_directors.direct_interest boolean not null default false`,
+the column the director has always written and `conversation_director_v1.sql`
+never created. See the drift section above for why that failed silently.
+
+### 2. `message_platform_identity_v1.sql` — **already in the repo, not applied**
+
+This is not a new migration and must not be duplicated. It already exists and is
+already listed in `migration_order.txt`; the deployment simply has not run it.
+`scripts/production_preflight.py` reports it as
+`message platform identity: no unique index on (creator_id, fansly_message_id)`.
+
+### 3. `experience_director_v1.sql` — the scene, and media as beats
+
+Creates `fan_experience_scenes` and adds the experience columns to `vault_sets`
+(`paid_sellable`, `scene_key`, `scene_premise`, `intensity_level`, `reveals`,
+`setup_line`, `continuation`).
+
+No backfill, on purpose. `paid_sellable` defaults to `true` = "no explicit
+decision has been made", and teaser content is still excluded by evidence
+(`models/content_pricing.paid_sellable_block_reason` reads `content_category`
+and `tags`), so the boundary holds from the moment the code deploys whether or
+not this migration has run. Existing sets acquire their experience metadata the
+next time sets are generated; until then `scene_metadata_from_set` falls back to
+the columns that already existed.
+
+### 4. `retire_post_purchase_cooldown_v1.sql` — drops a dead control
+
+Drops `creator_commercial_policies.post_purchase_cooldown_messages`. It
+configured a window that one-unlock sessions made unreachable. It holds
+configuration, not history, so nothing is lost.
+
+**Order note:** the backend tolerates this column still being present (pydantic
+ignores unknown keys), so the code may be deployed before the drop. The reverse
+is also safe. The only ordering that matters is that `experience_director_v1`
+precedes `tenant_isolation_v1` + `browser_least_privilege_v1`.
+
+### Verify
+
+```sql
+select column_name, column_default, is_nullable
+  from information_schema.columns
+ where table_schema = 'public'
+   and table_name = 'fan_conversation_directors'
+   and column_name = 'direct_interest';
+-- expect: direct_interest | false | NO
+
+select count(*) from information_schema.tables
+ where table_schema = 'public' and table_name = 'fan_experience_scenes';
+-- expect: 1
+
+select policyname, cmd from pg_policies
+ where schemaname = 'public' and tablename = 'fan_experience_scenes';
+-- expect: narrowed per-command policies, NOT a single FOR ALL
+```
+
+Then run the read-only preflight, which now FAILS on any column the application
+writes that the database lacks:
+
+```bash
+SUPABASE_DB_URL=... python scripts/production_preflight.py
+```

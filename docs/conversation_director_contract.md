@@ -44,3 +44,22 @@ OFFER | OBJECTION | PAID_SESSION | FOLLOW_UP | PAUSED | SAFETY
 
 A future UI may show current phase, next move, transition reason and engagement
 as explainable guidance. Engagement is not a guaranteed conversion probability.
+
+## Persistence
+
+Every field above is a column of `fan_conversation_directors`, and that is a
+requirement rather than an observation: `save_conversation_director` upserts the
+whole `to_context()` dict, and PostgREST rejects the entire row when one key has
+no column. `direct_interest` was missing in production for the life of the
+feature — see `db/MIGRATIONS.md` § "Drift: a column the application WRITES but
+the schema does not have", and
+`tests/test_schema_pipeline.py::test_the_director_can_persist_every_field_it_computes`,
+which asserts the rule rather than the one column.
+
+## Relationship to the Experience Director
+
+They are different machines and do not overlap. The Conversation Director tracks
+the RELATIONSHIP's phase across the whole conversation. The Experience Director
+(`docs/experience_director_contract.md`) tracks the current SCENE — the beat,
+what he just unlocked, how he reacted, and whether the conversation has earned
+another paid moment. Only the Experience Director can withhold an offer.

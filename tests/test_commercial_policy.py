@@ -189,21 +189,49 @@ def test_one_offer_is_never_accompanied_by_a_second():
     assert not hasattr(decision, "package_options")
 
 
-def test_post_purchase_cooldown_stays_in_the_moment_instead_of_selling():
+def test_the_scene_can_veto_a_new_offer_after_an_unlock():
+    """The replacement for the fixed post-purchase cooldown.
+
+    He is asking for media and everything commercial says yes — inventory,
+    caps, a priced offer. The only thing saying no is the Experience Director,
+    because he has already unlocked something in this scene and has not been
+    talked to about it yet. The result must be conversation, not a sale.
+    """
     decision = decide_next_action(
         CreatorPolicy(),
-        FanCommercialState(status=FanStatus.PAID_SESSION_ACTIVE),
-        [ev(EventType.WANTS_MEDIA)],
+        FanCommercialState(),
+        [ev(EventType.WANTS_MEDIA), ev(EventType.WANTS_EXPLICIT)],
         CommercialContext(
             next_offer=offer(),
-            session_exists=True,
-            session_cooldown_active=True,
+            experience_allows_new_offer=False,
         ),
     )
     assert decision.action == ActionType.CONTINUE_NORMAL_CHAT
     assert decision.must_not_send_media is True
     assert decision.mention_price is None
     assert decision.next_offer is None
+    assert "bridge" in decision.reason
+
+
+def test_the_scene_veto_does_not_touch_an_offer_he_has_already_accepted():
+    """Choreography narrows discovery. It never blocks a purchase he made.
+
+    A veto that could swallow an acceptance would be a checkout bug wearing a
+    narrative costume, so the gate is deliberately placed only on the path that
+    invents a NEW offer.
+    """
+    accepted = ev(EventType.OFFER_ACCEPTED, cents=2500, metadata={"set_id": "set-1"})
+    decision = decide_next_action(
+        CreatorPolicy(),
+        FanCommercialState(),
+        [accepted],
+        CommercialContext(
+            next_offer=offer(),
+            experience_allows_new_offer=False,
+        ),
+    )
+    assert decision.action == ActionType.SEND_NEXT_PPV_STEP
+    assert decision.accepted_offer_set_id == "set-1"
 
 
 def test_timezone_aware_payday_resolver():

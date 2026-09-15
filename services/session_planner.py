@@ -18,7 +18,7 @@ from typing import Any
 
 from core.simulation_catalog import exclude_simulation_only, run_live_catalog_query
 from core.supabase import get_supabase
-from db.commercial_queries import get_creator_policy, get_fan_state
+from db.commercial_queries import get_fan_state
 from db.queries import get_sent_ppv, save_fan_session
 from models.commercial import FanStatus
 from db.pricing_policy_queries import get_effective_price_learning_policy
@@ -37,7 +37,10 @@ async def plan_session_for_fan(
     accepted_price_cents: int | None = None,
 ) -> dict[str, Any]:
     """Build the single locked step that delivers the accepted offer."""
-    policy = await get_creator_policy(creator_id)
+    # The creator policy is deliberately not read here any more. The only
+    # thing this function took from it was the purchase-gating flag, which
+    # CreatorPolicy forces True and nothing downstream read — so the read was a
+    # round trip to Supabase on every plan, for a value that could not vary.
     state = await get_fan_state(fan_id)
 
     set_id = str(accepted_set_id or state.accepted_offer_set_id or "").strip()
@@ -141,9 +144,9 @@ async def plan_session_for_fan(
         "confirmed_budget_cents": cents,
         "revenue_cents": 0,
         "payment_state": "OFFER_SELECTED",
-        "post_ppv_cooldown": False,
-        "cooldown_messages_remaining": 0,
-        "require_purchase_before_next_step": policy.require_purchase_before_next_step,
+        # No require_purchase_before_next_step snapshot: it is forced True by
+        # CreatorPolicy's own validator and nothing ever read the copy, so it
+        # was a field in persisted JSON that could only ever say one thing.
     }
     await save_fan_session(fan_id, session)
 

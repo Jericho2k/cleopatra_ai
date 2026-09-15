@@ -86,10 +86,19 @@ COMMERCIAL INTERPRETATION RULES:
 - There is only ever ONE offer on the table. offer_response describes what he did
   about that one thing; there is no option to pick and no position to report.
 - Treat facts independently. A fan can accept the offer now AND mention a future payday.
+- current_budget_limit_usd IS A CEILING, and it needs ceiling words. Buying at a
+  price is not a limit at that price: "yeah send it" tells you he will pay that
+  much, not that it is all he has. Leave current_budget_limit_usd EMPTY unless he
+  actually said something like "that's all I have", "I can't spend more than X",
+  "X is my max", or "I only have X". Never copy the accepted or offered price
+  into it because he agreed to it.
 - Example: "yeah send it, I don't have more right now, I get paid Friday" means:
   offer_response=accepted, selected_offer_price_usd=<the offered price>,
-  current_budget_limit_usd=<that price>, cannot_afford_any_offer_now=false,
-  payday_raw=Friday, deferred_purchase_intent=false, purchase_signal=ready_to_buy.
+  current_budget_limit_usd=<that price, because "I don't have more" IS a ceiling>,
+  cannot_afford_any_offer_now=false, payday_raw=Friday,
+  deferred_purchase_intent=false, purchase_signal=ready_to_buy.
+- Counter-example: "yeah send it" on its own means offer_response=accepted,
+  selected_offer_price_usd=<the offered price>, current_budget_limit_usd=EMPTY.
 - cannot_afford_any_offer_now=true only when he cannot buy the offer now.
 - "I can't spend more than $28" is a limit, not a refusal, if he accepts at $28.
 - declined means he refused the offer.

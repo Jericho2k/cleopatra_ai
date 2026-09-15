@@ -110,6 +110,20 @@ def realistic_context() -> ConversationContext:
     )
 
 
+def _ctx(**overrides) -> ConversationContext:
+    """The realistic turn with one or two layers replaced."""
+    context = realistic_context()
+    return context.model_copy(update=overrides)
+
+
+def _render_ctx(context: ConversationContext, version: str = WRITER_V3) -> str:
+    prompt = build_prompt(context, prompt_version=version, reply_mode=MODE_AUTO)
+    system = prompt[0]["content"]
+    if isinstance(system, list):
+        system = "".join(str(block.get("text", "")) for block in system)
+    return f"{system}\n\n{prompt[1]['content']}"
+
+
 def rendered(version: str, mode: str) -> str:
     prompt = build_prompt(
         realistic_context(), prompt_version=version, reply_mode=mode
@@ -221,9 +235,73 @@ def test_it_still_carries_every_commercial_and_inventory_constraint(v3_auto):
     assert "approved content: 12 photos, hotel window light" in v3_auto
     assert "do not invent one" in v3_auto
     assert "The exact price is $25." in v3_auto
-    assert "Keep this response non-explicit." in v3_auto
     # And the writer block agrees rather than arguing with it.
     assert "decided outside this conversation and supplied to you separately" in v3_auto
+
+
+def test_the_commercial_decision_no_longer_dictates_the_text_register():
+    """``may_be_explicit: False`` is about the MEDIA, and used to gag the words.
+
+    The fixture's decision carries ``may_be_explicit: False`` — the default on
+    every ordinary decision — and that used to render "Keep this response
+    non-explicit." Whether the creator may speak sexually is now decided by
+    services/text_intimacy.py and arrives in its own block, so a turn with
+    nothing to sell no longer silently becomes a chaperone.
+    """
+    rendered_prompt = _render_ctx(
+        _ctx(
+            commercial_decision={
+                "action": "CONTINUE_NORMAL_CHAT",
+                "goal": "keep the conversation going",
+                "may_be_explicit": False,
+            }
+        )
+    )
+    assert "Keep this response non-explicit." not in rendered_prompt
+    assert "TEXT INTIMACY" not in rendered_prompt, (
+        "no register supplied, no register block"
+    )
+
+
+def test_the_register_block_is_what_grants_or_withholds_explicit_text():
+    def _render(text_intimacy):
+        return _render_ctx(_ctx(text_intimacy=text_intimacy))
+
+    explicit = _render({"level": "EXPLICIT"})
+    assert "explicitly sexual language is in bounds" in explicit
+    assert "What you may OFFER, PRICE or SEND is decided separately" in explicit
+
+    flirty = _render({"level": "FLIRTY"})
+    assert "flirty and suggestive is in bounds; graphic is not" in flirty
+
+    none = _render({"level": "NONE"})
+    assert "nothing sexual and nothing flirtatious" in none
+
+
+def test_the_scene_block_never_carries_a_price_or_a_step_count():
+    rendered_prompt = _render_ctx(
+        _ctx(
+            scene={
+                "beat": "AWAIT_REACTION",
+                "premise": "photos in the shower",
+                "just_unlocked": "undressed in the shower",
+                "fan_reaction": "NONE",
+                "reaction_owed": True,
+                "intimacy_level": 4,
+                "tension_level": 3,
+                "open_hook": "",
+                "desired_direction": "",
+            }
+        )
+    )
+    scene_block = rendered_prompt.split("SCENE (internal, authoritative choreography):")[1]
+    scene_block = scene_block.split("\n\n")[0]
+
+    assert "he has just unlocked something" in scene_block
+    assert "Nothing new is being offered" in scene_block
+    assert "$" not in scene_block
+    assert "step" not in scene_block.lower()
+    assert "price" not in scene_block.lower()
 
 
 # --- no duplicated stylistic pressure ---------------------------------------

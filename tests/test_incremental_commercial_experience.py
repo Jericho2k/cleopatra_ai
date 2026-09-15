@@ -376,16 +376,21 @@ def test_progression_is_locked_behind_a_confirmed_purchase():
 def test_after_a_purchase_the_conversation_comes_first():
     offer = build_next_offer(vault(), CreatorPolicy())
     session = mark_step_sent(_session_for(offer))
-    session, completed = mark_step_purchased(
-        session, media_id="m1", cooldown_messages=2
-    )
+    session, completed = mark_step_purchased(session, media_id="m1")
     assert completed is True, "one unlock is one step; it is done when it is paid"
 
+    # And because it is done, the SESSION can no longer be what holds the
+    # conversation back — which is exactly why the Experience Director exists.
+    # The veto now comes from the scene, not from a counter on a dead session.
     decision = decide_next_action(
         CreatorPolicy(),
         FanCommercialState(status=FanStatus.PAID_SESSION_ACTIVE),
         _events("that was so hot"),
-        _ctx(next_offer=offer, session_exists=True, session_cooldown_active=True),
+        _ctx(
+            next_offer=offer,
+            session_exists=True,
+            experience_allows_new_offer=False,
+        ),
     )
     assert decision.action == ActionType.CONTINUE_NORMAL_CHAT
     assert decision.must_not_send_media is True

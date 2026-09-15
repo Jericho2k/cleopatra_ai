@@ -477,6 +477,111 @@ def _render_message_shape(message_shape: dict) -> str:
     )
 
 
+def _render_text_intimacy(text_intimacy: dict) -> str:
+    """How sexual this reply may be — decided apart from the commercial engine.
+
+    This block exists because the register used to be read off
+    ``CommercialDecision.may_be_explicit``, which meant "the engine is not
+    selling this turn" silently became "do not speak sexually". The two are now
+    separate questions and this is the answer to the second one
+    (services/text_intimacy.py). It never authorizes media, a price or a send:
+    the FINAL COMMERCIAL POLICY block below remains the only thing that does.
+    """
+    if not text_intimacy:
+        return ""
+    level = str(text_intimacy.get("level") or "").upper()
+    if level == "NONE":
+        return (
+            "TEXT INTIMACY: nothing sexual and nothing flirtatious in this "
+            "response, whatever he said."
+        )
+    if level == "EXPLICIT":
+        return (
+            "TEXT INTIMACY: explicitly sexual language is in bounds this turn. "
+            "If he is being sexual, be in it with him rather than deflecting "
+            "with a tease and a question — this is a conversation, not a "
+            "performance, and it does not need a sale attached to it. What you "
+            "may OFFER, PRICE or SEND is decided separately below and this "
+            "changes none of it."
+        )
+    return (
+        "TEXT INTIMACY: flirty and suggestive is in bounds; graphic is not. "
+        "Warmth and innuendo rather than explicit description."
+    )
+
+
+def _render_scene(scene: dict) -> str:
+    """The current scene, as choreography the writer is inside.
+
+    Carries no price, no set id, no step count and nothing about what might be
+    offered later — see ``SceneState.writer_context``. It says what is going on
+    and what this beat owes him, and that is all.
+    """
+    if not scene:
+        return ""
+    beat = str(scene.get("beat") or "SETUP")
+    lines: list[str] = []
+    premise = str(scene.get("premise") or "").strip()
+    if premise:
+        lines.append(f"what is going on between you: {premise}")
+
+    unlocked = str(scene.get("just_unlocked") or "").strip()
+    reaction = str(scene.get("fan_reaction") or "NONE").upper()
+    if beat == "AWAIT_REACTION":
+        lines.append(
+            "he has just unlocked something and has not said anything about it "
+            "yet. Nothing new is being offered. Let him have the moment and "
+            "react to him"
+            + (f" — what he got: {unlocked}" if unlocked else "")
+            + "."
+        )
+    elif beat == "PLAY":
+        lines.append(
+            "you are IN the thing he unlocked with him"
+            + (f" ({unlocked})" if unlocked else "")
+            + ". Talk and play around it. Do not move on to something else and "
+            "do not start selling again."
+        )
+    elif beat == "BRIDGE":
+        lines.append(
+            "the conversation has produced a natural next direction. Follow it "
+            "as the conversation, not as a pitch."
+        )
+    elif beat == "BUILD":
+        lines.append("there is momentum. Build on it rather than restarting.")
+    elif beat == "CLOSE":
+        lines.append("this scene is finished. Let it end warmly.")
+
+    if scene.get("reaction_owed") and reaction not in {"NONE", ""}:
+        described = {
+            "POSITIVE": "he liked it — answer THAT, specifically, not content in general",
+            "NEGATIVE": "it did not land for him — deal with that honestly first, and do not pitch",
+            "WANTS_MORE": "he is asking for more — respond to what he actually asked for",
+            "NEUTRAL": "his reaction was flat — meet him where he is rather than performing",
+        }.get(reaction)
+        if described:
+            lines.append(described + ".")
+
+    hook = str(scene.get("open_hook") or "").strip()
+    if hook:
+        lines.append(f"still unresolved between you: {hook}")
+    direction = str(scene.get("desired_direction") or "").strip()
+    if direction:
+        lines.append(f"where he has been steering it: {direction}")
+
+    if not lines:
+        return ""
+    # The scene text above is APPROVED metadata, generated during catalog
+    # classification from the classified media itself (services/scene_metadata.py).
+    # Saying so is what keeps it a fact rather than a prompt to elaborate on.
+    lines.append(
+        "everything above is approved fact. Describe the scene and what he "
+        "unlocked only in these terms — do not add details, body parts, acts or "
+        "formats that are not in them, and do not promise anything beyond them."
+    )
+    return "SCENE (internal, authoritative choreography):\n- " + "\n- ".join(lines)
+
+
 def _render_session_choreography(progress: dict) -> str:
     """Describe the paid session as one experience the writer is mid-way through."""
     if not progress:
@@ -514,18 +619,14 @@ def _render_session_choreography(progress: dict) -> str:
             lines.append(
                 f"it changes format to a {upcoming.get('asset_type') or 'piece'}."
             )
-        if progress.get("cooldown_active"):
-            lines.append(
-                "OBJECTIVE THIS TURN: stay in the moment with him and bridge toward "
-                "that next piece so it feels like one experience. Imply there is more "
-                "coming without pitching it, naming its price, or promising anything "
-                "outside the plan. Do not send media this turn and do not ask 'want "
-                "more?' — the session already knows what comes next."
-            )
     elif purchased:
+        # Deliberately says nothing about ending. Under one-unlock sessions
+        # every purchase leaves "nothing further planned", so telling the
+        # writer to close here closed the conversation after every single sale.
+        # What happens next is the SCENE block's to say.
         lines.append(
-            "nothing further is planned: close the experience warmly instead of "
-            "hinting at more."
+            "this unlock is the whole of the commercial plan: nothing further is "
+            "authorised, so do not promise, price or hint at another piece."
         )
     return "PAID SESSION CHOREOGRAPHY (internal, authoritative):\n- " + "\n- ".join(lines)
 
@@ -609,6 +710,13 @@ def build_prompt(
     session_choreography_block = _render_session_choreography(
         session_progress(ctx.active_session)
     )
+    # Two separate questions, two separate blocks. The scene says WHEN,
+    # conversationally, something may happen; text intimacy says how sexual the
+    # words may be. Neither can authorize media, a price, or a send.
+    scene = getattr(ctx, "scene", None) or {}
+    scene_block = _render_scene(scene)
+    text_intimacy = getattr(ctx, "text_intimacy", None) or {}
+    text_intimacy_block = _render_text_intimacy(text_intimacy)
     expression_guidance_block = _render_expression_guidance(
         conversation_director,
         session_strategy,
@@ -1043,6 +1151,10 @@ WELCOME MESSAGE (your opening style):
         live_state_parts.append(session_strategy_block)
     if session_choreography_block:
         live_state_parts.append(session_choreography_block)
+    if scene_block:
+        live_state_parts.append(scene_block)
+    if text_intimacy_block:
+        live_state_parts.append(text_intimacy_block)
     if expression_guidance_block:
         # Expression calibration is derived from the director and the session
         # strategy. With neither configured it renders one constant paragraph
@@ -1114,25 +1226,12 @@ Fan just said: "{fan_message}"
     sent_ppv = ctx.sent_ppv or []
     sent_ids = {s["media_id"] for s in sent_ppv}
     purchased_ids = {s["media_id"] for s in sent_ppv if s.get("purchased")}
-    active_session = ctx.active_session
-
     decision = getattr(ctx, "commercial_decision", None) or {}
-    decision_action = decision.get("action", "")
     purchase_signal = situation.get("purchase_signal", "none")
 
     # A commercial decision is authoritative. Session-specific instructions are
     # included only when the policy explicitly authorised a delivery.
     ppv_delivery = getattr(ctx, "ppv_delivery", None) or {}
-    if active_session and (not decision or decision_action == "SEND_NEXT_PPV_STEP"):
-        if active_session.get("post_ppv_cooldown"):
-            messages_left = active_session.get("cooldown_messages_remaining", 2)
-            user_prompt += (
-                f"\n\nJUST UNLOCKED ({messages_left} exchanges before anything else "
-                "is offered): react to what he actually opened and stay in it with "
-                "him. Nothing is being sent this message and nothing new is being "
-                "offered. Do not name a price and do not ask whether he wants more."
-            )
-
     if ppv_delivery.get("attached"):
         # The backend attaches the media to this very message. The writer's only
         # job is the human text it arrives with; it has no tag to emit and no
@@ -1180,10 +1279,14 @@ Fan just said: "{fan_message}"
                 "link\". Write \"want me to send it\", \"want it\", \"sending it now\", "
                 "or \"it's right there\"."
             )
-        if not decision.get("may_be_explicit", False):
-            lines.append("Keep this response non-explicit.")
-        else:
-            lines.append("Explicit text is allowed only to the degree required by the decided action.")
+        # NOTE: the decision's own ``may_be_explicit`` is deliberately NOT read
+        # here any more. It answers "may this turn talk about the media it is
+        # selling", and using it as the text register turned every ordinary
+        # CONTINUE_NORMAL_CHAT turn into "keep this response non-explicit" —
+        # i.e. it made whether the creator could speak sexually depend on
+        # whether the engine happened to be selling. The register now comes
+        # from TEXT INTIMACY below (services/text_intimacy.py); what may be
+        # OFFERED, PRICED or SENT is still decided here and nowhere else.
 
         offer = decision.get("next_offer")
         if hasattr(offer, "model_dump"):

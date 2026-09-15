@@ -23,6 +23,10 @@ adaptive_planning_v1.sql
 affordability_v1.sql
 agency_operability_v1.sql
 conversation_director_v1.sql
+# Production drift repair (DB): the direct_interest column the director has
+# always written but conversation_director_v1 never created. Must run AFTER
+# conversation_director_v1.sql, which creates the table.
+conversation_director_direct_interest_v1.sql
 fan_intelligence_v1.sql
 fan_lifecycle_v1.sql
 fansly_audience_sync_v1.sql
@@ -75,6 +79,17 @@ ai_stack_profile_v3.sql
 # full_auto_lifecycle_v1.sql, whose fan_commercial_states.last_session_package_id
 # it renames, and before tenant_isolation_v1.
 incremental_offer_v1.sql
+
+# Experience Director: fan_experience_scenes (the persistent conversational
+# scene) plus the vault_sets experience-metadata and paid_sellable columns.
+# Must run AFTER conversation_director_v1.sql and, being a new creator-owned
+# table, before tenant_isolation_v1.sql.
+experience_director_v1.sql
+
+# Drops the fixed post-purchase message cooldown the Experience Director
+# replaces. Must run AFTER experience_director_v1.sql, which creates what
+# takes over from it.
+retire_post_purchase_cooldown_v1.sql
 
 # Always last, and always as a PAIR, in this order.
 #

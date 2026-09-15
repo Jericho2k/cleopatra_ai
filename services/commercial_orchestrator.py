@@ -18,6 +18,7 @@ from models.commercial import (
     EventType,
     FanStatus,
     Offer,
+    SextingMode,
 )
 from services.commercial_events import (
     accepted_offer_event,
@@ -26,6 +27,7 @@ from services.commercial_events import (
     stated_budget_cents,
 )
 from services.commercial_policy import CommercialContext, decide_next_action
+from services.experience_director import scene_allows_new_offer
 from services.followup_lifecycle import (
     complete_session_state,
     pending_offer_expiry_obligation,
@@ -34,7 +36,6 @@ from services.payday import resolve_payday
 from services.session_lifecycle import (
     has_pending_purchase,
     has_remaining_steps,
-    is_cooldown_active,
     normalize_session,
     resume_session,
 )
@@ -220,6 +221,7 @@ async def orchestrate(
     within_daily_caps: bool = True,
     frozen_for_review: bool = False,
     active_session: dict | None = None,
+    scene: dict | None = None,
 ) -> CommercialDecision:
     events = extract_events(situation)
     _augment_events_with_safe_learned_context(events, situation)
@@ -266,6 +268,9 @@ async def orchestrate(
         price_learning=price_learning,
         desired_experience=desired_experience or None,
         hard_ceiling_cents=hard_ceiling_cents,
+        # Content selection weighs scene continuity, explicitness AND whether
+        # the candidate actually advances the interaction he is in.
+        scene=scene,
     )
     # A live offer is held to exactly as presented until it is resolved; only
     # when nothing is pending does the freshly built next unlock apply.
@@ -288,7 +293,10 @@ async def orchestrate(
         paused_session_available=bool(session and session.get("status") == "paused"),
         session_has_pending_purchase=has_pending_purchase(session),
         session_has_remaining_steps=has_remaining_steps(session),
-        session_cooldown_active=is_cooldown_active(session),
+        # Choreography's only input to policy, and it can only narrow: the
+        # scene may withhold the DISCOVERY of a new offer after an unlock it
+        # has not been talked about yet. Everything else here is commercial.
+        experience_allows_new_offer=scene_allows_new_offer(scene),
     )
     decision = decide_next_action(policy, state, events, ctx)
 
@@ -586,3 +594,38 @@ def _offer_from_event(
     if not offer_id and event.amount_cents is not None:
         return active_offer if active_offer.price_cents == event.amount_cents else None
     return active_offer
+
+
+async def consume_free_text_allowance(creator_id: str, fan_id: str) -> None:
+    """Spend one of the creator's configured free explicit-text messages.
+
+    Decoupling sexual text from the commercial decision created a real risk the
+    brief called out by name: an explicit reply on a ``CONTINUE_NORMAL_CHAT``
+    turn is not a ``CONTINUE_FREE_TEXT`` action, so nothing would have counted
+    it, and a HYBRID_TEASER creator configured for four free messages would
+    have been giving away an unbounded sexting service.
+
+    This is what makes ``TextIntimacyDecision.consumes_free_allowance`` real. It
+    writes the same counter the commercial free-text actions already write, so
+    one budget governs both routes and ``free_mode_on_cooldown`` still ends the
+    window.
+    """
+    policy = await get_creator_policy(creator_id)
+    state = await get_fan_state(fan_id)
+    now = datetime.now(timezone.utc)
+
+    state.teaser_messages_used += 1
+    if state.free_session_started_at is None:
+        state.free_session_started_at = now
+    limit = (
+        policy.free_text_max_messages
+        if policy.sexting_mode == SextingMode.FREE_TEXT_ALLOWED
+        else policy.teaser_max_messages
+    )
+    if state.teaser_messages_used >= max(1, limit):
+        state.free_session_ended_at = now
+    await save_fan_state(fan_id, creator_id, state)
+    print(
+        f"[TEXT INTIMACY] fan={fan_id} free allowance "
+        f"{state.teaser_messages_used}/{limit}"
+    )

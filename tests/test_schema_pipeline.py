@@ -555,3 +555,50 @@ def test_every_registered_ai_stack_profile_is_writable(pipeline):
                     ("cleo_not_a_profile", row_id),
                 )
             connection.rollback()
+
+
+def test_the_director_can_persist_every_field_it_computes(pipeline):
+    """DB drift: every key of ``ConversationDirectorState.to_context`` is a column.
+
+    ``services/conversation_director.save_conversation_director`` upserts the
+    whole context dict. A key with no column is not a partial write — PostgREST
+    rejects the row, the service logs "persistence failed" and swallows it, and
+    the director quietly stops being persistent at all. ``direct_interest`` was
+    exactly that for the life of the feature, so this asserts the general rule
+    rather than the one column.
+    """
+    from models.conversation_director import ConversationDirectorState
+
+    connection, name = pipeline
+    columns = _columns(connection, name, "fan_conversation_directors")
+    written = set(ConversationDirectorState().to_context())
+
+    assert written - columns == set(), (
+        "the director writes these keys and the table has no column for them"
+    )
+
+
+def test_direct_interest_defaults_to_no_warm_up_owed(pipeline):
+    """A pre-existing row must keep the meaning it already had.
+
+    ``false`` is what ``advance_conversation_director`` computes for a fan who
+    has not asked for content, so backfilling every historical row with it is
+    the only value that changes nothing.
+    """
+    connection, name = pipeline
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            select column_default, is_nullable
+              from information_schema.columns
+             where table_schema = %s
+               and table_name = 'fan_conversation_directors'
+               and column_name = 'direct_interest'
+            """,
+            (name,),
+        )
+        row = cursor.fetchone()
+    assert row is not None, "fan_conversation_directors.direct_interest is missing"
+    default, nullable = row
+    assert default == "false"
+    assert nullable == "NO"

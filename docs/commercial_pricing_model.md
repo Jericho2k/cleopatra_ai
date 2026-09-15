@@ -112,16 +112,55 @@ videos both win immediately.
 The fan sees the next unlock and its price. He is never told a session total,
 how many further pieces exist, or that a sequence exists at all.
 
-After a confirmed purchase the conversation returns to being a conversation for
-`post_purchase_cooldown_messages` turns (`must_not_send_media`, no price, no
-"want more?"). Only then may a NEXT offer be built — from approved unsent
-inventory, escalating from the piece he just unlocked, at a price probed from
-its own range and from his confirmed purchase evidence
-(`purchase_probe_bonus_bps`).
+After a confirmed purchase the conversation returns to being a conversation.
+That used to be a counter — `post_purchase_cooldown_messages` — and the counter
+could not survive one-unlock sessions: a single-step plan reaches `completed` ON
+the purchase, and the completion branch of `mark_step_purchased` cleared the
+counter on the same line that would have set it, so the window never existed in
+production. It is retired (`db/retire_post_purchase_cooldown_v1.sql`).
+
+What replaces it is the **Experience Director**
+(`services/experience_director.py`, `docs/experience_director_contract.md`): a
+persistent SCENE that outlives the commercial session. A confirmed unlock moves
+the scene to `AWAIT_REACTION`; the next offer becomes eligible only when the
+scene reaches `BRIDGE`, which happens when the dialogue actually produces one —
+immediately if he asks for more, and never on a flat reaction however long he
+keeps talking. Policy sees this as the single `ctx.experience_allows_new_offer`
+flag, and it can only NARROW: an offer already on the table, an acceptance and a
+delivery are unaffected.
+
+Once eligible, the NEXT offer is built from approved unsent inventory,
+escalating from the piece he just unlocked, at a price probed from its own range
+and from his confirmed purchase evidence (`purchase_probe_bonus_bps`).
 
 `session_progress(session)` still gives the writer exact, writer-safe state
 about what he just unlocked. Nothing here authorizes a send — purchase gating
 decides that.
+
+## 8b. What may be SOLD, and what may be SAID
+
+Two boundaries that used to be one.
+
+**Paid-sellable content.** `models/content_pricing.is_paid_sellable` is the one
+predicate every commercial path asks. Teaser inventory — the `teaser_clothed`
+and `teaser_bundle` categories the agency prices $0-$0, plus a bare
+`tease`/`free`/`not_for_sale` tag on hand-curated rows — is never eligible for
+an automatic offer, for pricing, or for paid delivery, whatever price columns it
+carries. It is filtered in `services/media_packages.usable_sets`, the single
+chokepoint both offer construction and session planning read through. It is NOT
+deleted: it stays in the vault for use as a free reward, and the Sets UI marks
+it NOT SELLABLE and offers no pricing controls for it.
+
+**Sexual text.** `CommercialDecision.may_be_explicit` answers "may this turn
+talk about the media it is selling". It used to be read as the text register
+too, which meant an ordinary `CONTINUE_NORMAL_CHAT` turn instructed the writer
+to "Keep this response non-explicit" — i.e. whether the creator could speak
+sexually depended on whether the engine happened to be selling. The register is
+now `services/text_intimacy.py`, decided from fan intent, conversation
+intensity, the creator's configured sexting mode and safety state. The agency's
+controls are preserved exactly, including that free explicit text SPENDS the
+configured allowance (`consumes_free_allowance`) — without that, decoupling
+would have created an unlimited free sexting service on chat turns.
 
 ## 8a. Delivery is deterministic
 

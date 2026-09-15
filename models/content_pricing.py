@@ -173,3 +173,79 @@ __all__ = [
     "normalize_category",
     "row_category_range_cents",
 ]
+
+
+# --- The paid-sellable boundary ---------------------------------------------
+#
+# ONE predicate answers "may the engine put this in front of a fan for money?"
+# for every caller: offer construction, progression planning, session planning,
+# PPV delivery and the operator UI. It used to be four different ad-hoc filters
+# — three `.neq("content_category", "teaser_clothed")` chains in db/queries.py
+# and nothing at all in services/media_packages.usable_sets — which is why
+# `tease` inventory reached automatic offers through vault_sets even though the
+# media queries excluded it.
+
+#: Classifier categories that describe a teaser. These are content the agency
+#: priced at $0-$0 on purpose: it exists to be given, not sold. Keeping it in
+#: the vault is deliberate — a free reward is a real use for it — so this is an
+#: eligibility rule, never a deletion.
+FREE_ONLY_CATEGORIES: frozenset[str] = frozenset({"teaser_clothed", "teaser_bundle"})
+
+#: Free-only markers that can appear as a plain tag rather than as the
+#: classifier category, on hand-curated rows and on legacy imports. Matched on
+#: the WHOLE normalized tag, never as a substring: "striptease_video" is a
+#: priced category and must not be caught by the word "tease" inside it.
+FREE_ONLY_TAGS: frozenset[str] = frozenset(
+    {"tease", "teaser", "teasers", "teaser_only", "free", "free_only", "not_for_sale"}
+)
+
+
+def _row_category_tokens(row: dict[str, Any]) -> set[str]:
+    tokens = {normalize_category(row.get("content_category"))}
+    tokens.update(normalize_category(tag) for tag in (row.get("tags") or []))
+    tokens.discard("")
+    return tokens
+
+
+def paid_sellable_block_reason(row: dict[str, Any]) -> str | None:
+    """Why this row may not be sold automatically, or ``None`` if it may.
+
+    Order matters, and it is the order of authority:
+
+    1. An explicit ``paid_sellable = false`` is a human or classifier decision
+       and outranks everything. Nothing infers its way past it.
+    2. A row carrying ANY genuinely priced category is sellable at that
+       category's range. A mixed shoot whose tags contain both ``teaser_clothed``
+       and ``nude_photo`` is a nude set — the strongest content is what the
+       agency prices it by, exactly as ``row_category_range_cents`` already does.
+    3. Only then does a free-only marker block it. A row whose only category
+       evidence says "teaser" is teaser inventory, and it stays non-sellable no
+       matter what price columns it happens to carry: an operator typing a
+       number into the Sets UI must not be able to turn $0-$0 content into a
+       $20 PPV by accident.
+
+    A row with no category evidence at all (a hand-curated set, an "other"
+    import) is left alone. Blocking those would silently break manual curation,
+    which is a real workflow and is not what this boundary is about.
+    """
+    if row.get("paid_sellable") is False:
+        return "marked_not_paid_sellable"
+
+    tokens = _row_category_tokens(row)
+    if any(category_range_cents(token) is not None for token in tokens):
+        return None
+
+    free_only = (tokens & FREE_ONLY_CATEGORIES) or (tokens & FREE_ONLY_TAGS)
+    if free_only:
+        return f"free_only_content:{sorted(free_only)[0]}"
+    return None
+
+
+def is_paid_sellable(row: dict[str, Any]) -> bool:
+    """The authoritative predicate. Everything commercial asks this one function."""
+    return paid_sellable_block_reason(row) is None
+
+
+def paid_sellable_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only the rows the engine may automatically sell."""
+    return [row for row in rows if is_paid_sellable(row)]

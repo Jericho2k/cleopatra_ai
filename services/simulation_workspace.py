@@ -136,6 +136,7 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
         get_purchase_aggregates,
         lifecycle_row_to_context,
     )
+    from db.experience_director_queries import get_scene
     from db.price_learning_queries import get_price_learning_profile
     from services.ai_stack import resolve_ai_stack
 
@@ -157,6 +158,7 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
         intelligence,
         actions,
         stack,
+        scene,
     ) = await asyncio.gather(
         _safe("commercial_state", get_fan_state(fan_id)),
         _safe("lifecycle", get_lifecycle_state(fan_id)),
@@ -166,6 +168,7 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
         _safe("fan_intelligence", get_fan_intelligence_context(fan_id)),
         _safe("scheduled_actions", pending_scheduled_actions(fan_id)),
         _safe("ai_stack", resolve_ai_stack(creator_id=creator_id, fan_id=fan_id)),
+        _safe("scene", get_scene(fan_id)),
     )
 
     commercial_json = (
@@ -224,6 +227,26 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
             "next_followup_type": commercial_json.get("next_followup_type"),
         },
         "active_session": session,
+        # The conversational scene. It is the half of the state that now
+        # survives a purchase — a one-unlock session is over the moment it is
+        # paid, so without this the panel showed nothing between the sale and
+        # the next offer and the operator could not see WHY nothing was being
+        # offered (services/experience_director.py).
+        "scene": {
+            "beat": (scene or {}).get("beat"),
+            "premise": (scene or {}).get("premise"),
+            "last_fan_reaction": (scene or {}).get("last_fan_reaction"),
+            "reaction_processed": (scene or {}).get("reaction_processed"),
+            "intimacy_level": (scene or {}).get("intimacy_level"),
+            "tension_level": (scene or {}).get("tension_level"),
+            "open_hook": (scene or {}).get("open_hook"),
+            "desired_direction": (scene or {}).get("desired_direction"),
+            "another_unlock_ready": (scene or {}).get("another_unlock_ready"),
+            "unlocks_in_scene": (scene or {}).get("unlocks_in_scene"),
+            "transition_reason": (scene or {}).get("transition_reason"),
+        }
+        if scene
+        else None,
         "pending_ppv": fan.get("pending_ppv_check") or None,
         "fan_intelligence": intelligence or {},
         "scheduled_actions": actions or [],

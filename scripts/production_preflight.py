@@ -328,6 +328,36 @@ def check_schema(catalog: Catalog, report: Report) -> None:
             "apply db/message_platform_identity_v1.sql",
         )
 
+    # --- DB drift: columns the application WRITES ---------------------------
+    #
+    # A failure, not a warning. These are not optional features: the code
+    # unconditionally sends these columns, PostgREST rejects the whole row when
+    # one is missing, and the callers swallow the exception — so the symptom in
+    # production is a feature that silently does nothing rather than an error
+    # anybody sees. direct_interest was exactly that.
+    written_columns = [
+        ("fan_conversation_directors", "direct_interest",
+         "db/conversation_director_direct_interest_v1.sql"),
+        ("fan_experience_scenes", "beat", "db/experience_director_v1.sql"),
+        ("vault_sets", "paid_sellable", "db/experience_director_v1.sql"),
+    ]
+    missing_written = [
+        (table, column, migration)
+        for table, column, migration in written_columns
+        if not catalog.column_exists(table, column)
+    ]
+    if missing_written:
+        for table, column, migration in missing_written:
+            report.fail(
+                f"{table}.{column}",
+                f"missing, but the application writes it; apply {migration}",
+            )
+    else:
+        report.ok(
+            "written-column drift",
+            "every column the application writes exists",
+        )
+
     # --- Owner-only simulation catalog -------------------------------------
     #
     # A warning rather than a failure: without these columns no mirrored row can
