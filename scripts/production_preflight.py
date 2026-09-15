@@ -387,6 +387,28 @@ def check_schema(catalog: Catalog, report: Report) -> None:
             "simulation_only and provenance columns present",
         )
 
+    # --- HIST-001: historical backfill state -------------------------------
+    #
+    # A warning rather than a failure, and deliberately so. Without this table
+    # historical import is UNAVAILABLE — db/fan_history_queries.py detects its
+    # absence and degrades — while live conversation, delivery and purchase
+    # reconciliation are entirely unaffected. That is the correct failure
+    # direction for optional work, so a deployment without it is degraded, not
+    # broken.
+    if catalog.column_exists("fan_history_backfill", "page_cursor"):
+        report.ok(
+            "historical backfill state",
+            "fan_history_backfill is present; history import can resume",
+        )
+    else:
+        report.warn(
+            "historical backfill state",
+            "fan_history_backfill is missing; historical import and compaction "
+            "are disabled (live conversation is unaffected). Apply "
+            "db/fan_history_backfill_v1.sql, then the tenant_isolation_v1 + "
+            "browser_least_privilege_v1 pair",
+        )
+
     # --- The hottest read in the product -----------------------------------
     if catalog.index_definition("messages", "fan_id"):
         report.ok("messages conversation index", "an index on fan_id exists")

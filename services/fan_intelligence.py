@@ -275,10 +275,35 @@ def validate_observation(
     )
 
 
+# A fact the live path has already established as EXPLICIT or CONFIRMED is
+# current knowledge. Historical evidence is older by construction, so it may
+# add, reinforce and replace guesses — but it may never overturn one of these.
+_LIVE_AUTHORITATIVE_STATUSES = {
+    FactStatus.EXPLICIT.value,
+    FactStatus.CONFIRMED.value,
+}
+
+
 def plan_fact_merge(
     existing_facts: list[dict[str, Any]],
     observation: ValidatedObservation,
+    *,
+    historical: bool = False,
 ) -> MergePlan:
+    """Decide what one validated observation does to the durable record.
+
+    ``historical`` marks evidence compacted out of an old conversation. It
+    changes exactly one outcome: where live evidence would declare a CONFLICT
+    and deactivate the current value, historical evidence stands down instead.
+
+    That asymmetry is deliberate and is the answer to "do not let a historical
+    model summary overwrite stronger structured facts". A backfill reading a
+    three-year-old message in which the fan said he lived in Chicago must not
+    deactivate the fact, established last week, that he lives in Austin — the
+    old statement was true when he made it and is not news. The observation is
+    still written to fan_fact_observations, so the evidence is not lost; only
+    the authority to overturn is withheld.
+    """
     same_value = next(
         (
             fact
@@ -311,6 +336,15 @@ def plan_fact_merge(
             action=MergeAction.REPLACE_INFERRED,
             conflicting_fact_ids=[str(fact["id"]) for fact in active],
             reason="explicit evidence supersedes inference",
+        )
+
+    if historical and any(
+        str(fact.get("status") or "") in _LIVE_AUTHORITATIVE_STATUSES
+        for fact in active
+    ):
+        return MergePlan(
+            action=MergeAction.IGNORE,
+            reason="historical evidence does not overturn a current fact",
         )
 
     return MergePlan(
@@ -354,7 +388,16 @@ async def _merge_one(
     observation: ValidatedObservation,
     extraction_provider: str,
     extraction_model: str,
-) -> None:
+    historical: bool = False,
+) -> bool:
+    """Record one observation and apply its merge. True if a fact changed.
+
+    Shared by live extraction and historical compaction on purpose: there is
+    ONE fan memory, one set of merge rules and one evidence table. A second
+    "historical facts" store would be a parallel database that the writer, the
+    commercial engine and the operator UI would all have to learn about, and
+    that the contradiction rules would not cover.
+    """
     inserted = await insert_observation(
         {
             "creator_id": creator_id,
@@ -379,10 +422,16 @@ async def _merge_one(
         }
     )
     if not inserted:
-        return
+        return False
 
     existing = await get_facts_for_key(fan_id, observation.fact_key)
-    plan = plan_fact_merge(existing, observation)
+    plan = plan_fact_merge(existing, observation, historical=historical)
+    if plan.action == MergeAction.IGNORE:
+        print(
+            f"[FAN INTELLIGENCE] fan={fan_id} key={observation.fact_key} "
+            f"ignored: {plan.reason}"
+        )
+        return False
 
     if plan.action == MergeAction.REINFORCE and plan.matched_fact_id:
         fact = next(f for f in existing if str(f["id"]) == plan.matched_fact_id)
@@ -403,7 +452,7 @@ async def _merge_one(
                 "is_active": True,
             },
         )
-        return
+        return True
 
     if plan.action == MergeAction.REPLACE_INFERRED:
         await mark_facts_contradicted(plan.conflicting_fact_ids, deactivate=True)
@@ -415,7 +464,7 @@ async def _merge_one(
             status=FactStatus.EXPLICIT,
             is_active=True,
         )
-        return
+        return True
 
     if plan.action == MergeAction.CONFLICT:
         await mark_facts_contradicted(plan.conflicting_fact_ids, deactivate=True)
@@ -427,7 +476,7 @@ async def _merge_one(
             status=FactStatus.CONTRADICTED,
             is_active=False,
         )
-        return
+        return True
 
     if plan.action in {MergeAction.CREATE, MergeAction.ADD_MULTI_VALUE}:
         await insert_fact(
@@ -438,6 +487,9 @@ async def _merge_one(
             status=_initial_status(observation),
             is_active=True,
         )
+        return True
+
+    return False
 
 
 async def learn_from_fan_message(

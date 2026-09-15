@@ -271,6 +271,15 @@ def _is_missing_conflict_target(error: Exception) -> bool:
     return any(marker.lower() in text for marker in _MISSING_CONFLICT_TARGET_MARKERS)
 
 
+# Public names for the other ingestion path. services/fan_history.py writes
+# historical messages in batches and needs exactly the same conflict target and
+# the same pre-migration fallback trigger; duplicating either would be a second
+# definition of what message identity means, which is the mistake
+# db/message_platform_identity_v1.sql exists to prevent.
+PLATFORM_IDENTITY_CONFLICT = _PLATFORM_IDENTITY_CONFLICT
+is_missing_conflict_target = _is_missing_conflict_target
+
+
 # Whether the platform-identity index is currently believed to be missing.
 #
 # The fallback below keeps ingestion working without it, which is exactly why a

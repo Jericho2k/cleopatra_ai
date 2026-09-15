@@ -12,8 +12,10 @@ import os
 import random
 import threading
 import time
-from collections import Counter, deque
-from contextlib import asynccontextmanager
+from collections import Counter, defaultdict, deque
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Iterable
 from urllib.parse import urlparse
 
@@ -38,8 +40,104 @@ from core.apifansly_gate import (
 DEFAULT_BASE_URL = "https://v1.apifansly.com/api/fansly"
 _USAGE_WINDOW_SECONDS = 24 * 60 * 60
 _USAGE_EVENTS: deque[dict[str, Any]] = deque(maxlen=50_000)
+_WEBHOOK_EVENTS: deque[dict[str, Any]] = deque(maxlen=200_000)
 _USAGE_LOCK = threading.Lock()
 _USAGE_STARTED_AT = time.time()
+
+
+# ---------------------------------------------------------------------------
+# Credit estimation.
+#
+# API Fansly bills in credits, and its own Usage dashboard is the AUTHORITY.
+# Everything this module computes is an ESTIMATE from what the transport can
+# observe, published so an operator can see where credits are going between
+# dashboard refreshes and so background history work can be throttled before it
+# surprises anybody.
+#
+# The published billing rules this models:
+#
+#   * an ordinary request costs 1 credit
+#   * a standard response larger than 80 KB costs proportionally more
+#   * 80 received webhook events cost 1 credit
+#   * media upload/download costs 2 credits per MB transferred
+#
+# The proportional rule is applied as bytes / 80 KB with a floor of one credit,
+# so a 240 KB chat page is estimated at three credits rather than one. This
+# matters specifically for history backfill: an API Fansly chat page carries
+# the full ``accountMedia`` metadata for every attachment on it, so a page of
+# ten messages is routinely far larger than 80 KB and assuming "one page, one
+# credit" would understate a 5,000-message import several-fold.
+#
+# A media transfer is charged on the bytes that moved rather than on the JSON
+# envelope, because those bytes ARE what the provider meters. The ordinary
+# one-credit floor still applies, so a media call is never estimated at less
+# than a plain request.
+# ---------------------------------------------------------------------------
+CREDIT_RESPONSE_BYTES_PER_CREDIT = 80 * 1024
+CREDIT_MEDIA_CREDITS_PER_MB = 2.0
+CREDIT_BYTES_PER_MB = 1024 * 1024
+WEBHOOK_EVENTS_PER_CREDIT = 80
+
+
+# Which part of the product spent the credit. Live conversation is separated
+# from every kind of background work precisely so that throttling background
+# work can never be confused with throttling a fan's reply.
+CATEGORY_LIVE_CHAT = "live_chat"
+CATEGORY_BACKGROUND_HISTORY = "background_history"
+CATEGORY_VAULT = "vault"
+CATEGORY_RECONCILIATION = "reconciliation"
+CATEGORY_ACCOUNT = "account"
+CATEGORY_OTHER = "other"
+
+USAGE_CATEGORIES: tuple[str, ...] = (
+    CATEGORY_LIVE_CHAT,
+    CATEGORY_BACKGROUND_HISTORY,
+    CATEGORY_VAULT,
+    CATEGORY_RECONCILIATION,
+    CATEGORY_ACCOUNT,
+    CATEGORY_OTHER,
+)
+
+# A call made outside any explicit scope still has to be classified, because an
+# unclassified majority would make the breakdown useless. The operation name is
+# the only thing every call site already carries, so it is the fallback.
+_OPERATION_CATEGORY_DEFAULTS: tuple[tuple[str, str], ...] = (
+    ("vault", CATEGORY_VAULT),
+    ("chat listing", CATEGORY_RECONCILIATION),
+    ("chat message listing", CATEGORY_RECONCILIATION),
+    ("message delivery", CATEGORY_LIVE_CHAT),
+    ("message deletion", CATEGORY_LIVE_CHAT),
+    ("typing", CATEGORY_LIVE_CHAT),
+    ("mark", CATEGORY_LIVE_CHAT),
+    ("history", CATEGORY_BACKGROUND_HISTORY),
+    ("connect", CATEGORY_ACCOUNT),
+    ("2fa", CATEGORY_ACCOUNT),
+    ("account", CATEGORY_ACCOUNT),
+    ("follower", CATEGORY_ACCOUNT),
+    ("subscriber", CATEGORY_ACCOUNT),
+    ("list", CATEGORY_ACCOUNT),
+)
+
+_USAGE_CATEGORY: ContextVar[str | None] = ContextVar(
+    "apifansly_usage_category", default=None
+)
+
+# An open ``collect_usage`` scope's sink. A ContextVar rather than a global, so
+# two concurrent backfills each measure their own pages instead of each other's.
+_USAGE_COLLECTOR: ContextVar[list[dict[str, Any]] | None] = ContextVar(
+    "apifansly_usage_collector", default=None
+)
+
+# How many live-chat scopes are open right now, across every task in the
+# process. Deep-history work reads this and yields, which is the whole reason
+# the counter exists: a fan waiting on a reply must never queue behind a
+# hundred background history pages.
+_live_scope_depth = 0
+
+# Set on a response object once its cost has been recorded, so a call site that
+# both raises through ``raise_for_response`` and reports its own media bytes
+# cannot be billed twice.
+_RECORDED_MARKER = "_apifansly_usage_recorded"
 
 
 class ApiFanslyConfigurationError(RuntimeError):
@@ -159,14 +257,286 @@ async def client_scope() -> AsyncIterator[httpx.AsyncClient]:
     yield shared_client()
 
 
+def usage_category_default(operation: str) -> str:
+    """Classify a call that was made outside an explicit usage scope."""
+    text = str(operation or "").strip().lower()
+    for needle, category in _OPERATION_CATEGORY_DEFAULTS:
+        if needle in text:
+            return category
+    return CATEGORY_OTHER
+
+
+def current_usage_category() -> str | None:
+    """The usage category of the scope this call is running inside, if any."""
+    return _USAGE_CATEGORY.get()
+
+
+@contextmanager
+def usage_category(category: str):
+    """Attribute every API Fansly call made inside this block to one category.
+
+    The scope also carries the live/background priority signal: entering
+    ``CATEGORY_LIVE_CHAT`` raises ``live_calls_in_flight()`` for as long as the
+    block runs, which is what deep-history work checks before spending another
+    page. Categorisation and priority are the same fact, so they are one
+    mechanism rather than two that can disagree.
+    """
+    global _live_scope_depth
+
+    normalized = str(category or "").strip().lower() or CATEGORY_OTHER
+    if normalized not in USAGE_CATEGORIES:
+        normalized = CATEGORY_OTHER
+    token = _USAGE_CATEGORY.set(normalized)
+    if normalized == CATEGORY_LIVE_CHAT:
+        with _USAGE_LOCK:
+            _live_scope_depth += 1
+    try:
+        yield normalized
+    finally:
+        if normalized == CATEGORY_LIVE_CHAT:
+            with _USAGE_LOCK:
+                _live_scope_depth = max(0, _live_scope_depth - 1)
+        _USAGE_CATEGORY.reset(token)
+
+
+def live_calls_in_flight() -> int:
+    """How many live-chat scopes are currently open in this process."""
+    with _USAGE_LOCK:
+        return _live_scope_depth
+
+
+@contextmanager
+def collect_usage(category: str):
+    """Run inside a usage category AND capture what the calls in it cost.
+
+    Yields a list that receives one event dict per provider call made inside
+    the block, so a caller can report the exact calls, bytes and estimated
+    credits that one unit of work consumed — which is what makes per-fan
+    history cost visible instead of being averaged into a process total.
+
+    Scoped to the calling task: two backfills running at once each measure
+    their own pages.
+    """
+    sink: list[dict[str, Any]] = []
+    token = _USAGE_COLLECTOR.set(sink)
+    try:
+        with usage_category(category):
+            yield sink
+    finally:
+        _USAGE_COLLECTOR.reset(token)
+
+
+def summarize_usage_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Calls, bytes and estimated credits for one collected batch."""
+    return {
+        "calls": len(events),
+        "response_bytes": sum(int(event.get("response_bytes") or 0) for event in events),
+        "media_bytes": sum(int(event.get("media_bytes") or 0) for event in events),
+        "estimated_credits": round(
+            sum(float(event.get("credits") or 0.0) for event in events), 3
+        ),
+    }
+
+
+# How recently a live-chat call must have happened for deep-history work to
+# stand aside. Deliberately short: this is "a conversation is happening right
+# now", not "a conversation happened today".
+LIVE_ACTIVITY_WINDOW_SECONDS = 30.0
+
+
+def live_activity_recent(within_seconds: float = LIVE_ACTIVITY_WINDOW_SECONDS) -> bool:
+    """Whether a live-chat provider call happened in the last few seconds.
+
+    The companion to ``live_calls_in_flight()``, and the one that does the real
+    work. A reply's typing indicator and its message delivery are both recorded
+    as live-chat calls, so this sees an active conversation without every
+    delivery path having to wrap itself in a scope — and a scope that spans a
+    whole model-generating turn would be both hard to place correctly and
+    coarser than this.
+    """
+    cutoff = time.time() - max(0.0, float(within_seconds))
+    with _USAGE_LOCK:
+        for event in reversed(_USAGE_EVENTS):
+            if event["at"] < cutoff:
+                return False
+            if event.get("category") == CATEGORY_LIVE_CHAT:
+                return True
+    return False
+
+
+def live_work_in_progress() -> bool:
+    """Whether anything live is happening that background work must yield to.
+
+    Live conversation, delivery and purchase correctness have priority over
+    optional history work, always. This is the single question deep-history
+    code asks before spending another provider call.
+    """
+    return live_calls_in_flight() > 0 or live_activity_recent()
+
+
+def estimate_call_credits(
+    *,
+    response_bytes: int = 0,
+    media_bytes: int = 0,
+) -> float:
+    """Estimate the credits one provider call consumed.
+
+    See the credit-model comment at the top of this module. Media transfer is
+    metered on bytes moved; everything else on response size, with the ordinary
+    one-credit floor that every request pays.
+    """
+    if media_bytes and media_bytes > 0:
+        media = (
+            CREDIT_MEDIA_CREDITS_PER_MB
+            * float(media_bytes)
+            / float(CREDIT_BYTES_PER_MB)
+        )
+        return max(1.0, media)
+    if response_bytes and response_bytes > CREDIT_RESPONSE_BYTES_PER_CREDIT:
+        return float(response_bytes) / float(CREDIT_RESPONSE_BYTES_PER_CREDIT)
+    return 1.0
+
+
+def estimate_webhook_credits(events: int) -> float:
+    """Estimate the credits ``events`` received webhook deliveries consumed."""
+    if events <= 0:
+        return 0.0
+    return float(events) / float(WEBHOOK_EVENTS_PER_CREDIT)
+
+
+def _prune_locked(now: float) -> None:
+    """Drop events older than the rolling window. Caller holds _USAGE_LOCK."""
+    cutoff = now - _USAGE_WINDOW_SECONDS
+    while _USAGE_EVENTS and _USAGE_EVENTS[0]["at"] < cutoff:
+        _USAGE_EVENTS.popleft()
+    while _WEBHOOK_EVENTS and _WEBHOOK_EVENTS[0]["at"] < cutoff:
+        _WEBHOOK_EVENTS.popleft()
+
+
+def _append_usage_event(event: dict[str, Any]) -> int:
+    with _USAGE_LOCK:
+        _USAGE_EVENTS.append(event)
+        _prune_locked(event["at"])
+        return len(_USAGE_EVENTS)
+
+
+def record_usage_event(
+    *,
+    operation: str,
+    account_id: str | None,
+    method: str = "",
+    path: str = "",
+    status: int = 0,
+    response_bytes: int = 0,
+    media_bytes: int = 0,
+    category: str | None = None,
+) -> dict[str, Any]:
+    """Record one provider call with its estimated credit cost.
+
+    Public because not every API Fansly call goes through ``request()``. The
+    typing indicator, mark-as-read, account connection and 2FA verification are
+    raw httpx calls that still cost credits, and a usage report that silently
+    omits them is worse than none.
+    """
+    now = time.time()
+    resolved_category = (
+        str(category).strip().lower()
+        if category
+        else (_USAGE_CATEGORY.get() or usage_category_default(operation))
+    )
+    if resolved_category not in USAGE_CATEGORIES:
+        resolved_category = CATEGORY_OTHER
+    response_bytes = max(0, int(response_bytes or 0))
+    media_bytes = max(0, int(media_bytes or 0))
+    event = {
+        "at": now,
+        "operation": str(operation or "unknown"),
+        "account_id": str(account_id or ""),
+        "method": str(method or ""),
+        "path": str(path or ""),
+        "status": int(status or 0),
+        "response_bytes": response_bytes,
+        "media_bytes": media_bytes,
+        "category": resolved_category,
+        "credits": estimate_call_credits(
+            response_bytes=response_bytes,
+            media_bytes=media_bytes,
+        ),
+    }
+    total_24h = _append_usage_event(event)
+    sink = _USAGE_COLLECTOR.get()
+    if sink is not None:
+        sink.append(event)
+    print(
+        f"[APIFANSLY USAGE] operation={event['operation']} "
+        f"account={event['account_id'] or 'none'} method={event['method']} "
+        f"status={event['status']} bytes={event['response_bytes']} "
+        f"media_bytes={event['media_bytes']} category={event['category']} "
+        f"credits={event['credits']:.2f} calls_24h={total_24h}"
+    )
+    return event
+
+
+def record_raw_call(
+    response: httpx.Response,
+    *,
+    operation: str,
+    account_id: str | None = None,
+    media_bytes: int = 0,
+    category: str | None = None,
+) -> None:
+    """Account for a response produced outside ``request()``.
+
+    Idempotent per response object: a call site that both raises through
+    ``raise_for_response`` and reports its own media bytes is billed once, not
+    twice. The first record wins, so a site that knows its media bytes must
+    report them at the point it raises rather than afterwards.
+    """
+    _record_usage(
+        response,
+        operation=operation,
+        account_id=account_id,
+        media_bytes=media_bytes,
+        category=category,
+    )
+
+
+def record_webhook_event(
+    event: str | None = None,
+    *,
+    account_id: str | None = None,
+) -> None:
+    """Count one received webhook delivery. 80 of them cost one credit."""
+    now = time.time()
+    with _USAGE_LOCK:
+        _WEBHOOK_EVENTS.append(
+            {
+                "at": now,
+                "event": str(event or "unknown"),
+                "account_id": str(account_id or ""),
+            }
+        )
+        _prune_locked(now)
+
+
 def _record_usage(
     response: httpx.Response,
     *,
     operation: str,
     account_id: str | None,
+    media_bytes: int = 0,
+    category: str | None = None,
 ) -> None:
     """Record a bounded, secret-free API usage event for diagnostics."""
-    now = time.time()
+    if getattr(response, _RECORDED_MARKER, False):
+        return
+    try:
+        setattr(response, _RECORDED_MARKER, True)
+    except Exception:
+        # A test double that refuses attributes still gets accounted; it just
+        # cannot be deduplicated. Under-reporting is worse than double-counting
+        # a stub.
+        pass
     try:
         request = response.request
         method = str(request.method or "")
@@ -174,57 +544,179 @@ def _record_usage(
     except RuntimeError:
         method = ""
         path = ""
-    event = {
-        "at": now,
-        "operation": str(operation or "unknown"),
-        "account_id": str(account_id or ""),
-        "method": method,
-        "path": path,
-        "status": int(response.status_code),
-        "response_bytes": len(response.content or b""),
-    }
-    with _USAGE_LOCK:
-        _USAGE_EVENTS.append(event)
-        cutoff = now - _USAGE_WINDOW_SECONDS
-        while _USAGE_EVENTS and _USAGE_EVENTS[0]["at"] < cutoff:
-            _USAGE_EVENTS.popleft()
-        total_24h = len(_USAGE_EVENTS)
-    print(
-        f"[APIFANSLY USAGE] operation={event['operation']} "
-        f"account={event['account_id'] or 'none'} method={event['method']} "
-        f"status={event['status']} bytes={event['response_bytes']} "
-        f"calls_24h={total_24h}"
+    try:
+        response_bytes = len(response.content or b"")
+    except Exception:
+        # A streamed response that was never read has no .content. The call
+        # still happened and still costs its one-credit floor.
+        response_bytes = 0
+    record_usage_event(
+        operation=operation,
+        account_id=account_id,
+        method=method,
+        path=path,
+        status=int(response.status_code),
+        response_bytes=response_bytes,
+        media_bytes=media_bytes,
+        category=category,
     )
+
+
+def _usage_totals() -> dict[str, Any]:
+    """Every accounting figure the snapshot and the throttle both need."""
+    now = time.time()
+    with _USAGE_LOCK:
+        _prune_locked(now)
+        events = list(_USAGE_EVENTS)
+        webhook_events = list(_WEBHOOK_EVENTS)
+    return {
+        "now": now,
+        "events": events,
+        "webhook_events": webhook_events,
+    }
+
+
+def _breakdown(events: list[dict[str, Any]], key: str, *, fallback: str) -> dict[str, Any]:
+    grouped: dict[str, dict[str, float]] = defaultdict(
+        lambda: {"calls": 0, "response_bytes": 0, "media_bytes": 0, "estimated_credits": 0.0}
+    )
+    for event in events:
+        bucket = grouped[str(event.get(key) or fallback)]
+        bucket["calls"] += 1
+        bucket["response_bytes"] += int(event.get("response_bytes") or 0)
+        bucket["media_bytes"] += int(event.get("media_bytes") or 0)
+        bucket["estimated_credits"] += float(event.get("credits") or 0.0)
+    return {
+        name: {
+            "calls": int(values["calls"]),
+            "response_bytes": int(values["response_bytes"]),
+            "media_bytes": int(values["media_bytes"]),
+            "estimated_credits": round(values["estimated_credits"], 3),
+        }
+        for name, values in sorted(grouped.items())
+    }
+
+
+def background_history_credit_budget() -> float:
+    """Rolling 24h estimated-credit ceiling for deep history work.
+
+    Zero or unset means no ceiling. This budget governs OPTIONAL backfill only.
+    It is never consulted on a live conversation, a delivery, or a purchase
+    reconciliation, because running out of history budget must never be able to
+    stop a fan being answered or a sale being recorded.
+    """
+    raw = str(os.environ.get("APIFANSLY_HISTORY_CREDIT_BUDGET_24H") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.0
+    return value if value > 0 else 0.0
+
+
+def background_history_budget_state() -> dict[str, Any]:
+    """Whether optional deep-history work may spend another provider call."""
+    totals = _usage_totals()
+    spent = sum(
+        float(event.get("credits") or 0.0)
+        for event in totals["events"]
+        if event.get("category") == CATEGORY_BACKGROUND_HISTORY
+    )
+    budget = background_history_credit_budget()
+    remaining = max(0.0, budget - spent) if budget else None
+    return {
+        "budget_credits": budget or None,
+        "spent_credits": round(spent, 3),
+        "remaining_credits": round(remaining, 3) if remaining is not None else None,
+        "exhausted": bool(budget and spent >= budget),
+    }
+
+
+def background_history_allowed() -> bool:
+    """False only when an explicitly configured history budget is spent."""
+    return not background_history_budget_state()["exhausted"]
 
 
 def usage_snapshot() -> dict[str, Any]:
-    """Return the current process's rolling 24-hour API usage summary."""
-    now = time.time()
-    cutoff = now - _USAGE_WINDOW_SECONDS
-    with _USAGE_LOCK:
-        while _USAGE_EVENTS and _USAGE_EVENTS[0]["at"] < cutoff:
-            _USAGE_EVENTS.popleft()
-        events = list(_USAGE_EVENTS)
+    """Return the current process's rolling 24-hour API usage summary.
+
+    Credit figures are ESTIMATES derived from observed bytes and the published
+    billing rules. API Fansly's own Usage dashboard is authoritative; this
+    exists so an operator can see the shape of spend between refreshes and
+    attribute it to an operation, an account and a part of the product.
+    """
+    totals = _usage_totals()
+    events = totals["events"]
+    webhook_events = totals["webhook_events"]
+    now = totals["now"]
+
+    call_credits = sum(float(event.get("credits") or 0.0) for event in events)
+    webhook_credits = estimate_webhook_credits(len(webhook_events))
+    total_credits = call_credits + webhook_credits
+
+    # Run-rate is extrapolated from what this process has actually observed. A
+    # process that booted ten minutes ago has ten minutes of evidence, not a
+    # day of it, so the divisor is the observed window rather than a flat 24h.
+    observed_seconds = max(1.0, min(_USAGE_WINDOW_SECONDS, now - _USAGE_STARTED_AT))
+    per_day = total_credits * (86400.0 / observed_seconds)
+
     by_operation = Counter(event["operation"] for event in events)
-    by_account = Counter(
-        event["account_id"] or "unbound"
-        for event in events
-    )
+    by_account = Counter(event["account_id"] or "unbound" for event in events)
     by_status = Counter(str(event["status"]) for event in events)
+
     return {
         "window_hours": 24,
         "process_started_at": _USAGE_STARTED_AT,
+        "observed_seconds": round(observed_seconds, 1),
         "calls": len(events),
         "response_bytes": sum(event["response_bytes"] for event in events),
+        "media_bytes": sum(int(event.get("media_bytes") or 0) for event in events),
+        # Retained exactly as before so existing dashboard readers keep working.
         "by_operation": dict(sorted(by_operation.items())),
         "by_account": dict(sorted(by_account.items())),
         "by_status": dict(sorted(by_status.items())),
+        # The credit view.
+        "estimated_credits": round(total_credits, 3),
+        "estimated_call_credits": round(call_credits, 3),
+        "estimated_webhook_credits": round(webhook_credits, 3),
+        "webhook_events": len(webhook_events),
+        "estimated_monthly_credits": round(per_day * 30.0, 1),
+        "estimated_daily_credits": round(per_day, 1),
+        "credits_by_operation": _breakdown(events, "operation", fallback="unknown"),
+        "credits_by_account": _breakdown(events, "account_id", fallback="unbound"),
+        "credits_by_category": _breakdown(events, "category", fallback=CATEGORY_OTHER),
+        "webhook_events_by_type": dict(
+            sorted(Counter(event["event"] for event in webhook_events).items())
+        ),
+        "background_history_budget": background_history_budget_state(),
+        "credit_model": {
+            "request_credits": 1,
+            "response_bytes_per_extra_credit": CREDIT_RESPONSE_BYTES_PER_CREDIT,
+            "media_credits_per_mb": CREDIT_MEDIA_CREDITS_PER_MB,
+            "webhook_events_per_credit": WEBHOOK_EVENTS_PER_CREDIT,
+        },
         "note": (
-            "This counts HTTP calls observed by the current backend process. "
-            "Provider credits may be higher for large payloads."
+            "Calls and bytes are what this backend process observed. Credit "
+            "figures are ESTIMATES from the published billing rules "
+            "(1/request, proportional above 80 KB, 2/MB of media, 80 webhook "
+            "events per credit). API Fansly's own Usage dashboard is "
+            "authoritative."
         ),
     }
 
+
+def reset_usage_for_tests() -> None:
+    """Clear rolling usage state. Test support only.
+
+    The deques are process-global on purpose — they describe this process, not
+    a request — which is exactly what makes them leak between tests.
+    """
+    global _live_scope_depth
+    with _USAGE_LOCK:
+        _USAGE_EVENTS.clear()
+        _WEBHOOK_EVENTS.clear()
+        _live_scope_depth = 0
 
 def api_key() -> str:
     value = str(os.environ.get("APIFANSLY_API_KEY") or "").strip()
@@ -319,11 +811,26 @@ def raise_for_response(
     *,
     operation: str,
     account_id: str | None = None,
+    media_bytes: int = 0,
+    category: str | None = None,
 ) -> None:
+    """Account for the call, then translate a failure into a typed error.
+
+    Accounting happens FIRST and unconditionally: a refused call still reached
+    the provider and still costs a credit, so a usage report that only counted
+    successes would understate spend exactly when spend is going wrong.
+
+    ``media_bytes`` is how a media transfer reports the bytes that actually
+    moved, which is what the provider meters at 2 credits/MB. It is passed here
+    rather than recorded afterwards because accounting is idempotent per
+    response object: whoever records first decides the cost.
+    """
     _record_usage(
         response,
         operation=operation,
         account_id=account_id,
+        media_bytes=media_bytes,
+        category=category,
     )
     if response.is_success:
         return
@@ -498,6 +1005,143 @@ def account_media_prices(row: dict[str, Any]) -> list[float]:
         if price not in unique:
             unique.append(price)
     return unique
+
+
+def _first_media_location(value: Any) -> str | None:
+    """The first https:// location anywhere in a nested media/variant shape."""
+    if isinstance(value, dict):
+        direct = value.get("location")
+        if isinstance(direct, str) and direct.startswith("https://"):
+            return direct
+        for key in ("locations", "variants", "media", "preview"):
+            found = _first_media_location(value.get(key))
+            if found:
+                return found
+    elif isinstance(value, list):
+        for nested in value:
+            found = _first_media_location(nested)
+            if found:
+                return found
+    return None
+
+
+def account_media_lookup(account_media: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Index one page's ``accountMedia`` block by every id it answers to.
+
+    This is metadata the chat-message response ALREADY carried and we have
+    ALREADY paid for. Reading it costs nothing extra and downloads nothing:
+    there is no media call anywhere in this function, by design. History
+    backfill in particular must never fetch a binary, so the only media facts
+    it can ever persist are the ones indexed here.
+    """
+    lookup: dict[str, dict[str, Any]] = {}
+    for item in account_media:
+        if not isinstance(item, dict):
+            continue
+        media = item.get("media") or {}
+        media_url = _first_media_location(media) or _first_media_location(item)
+        prices = account_media_prices(item)
+        positive_prices = [price for price in prices if price > 0]
+        raw_price = positive_prices[0] if positive_prices else (prices[0] if prices else 0)
+        info = {
+            "url": media_url,
+            "price": raw_price,
+            "is_ppv": bool(positive_prices),
+            "purchased": bool(item.get("purchased", item.get("isPurchased", False))),
+            "access": item.get("access"),
+            "mimetype": (
+                media.get("mimetype")
+                or media.get("mimeType")
+                or item.get("mimetype")
+                or item.get("mimeType")
+            ),
+            "filename": (
+                media.get("filename")
+                or media.get("fileName")
+                or item.get("filename")
+                or item.get("fileName")
+            ),
+        }
+        for key in (item.get("id"), item.get("mediaId")):
+            if key:
+                lookup[str(key)] = info
+    return lookup
+
+
+def message_sent_at(message: dict[str, Any]) -> str:
+    """Normalize a platform ``createdAt`` into an ISO-8601 UTC timestamp."""
+    created_at = message.get("createdAt")
+    try:
+        timestamp = float(created_at or 0)
+    except (TypeError, ValueError):
+        timestamp = 0
+    if timestamp > 0:
+        if timestamp > 1e12:
+            timestamp /= 1000
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+    return datetime.now(timezone.utc).isoformat()
+
+
+def chat_message_row(
+    message: dict[str, Any],
+    *,
+    fan_id: str,
+    creator_id: str,
+    creator_platform_id: str,
+    media_lookup: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Turn one platform message into the ``messages`` row this product stores.
+
+    ONE parser for every ingestion path — live reconciliation, the active-chat
+    endpoint and historical backfill — so a message imported from page 300 of a
+    five-year-old conversation is byte-identical to the same message imported
+    live. Two parsers would eventually disagree about a role or a timestamp, and
+    the unique (creator_id, fansly_message_id) index would then be deciding
+    which of two wrong rows survives.
+
+    Returns None for a message with neither text nor attachments: there is
+    nothing durable to store and nothing a writer could ever use.
+    """
+    message_id = str(message.get("id") or "")
+    if not message_id:
+        return None
+    content = str(message.get("content") or "")
+    attachments = message.get("attachments") or []
+    if not content and not attachments:
+        return None
+
+    resolved_attachments = []
+    for attachment in attachments:
+        if not isinstance(attachment, dict):
+            continue
+        content_id = str(attachment.get("contentId") or "")
+        info = media_lookup.get(content_id) or {}
+        resolved_attachments.append(
+            {
+                "contentId": content_id,
+                "url": info.get("url"),
+                "type": attachment.get("contentType", 1),
+                "mimetype": info.get("mimetype"),
+                "filename": info.get("filename"),
+                "price": info.get("price"),
+                "is_ppv": info.get("is_ppv"),
+                "purchased": info.get("purchased"),
+                "access": info.get("access"),
+            }
+        )
+
+    sender_id = str(message.get("senderId") or "")
+    return {
+        "fan_id": fan_id,
+        "creator_id": creator_id,
+        "role": "creator" if sender_id == creator_platform_id else "fan",
+        "content": content,
+        "fansly_message_id": message_id,
+        "sent_at": message_sent_at(message),
+        "media_context": (
+            {"attachments": resolved_attachments} if resolved_attachments else None
+        ),
+    }
 
 
 def ppv_delivery_evidence(
@@ -754,7 +1398,14 @@ async def download_media(
         timeout=timeout,
         follow_redirects=True,
     )
-    raise_for_response(response, operation="protected media download")
+    # A media transfer is metered on bytes, not on being one request, so the
+    # downloaded size is reported at the moment of accounting. Reading
+    # ``response.content`` here is free: the transport already buffered it.
+    raise_for_response(
+        response,
+        operation="protected media download",
+        media_bytes=len(response.content or b""),
+    )
     content_type = str(response.headers.get("content-type") or "").lower()
     if "application/json" in content_type:
         raise ApiFanslyProtocolError(
@@ -853,15 +1504,43 @@ async def list_chats(
     )
 
 
+# ---------------------------------------------------------------------------
+# DO NOT RAISE THIS. IT IS NOT A CONSERVATIVE DEFAULT.
+#
+# API Fansly's documented chat-messages endpoint declares `limit min=1 max=10`.
+# Ten is the provider's ceiling, not ours. Asking for 50 does not return 50: it
+# is silently clamped upstream (or rejected), which is how a "history import"
+# that looked like it was reading 50 messages a page was in fact reading 10 and
+# quietly paying five times the pages it thought it was.
+#
+# The consequence is structural, and it is why history backfill in this
+# codebase is cursor-based and resumable rather than a loop: a 5,000-message
+# conversation is 500 provider round trips, minimum, forever, until the
+# UPSTREAM API changes its documented maximum. Raising this constant without
+# that upstream change buys nothing and hides the real cost.
+#
+# If API Fansly ever publishes a larger maximum, change it HERE, in one place,
+# and update docs/historical_memory_and_credits.md with the new page economics.
+# ---------------------------------------------------------------------------
+CHAT_MESSAGE_PAGE_MAX = 10
+
+
 async def list_chat_messages(
     account_id: str,
     chat_id: str,
     *,
     cursor: str | None = None,
-    limit: int = 10,
+    limit: int = CHAT_MESSAGE_PAGE_MAX,
     client: httpx.AsyncClient | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
-    params: dict[str, Any] = {"limit": max(1, min(10, int(limit)))}
+    """One page of a conversation, newest first, with its accountMedia.
+
+    ``limit`` is clamped to ``CHAT_MESSAGE_PAGE_MAX`` because that is the
+    provider's documented maximum. See the constant above before changing it.
+    """
+    params: dict[str, Any] = {
+        "limit": max(1, min(CHAT_MESSAGE_PAGE_MAX, int(limit)))
+    }
     if cursor:
         params["cursor"] = cursor
     payload = await request(

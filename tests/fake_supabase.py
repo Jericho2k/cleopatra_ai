@@ -94,6 +94,7 @@ class _FakeQuery:
         self._op: str | None = None
         self._payload: Any = None
         self._on_conflict: str | None = None
+        self._ignore_duplicates = False
 
     # --- read builders ------------------------------------------------------
 
@@ -159,10 +160,16 @@ class _FakeQuery:
         self._payload = payload
         return self
 
-    def upsert(self, payload, on_conflict: str | None = None, **_kwargs):
+    def upsert(self, payload, on_conflict: str | None = None, **kwargs):
         self._op = "upsert"
         self._payload = payload
         self._on_conflict = on_conflict
+        # PostgREST's `Prefer: resolution=ignore-duplicates`: a conflicting row
+        # is left alone AND is not returned. Modelled because that returned-or-
+        # not distinction is exactly how ingestion decides whether THIS caller
+        # inserted the row, and a fake that returns the loser's row would let a
+        # double-processing bug pass.
+        self._ignore_duplicates = bool(kwargs.get("ignore_duplicates", False))
         return self
 
     def delete(self):
@@ -266,6 +273,8 @@ class _FakeQuery:
                     None,
                 )
                 if existing is not None:
+                    if self._ignore_duplicates:
+                        continue
                     existing.update(payload)
                     written.append(dict(existing))
                     continue

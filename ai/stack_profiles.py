@@ -64,6 +64,7 @@ STAGE_WRITER_COMMERCIAL = "writer_commercial"
 STAGE_WRITER_SAFETY = "writer_safety"
 STAGE_FAN_INTELLIGENCE = "fan_intelligence"
 STAGE_FAN_SUMMARY = "fan_summary"
+STAGE_HISTORY_EXTRACTION = "history_extraction"
 
 STAGE_ORDER: tuple[str, ...] = (
     STAGE_SITUATION_ANALYZER,
@@ -72,6 +73,7 @@ STAGE_ORDER: tuple[str, ...] = (
     STAGE_WRITER_SAFETY,
     STAGE_FAN_INTELLIGENCE,
     STAGE_FAN_SUMMARY,
+    STAGE_HISTORY_EXTRACTION,
 )
 
 STAGE_LABELS: dict[str, str] = {
@@ -81,6 +83,7 @@ STAGE_LABELS: dict[str, str] = {
     STAGE_WRITER_SAFETY: "Writer — safety-sensitive",
     STAGE_FAN_INTELLIGENCE: "Fan intelligence extraction",
     STAGE_FAN_SUMMARY: "Fan psychological summary",
+    STAGE_HISTORY_EXTRACTION: "Historical conversation compaction",
 }
 
 # What the stage does with the model's text. Recorded because a parser mode is
@@ -325,6 +328,45 @@ _LEGACY_FAN_SUMMARY = StageSpec(
     notes="Periodic psychological profile refresh. Best-effort, out of band.",
 )
 
+# ---------------------------------------------------------------------------
+# Historical compaction.
+#
+# This stage reads OLD conversations in bulk — potentially thousands of
+# messages per fan — and turns them into evidence-backed durable facts. It is
+# the same spec in every profile, on purpose:
+#
+#   * It is not a writer. It never produces a message a fan can see, so the
+#     voice comparison the profiles exist to run does not involve it.
+#   * It is not the live extractor. Live fan intelligence stays on
+#     gpt-oss-120b; re-pointing a live stage for symmetry with a background one
+#     would change behaviour a profile comparison is supposed to hold constant.
+#   * Its only real requirement is being cheap per input token, because the
+#     input is an archive. GLM-5.3-Flash is $0.15/M in and $0.50/M out — an
+#     order of magnitude under the conversational writer.
+#
+# max_tokens is generous relative to the extractor because one historical chunk
+# proposes facts for up to forty messages rather than one, and a truncated JSON
+# object loses the whole chunk.
+_HISTORY_EXTRACTION = StageSpec(
+    stage=STAGE_HISTORY_EXTRACTION,
+    provider="together",
+    model="zai-org/GLM-5.3-Flash",
+    prompt_version="history_extraction_v1",
+    reasoning=False,
+    output_mode=OUTPUT_JSON_OBJECT,
+    max_tokens=1400,
+    temperature=0.0,
+    provider_env="HISTORY_EXTRACTOR_PROVIDER",
+    model_env="HISTORY_EXTRACTOR_MODEL",
+    max_tokens_env="HISTORY_EXTRACTOR_MAX_TOKENS",
+    notes=(
+        "Bulk historical compaction only. Never writes a reply, never replaces "
+        "the live extractor. Proposals are validated against the source "
+        "message deterministically before anything is stored."
+    ),
+)
+
+
 CLEO_LEGACY_V1 = AIStackProfile(
     profile_id="cleo_legacy_v1",
     label="Cleo Legacy v1",
@@ -340,6 +382,7 @@ CLEO_LEGACY_V1 = AIStackProfile(
         STAGE_WRITER_SAFETY: _LEGACY_WRITER_SAFETY,
         STAGE_FAN_INTELLIGENCE: _LEGACY_FAN_INTELLIGENCE,
         STAGE_FAN_SUMMARY: _LEGACY_FAN_SUMMARY,
+        STAGE_HISTORY_EXTRACTION: _HISTORY_EXTRACTION,
     },
 )
 
@@ -418,6 +461,7 @@ CLEO_V2 = AIStackProfile(
             _LEGACY_FAN_INTELLIGENCE, provider_env=None, model_env=None
         ),
         STAGE_FAN_SUMMARY: _LEGACY_FAN_SUMMARY,
+        STAGE_HISTORY_EXTRACTION: _HISTORY_EXTRACTION,
     },
 )
 
@@ -480,6 +524,7 @@ CLEO_V3 = AIStackProfile(
         STAGE_WRITER_SAFETY: _V3_WRITER_SAFETY,
         STAGE_FAN_INTELLIGENCE: CLEO_V2.stage(STAGE_FAN_INTELLIGENCE),
         STAGE_FAN_SUMMARY: CLEO_V2.stage(STAGE_FAN_SUMMARY),
+        STAGE_HISTORY_EXTRACTION: CLEO_V2.stage(STAGE_HISTORY_EXTRACTION),
     },
 )
 
