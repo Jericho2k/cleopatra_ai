@@ -91,6 +91,12 @@ experience_director_v1.sql
 # takes over from it.
 retire_post_purchase_cooldown_v1.sql
 
+# HIST-001: fan_history_backfill, the restart-safe cursor/cost state for
+# historical chat import and its compaction into fan_facts. Must run AFTER
+# fan_intelligence_v1.sql, whose fan_facts.source_type it comments, and (being a
+# new creator-owned table) before tenant_isolation_v1.sql.
+fan_history_backfill_v1.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each

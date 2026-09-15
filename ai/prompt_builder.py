@@ -127,11 +127,61 @@ def _render_fan_intelligence(intelligence: dict) -> str:
                 + ", ".join(keys[:8])
             )
 
+    lines.extend(_history_continuity_lines(intelligence.get("history_continuity")))
+
     if not lines:
         return ""
     return "LEARNED FAN INTELLIGENCE (evidence-backed):\n" + "\n".join(
         f"- {line}" for line in lines
     )
+
+
+def _history_continuity_lines(continuity: object) -> list[str]:
+    """Compact continuity from an old conversation, for a RETURNING fan.
+
+    This is what lets an existing relationship be picked up rather than
+    restarted: what the two of them were actually talking about, what happened
+    commercially, and where things stood. It is deliberately a few short lines
+    and never a transcript — the whole point of compaction is that thousands of
+    archived messages never reach a writer prompt.
+
+    Structured facts above stay authoritative. This block is explicitly marked
+    as older context so the writer treats a durable fact and a historical
+    impression differently rather than averaging them.
+    """
+    if not isinstance(continuity, dict) or not continuity:
+        return []
+
+    lines: list[str] = []
+    topics = [
+        str(value).strip()
+        for value in (continuity.get("ongoing_topics") or [])
+        if str(value).strip()
+    ]
+    if topics:
+        lines.append("Earlier ongoing topics with him: " + "; ".join(topics[:8]))
+
+    commercial = [
+        str(value).strip()
+        for value in (continuity.get("commercial_context") or [])
+        if str(value).strip()
+    ]
+    if commercial:
+        lines.append("Earlier commercial context: " + "; ".join(commercial[:6]))
+
+    summary = str(continuity.get("relationship_summary") or "").strip()
+    if summary:
+        lines.append(
+            "Where the earlier conversation stood (older context, not current "
+            f"fact): {summary[:600]}"
+        )
+
+    if lines and not continuity.get("history_fully_paged", True):
+        lines.append(
+            "Older history is still being read; absence of a detail here does "
+            "not mean it did not happen."
+        )
+    return lines
 
 
 

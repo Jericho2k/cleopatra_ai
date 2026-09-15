@@ -79,7 +79,9 @@ from core.apifansly_gate import apifansly_enabled, simulation_scope
 from core.simulation import mark_simulation_owned_message, simulation_message_marker
 from core.simulation_catalog import contains_simulation_media
 from services.apifansly import (
+    CATEGORY_LIVE_CHAT,
     headers as apifansly_headers,
+    record_raw_call as record_apifansly_raw_call,
     shared_client as apifansly_shared_client,
     send_message as send_apifansly_message,
     sent_message_id,
@@ -2057,12 +2059,21 @@ async def _debounced_auto_reply(
                 # human-like composition delay on the live reply path, so a
                 # per-call TLS handshake here was pure added latency before the
                 # fan sees anything.
-                await apifansly_shared_client().post(
+                typing_response = await apifansly_shared_client().post(
                     apifansly_url(
                         f"{apifansly_account_id}/chats/{str(group_id)}/typing"
                     ),
                     headers=apifansly_headers(),
                     timeout=5,
+                )
+                # A raw post outside services.apifansly.request(). It still
+                # costs a credit per typing indicator, and on a chatty auto-mode
+                # deployment there is one of these per reply.
+                record_apifansly_raw_call(
+                    typing_response,
+                    operation="typing indicator",
+                    account_id=str(apifansly_account_id),
+                    category=CATEGORY_LIVE_CHAT,
                 )
             except Exception:
                 pass

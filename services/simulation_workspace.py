@@ -393,8 +393,16 @@ def generate_test_platform_fan_id() -> str:
     instead of to the platform. Generating the id here — never accepting one
     from a client — is what makes it impossible for this control to create a
     fan that later turns out to be real.
+
+    The suffix is guaranteed to contain a letter. ``token_hex`` alone can draw
+    twelve digits — about once in three hundred — and an all-numeric suffix is
+    exactly the shape a real Fansly account id has, which is the one thing this
+    function's own contract says it will never produce. Only the prefix is
+    load-bearing anywhere (``is_simulatable_fan`` and the analytics filter both
+    test it), so pinning one character costs nothing and makes the guarantee
+    real rather than probable.
     """
-    return f"{TEST_FAN_PREFIX}{secrets.token_hex(6)}"
+    return f"{TEST_FAN_PREFIX}{secrets.choice('abcdef')}{secrets.token_hex(6)}"
 
 
 async def create_test_fan(

@@ -83,7 +83,12 @@ from core.simulation_catalog import (
 from services.apifansly import (
     ApiFanslyAccountAccessError,
     ApiFanslyConfigurationError,
-    account_media_prices,
+    CATEGORY_ACCOUNT,
+    CATEGORY_LIVE_CHAT,
+    CATEGORY_RECONCILIATION,
+    CATEGORY_VAULT,
+    account_media_lookup as apifansly_account_media_lookup,
+    chat_message_row as apifansly_chat_message_row,
     client_scope as apifansly_client_scope,
     close_shared_client as close_apifansly_client,
     current_account as apifansly_current_account,
@@ -95,10 +100,13 @@ from services.apifansly import (
     list_vault_album_media as apifansly_list_vault_album_media,
     list_vault_albums as apifansly_list_vault_albums,
     raise_for_response as raise_for_apifansly_response,
+    record_raw_call as record_apifansly_raw_call,
+    record_webhook_event as record_apifansly_webhook_event,
     send_message as send_apifansly_message,
     response_message as apifansly_response_message,
     url as apifansly_url,
     sent_message_id,
+    usage_category as apifansly_usage_category,
     usage_snapshot as apifansly_usage_snapshot,
 )
 from services.auto_audience import AutoAudiencePolicy
@@ -520,6 +528,32 @@ async def process_incoming_fan_message(
         # Conversation can continue. The worker also revalidates recent fan
         # activity before any proactive message is sent.
         print(f"[OFFER FOLLOWUP CANCEL ERROR] fan={fan_id}: {exc}")
+
+    # A returning fan with a long past and almost no local context is the case
+    # this exists for: Cleopatra must be able to pick the conversation up rather
+    # than answer as if she had never met him.
+    #
+    # Bounded on purpose. This fetches the newest few pages — about thirty
+    # messages — and nothing else. The archive behind them may be five hundred
+    # provider pages; none of it is fetched here, because a fan waiting for a
+    # reply must never wait through it. The deep pass is resumable and runs
+    # later, behind live work.
+    #
+    # Costs nothing in the common case: a fan with enough recent local context
+    # returns immediately without a provider call. Best-effort, because history
+    # must never be the reason a conversation cannot be answered.
+    try:
+        from services.fan_history import warm_resume
+
+        warm = await warm_resume(creator_id=creator_id, fan_id=fan_id)
+        if warm.get("imported"):
+            print(
+                f"[HISTORY WARM RESUME] fan={fan_id} "
+                f"imported={warm['imported']} pages={warm.get('pages')}"
+            )
+    except Exception as exc:
+        print(f"[HISTORY WARM RESUME ERROR] fan={fan_id}: {exc}")
+
     conversation_history = await get_conversation_history(fan_id)
     fan_profile = await get_fan_by_id(fan_id)
     if fan_profile is None:
@@ -821,6 +855,7 @@ vault_autosync_task: asyncio.Task | None = None
 scheduled_actions_task: asyncio.Task | None = None
 chat_reconcile_task: asyncio.Task | None = None
 model_availability_task: asyncio.Task | None = None
+history_backfill_task: asyncio.Task | None = None
 
 
 async def ppv_sweep_scheduler():
@@ -1137,14 +1172,83 @@ async def chat_reconciliation_scheduler():
                 )
 
             if due:
-                await _reconcile_chat_creators_once(due)
+                # Reconciliation is background work, not a live conversation.
+                # Categorising it keeps the credit breakdown honest about which
+                # part of the product is actually spending.
+                with apifansly_usage_category(CATEGORY_RECONCILIATION):
+                    await _reconcile_chat_creators_once(due)
         except Exception as exc:
             print(f"[CRON CHAT RECONCILE INFRA ERROR] {exc}")
 
 
+_HISTORY_BACKFILL_TICK_SECONDS = 120
+
+
+async def history_backfill_scheduler():
+    """Advance deep historical backfill, always behind live conversation.
+
+    Deliberately the lowest-priority loop in the process:
+
+      * It does nothing at all unless HISTORY_BACKFILL_ENABLED is on. A
+        deployment that has not asked for archive imports does not get them.
+      * Every tick and every page re-asks whether live work is happening, and
+        yields entirely when it is. A returning fan must never wait behind a
+        backfill.
+      * It stops when the optional history credit budget is spent. That budget
+        governs THIS loop and nothing else — live conversation, delivery and
+        purchase reconciliation are never gated on it.
+      * Paging and compaction are separate bounded steps, so a model outage
+        cannot stall the import and a provider outage cannot stall compaction.
+    """
+    while True:
+        await asyncio.sleep(_HISTORY_BACKFILL_TICK_SECONDS)
+        try:
+            from services.fan_history import (
+                backfill_scheduler_pass,
+                history_backfill_enabled,
+            )
+
+            if not history_backfill_enabled() or not apifansly_enabled():
+                continue
+            result = await backfill_scheduler_pass()
+            if result.get("fans"):
+                print(
+                    f"[CRON HISTORY] fans={result['fans']} "
+                    f"credits={result.get('estimated_credits', 0)}"
+                )
+                await _compact_recent_backfills()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[CRON HISTORY ERROR] {exc}")
+
+
+async def _compact_recent_backfills(limit: int = 3) -> None:
+    """Turn freshly imported history into durable facts, a few fans at a time."""
+    from db.fan_history_queries import list_unfinished_backfills
+    from services.apifansly import live_work_in_progress
+    from services.fan_history_memory import (
+        compact_fan_history,
+        history_extraction_enabled,
+    )
+
+    if not history_extraction_enabled():
+        return
+    for row in await list_unfinished_backfills(limit=limit):
+        if live_work_in_progress():
+            return
+        try:
+            await compact_fan_history(
+                creator_id=str(row.get("creator_id") or ""),
+                fan_id=str(row.get("fan_id") or ""),
+            )
+        except Exception as exc:
+            print(f"[CRON HISTORY COMPACT ERROR] fan={row.get('fan_id')}: {exc}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global session_store, fansly_poller, ppv_sweep_task, vault_autosync_task, scheduled_actions_task, chat_reconcile_task, model_availability_task
+    global session_store, fansly_poller, ppv_sweep_task, vault_autosync_task, scheduled_actions_task, chat_reconcile_task, model_availability_task, history_backfill_task
 
     # SEC-004: state the resolved deployment mode once at boot. An unset or
     # unrecognised APP_ENV resolves to production, so a misconfigured deploy is
@@ -1186,6 +1290,7 @@ async def lifespan(app: FastAPI):
     scheduled_actions_task = asyncio.create_task(_scheduled_actions_scheduler())
     chat_reconcile_task = asyncio.create_task(chat_reconciliation_scheduler())
     model_availability_task = asyncio.create_task(model_availability_scheduler())
+    history_backfill_task = asyncio.create_task(history_backfill_scheduler())
 
     yield
 
@@ -1201,6 +1306,8 @@ async def lifespan(app: FastAPI):
         chat_reconcile_task.cancel()
     if model_availability_task:
         model_availability_task.cancel()
+    if history_backfill_task:
+        history_backfill_task.cancel()
 
     # PERF-006 — the API Fansly connection pool is process-wide, so shutdown is
     # the only place that closes it. Sockets are released here rather than at
@@ -1552,6 +1659,11 @@ async def connect_creator(req: ConnectCreatorRequest, request: Request) -> dict:
             },
             timeout=30,
         )
+        record_apifansly_raw_call(
+            response,
+            operation="account connect",
+            category=CATEGORY_ACCOUNT,
+        )
         if not response.is_success:
             return {
                 "success": False,
@@ -1645,6 +1757,11 @@ async def connect_creator_2fa(req: Connect2FARequest, request: Request) -> dict:
             },
             timeout=30,
         )
+        record_apifansly_raw_call(
+            response,
+            operation="account 2fa verification",
+            category=CATEGORY_ACCOUNT,
+        )
         if not response.is_success:
             return {
                 "success": False,
@@ -1710,119 +1827,12 @@ async def sync_chats_background(creator_id: str) -> None:
         print(f"[SYNC ERROR] {e}")
 
 
-def _apifansly_account_media_lookup(account_media: list[dict]) -> dict[str, dict]:
-    def first_location(value: object) -> str | None:
-        if isinstance(value, dict):
-            direct = value.get("location")
-            if isinstance(direct, str) and direct.startswith("https://"):
-                return direct
-            for key in ("locations", "variants", "media", "preview"):
-                found = first_location(value.get(key))
-                if found:
-                    return found
-        elif isinstance(value, list):
-            for nested in value:
-                found = first_location(nested)
-                if found:
-                    return found
-        return None
-
-    lookup: dict[str, dict] = {}
-    for item in account_media:
-        if not isinstance(item, dict):
-            continue
-        media = item.get("media") or {}
-        media_url = first_location(media) or first_location(item)
-        prices = account_media_prices(item)
-        positive_prices = [price for price in prices if price > 0]
-        raw_price = positive_prices[0] if positive_prices else (prices[0] if prices else 0)
-        info = {
-            "url": media_url,
-            "price": raw_price,
-            "is_ppv": bool(positive_prices),
-            "purchased": bool(
-                item.get("purchased", item.get("isPurchased", False))
-            ),
-            "access": item.get("access"),
-            "mimetype": (
-                media.get("mimetype")
-                or media.get("mimeType")
-                or item.get("mimetype")
-                or item.get("mimeType")
-            ),
-            "filename": (
-                media.get("filename")
-                or media.get("fileName")
-                or item.get("filename")
-                or item.get("fileName")
-            ),
-        }
-        for key in (item.get("id"), item.get("mediaId")):
-            if key:
-                lookup[str(key)] = info
-    return lookup
-
-
-def _apifansly_message_row(
-    message: dict,
-    *,
-    fan_id: str,
-    creator_id: str,
-    creator_platform_id: str,
-    media_lookup: dict[str, dict],
-) -> dict | None:
-    message_id = str(message.get("id") or "")
-    if not message_id:
-        return None
-    content = str(message.get("content") or "")
-    attachments = message.get("attachments") or []
-    if not content and not attachments:
-        return None
-
-    created_at = message.get("createdAt")
-    try:
-        timestamp = float(created_at or 0)
-    except (TypeError, ValueError):
-        timestamp = 0
-    if timestamp > 0:
-        if timestamp > 1e12:
-            timestamp /= 1000
-        sent_at = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
-    else:
-        sent_at = datetime.now(timezone.utc).isoformat()
-
-    resolved_attachments = []
-    for attachment in attachments:
-        if not isinstance(attachment, dict):
-            continue
-        content_id = str(attachment.get("contentId") or "")
-        info = media_lookup.get(content_id) or {}
-        resolved_attachments.append({
-            "contentId": content_id,
-            "url": info.get("url"),
-            "type": attachment.get("contentType", 1),
-            "mimetype": info.get("mimetype"),
-            "filename": info.get("filename"),
-            "price": info.get("price"),
-            "is_ppv": info.get("is_ppv"),
-            "purchased": info.get("purchased"),
-            "access": info.get("access"),
-        })
-
-    sender_id = str(message.get("senderId") or "")
-    return {
-        "fan_id": fan_id,
-        "creator_id": creator_id,
-        "role": "creator" if sender_id == creator_platform_id else "fan",
-        "content": content,
-        "fansly_message_id": message_id,
-        "sent_at": sent_at,
-        "media_context": (
-            {"attachments": resolved_attachments}
-            if resolved_attachments
-            else None
-        ),
-    }
+# API-004 — the platform-message parser lives in services/apifansly.py so live
+# reconciliation, the active-chat endpoint and historical backfill all build the
+# same row from the same payload. These two names are kept as thin aliases
+# because several call sites and tests already read this way.
+_apifansly_account_media_lookup = apifansly_account_media_lookup
+_apifansly_message_row = apifansly_chat_message_row
 
 
 def _matching_unbound_creator_message(
@@ -2165,17 +2175,40 @@ async def sync_recent_fan_messages(creator_id: str, fan_id: str) -> dict:
                 "retry_after_seconds": retry_after_seconds,
             }
 
-    async with apifansly_client_scope() as client:
-        result = await _sync_recent_fan_messages(
-            creator_id=creator_id,
-            fan_id=fan_id,
-            account_id=account_id,
-            creator_platform_id=platform_id,
-            group_id=group_id,
-            creator_auto_mode=bool(creator.get("auto_mode")),
-            client=client,
-        )
-    return {"status": "ok", **result}
+    # The dashboard calls this when an operator opens a conversation and on tab
+    # focus, so it IS a live conversation happening right now. Marking the scope
+    # both attributes its credits correctly and tells deep-history work to stand
+    # aside while an operator is looking at this chat.
+    with apifansly_usage_category(CATEGORY_LIVE_CHAT):
+        async with apifansly_client_scope() as client:
+            result = await _sync_recent_fan_messages(
+                creator_id=creator_id,
+                fan_id=fan_id,
+                account_id=account_id,
+                creator_platform_id=platform_id,
+                group_id=group_id,
+                creator_auto_mode=bool(creator.get("auto_mode")),
+                client=client,
+            )
+
+    # A previously known fan whose local context is too thin to answer from
+    # gets the newest few pages of history now, cheaply and boundedly, before
+    # the reply path runs. Best-effort: history is never allowed to be the
+    # reason a conversation cannot be answered.
+    warm: dict = {}
+    try:
+        from services.fan_history import warm_resume
+
+        warm = await warm_resume(creator_id=creator_id, fan_id=fan_id)
+    except Exception as exc:
+        print(f"[HISTORY WARM RESUME ERROR] fan={fan_id}: {exc}")
+        warm = {"status": "error", "detail": str(exc)[:200]}
+    if warm.get("imported"):
+        result = {
+            **result,
+            "imported": int(result.get("imported") or 0) + int(warm["imported"]),
+        }
+    return {"status": "ok", **result, "warm_resume": warm}
 
 
 _FANSLY_LISTS_DEFAULT_INTERVAL_HOURS = 6
@@ -2658,181 +2691,158 @@ async def get_apifansly_usage() -> dict:
     "/load-history/{creator_id}/{fan_id}",
     dependencies=[Depends(require_creator_fan_access), Depends(require_apifansly_connector)],
 )
-async def load_fan_history(creator_id: str, fan_id: str) -> dict:
+async def load_fan_history(
+    creator_id: str,
+    fan_id: str,
+    pages: int | None = None,
+    deep: bool = True,
+) -> dict:
+    """Import this fan's conversation history, cursor-based and resumable.
 
-    db = get_supabase()
+    What changed and why
+    --------------------
+    This route used to page an entire conversation inside one request, in
+    memory, asking for 50 messages a page. Both halves of that were wrong.
 
-    fan_row = await asyncio.to_thread(
-        lambda: db.table("fans")
-        .select("fansly_group_id, platform_fan_id")
-        .eq("id", fan_id)
-        .single()
-        .execute()
+    API Fansly documents `limit min=1 max=10` on the chat-messages endpoint, so
+    a request for 50 returned 10 and the import silently paid five times the
+    pages it believed it was buying. A 5,000-message fan is therefore 500
+    provider round trips — a fact about the upstream API, not a tunable — and
+    holding an HTTP request open for 500 sequential calls meant any
+    interruption threw away every page already paid for.
+
+    So the work is now durable and bounded. One call advances the cursor by a
+    bounded number of pages and returns; the cursor lives in
+    public.fan_history_backfill, so the next call resumes where this one
+    stopped instead of restarting. Pressing this button twice imports nothing
+    twice: persistence is idempotent on (creator_id, fansly_message_id).
+
+    ``imported`` is still the number of messages this call newly persisted, so
+    the dashboard's existing toast keeps working unchanged.
+    """
+    from services.fan_history import (
+        advance_backfill,
+        deep_backfill_pages_per_run,
+        fan_history_status,
+        warm_resume,
     )
-    creator_row = await asyncio.to_thread(
-        lambda: db.table("creators")
-        .select("apifansly_account_id, fansly_account_id")
-        .eq("id", creator_id)
-        .single()
-        .execute()
-    )
 
-    group_id = (fan_row.data or {}).get("fansly_group_id")
-    apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
-    fansly_account_id = str((creator_row.data or {}).get("fansly_account_id", ""))
+    # Warm resume first, so an operator who opens a stale conversation and
+    # presses Load history gets answerable context from the first few pages
+    # even if the deep pass is later throttled.
+    warm = await warm_resume(creator_id=creator_id, fan_id=fan_id)
 
-    if not group_id or not apifansly_id:
-        return {"status": "error", "message": "missing fan or creator info"}
-
-    # Paginated: a truncated set makes history import re-attempt inserts the
-    # unique (creator_id, fansly_message_id) index then rejects, so a long
-    # conversation turned into a wave of failing writes on every load.
-    existing_rows = await fetch_all_rows_async(
-        lambda start, end: db.table("messages")
-        .select("fansly_message_id")
-        .eq("fan_id", fan_id)
-        .order("id")
-        .range(start, end)
-        .execute()
-    )
-    existing_ids = {
-        r["fansly_message_id"] for r in existing_rows if r.get("fansly_message_id")
-    }
-
-    all_messages = []
-    all_media = {}
-    cursor = None
-
-    print(f"[LOAD HISTORY URL] apifansly_id={apifansly_id} group_id={group_id}")
-
-    async with apifansly_client_scope() as client:
-        while True:
-            messages, account_media_batch, cursor = (
-                await apifansly_list_chat_messages(
-                    str(apifansly_id),
-                    str(group_id),
-                    cursor=cursor,
-                    limit=50,
-                    client=client,
-                )
-            )
-
-            print(f"[LOAD HISTORY] batch={len(messages)} total={len(all_messages)+len(messages)} nextCursor={cursor}")
-
-            for am in account_media_batch:
-                content_id_1 = str(am.get("id", ""))
-                content_id_2 = str(am.get("mediaId", ""))
-                media = am.get("media", {})
-                locations = media.get("locations", [])
-                variants = media.get("variants", [])
-                url = None
-                if locations:
-                    url = locations[0].get("location")
-                elif variants and variants[0].get("locations"):
-                    url = variants[0]["locations"][0].get("location")
-                price = int(am.get("price") or 0)
-                purchased = bool(am.get("purchased", am.get("isPurchased", False)))
-                access = am.get("access")
-                media_info = {
-                    "url": url,
-                    "price": price / 100 if price > 100 else price,
-                    "is_ppv": price > 0,
-                    "purchased": purchased,
-                    "access": access,
-                }
-                if content_id_1:
-                    all_media[content_id_1] = media_info
-                if content_id_2 and content_id_2 != content_id_1:
-                    all_media[content_id_2] = media_info
-
-            all_messages.extend(messages)
-
-            if not cursor or not messages:
-                break
-
-    print(f"[MEDIA LOOKUP] keys={list(all_media.keys())[:5]}")
-
-    rows_to_insert: list[dict] = []
-    for msg in reversed(all_messages):
-        msg_id = str(msg.get("id", ""))
-        if not msg_id or msg_id in existing_ids:
-            continue
-
-        content = msg.get("content", "")
-        sender_id = str(msg.get("senderId", ""))
-        role = "fan" if sender_id != fansly_account_id else "creator"
-
-        created_at = msg.get("createdAt")
-        if created_at and created_at > 0:
-            ts = float(created_at)
-            if ts > 1e12:
-                ts /= 1000.0
-            sent_at = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
-        else:
-            sent_at = datetime.now(timezone.utc).isoformat()
-
-        attachments = msg.get("attachments", [])
-        media_context = None
-        if attachments:
-            resolved = []
-            for att in attachments:
-                content_id = str(att.get("contentId", ""))
-                print(f"[ATT RESOLVE] contentId={content_id} found={content_id in all_media}")
-                info = all_media.get(content_id)
-                if isinstance(info, dict):
-                    resolved.append({
-                        "contentId": content_id,
-                        "url": info.get("url"),
-                        "type": att.get("contentType", 1),
-                        "price": info.get("price"),
-                        "is_ppv": info.get("is_ppv"),
-                        "purchased": info.get("purchased"),
-                        "access": info.get("access"),
-                    })
-                else:
-                    resolved.append({
-                        "contentId": content_id,
-                        "url": info,
-                        "type": att.get("contentType", 1),
-                    })
-            media_context = {"attachments": resolved}
-
-        if not content and not attachments:
-            continue
-
-        row = {
-            "fan_id": fan_id,
-            "creator_id": creator_id,
-            "role": role,
-            "content": content,
-            "fansly_message_id": msg_id,
-            "sent_at": sent_at,
-            "media_context": media_context,
-        }
-
-        rows_to_insert.append(row)
-        existing_ids.add(msg_id)
-
-    for start in range(0, len(rows_to_insert), 250):
-        batch = rows_to_insert[start:start + 250]
-        await asyncio.to_thread(
-            lambda rows=batch: db.table("messages").insert(rows).execute()
+    result: dict = {}
+    if deep:
+        result = await advance_backfill(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            max_pages=int(pages) if pages else deep_backfill_pages_per_run(),
+            # An operator pressing this button is themselves the live activity.
+            # Yielding to "a live call happened seconds ago" would make the
+            # button do nothing exactly when it is pressed.
+            respect_live_priority=False,
         )
 
-    imported = len(rows_to_insert)
+    imported = int(warm.get("imported") or 0) + int(result.get("imported") or 0)
+    credits = float(warm.get("estimated_credits") or 0.0) + float(
+        result.get("estimated_credits") or 0.0
+    )
 
+    # Unchanged from the previous implementation of this route, and deliberately
+    # so: the operator presses Load history expecting the profile panel to fill
+    # in, and those two documents are what it renders. Historical compaction
+    # (services/fan_history_memory.py) adds evidence-backed FACTS alongside
+    # them; it does not replace the summary the dashboard already shows.
     if imported > 0:
         conversation_history = await get_conversation_history(fan_id)
         fan_profile = await get_fan_by_id(fan_id)
-
         if fan_profile and len(conversation_history) >= 10:
-            spawn(_update_fan_ai_summary(fan_id, conversation_history), name="update_fan_ai_summary")
             spawn(
-                _update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent),
+                _update_fan_ai_summary(fan_id, conversation_history),
+                name="update_fan_ai_summary",
+            )
+            spawn(
+                _update_fan_memory(
+                    fan_id, creator_id, conversation_history, fan_profile.total_spent
+                ),
                 name="update_fan_memory",
             )
 
-    return {"status": "ok", "imported": imported}
+    status = await fan_history_status(fan_id)
+    return {
+        "status": "ok",
+        "imported": imported,
+        "warm_resume": warm,
+        "deep": result or {"status": "skipped"},
+        "estimated_credits": round(credits, 3),
+        **status,
+    }
+
+
+@app.get(
+    "/fan-history/{creator_id}/{fan_id}",
+    dependencies=[Depends(require_creator_fan_access)],
+)
+async def fan_history_progress(creator_id: str, fan_id: str) -> dict:
+    """How much of this fan's history is imported, and what it has cost.
+
+    Needs no provider call and no connector: it reads the durable checkpoint.
+    """
+    from services.fan_history import fan_history_status
+
+    return {"status": "ok", "fan_id": fan_id, **await fan_history_status(fan_id)}
+
+
+@app.post(
+    "/fan-history/{creator_id}/{fan_id}/compact",
+    dependencies=[Depends(require_creator_fan_access)],
+)
+async def compact_fan_history_endpoint(
+    creator_id: str,
+    fan_id: str,
+    chunks: int | None = None,
+) -> dict:
+    """Compact already-imported history into durable evidence-backed facts.
+
+    Deliberately separate from importing. Paging costs provider credits and
+    compaction costs model tokens; they resume independently, and a fan whose
+    archive is fully imported can be re-compacted without paying for the
+    archive again.
+    """
+    from services.fan_history_memory import compact_fan_history
+
+    return await compact_fan_history(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        max_chunks=int(chunks) if chunks else None,
+    )
+
+
+@app.get(
+    "/creator-history-usage/{creator_id}",
+    dependencies=[Depends(require_creator_path_access)],
+)
+async def creator_history_usage(creator_id: str) -> dict:
+    """Rolled-up historical-backfill cost and progress for one creator."""
+    from db.fan_history_queries import creator_history_totals
+    from services.apifansly import (
+        CHAT_MESSAGE_PAGE_MAX,
+        background_history_budget_state,
+    )
+
+    totals = await creator_history_totals(creator_id)
+    return {
+        "status": "ok",
+        "creator_id": creator_id,
+        "history": totals,
+        "budget": background_history_budget_state(),
+        "messages_per_page_max": CHAT_MESSAGE_PAGE_MAX,
+        "note": (
+            "Credit figures are estimates from observed response sizes. API "
+            "Fansly's Usage dashboard is authoritative."
+        ),
+    }
 
 
 @app.post(
@@ -2854,10 +2864,19 @@ async def mark_all_read(creator_id: str) -> dict:
         return {"status": "error"}
 
     async with apifansly_client_scope() as client:
-        await client.post(
+        # A raw post that never reaches services.apifansly.request(), so its
+        # credit is recorded explicitly. It is not free just because nobody
+        # reads the response.
+        response = await client.post(
             apifansly_url(f"{apifansly_id}/chats/mark-as-read"),
             headers=apifansly_headers(),
             timeout=10,
+        )
+        record_apifansly_raw_call(
+            response,
+            operation="chat mark as read",
+            account_id=str(apifansly_id),
+            category=CATEGORY_LIVE_CHAT,
         )
     return {"status": "ok"}
 
@@ -3321,6 +3340,11 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
             upload_resp,
             operation="media upload",
             account_id=apifansly_id,
+            # Upload is metered on what was sent, not on the small JSON that
+            # comes back. Counting the response would understate this call by
+            # orders of magnitude for a video.
+            media_bytes=len(file_bytes or b""),
+            category=CATEGORY_VAULT,
         )
         upload_data = upload_resp.json()
         print(f"[UPLOAD] initiate response: {upload_data}")
@@ -3342,6 +3366,7 @@ async def upload_vault_media(creator_id: str, request: Request) -> dict:
                 status_resp,
                 operation="media upload status",
                 account_id=apifansly_id,
+                category=CATEGORY_VAULT,
             )
             status_data = status_resp.json()
             state = status_data.get("data", {}).get("state")
@@ -5103,6 +5128,15 @@ async def fansly_webhook(request: Request) -> dict:
     print(
         f"[FANSLY WEBHOOK] event={payload.get('event')} "
         f"account={payload.get('accountId')}"
+    )
+
+    # API Fansly bills 80 received webhook events as one credit. Counted after
+    # authentication, so a rejected forgery cannot inflate the estimate, and
+    # before any routing, so an event for an unknown account still counts — the
+    # provider billed for delivering it either way.
+    record_apifansly_webhook_event(
+        payload.get("event"),
+        account_id=payload.get("accountId"),
     )
 
     event = payload.get("event")

@@ -527,3 +527,74 @@ writes that the database lacks:
 ```bash
 SUPABASE_DB_URL=... python scripts/production_preflight.py
 ```
+
+---
+
+## Applying `fan_history_backfill_v1.sql` (HIST-001 — historical memory)
+
+One new table plus the RLS pair. Additive and idempotent.
+
+```bash
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/fan_history_backfill_v1.sql
+
+# fan_history_backfill is a creator-owned table, so the pair must be re-run.
+# NEVER one without the other (SEC-001).
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/tenant_isolation_v1.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/browser_least_privilege_v1.sql
+```
+
+### What it creates
+
+`public.fan_history_backfill` — one row per fan, holding:
+
+* the **paging cursor** for historical chat import, so a 5,000-message fan that
+  stops after page 300 resumes at page 301 rather than at page one;
+* the **compaction cursor**, which trails paging and advances in the opposite
+  direction (paging walks backwards from newest, extraction forwards from
+  oldest);
+* the **provider cost already spent** on this fan — calls, response bytes,
+  estimated credits — so an operator can see what an import cost;
+* a compact `continuity` document, which is never authoritative over
+  `fan_facts`.
+
+It also adds a comment to `fan_facts.source_type` recording the vocabulary
+(`fan_message`, `historical_message`), so the next reader does not invent a
+second memory table. No constraint is widened: the column only ever defaulted.
+
+### Deploy order is not constrained
+
+The code tolerates this table being absent in both directions.
+`db/fan_history_queries.py` detects the missing relation, logs once, and reports
+historical import as unavailable — live conversation, delivery and purchase
+reconciliation are entirely unaffected, which is the correct failure direction
+for optional work. So the code may ship before or after the migration.
+
+Both `HISTORY_BACKFILL_ENABLED` and `HISTORY_EXTRACTION_ENABLED` default to
+`false`, so applying this migration alone changes no behaviour.
+
+### Verify
+
+```sql
+select count(*) from information_schema.tables
+ where table_schema = 'public' and table_name = 'fan_history_backfill';
+-- expect: 1
+
+select policyname, cmd from pg_policies
+ where schemaname = 'public' and tablename = 'fan_history_backfill';
+-- expect: narrowed per-command policies, NOT a single FOR ALL
+
+select indexname from pg_indexes
+ where schemaname = 'public' and tablename = 'fan_history_backfill';
+-- expect: the primary key, the unique (fan_id), the creator index and the
+--         partial pending index
+```
+
+The read-only preflight reports this table as a WARNING when it is missing,
+because history is optional work:
+
+```bash
+SUPABASE_DB_URL=... python scripts/production_preflight.py
+```
+
+See `docs/historical_memory_and_credits.md` for the rollout sequence and the
+cost model.

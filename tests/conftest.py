@@ -45,14 +45,27 @@ def _isolate_process_global_health_signals():
 
     Resetting on the way in AND out, so neither a test that sets these nor a
     test that merely runs after one can be affected.
+
+    The API Fansly usage ledger and the fan_history_backfill availability flag
+    are process-global for the same reason and are reset here too.
     """
     from core.db_health_state import DATABASE_HEALTH
+    from db.fan_history_queries import reset_backfill_table_state
     from db.queries import reset_message_identity_index_state
+    from services.apifansly import reset_usage_for_tests
 
-    reset_message_identity_index_state()
-    DATABASE_HEALTH.reset()
+    def _reset() -> None:
+        reset_message_identity_index_state()
+        reset_backfill_table_state()
+        # API Fansly usage is a rolling process-global ledger, and it now
+        # carries a live/background priority signal that history tests read.
+        # One test's recorded call must not make the next test believe a
+        # conversation is in progress.
+        reset_usage_for_tests()
+        DATABASE_HEALTH.reset()
+
+    _reset()
     try:
         yield
     finally:
-        reset_message_identity_index_state()
-        DATABASE_HEALTH.reset()
+        _reset()

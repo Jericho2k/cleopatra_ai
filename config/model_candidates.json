@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-09-11",
+  "updated_at": "2026-09-15",
   "notes": [
     "Pricing is a snapshot and must be reviewed before production decisions.",
     "adult_policy describes provider eligibility, not raw model capability.",
@@ -137,6 +137,24 @@
       "output_per_million": 0.6,
       "adult_policy": "unverified",
       "enabled": true
+    },
+    {
+      "name": "Together GLM-5.3-Flash",
+      "provider": "together",
+      "model": "zai-org/GLM-5.3-Flash",
+      "base_url": "https://api.together.xyz/v1",
+      "api_key_env": "TOGETHER_API_KEY",
+      "input_per_million": 0.15,
+      "output_per_million": 0.5,
+      "adult_policy": "unverified",
+      "enabled": true,
+      "stream": false,
+      "timeout_seconds": 90,
+      "metadata": {
+        "role": "historical conversation compaction only",
+        "reasoning_enabled": false,
+        "note": "Cheap bulk reader for HISTORICAL chat backfill. It never writes a reply and never replaces Kimi, and live fan-intelligence extraction is deliberately left on gpt-oss-120b: changing a live model for symmetry with a background one is how a comparison stops being a comparison. Pricing is a snapshot ($0.15/M in, $0.50/M out) and must be reverified before a large import."
+      }
     },
     {
       "name": "Together Llama 3.3 70B",

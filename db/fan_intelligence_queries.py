@@ -185,6 +185,19 @@ async def get_fan_intelligence_context(fan_id: str) -> dict[str, Any]:
             }
         )
 
+    # Historical continuity rides the same context read every writer already
+    # performs, rather than adding a second fan-knowledge fetch to the reply
+    # path. It is compact prose context and is deliberately NOT merged into
+    # `facts`: structured facts stay authoritative, continuity only says what
+    # the relationship was about.
+    try:
+        from db.fan_history_queries import get_history_continuity
+
+        history = await get_history_continuity(fan_id)
+    except Exception as exc:
+        print(f"[FAN INTELLIGENCE] history continuity unavailable fan={fan_id}: {exc}")
+        history = {}
+
     hard_limits = [
         fact["value"]
         for fact in active
@@ -203,6 +216,7 @@ async def get_fan_intelligence_context(fan_id: str) -> dict[str, Any]:
         "facts": active[:40],
         "hard_limits": hard_limits[:20],
         "commercial": commercial,
+        "history_continuity": history,
         "conflicts": [
             {"fact_key": key, "values": values[:5]}
             for key, values in contradicted.items()
