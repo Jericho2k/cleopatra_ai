@@ -112,6 +112,8 @@ from services.apifansly import (
     VAULT_MEDIA_DOWNLOAD_OPERATION,
 )
 from services.auto_audience import AutoAudiencePolicy
+from core import transport_policy
+from services import fansly_direct
 from services.fansly_poller import FanslyPoller
 from services.fansly_session_store import SessionStore
 from services.model_availability import (
@@ -227,6 +229,11 @@ RETRIEVAL_DIRECT_CDN = "direct_cdn"
 RETRIEVAL_DIRECT_FRAMES = "direct_video_frames"
 RETRIEVAL_REFRESHED_URL = "refreshed_signed_url"
 RETRIEVAL_APIFANSLY_DOWNLOAD = "apifansly_media_download"
+# Served by the creator's own Fansly session instead of the metered
+# provider. Recorded distinctly so the per-item telemetry shows which
+# transport did the work, and so a migration can be measured rather than
+# assumed.
+RETRIEVAL_DIRECT_SESSION = "direct_session"
 
 # How a sampled video is broken into contact sheets. Four frames per sheet is a
 # 2x2 grid at ~440px a cell, which is the largest number of moments that
@@ -1322,6 +1329,11 @@ async def lifespan(app: FastAPI):
         encryption_key=os.environ["FANSLY_SESSION_KEY"],
     )
     await session_store.load_all()
+    # The direct transport borrows the same per-creator sessions the poller
+    # uses. Installed here, once, so no module has to reach back into this one
+    # to find the store.
+    fansly_direct.set_session_provider(session_store)
+    print(transport_policy.describe())
 
     fansly_poller = FanslyPoller(
         session_store=session_store,
@@ -2726,8 +2738,20 @@ async def sync_chats(
 
 @app.get("/apifansly-usage")
 async def get_apifansly_usage() -> dict:
-    """Expose rolling, secret-free provider usage to dashboard operators."""
-    return apifansly_usage_snapshot()
+    """Expose rolling, secret-free provider usage to dashboard operators.
+
+    Carries the direct transport alongside the provider on purpose. What an
+    operator actually needs to decide is whether to move more operations off
+    the metered path, and that question is unanswerable from billed credits
+    alone: a smaller invoice could equally be a quiet week. Spent and saved
+    belong in one response, over the same window.
+    """
+    snapshot = apifansly_usage_snapshot()
+    snapshot["direct_transport"] = {
+        "policy": transport_policy.snapshot(),
+        "savings": fansly_direct.savings_snapshot(),
+    }
+    return snapshot
 
 
 @app.post(
@@ -3656,20 +3680,102 @@ async def _download_direct_cdn(visual_url: str, *, client) -> tuple[bytes, str]:
     return b"", status
 
 
-async def _guarded_proxy_download(
+@dataclass(frozen=True)
+class ProtectedMediaFetch:
+    """The outcome of reading one protected asset, and what it cost.
+
+    ``billed_bytes`` is zero whenever the direct transport served the read, so
+    the existing per-item cost telemetry keeps meaning "bytes API Fansly billed
+    us for" as the migration proceeds rather than quietly starting to mean
+    "bytes moved".
+    """
+
+    content: bytes
+    decision: DownloadDecision | None
+    retrieval_method: str
+    billed_bytes: int
+    direct_error: str = ""
+
+    def refusal_message(self) -> str:
+        """One sentence an operator can act on when nothing was fetched."""
+        if self.decision is not None:
+            return self.decision.operator_message()
+        if self.direct_error:
+            return (
+                "The protected Fansly media could not be downloaded and the "
+                "paid fallback is switched off in this deployment."
+            )
+        return "The protected Fansly media could not be downloaded."
+
+
+async def _fetch_protected_media(
     visual_url: str,
     *,
     client,
     manual: bool,
     is_video: bool,
     account_id: str = "",
-) -> tuple[bytes, DownloadDecision]:
-    """The billed path, taken only when the guard allows it.
+    media_id: str = "",
+) -> ProtectedMediaFetch:
+    """Read a protected asset by the cheapest transport this deployment allows.
 
-    Returns ``(b"", decision)`` when refused, so the caller can record exactly
-    why deeper analysis did not happen rather than reporting a generic failure.
-    A still image may proceed on an unreadable size; a video may not.
+    Order matters and is a cost decision, not a preference:
+
+    1. **Direct**, using the creator's own Fansly session, when
+       ``core.transport_policy`` says this account may. Costs zero provider
+       credits, so the credit guard below does not apply to it — only its own
+       in-process size ceiling does.
+    2. **The metered provider**, subject to the full credit guard, either
+       because direct is not enabled here or because it failed and fallback is
+       on.
+
+    Returns empty content with a decision when the guard refuses, so the caller
+    can record exactly why deeper analysis did not happen rather than reporting
+    a generic failure. A still image may proceed on an unreadable size; a video
+    may not.
     """
+    direct_error = ""
+    if transport_policy.direct_enabled(
+        transport_policy.OP_MEDIA_DOWNLOAD, account_id=account_id
+    ):
+        try:
+            content, route = await fansly_direct.download_media(
+                visual_url,
+                account_id=account_id,
+                media_id=media_id,
+                operation=VAULT_MEDIA_DOWNLOAD_OPERATION,
+            )
+            print(
+                f"[VAULT MEDIA DIRECT] served bytes={len(content)} route={route} "
+                f"credits_saved="
+                f"{fansly_direct.provider_credits_for_bytes(len(content)):.1f} "
+                f"manual={manual} video={is_video}"
+            )
+            return ProtectedMediaFetch(
+                content=content,
+                decision=None,
+                retrieval_method=RETRIEVAL_DIRECT_SESSION,
+                billed_bytes=0,
+            )
+        except fansly_direct.DirectTransportError as exc:
+            direct_error = f"{type(exc).__name__}: {exc}"
+            print(f"[VAULT MEDIA DIRECT] failed, {direct_error}")
+
+        if not transport_policy.fallback_enabled():
+            # Deliberate configuration: this deployment wants a direct
+            # regression to be visible rather than absorbed into an invoice.
+            print(
+                "[VAULT MEDIA DIRECT] provider fallback disabled, not paying "
+                "for this transfer"
+            )
+            return ProtectedMediaFetch(
+                content=b"",
+                decision=None,
+                retrieval_method="",
+                billed_bytes=0,
+                direct_error=direct_error,
+            )
+
     size = await _probe_media_size(visual_url, client=client)
     decision = evaluate_download(
         content_length_bytes=size,
@@ -3683,7 +3789,13 @@ async def _guarded_proxy_download(
             f"size_mb={decision.estimated_megabytes} "
             f"credits={decision.estimated_credits:.1f}"
         )
-        return b"", decision
+        return ProtectedMediaFetch(
+            content=b"",
+            decision=decision,
+            retrieval_method="",
+            billed_bytes=0,
+            direct_error=direct_error,
+        )
 
     # Attributed to the vault so the credits land in the right bucket, and to
     # the creator's account so "who caused this" is answerable.
@@ -3699,7 +3811,18 @@ async def _guarded_proxy_download(
         f"credits={estimated_credits_for_bytes(len(content)):.1f} "
         f"manual={manual} video={is_video}"
     )
-    return content, decision
+    return ProtectedMediaFetch(
+        content=content,
+        decision=decision,
+        retrieval_method=RETRIEVAL_APIFANSLY_DOWNLOAD,
+        billed_bytes=len(content),
+        direct_error=direct_error,
+    )
+
+
+def _item_media_id(item: dict) -> str:
+    """The Fansly media id for a vault item, under either stored key."""
+    return str(item.get("fansly_media_id") or item.get("media_id") or "")
 
 
 async def _download_visual_candidate(
@@ -3709,6 +3832,7 @@ async def _download_visual_candidate(
     manual: bool = False,
     is_video: bool = False,
     account_id: str = "",
+    media_id: str = "",
 ) -> tuple[bytes, str, int]:
     """One still image, by the cheapest route that works.
 
@@ -3725,21 +3849,22 @@ async def _download_visual_candidate(
         )
 
     try:
-        downloaded, decision = await _guarded_proxy_download(
+        fetch = await _fetch_protected_media(
             visual_url,
             client=client,
             manual=manual,
             is_video=is_video,
             account_id=account_id,
+            media_id=media_id,
         )
     except Exception as exc:
         raise VaultVisualAccessError(
             "The protected Fansly media could not be downloaded "
             f"(direct={direct_status}; proxy={type(exc).__name__})."
         ) from exc
-    if not downloaded:
-        raise VaultVisualAccessError(decision.operator_message())
-    return downloaded, RETRIEVAL_APIFANSLY_DOWNLOAD, len(downloaded)
+    if not fetch.content:
+        raise VaultVisualAccessError(fetch.refusal_message())
+    return fetch.content, fetch.retrieval_method, fetch.billed_bytes
 
 
 async def _refresh_vault_item_urls(item: dict) -> dict | None:
@@ -3890,6 +4015,7 @@ async def _load_vault_visual(
                     manual=manual,
                     is_video=False,
                     account_id=account_id,
+                    media_id=_item_media_id(item),
                 )
                 return VaultVisual(
                     source="image",
@@ -3916,6 +4042,7 @@ async def _load_vault_visual(
                 manual=manual,
                 is_video=False,
                 account_id=account_id,
+                media_id=_item_media_id(item),
             )
             return VaultVisual(
                 source="image",
@@ -4145,22 +4272,27 @@ async def _video_deep_scan(
     if not video_url or not is_fansly_cdn_url(video_url):
         return None
     try:
-        content, decision = await _guarded_proxy_download(
+        fetch = await _fetch_protected_media(
             video_url,
             client=client,
             manual=manual,
             is_video=True,
             account_id=account_id,
+            media_id=_item_media_id(item),
         )
     except Exception as exc:
         errors.append(f"proxy {type(exc).__name__}")
         return None
-    if not content:
-        errors.append(f"guard {decision.reason}")
-        refusals.append(decision)
+    if not fetch.content:
+        if fetch.decision is not None:
+            errors.append(f"guard {fetch.decision.reason}")
+            refusals.append(fetch.decision)
+        else:
+            errors.append(f"direct {fetch.direct_error or 'unavailable'}")
         return None
 
-    billed = len(content)
+    content = fetch.content
+    billed = fetch.billed_bytes
     try:
         sampled = await _sample_downloaded_video(content)
     except Exception as exc:
@@ -4171,7 +4303,7 @@ async def _video_deep_scan(
         return None
     return VaultVisual(
         source="video_frames",
-        retrieval_method=RETRIEVAL_APIFANSLY_DOWNLOAD,
+        retrieval_method=fetch.retrieval_method,
         frames=sampled.frames,
         offsets_seconds=sampled.offsets_seconds,
         duration_seconds=sampled.duration_seconds,

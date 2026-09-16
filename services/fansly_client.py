@@ -8,9 +8,11 @@ Auth: Bearer token + 3 custom headers captured from browser session.
 
 import asyncio
 import logging
+import os
 import random
 import time
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -36,6 +38,22 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
 ]
+
+
+def _is_fansly_host(value: str) -> bool:
+    """Whether a URL points at an HTTPS Fansly-controlled host.
+
+    Kept local rather than imported from ``services.apifansly`` so the direct
+    transport does not depend on the provider module it is meant to replace.
+    """
+    try:
+        parsed = urlparse(str(value or "").strip())
+    except ValueError:
+        return False
+    host = str(parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (
+        host == "fansly.com" or host.endswith(".fansly.com")
+    )
 
 
 class SessionExpiredError(Exception):
@@ -263,6 +281,70 @@ class FanslyClient:
         for batch in reversed(batches):
             for msg in reversed(batch):
                 yield msg
+
+    # ── Media ──────────────────────────────────────────────────────────────
+    #
+    # These two exist so vault classification can read a protected asset
+    # without paying the provider's per-megabyte media proxy. They are the
+    # only methods here that move bytes rather than JSON, so they deliberately
+    # bypass ``_request``: its JSON envelope handling, its ``success`` check
+    # and its ngsw-bypass parameter all describe the API, not the CDN.
+
+    async def get_account_media(self, media_ids: list[str]) -> dict:
+        """Metadata for account-media items, including FRESH signed locations.
+
+        This is the free way to recover from an expired signed URL: ask the API
+        for the item again and it answers with a newly signed location that the
+        CDN will serve to anyone. Fetching that location costs nothing, which
+        is the whole reason this method exists.
+
+        The path is overridable because it is observed from browser traffic
+        rather than published, and an upstream rename must be a configuration
+        change rather than a deploy — the same reason
+        ``APIFANSLY_LISTS_PATH`` is overridable in ``services/apifansly.py``.
+        """
+        ids = [str(value).strip() for value in media_ids if str(value or "").strip()]
+        if not ids:
+            return {}
+        path = str(
+            os.environ.get("FANSLY_DIRECT_MEDIA_PATH") or "/account/media"
+        )
+        if not path.startswith("/"):
+            path = "/" + path
+        return await self._request("GET", path, params={"ids": ",".join(ids)})
+
+    async def download_asset(
+        self,
+        url: str,
+        *,
+        timeout: float = 45.0,
+        authenticated: bool = True,
+    ) -> httpx.Response:
+        """GET one CDN asset as bytes, optionally carrying the session.
+
+        ``authenticated`` sends the account's session headers. That is only
+        ever safe against a Fansly-controlled host, so the caller must have
+        checked the host first; this method re-checks rather than trusting it,
+        because the cost of being wrong is leaking a live session token to
+        whatever host ended up in a stored URL.
+        """
+        headers = dict(BASE_HEADERS)
+        headers["Accept"] = "*/*"
+        headers["User-Agent"] = self.user_agent
+        if authenticated:
+            if not _is_fansly_host(url):
+                raise FanslyAPIError(
+                    "refusing to send session credentials to a non-Fansly host"
+                )
+            headers = self._auth_headers()
+            headers["Accept"] = "*/*"
+        await self._jitter()
+        return await self._client.get(
+            url,
+            headers=headers,
+            timeout=timeout,
+            follow_redirects=True,
+        )
 
     @staticmethod
     def _new_correlation_id() -> str:
