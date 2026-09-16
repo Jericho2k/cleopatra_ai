@@ -69,3 +69,41 @@ def _isolate_process_global_health_signals():
         yield
     finally:
         _reset()
+
+
+@pytest.fixture(autouse=True)
+def simulation_turns(monkeypatch):
+    """An in-memory ``public.simulation_turns`` and a deterministic scheduler.
+
+    Two things every test touching the Simulator needs, and neither of them is
+    what the test is about:
+
+    *Storage.* ``services.simulation_turns`` binds ``get_supabase`` at import,
+    and the route fakes in these files model creators and fans only. The
+    PostgREST double is used rather than a bespoke dict so upsert-with-
+    ignore-duplicates and conditional updates behave the way the service
+    actually relies on them behaving.
+
+    *Timing.* In production the POST returns and the pipeline runs behind it —
+    that IS the fix. Inside a test that would mean racing an event loop the
+    test does not own, so the scheduling seam is replaced by one that awaits
+    the turn. A test that needs the real asynchrony drives ``execute_turn``
+    itself, which is why it is public.
+
+    The two unique constraints this store does NOT enforce — one turn per
+    (fan, idempotency key) and one active turn per fan — are enforced by the
+    database, and are proved against a real PostgreSQL in
+    tests/test_simulation_turn_schema.py. What is proved here is that the
+    service asks for them correctly.
+    """
+    from tests.fake_supabase import FakeSupabase
+    from services import simulation_turns as module
+
+    store = FakeSupabase({"simulation_turns": []})
+    monkeypatch.setattr(module, "get_supabase", lambda: store)
+
+    async def _await_inline(coro, _name):
+        await coro
+
+    monkeypatch.setattr(module, "schedule_turn_execution", _await_inline)
+    return store
