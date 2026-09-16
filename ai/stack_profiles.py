@@ -236,7 +236,23 @@ class AIStackProfile:
     def writer_prompt_version(self) -> str:
         return self.stage(STAGE_WRITER_DEFAULT).prompt_version
 
+    def public_view(self) -> dict[str, Any]:
+        """The PRODUCT-level identity of this profile. Safe for any tenant.
+
+        A stable identifier and a display name, and deliberately nothing else —
+        not the summary, which names Kimi and Qwen and a prompt version in
+        prose. This is what an agency operator needs to pick a stack in the
+        Simulator, and it is the whole of what they are told about it.
+        """
+        return {"id": self.profile_id, "name": self.label}
+
     def describe(self) -> dict[str, Any]:
+        """The OWNER's diagnostic view: identity plus the entire routing.
+
+        Every provider, model, fallback, prompt version and generation setting.
+        Platform-owner only — see ``services/ai_stack_visibility.py`` for the
+        boundary and ``/ai-stack/profiles`` for where it is applied.
+        """
         return {
             "profile_id": self.profile_id,
             "label": self.label,
@@ -582,4 +598,15 @@ def environment_profile_id() -> str:
 
 
 def describe_profiles() -> list[dict[str, Any]]:
+    """Owner-only. Full routing for every registered profile."""
     return [PROFILES[profile_id].describe() for profile_id in PROFILE_IDS]
+
+
+def profile_directory() -> list[dict[str, Any]]:
+    """Every registered profile as ``{"id", "name"}`` and nothing more.
+
+    The list any authorised operator may see. Same order, same ids and the same
+    number of entries as ``describe_profiles`` — an agency picks from exactly
+    the same registry, it is simply not told what each entry routes to.
+    """
+    return [PROFILES[profile_id].public_view() for profile_id in PROFILE_IDS]
