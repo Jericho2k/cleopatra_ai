@@ -602,9 +602,8 @@ def test_missing_group_binding_does_not_trigger_a_chat_listing(world, spy, monke
     assert spy.requests == []
 
 
-def test_resend_request_does_not_send_a_real_ppv(world, spy, monkeypatch, two_bubble_turn):
-    """The resend branch returns before the delivery block, so without its own
-    guard a test fan could send a REAL PPV through the platform."""
+def test_resend_request_does_not_send_a_real_ppv(world, spy, monkeypatch):
+    """An access complaint is a support handoff, including in simulation."""
     monkeypatch.setenv("APIFANSLY_ENABLED", "true")
     db, calls = world
     for row in db.tables["fans"]:
@@ -629,14 +628,136 @@ def test_resend_request_does_not_send_a_real_ppv(world, spy, monkeypatch, two_bu
     monkeypatch.setattr(suggestions, "analyze_situation", resend_requested)
     monkeypatch.setattr(suggestions, "send_apifansly_message", should_not_send)
 
-    _run(
+    result = _run(
         suggestions.run_simulated_inbound(
             fan_id="fan-test", creator_id="creator-1", message="i cant see it", fast=True
         )
     )
     assert spy.requests == []
-    # Normal generation proceeded instead of a fake "resent" claim.
-    assert [r["content"] for r in _creator_rows(db)] == ["hey", "what are you doing?"]
+    assert _creator_rows(db) == []
+    assert calls["writer"] == []
+    assert result["outcome"] == "human_review"
+    assert db.tables["fans"][0]["needs_human_review"] is True
+    assert db.tables["fans"][0]["review_reason"] == "content_access_issue"
+
+
+@pytest.mark.parametrize("commercial_enabled", ["true", "false"])
+@pytest.mark.parametrize("platform_fan_id", ["test_jostar", "real-fan-99"])
+@pytest.mark.parametrize("pending", [None, {"media_id": "m1", "price": 25, "reference": "ref-1"}])
+@pytest.mark.parametrize("resend_signal", ["true", True])
+def test_access_issue_preempts_selling_and_preserves_payment_state(
+    world, spy, monkeypatch, commercial_enabled, platform_fan_id, pending, resend_signal
+):
+    """Even a mixed request to buy more cannot turn a delivery complaint into a sale.
+
+    Exercise both live and simulated routing through the actual Auto pipeline.
+    An already-purchased item has no pending payment, but still needs support.
+    """
+    db, calls = world
+    fan = db.tables["fans"][0]
+    fan.update(platform_fan_id=platform_fan_id, pending_ppv_check=pending)
+    monkeypatch.setenv("APIFANSLY_ENABLED", "true")
+    monkeypatch.setenv("COMMERCIAL_LAYER_ENABLED", commercial_enabled)
+    monkeypatch.setattr(
+        suggestions, "get_fan_by_id",
+        lambda _f: _value(Fan(
+            id="fan-test", display_name="Jostar", platform_fan_id=platform_fan_id,
+            fansly_group_id="stale-group-99",
+        )),
+    )
+    monkeypatch.setattr(suggestions, "analyze_situation", lambda *_a, **_k: _value({
+        "resend_requested": resend_signal, "purchase_signal": "ready_to_buy",
+        "offer_response": "accepted", "crisis_signal": "none",
+    }))
+    downstream_calls = []
+
+    async def unexpected(*_a, **_k):
+        downstream_calls.append(True)
+        raise AssertionError("access complaint reached commercial mutation or delivery")
+
+    for name in (
+        "refresh_affordability_from_situation", "refresh_price_learning", "orchestrate",
+        "plan_session_for_fan", "send_apifansly_message", "generate_replies",
+    ):
+        monkeypatch.setattr(suggestions, name, unexpected)
+    outcome = {}
+    _run(suggestions._debounced_auto_reply(
+        "fan-test", "creator-1", skip_debounce=True, skip_availability=True,
+        skip_human_delays=True, outcome_sink=outcome,
+    ))
+    assert downstream_calls == []
+    assert spy.requests == []
+    assert _creator_rows(db) == []
+    assert fan["pending_ppv_check"] == pending
+    assert fan["needs_human_review"] is True
+    assert fan["review_reason"] == "content_access_issue"
+    assert outcome == {"outcome": "human_review"}
+
+
+def test_access_issue_hold_failure_is_visible_and_never_falls_through(world, spy, monkeypatch):
+    db, calls = world
+    monkeypatch.setattr(suggestions, "analyze_situation", lambda *_a, **_k: _value({
+        "resend_requested": "true", "crisis_signal": "none",
+    }))
+
+    async def unavailable(*_a, **_k):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(suggestions, "freeze_fan_for_review", unavailable)
+    with pytest.raises(suggestions.HumanReviewHandoffError):
+        _run(suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="I paid but cannot open it", fast=True,
+        ))
+    assert calls["writer"] == []
+    assert _creator_rows(db) == []
+    assert spy.requests == []
+
+
+def test_crisis_hold_takes_priority_over_access_issue(world, spy, monkeypatch):
+    db, calls = world
+    monkeypatch.setattr(suggestions, "analyze_situation", lambda *_a, **_k: _value({
+        "resend_requested": "true", "crisis_signal": "self_harm",
+    }))
+
+    async def crisis_hold(_creator, fan_id, _situation):
+        await suggestions.freeze_fan_for_review(fan_id, "crisis:self_harm")
+        return True
+
+    monkeypatch.setattr(suggestions, "_crisis_freezes_chat", crisis_hold)
+    _run(suggestions.run_simulated_inbound(
+        fan_id="fan-test", creator_id="creator-1", message="help with my account", fast=True,
+    ))
+    assert db.tables["fans"][0]["review_reason"] == "crisis:self_harm"
+    assert calls["writer"] == []
+    assert spy.requests == []
+
+
+def test_full_auto_loads_creator_facts_on_each_turn(world, spy, monkeypatch):
+    """Saved creator identity must reach the Auto writer, not just Assisted mode.
+
+    A later correction must replace stale facts on the next turn; it must not
+    depend on whether those facts happen to fit in the recent transcript.
+    """
+    db, calls = world
+    legend = {"name": "Maya", "origin": "Lisbon", "other": ["plays the cello"]}
+    reads = []
+
+    async def load_legend(creator_id):
+        reads.append(creator_id)
+        return dict(legend)
+
+    monkeypatch.setattr(suggestions, "get_creator_legend", load_legend)
+    for origin in ("Lisbon", "Porto"):
+        legend["origin"] = origin
+        _run(suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="where are you from again?", fast=True,
+        ))
+        assert calls["analyzer"][-1].creator_legend == legend
+        assert calls["route"][-1].creator_legend == legend
+        prompt = str(calls["writer"][-1]["prompt"])
+        assert "Maya" in prompt and origin in prompt and "plays the cello" in prompt
+    assert reads == ["creator-1", "creator-1"]
+    assert spy.requests == []
 
 
 # --- 28, 29: the PPV path stays local and schedules nothing remote ---------
@@ -1128,8 +1249,8 @@ def test_writer_failure_reports_outcome_writer_failed(world, spy, monkeypatch):
     assert spy.requests == []
 
 
-def test_intentional_no_send_is_distinct_from_writer_failure(world, spy, monkeypatch):
-    """A turn that stops before the writer is a real Full Auto decision."""
+def test_existing_review_hold_is_distinct_from_writer_failure(world, spy, monkeypatch):
+    """The simulator identifies an existing hold instead of claiming silence."""
     db, calls = world
 
     monkeypatch.setattr(
@@ -1153,7 +1274,7 @@ def test_intentional_no_send_is_distinct_from_writer_failure(world, spy, monkeyp
         )
     )
 
-    assert result["outcome"] == "no_send"
+    assert result["outcome"] == "human_review"
     assert result["creator_messages"] == []
     assert calls["writer"] == [], "a no-send decision never reaches the writer"
 

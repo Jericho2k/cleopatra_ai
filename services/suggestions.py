@@ -194,6 +194,11 @@ AUTO_OUTCOME_PLAN_UNRECOVERABLE = "plan_unrecoverable"
 # Every writer candidate promised media that does not exist, and repairing
 # them left nothing sendable. Never send the promise instead.
 AUTO_OUTCOME_INVENTORY_UNSAFE = "inventory_unsafe"
+AUTO_OUTCOME_HUMAN_REVIEW = "human_review"
+
+
+class HumanReviewHandoffError(RuntimeError):
+    """A required review hold could not be persisted; retry without sending."""
 
 
 class AnalyzerDegradedError(RuntimeError):
@@ -1252,12 +1257,12 @@ async def _debounced_auto_reply(
 
         # The local-test boundary is established HERE, not at delivery time.
         #
-        # It used to be computed just before the send, which left four paths
+        # It used to be computed just before the send, which left several paths
         # above it able to reach the provider for a test fan: the chat-list
-        # lookup that resolves a missing group id, the typing indicator, the PPV
-        # resend branch (which returns before the delivery block is ever
-        # reached), and the eager purchase verification spawned on a "bought"
-        # signal. Each is now gated on this flag.
+        # lookup that resolves a missing group id, the typing indicator, and the
+        # eager purchase verification spawned on a "bought" signal. Each is
+        # gated on this flag. Access complaints now stop before delivery on
+        # both simulated and live routes.
         local_test_delivery = _is_local_test_fan(
             getattr(fan_profile, "platform_fan_id", None)
         )
@@ -1265,6 +1270,8 @@ async def _debounced_auto_reply(
         # Frozen for human review (e.g. prior crisis under 'freeze' policy): auto-mode
         # stays out until a human clears the flag in the dashboard.
         if getattr(fan_profile, "needs_human_review", False):
+            if outcome_sink is not None:
+                outcome_sink["outcome"] = AUTO_OUTCOME_HUMAN_REVIEW
             print(f"[AUTO REPLY] fan={fan_id} is frozen for human review — skipping auto-reply")
             return
         # Check for a pending tip and clear it atomically before building context
@@ -1298,12 +1305,14 @@ async def _debounced_auto_reply(
 
         (
             creator_persona,
+            creator_legend,
             ppv_offers,
             sent_ppv,
             active_session,
             similar_exchanges,
         ) = await asyncio.gather(
             get_creator_persona(creator_id),
+            get_creator_legend(creator_id),
             get_ppv_offers(creator_id),
             get_sent_ppv(fan_id),
             get_fan_session(fan_id),
@@ -1338,6 +1347,7 @@ async def _debounced_auto_reply(
             similar_exchanges=similar_exchanges,
             conversation_stage=conversation_stage,
             creator_name="a creator",
+            creator_legend=creator_legend,
             ppv_offers=ppv_offers,
             sent_ppv=sent_ppv,
             active_session=active_session,
@@ -1384,6 +1394,28 @@ async def _debounced_auto_reply(
                 f"situation analysis degraded ({reason}); Full Auto sent nothing"
             )
 
+        # Crisis handling retains priority over a content-access complaint.
+        if await _crisis_freezes_chat(creator_id, fan_id, situation):
+            return
+
+        # A request to fix an existing delivery is not authorization for a new
+        # paid message. This must precede commercial state writes and planning,
+        # including when the complaint also contains a purchase signal. No
+        # pending PPV is required: a paid item can still be inaccessible.
+        # Use the existing operator review workflow until entitlement/access
+        # repair can be verified. Never promise a repair that has not happened.
+        if str(situation.get("resend_requested", "false")).strip().lower() == "true":
+            try:
+                await freeze_fan_for_review(fan_id, "content_access_issue")
+            except Exception as exc:
+                raise HumanReviewHandoffError(
+                    "could not persist content-access review hold; no reply sent"
+                ) from exc
+            if outcome_sink is not None:
+                outcome_sink["outcome"] = AUTO_OUTCOME_HUMAN_REVIEW
+            print(f"[AUTO SUPPORT] fan={fan_id} reason=content_access_issue review_required=true")
+            return
+
         if fan_intelligence:
             situation["learned_fan_intelligence"] = fan_intelligence
         affordability = await refresh_affordability_from_situation(
@@ -1401,11 +1433,6 @@ async def _debounced_auto_reply(
         )
         situation["price_learning"] = price_learning
         print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} crisis={situation.get('crisis_signal', 'none')}")
-
-        # Sticky-situation policy: if a crisis is flagged and the creator opted to
-        # freeze rather than continue, stop here — flag for a human, send nothing.
-        if await _crisis_freezes_chat(creator_id, fan_id, situation):
-            return
 
         # Commercial layer: deterministic policy decides what happens next
         # (sell / pause / tease / schedule). Flag-gated so it can be turned off
@@ -1500,56 +1527,6 @@ async def _debounced_auto_reply(
         # Inject tip context into situation so prompt builder can use it
         if pending_tip:
             situation["pending_tip"] = pending_tip
-
-        # Resend handler — situation analyzer detected fan can't see sent content
-        if situation.get("resend_requested") == "true":
-            db = get_supabase()
-            fan_data = await asyncio.to_thread(
-                lambda: db.table("fans")
-                .select("pending_ppv_check, fansly_group_id, platform_fan_id")
-                .eq("id", fan_id)
-                .single()
-                .execute()
-            )
-            pending = (fan_data.data or {}).get("pending_ppv_check")
-            group_id_resend = (fan_data.data or {}).get("fansly_group_id")
-            creator_data = await asyncio.to_thread(
-                lambda: db.table("creators")
-                .select("apifansly_account_id")
-                .eq("id", creator_id)
-                .single()
-                .execute()
-            )
-            apifansly_id_resend = (creator_data.data or {}).get("apifansly_account_id")
-
-            if pending and local_test_delivery:
-                # This branch returns before the delivery block below, so
-                # without this guard a test fan could send a REAL PPV. The
-                # simulated equivalent is to let normal generation proceed.
-                print(f"[AUTO TEST DELIVERY] fan={fan_id} ppv_resend=skipped")
-            elif pending and group_id_resend and apifansly_id_resend:
-                media_id_resend = pending.get("media_id")
-                media_ids_resend = (
-                    pending.get("media_ids")
-                    or ([media_id_resend] if media_id_resend else [])
-                )
-                price_resend = pending.get("price")
-                if media_id_resend and price_resend:
-                    print(f"[PPV RESEND] Resending media={media_id_resend} price={price_resend} for fan={fan_id}")
-                    try:
-                        await send_apifansly_message(
-                            str(apifansly_id_resend),
-                            str(group_id_resend),
-                            content="sorry about that, here it is again 😏",
-                            media_ids=media_ids_resend,
-                            price_dollars=float(price_resend),
-                        )
-                        print("[PPV RESEND] accepted=true")
-                        await save_message(fan_id, creator_id, "creator", "sorry about that, here it is again 😏", was_ai_suggested=True)
-                        return  # Skip normal generation
-                    except Exception as e:
-                        print(f"[PPV RESEND ERROR] {e}")
-                        # Fall through to normal generation if resend fails
 
         # Purchase/decline reactions. With Commercial v2 enabled, the final
         # policy action — not the analyzer's raw single label — controls locks.
@@ -1790,6 +1767,7 @@ async def _debounced_auto_reply(
             similar_exchanges=similar_exchanges,
             conversation_stage=conversation_stage,
             creator_name="a creator",
+            creator_legend=creator_legend,
             situation=situation,
             ppv_offers=ppv_offers,
             sent_ppv=sent_ppv,
@@ -2342,10 +2320,10 @@ async def _debounced_auto_reply(
 
     except asyncio.CancelledError:
         raise
-    except AnalyzerDegradedError:
-        # REL-001 — propagate rather than swallow. The durable action's
-        # last_error should say the analyzer failed, not the generic "completed
-        # without a confirmed message" this handler would otherwise produce.
+    except (AnalyzerDegradedError, HumanReviewHandoffError):
+        # Preserve the actual failure so the durable action can retry it and
+        # the simulator cannot report a failed analysis or hold as a decision
+        # to send nothing.
         raise
     except Exception as e:
         print(f"[DEBOUNCED AUTO REPLY ERROR] fan={fan_id} error={e}")
