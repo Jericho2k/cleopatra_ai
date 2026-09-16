@@ -495,8 +495,31 @@ def test_an_agency_turn_reports_the_profile_and_not_the_model(
     It is diagnostics, so it is redacted on the way out to an agency — and the
     rest of the message's media_context, which is ordinary product state, is
     not touched.
+
+    Asserted on the POLL response rather than the POST, because that is where
+    the turn's creator messages now come back: a simulated turn is durable and
+    pollable, so the POST returns a turn id and the transcript arrives with the
+    completed turn. The boundary is the same one, on the surface that now
+    carries it.
     """
-    from services import suggestions
+    from services import simulation_turns, suggestions
+
+    message_row = {
+        "id": "message-1",
+        "role": "creator",
+        "content": "hey you",
+        "sent_at": None,
+        "media_context": {
+            "ppv": {"media_ids": ["media-1"], "price_cents": 2500},
+            "ai_stack": {
+                "profile": "cleo_v3",
+                "route": "commercial_complex",
+                "prompt_version": "writer_v3",
+                "provider": "openrouter",
+                "model": "moonshotai/kimi-k2.6",
+            },
+        },
+    }
 
     async def fake_turn(**_kwargs):
         return {
@@ -504,34 +527,35 @@ def test_an_agency_turn_reports_the_profile_and_not_the_model(
             "simulation": True,
             "fan_message_id": "fan-message-1",
             "outcome": "replied",
-            "creator_messages": [
-                {
-                    "id": "message-1",
-                    "role": "creator",
-                    "content": "hey you",
-                    "sent_at": None,
-                    "media_context": {
-                        "ppv": {"media_ids": ["media-1"], "price_cents": 2500},
-                        "ai_stack": {
-                            "profile": "cleo_v3",
-                            "route": "commercial_complex",
-                            "prompt_version": "writer_v3",
-                            "provider": "openrouter",
-                            "model": "moonshotai/kimi-k2.6",
-                        },
-                    },
-                }
-            ],
+            "creator_messages": [message_row],
         }
 
-    monkeypatch.setattr(suggestions, "run_simulated_inbound", fake_turn)
+    async def fake_rows(_fan_id):
+        return [message_row]
 
-    agency = client.post(
-        "/creator/creator-1/fan/fan-test/simulate-inbound",
-        headers=headers(AGENCY),
-        json={"message": "hi", "fast": True},
+    monkeypatch.setattr(suggestions, "run_simulated_inbound", fake_turn)
+    monkeypatch.setattr(suggestions, "_recent_creator_message_rows", fake_rows)
+    monkeypatch.setattr(
+        simulation_turns, "_creator_message_ids", lambda _fan_id: _empty_snapshot()
     )
+
+    def _run(user: str, key: str):
+        started = client.post(
+            "/creator/creator-1/fan/fan-test/simulate-inbound",
+            headers=headers(user),
+            json={"message": "hi", "fast": True, "idempotency_key": key},
+        )
+        assert started.status_code == 200, started.text
+        assert started.json()["status"] == "processing"
+        turn_id = started.json()["turn_id"]
+        return client.get(
+            f"/creator/creator-1/fan/fan-test/simulation/turn/{turn_id}",
+            headers=headers(user),
+        )
+
+    agency = _run(AGENCY, "key-agency")
     assert agency.status_code == 200, agency.text
+    assert agency.json()["status"] == "completed"
     context = agency.json()["creator_messages"][0]["media_context"]
     assert context["ai_stack"] == {"profile": "cleo_v3"}
     # Untouched: this is a stack-routing boundary, not a general scrubber.
@@ -539,17 +563,18 @@ def test_an_agency_turn_reports_the_profile_and_not_the_model(
     assert "kimi" not in agency.text.lower()
     assert "openrouter" not in agency.text.lower()
 
-    owner = client.post(
-        "/creator/creator-1/fan/fan-test/simulate-inbound",
-        headers=headers(OWNER),
-        json={"message": "hi", "fast": True},
-    )
+    owner = _run(OWNER, "key-owner")
     assert owner.status_code == 200, owner.text
     owner_marker = owner.json()["creator_messages"][0]["media_context"]["ai_stack"]
     assert owner_marker["provider"] == "openrouter"
     assert owner_marker["model"] == "moonshotai/kimi-k2.6"
     assert owner_marker["route"] == "commercial_complex"
     assert owner_marker["prompt_version"] == "writer_v3"
+
+
+async def _empty_snapshot():
+    """The pre-turn transcript snapshot, for a fan with no history."""
+    return set()
 
 
 # --- and on the health banner, which named the failing model in prose -------

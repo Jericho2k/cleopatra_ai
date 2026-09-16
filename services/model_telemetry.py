@@ -75,6 +75,78 @@ async def record_model_failure(
     )
 
 
+async def record_writer_recovery_outcome(
+    outcome: str,
+    *,
+    target: ModelTarget,
+    context: ModelTelemetryContext,
+    profile: str,
+    policy: str,
+    elapsed_ms: int,
+    deadline_seconds: float,
+    attempts: int,
+    pinned_attempts: int,
+    alternate_attempts: int,
+    role: str = "",
+    upstream_provider: str | None = None,
+    error: str | None = None,
+) -> None:
+    """One row per writer TURN saying how far down the recovery ladder it went.
+
+    Deliberately the same table as every other model event rather than a second
+    telemetry store: "what fraction of production replies fall all the way to
+    Qwen" has to be answerable next to cost and latency, not in a system that
+    has to be joined to them by hand.
+
+    ``feature`` is ``writer_recovery`` so these rows are trivially separable
+    from the per-attempt ones, which keep their own feature. ``latency_ms``
+    here is the whole turn including waits — the thing a deadline is set
+    against — not one provider call.
+
+    Operator telemetry only. Nothing written here is ever surfaced to an
+    agency: provider and model identities are redacted from tenant-facing
+    responses by services/ai_stack_visibility.py, and this table is not a
+    tenant-facing surface at all.
+    """
+
+    metadata = dict(context.metadata or {})
+    metadata.update(
+        {
+            "writer_recovery_outcome": outcome,
+            "writer_recovery_role": role or None,
+            "writer_recovery_profile": profile,
+            "writer_recovery_policy": policy,
+            "writer_recovery_attempts": int(attempts),
+            "writer_recovery_pinned_attempts": int(pinned_attempts),
+            "writer_recovery_alternate_attempts": int(alternate_attempts),
+            "writer_recovery_deadline_seconds": round(float(deadline_seconds), 3),
+            "writer_recovery_elapsed_ms": int(elapsed_ms),
+        }
+    )
+    _enqueue_record(
+        target=target,
+        usage=ModelUsage(),
+        # The turn's wall clock, waits included. The per-attempt rows carry
+        # provider latency; conflating the two would make the 5s/30s schedule
+        # look like slow inference.
+        latency_ms=int(elapsed_ms),
+        context=ModelTelemetryContext(
+            feature="writer_recovery",
+            creator_id=context.creator_id,
+            fan_id=context.fan_id,
+            evaluation_run_id=context.evaluation_run_id,
+            scenario_id=context.scenario_id,
+            metadata=metadata,
+        ),
+        success=outcome != "writer_total_failure",
+        retry_count=max(0, int(attempts) - 1),
+        parse_valid=None,
+        error=error,
+        raw_response_id=None,
+        upstream_provider=upstream_provider,
+    )
+
+
 def _enqueue_record(**kwargs: Any) -> None:
     """Queue telemetry off the reply path with a hard memory bound."""
     global _pending_writes

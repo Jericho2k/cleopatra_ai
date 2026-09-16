@@ -10,6 +10,10 @@ Verified against the OpenRouter request schema published in the official
     ``data_collection`` ``"deny"`` restricts routing to providers that do not
                         collect user data; the request errors when no eligible
                         provider meets it.
+    ``ignore``          list of provider slugs the request may NOT use. This
+                        is what expresses "any eligible host EXCEPT the one
+                        that just failed" without an operator maintaining a
+                        list of every Kimi host by hand.
     ``zdr``             true restricts routing to Zero Data Retention
                         endpoints. Left off by default — see below.
 
@@ -28,6 +32,28 @@ configures the controls OpenRouter exposes; the actual guarantee depends on the
 pinned provider's own policy, which operators must confirm on the model's
 provider page before relying on it. ``OPENROUTER_ZDR=true`` is available for
 deployments that have confirmed a ZDR endpoint exists for the pinned model.
+
+TWO ROUTING MODES, AND WHY THERE IS NO THIRD
+--------------------------------------------
+Normal traffic is *pinned*: ``only=[Inceptron]``, ``allow_fallbacks=false``.
+That is the whole of production's healthy behaviour and it is unchanged — one
+provider, one warm prefix cache, one predictable price. OpenRouter can also
+express ordered preference directly (``order=[Inceptron]`` with
+``allow_fallbacks=true``), and that was deliberately NOT used: it switches
+upstream on the first error, which would silently discard the cache-affine
+retries that a passing rate limit needs, and would leave nothing to measure.
+
+*Alternate* mode is the recovery mode, reached only after the pinned provider
+has failed repeatedly within one turn. It asks OpenRouter to route the SAME
+model anywhere eligible except the provider that just failed. Discovery is
+OpenRouter's job — ``ignore=[preferred]`` with fallbacks allowed — so no
+operator has to keep a list of twenty Kimi hosts current. ``OPENROUTER_FALLBACK_PROVIDERS``
+narrows that to an explicit list for a deployment that wants one.
+
+``data_collection`` and ``zdr`` are applied identically in BOTH modes. Provider
+failover must never be a way to reach a host the privacy configuration excludes:
+if ``deny`` leaves no alternate eligible, the alternate attempt fails and the
+turn goes to the model fallback, which is the correct outcome.
 """
 
 from __future__ import annotations
@@ -43,6 +69,13 @@ DEFAULT_API_KEY_ENV = "OPENROUTER_API_KEY"
 # in OpenRouter's published ProviderName enum and a live provider for
 # moonshotai/kimi-k2.6. Overridable without a deploy via OPENROUTER_PROVIDERS.
 DEFAULT_PINNED_PROVIDERS = ("Inceptron",)
+
+# How one request is routed among the eligible hosts for its model.
+#
+# PINNED is normal production traffic and is the default everywhere, so cache
+# affinity is preserved unless a caller explicitly asks for recovery routing.
+PROVIDER_MODE_PINNED = "pinned"
+PROVIDER_MODE_ALTERNATE = "alternate"
 
 _SESSION_ID_MAX_LENGTH = 256
 
@@ -69,7 +102,11 @@ def _csv(name: str, default: tuple[str, ...]) -> list[str]:
 
 
 def pinned_providers(target_metadata: dict[str, Any] | None = None) -> list[str]:
-    """Return the provider slugs this route is allowed to use."""
+    """Return the PREFERRED provider slugs for this route.
+
+    This is what healthy traffic uses and is deliberately a pin, not a
+    preference order: see the module docstring.
+    """
 
     metadata = target_metadata or {}
     catalog_providers = metadata.get("openrouter_providers")
@@ -82,21 +119,65 @@ def pinned_providers(target_metadata: dict[str, Any] | None = None) -> list[str]
     return _csv("OPENROUTER_PROVIDERS", catalog_default)
 
 
+def alternate_providers() -> list[str]:
+    """Explicit recovery hosts, when a deployment names them.
+
+    Empty is the normal and preferred answer: an empty list means "let
+    OpenRouter pick any eligible host that is not the preferred one", which is
+    the only version of this that does not rot as providers come and go.
+    """
+
+    return _csv("OPENROUTER_FALLBACK_PROVIDERS", ())
+
+
+def provider_failover_enabled() -> bool:
+    """Whether a turn may leave the preferred provider after repeated failure.
+
+    On by default. Turning it off restores the pre-failover behaviour exactly:
+    the pinned attempts, then the model fallback.
+    """
+
+    return _flag("OPENROUTER_PROVIDER_FAILOVER", True)
+
+
 def provider_preferences(
     target_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the ``provider`` routing object for one OpenRouter request."""
+    """Build the ``provider`` routing object for one OpenRouter request.
 
+    ``target_metadata["openrouter_provider_mode"]`` selects the mode. Absent
+    means ``PROVIDER_MODE_PINNED``, so every existing caller — and every
+    healthy production request — keeps exactly the routing it had.
+    """
+
+    metadata = target_metadata or {}
+    mode = str(metadata.get("openrouter_provider_mode") or PROVIDER_MODE_PINNED)
     preferences: dict[str, Any] = {}
 
-    providers = pinned_providers(target_metadata)
-    if providers:
+    providers = pinned_providers(metadata)
+
+    if mode == PROVIDER_MODE_ALTERNATE:
+        explicit = alternate_providers()
+        if explicit:
+            preferences["only"] = explicit
+        elif providers:
+            # Discovery rather than a hand-maintained list: anyone eligible
+            # except the host this turn has already given up on.
+            preferences["ignore"] = providers
+        # The point of this attempt is to leave the failing provider, so
+        # fallbacks are allowed regardless of OPENROUTER_ALLOW_FALLBACKS —
+        # that variable governs NORMAL traffic, which is still pinned.
+        preferences["allow_fallbacks"] = True
+    elif providers:
         preferences["only"] = providers
         # Fail closed. Without this, an unavailable Inceptron would silently
         # become some other upstream with different behaviour, different
-        # pricing, and a cold cache.
+        # pricing, and a cold cache — on the very first attempt, which is
+        # precisely what the recovery ladder exists to make deliberate.
         preferences["allow_fallbacks"] = _flag("OPENROUTER_ALLOW_FALLBACKS", False)
 
+    # Privacy and eligibility are identical in both modes. Recovery is never a
+    # reason to widen them.
     data_collection = (os.getenv("OPENROUTER_DATA_COLLECTION") or "deny").strip().lower()
     if data_collection in {"deny", "allow"}:
         preferences["data_collection"] = data_collection

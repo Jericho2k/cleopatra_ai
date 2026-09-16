@@ -203,8 +203,17 @@ the category bridge is applied at read time. New dials, all optional:
 | `PRICE_LEARNING_EFFORTLESS_PURCHASE_STREAK` | `2` | Confirmed purchases before repeat-buyer uplift applies. |
 | `PRICE_LEARNING_CUSTOMER_PRICE_STEP_CENTS` | `500` | Customer-facing price grid. |
 | `PRICE_LEARNING_POLICY_CACHE_SECONDS` | `60` | In-process TTL for scoped pricing settings. |
-| `WRITER_PRIMARY_RETRY_ATTEMPTS` | `4` | Attempts against the profile's primary writer before any fallback (`cleo_v3` only). |
-| `WRITER_PRIMARY_RETRY_WAIT_SECONDS` | `5,30,60` | Waits before primary attempts 2, 3 and 4. |
+| `WRITER_KIMI_PINNED_ATTEMPTS` | `3` | Cache-affine attempts against the preferred OpenRouter upstream before failover (`cleo_v3` only). |
+| `WRITER_KIMI_PINNED_WAIT_SECONDS` | `5,30` | Waits before pinned attempts 2 and 3. Attempt 1 is immediate. |
+| `WRITER_KIMI_ALTERNATE_ATTEMPTS` | `2` | Attempts at the SAME model on another eligible host, once the preferred one is unhealthy for this turn. |
+| `WRITER_KIMI_ALTERNATE_WAIT_SECONDS` | `0,5` | Waits before those. The first is zero: a different host's capacity has nothing to do with the rate limit just hit. |
+| `OPENROUTER_PROVIDER_FAILOVER` | `true` | Whether a turn may leave the preferred provider after repeated transient failure. Per-turn recovery, never load balancing. |
+| `OPENROUTER_FALLBACK_PROVIDERS` | *(empty)* | Explicit recovery hosts. Empty lets OpenRouter discover any eligible host that is not the preferred one. |
+| `WRITER_TURN_DEADLINE_SECONDS` | *(derived)* | Backend-owned ceiling for one writer turn. Derived from the ladder and each target's client timeout unless set. |
+
+`WRITER_PRIMARY_RETRY_ATTEMPTS` and `WRITER_PRIMARY_RETRY_WAIT_SECONDS` are
+retired and have no runtime effect; the backend logs `[WRITER CONFIG]` once at
+startup if either is still set.
 
 `db/incremental_offer_v1.sql` drops the two-package policy dials
 (`offer_two_packages`, `quick_package_target_cents`, `full_package_target_cents`,

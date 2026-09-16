@@ -891,6 +891,73 @@ def test_real_fan_auto_still_delivers_through_the_platform(world, spy, monkeypat
     assert [r["content"] for r in _creator_rows(db)] == ["hey", "what are you doing?"]
 
 
+def test_real_fan_auto_does_not_depend_on_the_simulator_turn_record(
+    world, spy, monkeypatch, two_bubble_turn
+):
+    """Backend-driven, and it stays backend-driven.
+
+    The durable/pollable turn record exists for operator VISIBILITY in the
+    Simulator. A real fan's reply must not acquire a dependency on it — nothing
+    is watching, nobody polls, and a delivery that waited on a dashboard
+    connection would be a far worse outage than the one this pass fixes.
+    """
+    monkeypatch.setenv("APIFANSLY_ENABLED", "true")
+    db, _calls = world
+    sent: list[tuple] = []
+    turn_writes: list[str] = []
+
+    for row in db.tables["fans"]:
+        row["platform_fan_id"] = "884422113355"
+        row["fansly_group_id"] = "group-1"
+
+    monkeypatch.setattr(
+        suggestions,
+        "get_fan_by_id",
+        lambda _f: _value(
+            Fan(
+                id="fan-test",
+                display_name="Real Fan",
+                platform_fan_id="884422113355",
+                fansly_group_id="group-1",
+            )
+        ),
+    )
+
+    async def fake_send(account_id, group_id, text):
+        sent.append((account_id, group_id, text))
+        return f"platform-{len(sent)}"
+
+    monkeypatch.setattr("main.send_fansly_message", fake_send)
+
+    from services import simulation_turns
+
+    async def forbidden(*_args, **_kwargs):
+        turn_writes.append("start_turn")
+        raise AssertionError("real Full Auto must not create a simulation turn")
+
+    monkeypatch.setattr(simulation_turns, "start_turn", forbidden)
+    monkeypatch.setattr(simulation_turns, "execute_turn", forbidden)
+
+    async def scenario():
+        task = asyncio.create_task(
+            suggestions._debounced_auto_reply(
+                "fan-test",
+                "creator-1",
+                skip_debounce=True,
+                skip_availability=True,
+                skip_human_delays=True,
+            )
+        )
+        suggestions._pending_auto_replies["fan-test"] = task
+        await task
+
+    _run(scenario())
+
+    assert [s[2] for s in sent] == ["hey", "what are you doing?"]
+    assert turn_writes == []
+    assert db.tables.get("simulation_turns", []) == []
+
+
 def test_real_fan_auto_is_blocked_when_the_connector_is_disabled(world, spy, monkeypatch):
     """Never persist a creator message as delivered when nothing was sent."""
     monkeypatch.setenv("APIFANSLY_ENABLED", "false")

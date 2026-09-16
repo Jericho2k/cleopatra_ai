@@ -7,15 +7,21 @@ import json
 import os
 import random
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from ai import openrouter_routing, writer_recovery
 from ai.model_providers import complete, get_runtime_target
 from ai.prompt_blocks import flatten_message_content
 from ai.session_affinity import writer_end_user_id, writer_session_id
 from models.model_runtime import ModelTarget, ModelTelemetryContext
 from models.schemas import Persona
-from services.model_telemetry import record_model_failure, record_model_result
+from services.model_telemetry import (
+    record_model_failure,
+    record_model_result,
+    record_writer_recovery_outcome,
+)
 from services.model_availability import (
     record_model_transport_failure,
     record_model_transport_success,
@@ -370,6 +376,8 @@ def _telemetry_context_for_attempt(
     attempt_target: ModelTarget,
     fallback_target: ModelTarget | None,
     attempt: int,
+    role: str = "",
+    routed_provider: str = "",
 ) -> ModelTelemetryContext:
     fallback_used = not _same_model_target(primary_target, attempt_target)
     reserved = {
@@ -391,6 +399,12 @@ def _telemetry_context_for_attempt(
             "writer_fallback_used": fallback_used,
             "writer_attempt_provider": attempt_target.provider,
             "writer_attempt_model": attempt_target.model,
+            # Which rung of the recovery ladder this was, and which upstream it
+            # was aimed at. "openrouter" names an aggregator and cannot answer
+            # "did the Inceptron pin hold?", which is the question this pass
+            # exists to make answerable.
+            "writer_recovery_role": role or None,
+            "writer_routed_provider": routed_provider or None,
             "writer_primary_provider": primary_target.provider,
             "writer_primary_model": primary_target.model,
             "writer_fallback_provider": (
@@ -411,16 +425,17 @@ def _telemetry_context_for_attempt(
     )
 
 
+
+
 # COST-001 — bounded jittered backoff between transport retries.
 #
-# Kimi is pinned to a single upstream with allow_fallbacks=False, so a retry
-# cannot route around a throttled provider. Three immediate requests into a
-# provider that just returned 429 is the most likely cascading-failure path in
-# the system, and it repeats under every durable action retry.
+# Used by the FROZEN legacy plan, and as a floor-raiser under the persistent
+# plan when a provider advertises a Retry-After longer than the schedule. The
+# persistent plan's own waits are fixed constants in ai/writer_recovery.py.
 _BACKOFF_BASE_SECONDS = float(os.getenv("WRITER_RETRY_BASE_SECONDS", "0.5"))
 _BACKOFF_MAX_SECONDS = float(os.getenv("WRITER_RETRY_MAX_SECONDS", "8.0"))
 # An upstream may advertise a very long Retry-After. Waiting minutes inside a
-# request is worse than giving up, so honour it only up to this bound.
+# turn is worse than moving to another host, so honour it only up to this bound.
 _RETRY_AFTER_CAP_SECONDS = float(os.getenv("WRITER_RETRY_AFTER_CAP_SECONDS", "30.0"))
 
 
@@ -435,37 +450,21 @@ _RETRY_AFTER_CAP_SECONDS = float(os.getenv("WRITER_RETRY_AFTER_CAP_SECONDS", "30
 # candidate — was enough to hand the turn to Qwen, so "primary: Kimi" was true
 # of the configuration and frequently false of the output.
 #
-# The persistent plan gives the primary model four real attempts, spaced far
-# enough apart that a rate limit or a brief provider incident has time to clear,
-# and only then falls back. The waits are constants here rather than sleeps
-# scattered through the attempt loop, so the schedule is one thing to read, one
-# thing to configure, and one thing for a test to patch.
+# The persistent plan keeps the profile's own writer for as long as it can
+# plausibly be served: several cache-affine attempts on the preferred upstream,
+# then the SAME model on another eligible host, and only then the fallback
+# model. The shape of that ladder lives in ai/writer_recovery.py, so the
+# schedule is one thing to read, one thing to configure, and one thing for a
+# test to patch.
 
-
-def _wait_schedule(env_name: str, default: tuple[float, ...]) -> tuple[float, ...]:
-    """Read a comma-separated wait schedule from the environment."""
-    raw = os.getenv(env_name)
-    if not raw:
-        return default
-    waits: list[float] = []
-    for chunk in raw.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        try:
-            waits.append(max(0.0, float(chunk)))
-        except ValueError:
-            return default
-    return tuple(waits) or default
-
-
-# Waits BEFORE primary attempts 2, 3 and 4. Attempt 1 is immediate.
-PRIMARY_RETRY_WAIT_SECONDS: tuple[float, ...] = _wait_schedule(
-    "WRITER_PRIMARY_RETRY_WAIT_SECONDS", (5.0, 30.0, 60.0)
-)
-PRIMARY_RETRY_ATTEMPTS = max(
-    1, int(os.getenv("WRITER_PRIMARY_RETRY_ATTEMPTS", "4") or 4)
-)
+# Pinned attempts against the preferred upstream, and the waits between them.
+# Attempt 1 is immediate; these are the waits BEFORE attempts 2..N.
+KIMI_PINNED_ATTEMPTS = writer_recovery.pinned_attempts()
+KIMI_PINNED_WAIT_SECONDS: tuple[float, ...] = writer_recovery.pinned_waits()
+# Attempts at the same model on a different eligible host, once the preferred
+# one is considered unhealthy for this turn.
+KIMI_ALTERNATE_ATTEMPTS = writer_recovery.alternate_attempts()
+KIMI_ALTERNATE_WAIT_SECONDS: tuple[float, ...] = writer_recovery.alternate_waits()
 
 
 @dataclass(frozen=True)
@@ -473,10 +472,16 @@ class WriterRetryPolicy:
     """How hard a turn tries the primary writer before accepting the fallback."""
 
     label: str
-    #: Attempts against the profile's primary model before any fallback.
+    #: Cache-affine attempts against the profile's primary model on its
+    #: preferred upstream.
     primary_attempts: int = 2
-    #: Fixed waits before primary attempts 2..N. Empty means jittered backoff.
+    #: Fixed waits before pinned attempts 2..N. Empty means jittered backoff.
     primary_waits: tuple[float, ...] = ()
+    #: Attempts at the SAME model on another eligible host, after the pinned
+    #: ones are spent. Zero keeps the frozen "pinned, then fallback" shape.
+    alternate_provider_attempts: int = 0
+    #: Waits before alternate attempts 1..N. The first is normally zero.
+    alternate_provider_waits: tuple[float, ...] = ()
     #: Whether output the validator rejected is worth another primary attempt.
     retry_rejected_output: bool = False
     #: Whether a turn with no configured fallback repeats the primary once more.
@@ -487,64 +492,53 @@ class WriterRetryPolicy:
     backoff_before_fallback: bool = True
 
     def wait_before_primary_attempt(self, attempt_number: int) -> float:
-        """Seconds to wait before primary attempt ``attempt_number`` (1-based)."""
+        """Seconds to wait before pinned attempt ``attempt_number`` (1-based)."""
         index = attempt_number - 2
         if index < 0 or index >= len(self.primary_waits):
             return 0.0
         return float(self.primary_waits[index])
 
+    def build_plan(
+        self,
+        primary_target: ModelTarget,
+        fallback_target: ModelTarget | None,
+    ) -> tuple[writer_recovery.WriterAttempt, ...]:
+        """The whole ladder for one turn, resolved before any request is made."""
+        return writer_recovery.build_attempt_plan(
+            primary_target,
+            fallback_target,
+            pinned=self.primary_attempts,
+            pinned_wait_schedule=self.primary_waits,
+            alternate=self.alternate_provider_attempts,
+            alternate_wait_schedule=self.alternate_provider_waits,
+            repeat_primary_without_fallback=self.repeat_primary_without_fallback,
+        )
+
 
 # The frozen plan. ``cleo_legacy_v1`` and ``cleo_v2`` keep it exactly: two Kimi
-# attempts with jittered backoff, then the configured fallback. Changing it
-# would change the baseline those profiles exist to be.
+# attempts with jittered backoff, then the configured fallback, and no provider
+# failover at all. Changing it would change the baseline those profiles exist
+# to be.
 LEGACY_WRITER_RETRY_POLICY = WriterRetryPolicy(label="legacy")
 
-# ``cleo_v3``: Kimi is the writer, so Qwen is a last resort rather than a second
-# attempt.
+# ``cleo_v3``: Kimi is the writer, so another Kimi host comes before another
+# model, and Qwen is a last resort rather than a second attempt.
 PERSISTENT_PRIMARY_RETRY_POLICY = WriterRetryPolicy(
     label="persistent_primary",
-    primary_attempts=PRIMARY_RETRY_ATTEMPTS,
-    primary_waits=PRIMARY_RETRY_WAIT_SECONDS,
+    primary_attempts=KIMI_PINNED_ATTEMPTS,
+    primary_waits=KIMI_PINNED_WAIT_SECONDS,
+    alternate_provider_attempts=KIMI_ALTERNATE_ATTEMPTS,
+    alternate_provider_waits=KIMI_ALTERNATE_WAIT_SECONDS,
     retry_rejected_output=True,
     repeat_primary_without_fallback=False,
     backoff_before_fallback=False,
 )
 
 
-# Statuses that no amount of waiting can fix. Sleeping 95 seconds before
-# discovering the API key is still wrong helps nobody, so these skip straight to
-# the fallback. A 408/409/425/429 and every 5xx are deliberately absent: those
-# are exactly what the waits exist for.
-_PERMANENT_STATUS_CODES = frozenset({400, 401, 402, 403, 404, 405, 422})
-
-_PERMANENT_ERROR_MARKERS = (
-    "api key",
-    "api_key",
-    "unauthorized",
-    "invalid authentication",
-    "authentication_error",
-    "permission denied",
-    "not configured",
-    "no such model",
-    "unknown model",
-    "model not found",
-    "unable to access non-serverless model",
-)
-
-
-def is_permanent_failure(error: Exception) -> bool:
-    """Whether retrying this exact request against this model is pointless."""
-    status = _status_code(error)
-    if status is not None:
-        if status in _PERMANENT_STATUS_CODES:
-            return True
-        # Any other status that is not a server error and not a rate limit is
-        # still a client-side problem; retrying identical input will repeat it.
-        if 400 <= status < 500 and status not in {408, 409, 425, 429}:
-            return True
-        return False
-    text = str(error).lower()
-    return any(marker in text for marker in _PERMANENT_ERROR_MARKERS)
+# Classification lives in ai/writer_recovery.py so the generator, the telemetry
+# and the logs cannot disagree about what a failure was. Re-exported because
+# callers and tests already import it from here.
+is_permanent_failure = writer_recovery.is_permanent_failure
 
 
 async def _sleep(seconds: float) -> None:
@@ -581,12 +575,7 @@ def _retry_after_seconds(error: Exception) -> float | None:
 
 
 def _status_code(error: Exception) -> int | None:
-    code = getattr(error, "status_code", None)
-    if isinstance(code, int):
-        return code
-    response = getattr(error, "response", None)
-    code = getattr(response, "status_code", None)
-    return code if isinstance(code, int) else None
+    return writer_recovery.status_code(error)
 
 
 def _backoff_delay(attempt: int, error: Exception) -> float:
@@ -603,6 +592,33 @@ def _backoff_delay(attempt: int, error: Exception) -> float:
     return random.uniform(0.0, ceiling)
 
 
+def _routed_provider_label(target: ModelTarget) -> str:
+    """What to call the upstream this attempt is aimed at, in a log line.
+
+    For a direct provider that is simply the provider. For OpenRouter it is the
+    pin the request carries, because "openrouter" names an aggregator and says
+    nothing about which host is actually serving — which is the entire subject
+    of these log lines.
+    """
+    if target.provider != "openrouter":
+        return target.provider
+    mode = str((target.metadata or {}).get("openrouter_provider_mode") or "")
+    if mode == openrouter_routing.PROVIDER_MODE_ALTERNATE:
+        explicit = openrouter_routing.alternate_providers()
+        return "+".join(explicit) if explicit else "any_eligible_except_preferred"
+    pinned = openrouter_routing.pinned_providers(target.metadata)
+    return "+".join(pinned) if pinned else "openrouter_default"
+
+
+def _retry_log_prefix(target: ModelTarget) -> str:
+    """``[KIMI RETRY]`` for the aggregator-routed writer, ``[WRITER RETRY]`` else.
+
+    The incident vocabulary is about the Kimi/OpenRouter path specifically, and
+    a safety turn retried on Together is not that. One prefix per thing.
+    """
+    return "[KIMI RETRY]" if target.provider == "openrouter" else "[WRITER RETRY]"
+
+
 async def generate_replies(
     prompt_messages: list[dict[str, Any]],
     creator_persona: Persona,
@@ -615,30 +631,39 @@ async def generate_replies(
     retry_policy: WriterRetryPolicy = LEGACY_WRITER_RETRY_POLICY,
     profile_id: str = "",
 ) -> list[str]:
-    """Generate the turn's copy with a bounded primary-to-fallback plan.
+    """Generate the turn's copy with a bounded, deadline-owned recovery ladder.
 
-    ``retry_policy`` decides how many attempts the profile's PRIMARY model gets
-    and how long the turn waits between them. ``LEGACY_WRITER_RETRY_POLICY`` is
-    the frozen plan — two primary attempts with jittered backoff, then the
-    configured fallback — and is what ``cleo_legacy_v1`` and ``cleo_v2`` run.
-    ``PERSISTENT_PRIMARY_RETRY_POLICY`` gives the primary four attempts spaced
-    by ``PRIMARY_RETRY_WAIT_SECONDS`` before the fallback is reached at all,
-    because on ``cleo_v3`` Kimi IS the writer and Qwen is the last resort.
+    ``retry_policy`` decides how far the profile's own writer is pursued before
+    a different model is accepted. ``LEGACY_WRITER_RETRY_POLICY`` is the frozen
+    plan — two primary attempts with jittered backoff, then the configured
+    fallback, and no provider failover — and is what ``cleo_legacy_v1`` and
+    ``cleo_v2`` run. ``PERSISTENT_PRIMARY_RETRY_POLICY`` runs the V3 ladder:
+    cache-affine attempts on the preferred upstream, the SAME model on another
+    eligible host once that upstream is unhealthy for this turn, and the
+    fallback model only when the writer itself cannot be served anywhere.
 
     What went wrong still decides what happens next:
 
-    * transport/provider failure — retryable. Under the persistent policy the
-      wait is the configured one (raised to a longer advertised Retry-After,
-      capped); under the legacy policy it is bounded jittered backoff.
-    * a failure that no wait can fix — a bad key, an unknown model, a rejected
-      request — skips the remaining primary attempts and their sleeps entirely
-      and goes straight to the fallback.
+    * a rate limit, a provider 5xx, a timeout or a transport failure — retryable.
+      Under the persistent policy the wait is the configured one (raised to a
+      longer advertised Retry-After, capped); repeated retryable failure on the
+      preferred upstream is what makes it unhealthy for this turn and moves the
+      request to another host.
+    * a failure that no wait and no other host can fix — a bad key, an unknown
+      model, a request our own code malformed — skips every remaining primary
+      attempt and its sleeps entirely and goes straight to the fallback.
     * unparseable output — the model ignored the output contract. Retried on the
       same target, because that is a generation fault, not a routing one.
     * every candidate rejected by validation — under the legacy policy the model
       is retired for this turn (COST-001: an identical generation cannot help).
-      Under the persistent policy it is retried, because four attempts at the
-      profile's own writer is the point and sampling is not deterministic.
+      Under the persistent policy it is retried, because pursuing the profile's
+      own writer is the point and sampling is not deterministic.
+
+    The whole turn is bounded by a backend-owned deadline derived from the
+    ladder itself (``ai/writer_recovery.plan_deadline_seconds``). When it
+    expires the turn ends in a reported total failure rather than running on:
+    an abandoned generation must never arrive later as a reply nobody is
+    expecting.
 
     ``output_contract`` selects how the model's text is read back:
     ``CONTRACT_CANDIDATES`` for a JSON array of alternatives (Assisted), or
@@ -652,12 +677,11 @@ async def generate_replies(
     if _same_model_target(primary_target, fallback_target):
         fallback_target = None
 
-    primary_attempts = max(1, int(retry_policy.primary_attempts))
-    attempt_targets = [primary_target] * primary_attempts
-    if fallback_target is not None:
-        attempt_targets.append(fallback_target)
-    elif retry_policy.repeat_primary_without_fallback:
-        attempt_targets.append(primary_target)
+    writer_recovery.warn_about_retired_configuration()
+
+    plan = retry_policy.build_plan(primary_target, fallback_target)
+    deadline_seconds = writer_recovery.plan_deadline_seconds(plan)
+    started = time.monotonic()
 
     metadata = dict(telemetry_context or {})
     profile = str(
@@ -693,25 +717,65 @@ async def generate_replies(
             text, creator_persona, max_candidates=max_candidates
         )
 
+    def _elapsed() -> float:
+        return time.monotonic() - started
+
+    def _remaining() -> float:
+        return deadline_seconds - _elapsed()
+
     exhausted_targets: set[tuple[str, str]] = set()
     pending_backoff: float = 0.0
     pending_reason: str = ""
+    pending_failover_reason: str = ""
     skip_remaining_primary = False
-    primary_attempt_number = 0
+    failover_announced = False
+    pinned_attempts_made = 0
+    primary_attempts_made = 0
+    attempts_made = 0
+    succeeded: writer_recovery.WriterAttempt | None = None
+    deadline_exceeded = False
 
-    for attempt, attempt_target in enumerate(attempt_targets):
-        is_primary = _same_model_target(primary_target, attempt_target)
-        if is_primary:
-            primary_attempt_number += 1
-        target_key = (attempt_target.provider, attempt_target.model)
+    async def _report(
+        outcome: str,
+        *,
+        attempt: writer_recovery.WriterAttempt | None,
+        upstream: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        await record_writer_recovery_outcome(
+            outcome,
+            target=(attempt.target if attempt else primary_target),
+            context=_telemetry_context_for_attempt(
+                metadata,
+                primary_target=primary_target,
+                attempt_target=(attempt.target if attempt else primary_target),
+                fallback_target=fallback_target,
+                attempt=(attempt.index - 1) if attempt else attempts_made,
+            ),
+            profile=profile,
+            policy=retry_policy.label,
+            elapsed_ms=int(_elapsed() * 1000),
+            deadline_seconds=deadline_seconds,
+            attempts=attempts_made,
+            pinned_attempts=pinned_attempts_made,
+            alternate_attempts=max(0, primary_attempts_made - pinned_attempts_made),
+            role=(attempt.role if attempt else ""),
+            upstream_provider=upstream,
+            error=error,
+        )
 
-        if is_primary and skip_remaining_primary and primary_attempt_number > 1:
-            # A failure no wait can repair. Do not spend the configured delay
-            # rediscovering it; the fallback is the only thing left that can
-            # still answer this turn.
+    for attempt in plan:
+        target = attempt.target
+        target_key = (target.provider, target.model)
+
+        if attempt.is_primary_model and skip_remaining_primary:
+            # A failure no wait and no other host can repair. Do not spend the
+            # configured delay rediscovering it; the fallback is the only thing
+            # left that can still answer this turn.
             print(
-                f"[WRITER RETRY] profile={profile} model={attempt_target.model} "
-                f"attempt={primary_attempt_number} wait=0 "
+                f"{_retry_log_prefix(target)} profile={profile} "
+                f"model={target.model} attempt={attempt.attempt_in_role} "
+                f"role={attempt.role} wait=0 "
                 f"reason=skipped_permanent_failure:{pending_reason or 'unknown'}"
             )
             continue
@@ -720,57 +784,128 @@ async def generate_replies(
             # Validation already refused this model's output and the policy says
             # another identical generation from it is pure cost (COST-001).
             print(
-                f"[GENERATOR] skipping attempt {attempt + 1} on "
-                f"{attempt_target.model}: validation already rejected its output"
+                f"[GENERATOR] skipping attempt {attempt.index} on "
+                f"{target.model}: validation already rejected its output"
             )
             continue
 
-        if is_primary and primary_attempt_number > 1:
-            wait = retry_policy.wait_before_primary_attempt(primary_attempt_number)
+        wait = attempt.wait_before
+        if attempt.role == writer_recovery.ROLE_FALLBACK:
+            wait = pending_backoff if retry_policy.backoff_before_fallback else 0.0
+        elif attempt.attempt_in_role > 1:
             # A provider that asked for longer than the schedule gets it, up to
             # the cap; the schedule is a floor, never a way to ignore a 429.
+            # Applies to the alternate host too: if IT rate-limits us, its
+            # Retry-After is about it, and the second alternate attempt owes it
+            # the same respect.
+            #
+            # The FIRST alternate attempt deliberately does not inherit this.
+            # The backoff there came from the provider we have just given up
+            # on, and its rate limit says nothing about a different host.
             wait = max(wait, pending_backoff)
-            print(
-                f"[WRITER RETRY] profile={profile} model={attempt_target.model} "
-                f"attempt={primary_attempt_number} wait={wait:g} "
-                f"reason={pending_reason or 'unknown'}"
-            )
-            if wait > 0:
-                await _sleep(wait)
-            pending_backoff = 0.0
-        elif pending_backoff > 0 and (is_primary or retry_policy.backoff_before_fallback):
-            print(
-                f"[GENERATOR] backing off {pending_backoff:.2f}s before attempt "
-                f"{attempt + 1} on {attempt_target.model}"
-            )
-            await _sleep(pending_backoff)
-            pending_backoff = 0.0
+        elif attempt.role == writer_recovery.ROLE_PINNED and not retry_policy.primary_waits:
+            # The legacy plan has no schedule of its own: jittered backoff is
+            # the whole of its spacing.
+            wait = pending_backoff
 
-        if not is_primary:
+        # The deadline is checked BEFORE the wait, so a turn never sleeps into
+        # an expiry it could already see coming.
+        if _remaining() <= wait:
+            deadline_exceeded = True
+            print(
+                f"[WRITER DEADLINE] profile={profile} policy={retry_policy.label} "
+                f"elapsed={_elapsed():.1f}s budget={deadline_seconds:.1f}s "
+                f"attempts={attempts_made} "
+                f"abandoned_before=attempt_{attempt.index}:{attempt.role} "
+                f"reason={pending_reason or 'deadline'}"
+            )
+            break
+
+        if attempt.role == writer_recovery.ROLE_ALTERNATE and not failover_announced:
+            failover_announced = True
+            print(
+                f"[KIMI PROVIDER FAILOVER] profile={profile} "
+                f"from={_routed_provider_label(primary_target)} "
+                f"to={_routed_provider_label(target)} "
+                f"model={target.model} "
+                f"reason={pending_failover_reason or 'repeated_failure'} "
+                f"after_pinned_attempts={pinned_attempts_made}"
+            )
+        elif attempt.role == writer_recovery.ROLE_FALLBACK:
             print(
                 f"[WRITER FALLBACK] profile={profile} "
-                f"primary={primary_target.model} fallback={attempt_target.model} "
-                f"after_primary_attempts={primary_attempt_number} "
+                f"primary={primary_target.model} fallback={target.model} "
+                f"after_primary_attempts={primary_attempts_made} "
+                f"reason={'kimi_exhausted' if primary_attempts_made else 'no_primary_attempt'}"
+                f":{pending_reason or 'unknown'}"
+            )
+        elif attempt.attempt_in_role > 1 or attempt.role == writer_recovery.ROLE_ALTERNATE:
+            print(
+                f"{_retry_log_prefix(target)} profile={profile} "
+                f"model={target.model} attempt={attempt.attempt_in_role} "
+                f"role={attempt.role} wait={wait:g} "
+                f"provider={_routed_provider_label(target)} "
                 f"reason={pending_reason or 'unknown'}"
             )
+        else:
+            print(
+                f"[WRITER PRIMARY] profile={profile} "
+                f"provider={_routed_provider_label(target)} "
+                f"model={target.model} attempt={attempt.attempt_in_role} "
+                f"deadline={deadline_seconds:.0f}s"
+            )
+
+        if wait > 0:
+            await _sleep(wait)
+        pending_backoff = 0.0
+
+        # Re-checked after the wait: the sleep is where most of a long ladder's
+        # time goes, and a turn that woke up past its budget must not then
+        # start a request nobody will be waiting for.
+        remaining = _remaining()
+        if remaining <= 0:
+            deadline_exceeded = True
+            print(
+                f"[WRITER DEADLINE] profile={profile} policy={retry_policy.label} "
+                f"elapsed={_elapsed():.1f}s budget={deadline_seconds:.1f}s "
+                f"attempts={attempts_made} "
+                f"abandoned_before=attempt_{attempt.index}:{attempt.role} "
+                f"reason={pending_reason or 'deadline'}"
+            )
+            break
+
+        attempts_made += 1
+        if attempt.is_primary_model:
+            primary_attempts_made += 1
+            if attempt.role == writer_recovery.ROLE_PINNED:
+                pinned_attempts_made += 1
 
         context = _telemetry_context_for_attempt(
             metadata,
             primary_target=primary_target,
-            attempt_target=attempt_target,
+            attempt_target=target,
             fallback_target=fallback_target,
-            attempt=attempt,
+            attempt=attempt.index - 1,
+            role=attempt.role,
+            routed_provider=_routed_provider_label(target),
         )
         try:
-            result = await complete(
-                attempt_target,
-                system=system,
-                messages=messages,
-                max_tokens=1000,
-                session_id=session_id,
-                end_user_id=end_user_id,
+            # The per-attempt ceiling is whichever is tighter: the target's own
+            # client timeout, or what is left of the turn's budget. Without the
+            # second, one slow provider could consume a deadline the remaining
+            # rungs were supposed to share.
+            result = await asyncio.wait_for(
+                complete(
+                    target,
+                    system=system,
+                    messages=messages,
+                    max_tokens=1000,
+                    session_id=session_id,
+                    end_user_id=end_user_id,
+                ),
+                timeout=remaining,
             )
-            record_model_transport_success(attempt_target.model)
+            record_model_transport_success(target.model)
             try:
                 outcome = _parse(result.text)
                 replies = outcome.replies
@@ -783,17 +918,17 @@ async def generate_replies(
                     result,
                     context,
                     success=False,
-                    retry_count=attempt,
+                    retry_count=attempt.index - 1,
                     parse_valid=False,
                     error=f"parse_error: {parse_error}",
                 )
                 print(
-                    f"[GENERATOR ERROR] attempt {attempt + 1} "
-                    f"model={attempt_target.model} parse_error={parse_error}"
+                    f"[GENERATOR ERROR] attempt {attempt.index} "
+                    f"model={target.model} parse_error={parse_error}"
                 )
                 _log_unsuccessful_generation(
-                    attempt=attempt + 1,
-                    target=attempt_target,
+                    attempt=attempt.index,
+                    target=target,
                     outcome="parse_error",
                     text=result.text,
                     output_tokens=result.usage.output_tokens,
@@ -804,22 +939,39 @@ async def generate_replies(
                 result,
                 context,
                 success=bool(replies),
-                retry_count=attempt,
+                retry_count=attempt.index - 1,
                 parse_valid=bool(replies),
                 error=None if replies else f"reply candidates failed: {parse_reason}",
             )
             if replies:
-                if not _same_model_target(primary_target, attempt_target):
+                succeeded = attempt
+                upstream = getattr(result, "upstream_provider", None)
+                if attempt.role == writer_recovery.ROLE_ALTERNATE:
+                    print(
+                        f"[KIMI PROVIDER SUCCESS] profile={profile} "
+                        f"provider={upstream or _routed_provider_label(target)} "
+                        f"model={target.model} "
+                        f"after_pinned_attempts={pinned_attempts_made}"
+                    )
+                elif attempt.role == writer_recovery.ROLE_FALLBACK:
                     print(
                         f"[WRITER ROUTE] fallback succeeded "
-                        f"primary={primary_target.model} fallback={attempt_target.model}"
+                        f"primary={primary_target.model} fallback={target.model}"
                     )
+                await _report(
+                    writer_recovery.outcome_for(attempt),
+                    attempt=attempt,
+                    upstream=upstream,
+                )
                 return replies
 
-            pending_reason = parse_reason
+            pending_reason = writer_recovery.REASON_UNPARSEABLE
+            if parse_reason == PARSE_ALL_REJECTED:
+                pending_reason = writer_recovery.REASON_REJECTED
+            pending_failover_reason = f"repeated_{pending_reason}"
             _log_unsuccessful_generation(
-                attempt=attempt + 1,
-                target=attempt_target,
+                attempt=attempt.index,
+                target=target,
                 outcome=parse_reason,
                 text=result.text,
                 output_tokens=result.usage.output_tokens,
@@ -830,31 +982,67 @@ async def generate_replies(
                 # configured fallback may still be tried below.
                 exhausted_targets.add(target_key)
                 print(
-                    f"[GENERATOR] attempt {attempt + 1} model={attempt_target.model} "
+                    f"[GENERATOR] attempt {attempt.index} model={target.model} "
                     "produced only rejected candidates; not retrying this model"
                 )
-        except Exception as error:
-            record_model_transport_failure(attempt_target.model, error)
-            status = _status_code(error)
-            permanent = is_permanent_failure(error)
-            pending_reason = (
-                f"{'permanent' if permanent else 'transport'}"
-                f"{f':{status}' if status is not None else ''}"
+        except asyncio.TimeoutError:
+            # The turn's budget ran out inside this request, not the provider's
+            # own client timeout (which surfaces as an SDK error below). The
+            # request is already cancelled by wait_for, so nothing it would
+            # have produced can arrive later.
+            deadline_exceeded = True
+            print(
+                f"[WRITER DEADLINE] profile={profile} policy={retry_policy.label} "
+                f"elapsed={_elapsed():.1f}s budget={deadline_seconds:.1f}s "
+                f"attempts={attempts_made} "
+                f"cancelled=attempt_{attempt.index}:{attempt.role} "
+                f"model={target.model}"
             )
-            pending_backoff = 0.0 if permanent else _backoff_delay(attempt, error)
-            if permanent and is_primary:
+            await record_model_failure(
+                target,
+                context,
+                error="writer turn deadline exceeded",
+                retry_count=attempt.index - 1,
+            )
+            break
+        except Exception as error:
+            record_model_transport_failure(target.model, error)
+            classification = writer_recovery.classify_failure(error)
+            pending_reason = classification.label
+            pending_failover_reason = (
+                f"repeated_{classification.status or classification.reason}"
+            )
+            pending_backoff = (
+                0.0 if not classification.retryable else _backoff_delay(attempt.index - 1, error)
+            )
+            if not classification.retryable and attempt.is_primary_model:
                 skip_remaining_primary = True
             await record_model_failure(
-                attempt_target,
+                target,
                 context,
                 error=str(error),
-                retry_count=attempt,
+                retry_count=attempt.index - 1,
             )
             print(
-                f"[GENERATOR ERROR] attempt {attempt + 1} "
-                f"provider={attempt_target.provider} "
-                f"model={attempt_target.model} status={status} error={error}"
+                f"[GENERATOR ERROR] attempt {attempt.index} "
+                f"provider={target.provider} "
+                f"routed_provider={_routed_provider_label(target)} "
+                f"model={target.model} status={classification.status} "
+                f"reason={classification.label} error={error}"
             )
 
-    print("[GENERATOR ERROR] all attempts failed — returning no suggestions (fail closed)")
+    print(
+        "[GENERATOR ERROR] all attempts failed — returning no suggestions "
+        f"(fail closed) profile={profile} attempts={attempts_made} "
+        f"deadline_exceeded={str(bool(deadline_exceeded)).lower()}"
+    )
+    await _report(
+        writer_recovery.OUTCOME_TOTAL_FAILURE,
+        attempt=succeeded,
+        error=(
+            "writer turn deadline exceeded"
+            if deadline_exceeded
+            else (pending_reason or "all attempts failed")
+        ),
+    )
     return []
