@@ -198,6 +198,12 @@ class Trajectory:
     #: the thing the row claims.
     requires_authoritative_purchase: bool = False
 
+    #: Authoritative state to establish before the first turn — currently
+    #: purchases the ledger should show. Applied by
+    #: services/trajectory_fixtures.py, which refuses to write it against
+    #: anything but a simulator test fan.
+    seed: dict[str, Any] = field(default_factory=dict)
+
 
 class TurnOutcome(str, Enum):
     """What actually happened on one turn, told apart from what it looks like.
@@ -332,6 +338,10 @@ class TrajectoryReport:
     clock_injected: bool = False
     #: How many turns ran queued work instead of delivering a customer message.
     due_worker_runs: int = 0
+    #: Authoritative state established before the first turn. Reported, so a
+    #: reader can see what the conversation started from rather than inferring
+    #: it from the transcript.
+    seeded_purchases: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def critical(self) -> list[Finding]:
@@ -437,6 +447,14 @@ class TrajectoryReport:
             "elapsed_days": self.elapsed_days,
             "clock_injected": self.clock_injected,
             "due_worker_runs": self.due_worker_runs,
+            "seeded_purchases": [
+                {
+                    "reference": row.get("reference"),
+                    "price_cents": row.get("price_cents"),
+                    "media_ids": row.get("media_ids"),
+                }
+                for row in self.seeded_purchases
+            ],
         }
 
     def render(self) -> str:
@@ -1086,7 +1104,10 @@ def coverage_gaps(
         )
 
     if trajectory.requires_authoritative_purchase:
-        recorded = any(
+        # Either the run seeded a purchase before it started, or a delivery it
+        # made recorded a price. Both are the ledger saying money moved; a
+        # customer message saying so is not.
+        recorded = bool(report.seeded_purchases) or any(
             record.get("delivery", {}).get("price_cents")
             for turn in report.turns
             for record in turn.provenance
@@ -1146,6 +1167,7 @@ def load_trajectories(payload: Sequence[dict[str, Any]]) -> list[Trajectory]:
                 requires_authoritative_purchase=bool(
                     requires.get("authoritative_purchase")
                 ),
+                seed=dict(raw.get("seed") or {}),
             )
         )
     return trajectories

@@ -186,7 +186,7 @@
       "turns": [
         {
           "message": "hey i bought that set yesterday",
-          "tests": "establishes a purchase"
+          "tests": "refers back to the seeded purchase; the ledger, not this message, is what establishes it"
         },
         {
           "message": "it wont open for me. can you check",
@@ -200,6 +200,19 @@
       ],
       "requires": {
         "authoritative_purchase": true
+      },
+      "seed": {
+        "purchases": [
+          {
+            "reference": "content-access-set",
+            "media_ids": [
+              "eval-media-1",
+              "eval-media-2"
+            ],
+            "price_cents": 2500,
+            "purchased_days_ago": 1
+          }
+        ]
       }
     },
     {
@@ -247,8 +260,7 @@
         }
       ],
       "requires": {
-        "elapsed_days": 3,
-        "authoritative_purchase": true
+        "elapsed_days": 3
       }
     },
     {

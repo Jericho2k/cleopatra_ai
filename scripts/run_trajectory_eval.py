@@ -41,6 +41,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from core import clock  # noqa: E402
+from services.trajectory_fixtures import (  # noqa: E402
+    FixtureRefused,
+    apply_seed,
+    clear_seeded,
+)
 from services.trajectory_eval import (  # noqa: E402
     TrajectoryReport,
     TurnRecord,
@@ -51,14 +56,23 @@ from services.trajectory_eval import (  # noqa: E402
 )
 
 
-def _declared_gaps(trajectory):
+def _declared_gaps(trajectory, *, use_clock: bool = False):
     """What this trajectory could not cover even if every turn succeeded.
 
     Built by asking the same function the real run uses, against a report
-    describing the best case: every declared turn ran, no clock was injected
-    (none exists), and no due-work cycle happened unless the fixture has an
-    unprompted turn. One definition of "covered", used by both paths.
+    describing the best case: every declared turn runs, every declared seed is
+    applied, a due-work cycle happens for each unprompted turn, and time
+    advances only if this invocation would advance it. One definition of
+    "covered", used by both paths, so --describe cannot drift from what a run
+    actually reports.
+
+    ``use_clock`` mirrors --simulate-time, because whether the elapsed-time
+    claims are covered is a property of the invocation and not of the file.
     """
+    elapsed = sum(
+        float(disturbance.days_since_previous or 0.0)
+        for disturbance in trajectory.disturbances
+    )
     best_case = TrajectoryReport(
         trajectory=trajectory.name,
         covers=trajectory.covers,
@@ -71,6 +85,13 @@ def _declared_gaps(trajectory):
             for disturbance in trajectory.disturbances
             if not str(disturbance.message or "").strip()
         ),
+        clock_injected=use_clock,
+        elapsed_days=elapsed if use_clock else 0.0,
+        # The seed has not been applied — nothing has run — but the file
+        # declares it, and describing a claim as uncovered when the very next
+        # run would cover it is the same class of wrong answer as the labels
+        # this whole mechanism exists to fix.
+        seeded_purchases=list(trajectory.seed.get("purchases") or []),
     )
     return coverage_gaps(trajectory, best_case)
 
@@ -150,15 +171,34 @@ async def _run_all(trajectories, creator_id: str, fan_id: str, *, use_clock: boo
             )
 
         # Fresh state between independent scenarios. A clock carried over
-        # from the previous trajectory is state, and the brief asks for
-        # scenarios not to inherit each other's.
+        # from the previous trajectory is state, and so is a purchase the last
+        # one seeded — the brief asks for scenarios not to inherit each
+        # other's, and the next trajectory would read a leftover delivery as
+        # a real one.
         clock.reset()
+        seeded: list[dict] = []
+        try:
+            await clear_seeded(creator, fan)
+            if trajectory.seed:
+                seeded = await apply_seed(
+                    creator_id=creator, fan_id=fan, seed=trajectory.seed
+                )
+        except FixtureRefused as refused:
+            # Refusing to seed is never a reason to fabricate the state
+            # anyway, and never a reason to run the trajectory as though the
+            # state were there. Say so and move on; the coverage check reports
+            # the purchase claim as uncovered.
+            print(f"[FIXTURE] {trajectory.name}: {refused}", file=sys.stderr)
 
-        reports.append(
-            await run_trajectory(
-                trajectory, send_turn=send_turn, advance_clock=advance_clock
-            )
+        report = await run_trajectory(
+            trajectory, send_turn=send_turn, advance_clock=advance_clock
         )
+        report.seeded_purchases = seeded
+        # Recomputed: the seed is what decides whether the purchase claim is
+        # covered, and run_trajectory could not know about it.
+        report.coverage_gaps = coverage_gaps(trajectory, report)
+        reports.append(report)
+
     clock.reset()
     return reports
 
@@ -218,7 +258,7 @@ def main() -> int:
             # The claim next to what the fixture can actually reach. Printing
             # the claim alone is how "40-80 turns of ordinary conversation"
             # came to sit above a seven-turn script for as long as it did.
-            for gap in _declared_gaps(trajectory):
+            for gap in _declared_gaps(trajectory, use_clock=args.simulate_time):
                 print(f"  {gap.render()}")
             for index, disturbance in enumerate(trajectory.disturbances):
                 marks = []
