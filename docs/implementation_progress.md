@@ -42,9 +42,22 @@ on its own, but the numbering may need renaming.
 
 | | |
 |---|---|
-| `Jericho2k/cleopatra_ai` `main` | `4c4f58f` — PR #48 merged 2026-09-17T08:31Z |
-| `Jericho2k/cleopatra-dashboard` `main` | `1b8c0c1` — PR #31 |
+| `Jericho2k/cleopatra_ai` `main` at session start | `4c4f58f` — PR #48 merged 2026-09-17T08:31Z |
+| `Jericho2k/cleopatra-dashboard` `main` at session start | `1b8c0c1` — PR #31 |
 | PR #48 | **Merged.** Everything it landed is on `main`; do not re-implement it. |
+
+### What this session landed
+
+| | |
+|---|---|
+| [cleopatra_ai#49](https://github.com/Jericho2k/cleopatra_ai/pull/49) | **Merged** (squash, `a7549dd`) — Sprints 0, 1, 2 and 3 |
+| [cleopatra-dashboard#32](https://github.com/Jericho2k/cleopatra-dashboard/pull/32) | **Merged** (squash, `8ff38c0`) — the dashboard halves of Sprints 0 and 1 |
+| Sprint 4 | Pushed to `claude/cleopatra-implementation-sprints-53j1xa` **after** #49 merged, so it is not on `main` yet and needs its own pull request. |
+
+Because #49 was squash-merged, none of this session's original commit SHAs are
+ancestors of `main` — check for the FILES, not the SHAs, before concluding
+something is missing. The branch was restarted from `main` and carries only the
+Sprint 4 commit.
 
 What PR #48 already did, and must not be proposed again: saved creator facts
 loaded in Full Auto; the direct paid resend replaced by a persisted
