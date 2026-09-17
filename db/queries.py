@@ -1066,29 +1066,75 @@ async def update_fan_ai_summary(fan_id: str, summary: dict) -> None:
 
 # --- Creator autonomy caps (per-creator, agency-configurable) ---
 
-async def freeze_fan_for_review(fan_id: str, reason: str) -> None:
+async def freeze_fan_for_review(fan_id: str, reason: str) -> str:
     """Mark a fan's conversation as frozen and needing human intervention.
-    Auto-mode will skip frozen fans until a human clears the flag in the dashboard."""
+
+    Auto-mode will skip frozen fans until a human clears the flag in the
+    dashboard.
+
+    Returns the new hold's ``review_case_id``. Every freeze mints a fresh one,
+    so two holds are never the same hold: a content-access hold that is cleared
+    and re-raised, and a crisis hold raised while a repair is in flight, both
+    used to be indistinguishable from "the hold this resolution was about". See
+    db/content_access_repair_v1.sql.
+    """
     from datetime import datetime, timezone
+
+    from services.content_access_repairs import new_case_id
+
+    case_id = new_case_id()
+
     def _update():
         get_supabase().table("fans").update({
             "needs_human_review": True,
             "review_reason": reason,
+            "review_case_id": case_id,
             "frozen_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", fan_id).execute()
     await asyncio.to_thread(_update)
+    return case_id
 
 
-async def clear_fan_review(fan_id: str) -> None:
-    """Clear a review hold only after its backend resolution has completed."""
+async def clear_fan_review(fan_id: str, *, expected_case_id: str | None = None) -> bool:
+    """Clear a review hold only after its backend resolution has completed.
+
+    ``expected_case_id`` makes this a compare-and-set against the hold the
+    caller actually resolved. Without it this was an unconditional update by
+    fan id, and a content-access repair that finished after a crisis hold had
+    been raised cleared the crisis hold — reproduced at backend 4a1683a, where
+    a conversation frozen for crisis language silently resumed.
+
+    Returns whether a hold was cleared. False means the hold moved underneath
+    the caller and is deliberately left alone; the caller reports the
+    resolution honestly rather than claiming a hold it did not clear.
+
+    The argument is optional because not every caller resolves a specific case
+    — an operator clearing a hold from the dashboard is acting on whatever is
+    there now, which is the unconditional behaviour and correct for them.
+    """
+    payload = {
+        "needs_human_review": False,
+        "review_reason": None,
+        "review_case_id": "",
+        "frozen_at": None,
+    }
+
     def _update():
-        get_supabase().table("fans").update({
-            "needs_human_review": False,
-            "review_reason": None,
-            "frozen_at": None,
-        }).eq("id", fan_id).execute()
+        query = get_supabase().table("fans").update(payload).eq("id", fan_id)
+        if expected_case_id is not None:
+            query = query.eq("review_case_id", expected_case_id)
+        return query.execute()
 
-    await asyncio.to_thread(_update)
+    result = await asyncio.to_thread(_update)
+    if expected_case_id is None:
+        return True
+    cleared = bool(getattr(result, "data", None))
+    if not cleared:
+        print(
+            f"[REVIEW] hold not cleared fan={fan_id}: the hold changed while "
+            f"the resolution was running (expected case={expected_case_id})"
+        )
+    return cleared
 
 
 async def set_fan_decline_lock(fan_id: str, price: float | None) -> None:

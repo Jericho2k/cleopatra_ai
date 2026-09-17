@@ -6908,9 +6908,20 @@ class ResolvePPVApprovalRequest(BaseModel):
 class ResolveFanReviewRequest(BaseModel):
     resolution: str
     amount: float | None = None
-    # Which confirmed purchase a content-access repair restores. Omitted means
-    # the most recent one (services/content_access.py).
+    # Which confirmed purchase a content-access repair restores.
+    #
+    # Required when the customer has more than one repairable purchase: the
+    # backend refuses rather than assuming the most recent, because assuming
+    # resends a working item and leaves the broken one broken
+    # (services/content_access.py).
     reference: str = ""
+    # The hold the operator was looking at when they decided. Sent back from
+    # the access panel so the resolution clears THAT hold and not whatever hold
+    # exists by the time it lands (db/content_access_repair_v1.sql).
+    review_case_id: str = ""
+    # Who resolved it. Same convention as ResolvePPVApprovalRequest: an
+    # auditable resolution needs an actor, and "the backend did it" is not one.
+    resolved_by: str | None = None
 
 
 @app.get(
@@ -6948,6 +6959,8 @@ async def resolve_review(fan_id: str, request: ResolveFanReviewRequest) -> dict:
             resolution=request.resolution,
             amount=request.amount,
             reference=request.reference,
+            review_case_id=request.review_case_id,
+            actor=request.resolved_by or "",
         )
     except (PPVRecoveryError, ContentAccessError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
