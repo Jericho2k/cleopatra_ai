@@ -149,6 +149,16 @@ class ConversationContext(BaseModel):
     ai_stack_profile: str = "cleo_legacy_v1"
     writer_prompt_version: str = "writer_v1"
 
+    # What this conversation is still carrying, already rendered to one line
+    # each (services/conversation_continuity.py). Given their own allowance in
+    # the context packet so recent small talk cannot evict an unanswered
+    # question — docs/autonomy_architecture_review.md §4. Empty is the
+    # pre-Sprint-2 behaviour exactly.
+    open_threads: list[str] = Field(default_factory=list)
+    # What earlier stretches of this conversation were about. Never proof of
+    # payment; ppv_deliveries is the authority on money.
+    conversation_episodes: list[str] = Field(default_factory=list)
+
 
 class SuggestionRequest(BaseModel):
     """Request body for the suggestion API."""
@@ -179,6 +189,13 @@ class SuggestionResponse(BaseModel):
     # as a normally analysed suggestion.
     analysis_degraded: bool = False
     analysis_degraded_reason: str = ""
+    # An opaque handle to this turn's provenance record, held in memory by the
+    # backend until the operator sends one of these candidates
+    # (services/reply_provenance.py). The dashboard returns it on POST /reply so
+    # the sent message can be attributed to the turn, the context and the model
+    # attempt that actually produced it. Empty when provenance is unavailable;
+    # the dashboard treats it as opaque and never displays it.
+    suggestion_token: str = ""
 
     @field_validator("suggestions")
     @classmethod

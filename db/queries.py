@@ -1118,3 +1118,107 @@ async def update_creator_legend(creator_id: str, new_facts: dict) -> dict:
             ).eq("id", creator_id).execute()
         await asyncio.to_thread(_write)
     return merged
+
+
+# --- Purchase aggregates under concurrent events ----------------------------
+#
+# Finding I of docs/autonomy_architecture_review.md, second half: purchase
+# recording "updates aggregate fan state through read/modify/write operations
+# that need concurrent-event verification".
+#
+# ``services/suggestions.py::record_ppv_purchase`` reads total_spent, sales_log
+# and not_sold_log near the top, then awaits the session, the ledger and the
+# platform before writing all three back. Two purchase events for one fan —
+# a webhook and the reconciliation sweep, or two webhooks — interleave inside
+# that gap. Both read $100, both write $125, and one $25 purchase disappears
+# from the customer's spend along with its sales_log entry. There is no
+# exception, no retry, and no log line: the money is simply gone from the
+# record, and spend tier, affordability and price learning all read the wrong
+# number from then on.
+#
+# A row version column would be the clean fix and needs a migration. This is
+# the version that does not: the write carries the value it was computed from
+# as a predicate, so a row somebody else has already moved refuses it, and the
+# caller recomputes against what is actually there. Same shape as the status
+# predicate in services/ppv_delivery_ledger.py, same reason.
+
+#: How many times a refused write is recomputed before giving up. Contention on
+#: one fan's row is two or three events at once, not a thundering herd; a
+#: budget rather than a loop, for the reason retry_transient_db_operation gives.
+_PURCHASE_CAS_ATTEMPTS = 4
+
+
+class PurchaseAggregateConflict(RuntimeError):
+    """Concurrent purchase events kept overwriting each other's spend."""
+
+
+async def apply_purchase_to_fan(
+    fan_id: str,
+    *,
+    merge,
+    expected_total_spent: int,
+    attempts: int = _PURCHASE_CAS_ATTEMPTS,
+) -> dict | None:
+    """Apply one purchase to a fan's aggregate state, or refuse to lose it.
+
+    ``merge`` receives the fan row as it actually is right now and returns the
+    update to write, or ``None`` when the purchase turns out to be already
+    recorded there. It may be called more than once, so it must be a pure
+    function of the row it is given — reading anything it captured from an
+    earlier snapshot is exactly the bug this closes.
+
+    The first attempt is guarded on ``expected_total_spent``, the value the
+    caller computed from. Each later attempt re-reads and guards on what it
+    found. Returns the row as written, or ``None`` when ``merge`` declined.
+
+    Raises ``PurchaseAggregateConflict`` when the budget runs out. A caller must
+    not treat that as "recorded": money that could not be written down is an
+    operator's problem, and silence is how it became invisible in the first
+    place.
+    """
+    guard = int(expected_total_spent)
+    row: dict | None = None
+
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        if attempt > 1:
+            # Re-read before recomputing: the whole point is to merge into the
+            # state that actually exists, not into the one this call started
+            # with.
+            fresh = await asyncio.to_thread(
+                lambda: get_supabase()
+                .table("fans")
+                .select(
+                    "total_spent, sales_log, not_sold_log, creator_id, "
+                    "needs_human_review, pending_ppv_check"
+                )
+                .eq("id", fan_id)
+                .single()
+                .execute()
+            )
+            row = fresh.data or {}
+            guard = int(row.get("total_spent") or 0)
+        update = merge(row)
+        if update is None:
+            return None
+
+        written = await asyncio.to_thread(
+            lambda: get_supabase()
+            .table("fans")
+            .update(dict(update))
+            .eq("id", fan_id)
+            .eq("total_spent", guard)
+            .execute()
+        )
+        rows = list(written.data or [])
+        if rows:
+            return rows[0]
+        print(
+            f"[PURCHASE CAS] fan={fan_id} attempt={attempt} "
+            f"expected_total_spent={guard} refused=true "
+            "reason=another_purchase_event_wrote_first"
+        )
+
+    raise PurchaseAggregateConflict(
+        f"could not apply a purchase to fan={fan_id} after {attempts} attempts; "
+        "concurrent purchase events kept overwriting each other"
+    )

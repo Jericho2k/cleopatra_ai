@@ -68,7 +68,13 @@ from models.schemas import (
     SuggestionRequest,
     SuggestionResponse,
 )
+from core.build_info import build_snapshot, describe_build, short_sha
 from services.ai_stack import resolve_ai_stack
+from services.reply_provenance import (
+    DELIVERY_TEXT,
+    SUGGESTION_PROVENANCE,
+    TRANSFORM_OPERATOR_EDIT,
+)
 from services.fan_intelligence import learn_from_fan_message
 from services.db_reliability import retry_db_read, retry_transient_db_operation
 from core.apifansly_gate import (
@@ -769,6 +775,15 @@ class ReplyRequest(BaseModel):
     creator_id: str
     content: str
     was_ai_suggested: bool = False
+    # Ground truth for an operator-sent reply. The token comes from the
+    # SuggestionResponse these candidates arrived in; suggestion_index says
+    # which of them the operator chose, and whether they edited it before
+    # sending. All three are optional: a reply typed from scratch, an older
+    # dashboard build, or a token that has expired all send exactly as before,
+    # with no provenance rather than invented provenance.
+    suggestion_token: str = ""
+    suggestion_index: int | None = None
+    suggestion_edited: bool | None = None
 
 
 class VaultMediaUrlsRequest(BaseModel):
@@ -1299,6 +1314,10 @@ async def lifespan(app: FastAPI):
     from core.environment import describe_environment
 
     print(f"[STARTUP] {describe_environment()}")
+    # The deployed commit and the flags that are actually on, once, at boot.
+    # docs/autonomy_architecture_review.md §6 step 1: a transcript is not
+    # evidence against a piece of code until both are on the record.
+    print(describe_build())
     # One line, once. Everything downstream suppresses its own work silently,
     # so this is the only place the disabled connector is announced.
     print(describe_apifansly())
@@ -1650,6 +1669,34 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
         ) from exc
     platform_message_id = sent_message_id(response_body)
 
+    # Close this reply's provenance record, if the dashboard handed one back.
+    # The receipt is read from the platform's response, never from the copy, so
+    # the record cannot claim a delivery that did not happen. A missing or
+    # expired token means no record at all — an operator's message must never
+    # fail to send because its evidence trail could not be completed.
+    media_context: dict | None = None
+    provenance = SUGGESTION_PROVENANCE.take(
+        req.suggestion_token, creator_id=req.creator_id, fan_id=req.fan_id
+    )
+    if provenance is not None:
+        if req.suggestion_index is not None:
+            provenance.record_decision(
+                source="assisted_operator",
+                action="send_suggestion",
+                extra={
+                    "chosen_index": req.suggestion_index,
+                    "operator_edited": req.suggestion_edited,
+                },
+            )
+        provenance.record_transform(
+            TRANSFORM_OPERATOR_EDIT, bool(req.suggestion_edited)
+        )
+        media_context = provenance.as_metadata(
+            delivery_kind=DELIVERY_TEXT,
+            platform_message_id=platform_message_id,
+        )
+        print(provenance.describe())
+
     message_id = await save_message(
         req.fan_id,
         req.creator_id,
@@ -1657,6 +1704,7 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
         req.content,
         req.was_ai_suggested,
         fansly_message_id=platform_message_id,
+        media_context=media_context,
     )
 
     # An assisted reply becomes creator canon here and nowhere earlier: this is
@@ -6860,6 +6908,9 @@ class ResolvePPVApprovalRequest(BaseModel):
 class ResolveFanReviewRequest(BaseModel):
     resolution: str
     amount: float | None = None
+    # Which confirmed purchase a content-access repair restores. Omitted means
+    # the most recent one (services/content_access.py).
+    reference: str = ""
 
 
 @app.get(
@@ -6888,6 +6939,7 @@ async def read_full_auto_status(fan_id: str) -> dict:
 )
 async def resolve_review(fan_id: str, request: ResolveFanReviewRequest) -> dict:
     """Resolve a frozen conversation through a deterministic backend action."""
+    from services.content_access import ContentAccessError
     from services.ppv_recovery import PPVRecoveryError, resolve_fan_review
 
     try:
@@ -6895,9 +6947,30 @@ async def resolve_review(fan_id: str, request: ResolveFanReviewRequest) -> dict:
             fan_id,
             resolution=request.resolution,
             amount=request.amount,
+            reference=request.reference,
         )
-    except PPVRecoveryError as exc:
+    except (PPVRecoveryError, ContentAccessError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get(
+    "/fan/{fan_id}/content-access",
+    dependencies=[Depends(require_fan_path_access)],
+)
+async def read_content_access(fan_id: str) -> dict:
+    """What this customer paid for, and what the platform shows for it now.
+
+    Read-only. It is what an operator opening a ``content_access_issue`` hold
+    sees instead of having to take the customer's word for what happened
+    (docs/autonomy_architecture_review.md §3B).
+    """
+    from services.content_access import ContentAccessError, inspect_content_access
+
+    try:
+        evidence = await inspect_content_access(fan_id)
+    except ContentAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return evidence.as_dict()
 
 
 @app.get(
@@ -9061,6 +9134,10 @@ async def health(request: Request = None) -> dict:
             "liveness": "ok",
             "error": type(exc).__name__,
             "vault_classifier_version": VAULT_CLASSIFIER_VERSION,
+            # Which commit is answering is knowable even when nothing else is.
+            # A process too unhealthy to describe itself is exactly when the
+            # deployed SHA matters most.
+            "build_sha": short_sha(),
         }
     return {
         **_health_payload(document, request),
@@ -9068,7 +9145,25 @@ async def health(request: Request = None) -> dict:
         "vault_semantics_configured": bool(
             os.environ.get("VAULT_SEMANTIC_BASE_URL", "").strip()
         ),
+        # Which commit is answering, and a digest of the flags it is running
+        # under. This path is public (Railway's healthcheck), so the digest
+        # goes here and the flag VALUES stay behind auth on /build.
+        "build_sha": short_sha(),
+        "flags_digest": build_snapshot(include_flags=False)["flags_digest"],
     }
+
+
+@app.get("/build")
+async def build_info() -> dict:
+    """The deployed commit and the behaviour flags it is actually running.
+
+    Authenticated, because the flag values name upstream hosts and which
+    controllers are live. This is the lookup that turns a ``flags_digest`` on a
+    message's provenance record into the configuration that produced it, which
+    is the whole point of recording the digest rather than the mapping on every
+    row (services/reply_provenance.py).
+    """
+    return build_snapshot()
 
 
 @app.get("/health/ready")

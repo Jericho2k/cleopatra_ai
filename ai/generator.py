@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ai import openrouter_routing, writer_recovery
+from ai.generation_trace import GenerationTrace
 from ai.model_providers import complete, get_runtime_target
 from ai.prompt_blocks import flatten_message_content
 from ai.session_affinity import writer_end_user_id, writer_session_id
@@ -630,6 +631,7 @@ async def generate_replies(
     output_contract: str = CONTRACT_CANDIDATES,
     retry_policy: WriterRetryPolicy = LEGACY_WRITER_RETRY_POLICY,
     profile_id: str = "",
+    trace: GenerationTrace | None = None,
 ) -> list[str]:
     """Generate the turn's copy with a bounded, deadline-owned recovery ladder.
 
@@ -670,6 +672,15 @@ async def generate_replies(
     ``CONTRACT_AUTO_MESSAGES`` for the Full Auto object whose ``messages`` array
     is ONE reply's bubbles. The auto contract returns a single joined reply, so
     downstream code still receives "the reply to send" and never a choice.
+
+    ``trace`` is an optional ``GenerationTrace`` the caller owns, into which this
+    function records which rung of the ladder actually answered. The return type
+    stays ``list[str]``, so nothing about the writer contract changes and callers
+    that pass nothing are unaffected; the trace exists because the model the
+    router ASKED for and the model that ANSWERED are different facts, and only
+    the first of them used to survive as far as the persisted message
+    (``docs/autonomy_architecture_review.md`` finding H). It is filled in on
+    total failure too: "every attempt failed" is ground truth worth keeping.
     """
 
     primary_target = target_override or get_runtime_target("CHAT")
@@ -687,6 +698,16 @@ async def generate_replies(
     profile = str(
         profile_id or metadata.get("ai_stack_profile") or "unknown"
     )
+    if trace is not None:
+        # Recorded before the first attempt, so a turn that never reaches a
+        # model still says which one it could not reach.
+        trace.record_request(
+            primary_target=primary_target,
+            fallback_target=fallback_target,
+            profile=profile,
+            policy=retry_policy.label,
+            deadline_seconds=deadline_seconds,
+        )
     # COST-002a — the system content is handed to the transport in whatever
     # shape build_prompt produced. Flattening it here is what used to discard
     # the cache_control marker before Anthropic ever saw it; the transport now
@@ -958,6 +979,21 @@ async def generate_replies(
                         f"[WRITER ROUTE] fallback succeeded "
                         f"primary={primary_target.model} fallback={target.model}"
                     )
+                if trace is not None:
+                    trace.record_success(
+                        target=target,
+                        role=attempt.role,
+                        attempt_index=attempt.index,
+                        upstream_provider=upstream,
+                        outcome=writer_recovery.outcome_for(attempt),
+                        attempts=attempts_made,
+                        pinned_attempts=pinned_attempts_made,
+                        alternate_attempts=max(
+                            0, primary_attempts_made - pinned_attempts_made
+                        ),
+                        elapsed_ms=int(_elapsed() * 1000),
+                    )
+                    print(trace.describe())
                 await _report(
                     writer_recovery.outcome_for(attempt),
                     attempt=attempt,
@@ -1036,13 +1072,25 @@ async def generate_replies(
         f"(fail closed) profile={profile} attempts={attempts_made} "
         f"deadline_exceeded={str(bool(deadline_exceeded)).lower()}"
     )
+    failure_reason = (
+        "writer turn deadline exceeded"
+        if deadline_exceeded
+        else (pending_reason or "all attempts failed")
+    )
+    if trace is not None:
+        trace.record_failure(
+            outcome=writer_recovery.OUTCOME_TOTAL_FAILURE,
+            reason=failure_reason,
+            attempts=attempts_made,
+            pinned_attempts=pinned_attempts_made,
+            alternate_attempts=max(0, primary_attempts_made - pinned_attempts_made),
+            elapsed_ms=int(_elapsed() * 1000),
+            deadline_exceeded=deadline_exceeded,
+        )
+        print(trace.describe())
     await _report(
         writer_recovery.OUTCOME_TOTAL_FAILURE,
         attempt=succeeded,
-        error=(
-            "writer turn deadline exceeded"
-            if deadline_exceeded
-            else (pending_reason or "all attempts failed")
-        ),
+        error=failure_reason,
     )
     return []

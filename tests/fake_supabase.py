@@ -56,6 +56,30 @@ class FakeSupabase:
         return [query for query in self.queries if query.table == table]
 
 
+def _compares(actual: Any, kind: str, expected: Any) -> bool:
+    """PostgREST's range filters, on the two shapes this double ever sees.
+
+    Numbers compare numerically; everything else compares as a string, which is
+    correct for the ISO-8601 timestamps these filters are used on here (an
+    expiry sweep, a window read) and is how PostgREST orders text anyway. A NULL
+    never satisfies a range filter, matching SQL.
+    """
+    if actual is None:
+        return False
+    try:
+        left: Any = float(actual)
+        right: Any = float(expected)
+    except (TypeError, ValueError):
+        left, right = str(actual), str(expected)
+    if kind == "lt":
+        return left < right
+    if kind == "lte":
+        return left <= right
+    if kind == "gt":
+        return left > right
+    return left >= right
+
+
 def _like_matches(value: str, pattern: str) -> bool:
     """SQL LIKE, enough of it for the filters this fake sees.
 
@@ -125,6 +149,22 @@ class _FakeQuery:
 
     def like(self, column: str, pattern: str):
         self._record.filters.append(("like", column, pattern))
+        return self
+
+    def lt(self, column: str, value: Any):
+        self._record.filters.append(("lt", column, value))
+        return self
+
+    def lte(self, column: str, value: Any):
+        self._record.filters.append(("lte", column, value))
+        return self
+
+    def gt(self, column: str, value: Any):
+        self._record.filters.append(("gt", column, value))
+        return self
+
+    def gte(self, column: str, value: Any):
+        self._record.filters.append(("gte", column, value))
         return self
 
     @property
@@ -197,6 +237,8 @@ class _FakeQuery:
             elif kind == "not.in":
                 unwanted = {str(item) for item in value}
                 rows = [row for row in rows if str(row.get(column)) not in unwanted]
+            elif kind in {"lt", "lte", "gt", "gte"}:
+                rows = [row for row in rows if _compares(row.get(column), kind, value)]
         return rows
 
     def execute(self):
@@ -286,6 +328,10 @@ class _FakeQuery:
 
     def _row_matches(self, row: dict) -> bool:
         for kind, column, value in self._record.filters:
+            if kind in {"lt", "lte", "gt", "gte"} and not _compares(
+                row.get(column), kind, value
+            ):
+                return False
             if kind == "eq" and str(row.get(column)) != str(value):
                 return False
             if kind == "in" and str(row.get(column)) not in {

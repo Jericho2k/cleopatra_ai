@@ -21,8 +21,40 @@ from ai.generator import (
     PERSISTENT_PRIMARY_RETRY_POLICY,
     generate_replies,
 )
+from ai.generation_trace import GenerationTrace
+from ai.prompt_builder import WRITER_TRANSCRIPT_MESSAGES
+from ai.situation_analyzer import ANALYZER_TRANSCRIPT_MESSAGES
+from services.context_packet import build_context_packet
 from ai.writer_router import select_writer_route
 from services.ppv_turn import plan_ppv_step_delivery, strip_ppv_tags
+from services.content_access import REVIEW_REASON as CONTENT_ACCESS_REVIEW_REASON
+from services.conversation_continuity import (
+    open_threads_for,
+    recent_episodes_for,
+    record_open_thread,
+    summarize_threads,
+)
+from models.conversation_continuity import (
+    EvidenceType,
+    OpenThread,
+    ThreadKind,
+    ThreadParty,
+)
+from services.reply_provenance import (
+    DELIVERY_PPV,
+    DELIVERY_TEXT,
+    PIPELINE_ASSISTED,
+    PIPELINE_AUTO,
+    SUGGESTION_PROVENANCE,
+    TRANSFORM_DELIVERY_LANGUAGE,
+    TRANSFORM_INVENTORY_REPAIR,
+    TRANSFORM_PPV_MERGED,
+    TRANSFORM_PPV_TAG_STRIPPED,
+    TRANSFORM_SHAPE_APPLIED,
+    ReplyProvenance,
+    fingerprint,
+    merge_provenance,
+)
 from ai.stack_profiles import STAGE_FAN_SUMMARY, get_profile
 from openai import AsyncOpenAI
 from core.config import get_settings
@@ -145,6 +177,8 @@ from ai.situation_analyzer import (
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from db.queries import (
+    PurchaseAggregateConflict,
+    apply_purchase_to_fan,
     get_conversation_history,
     get_creator_persona,
     get_fan_by_id,
@@ -221,7 +255,9 @@ def _release_auto_reply_slot(fan_id: str) -> bool:
     return True
 
 
-def message_ai_stack_metadata(route, *, profile_id: str) -> dict:
+def message_ai_stack_metadata(
+    route, *, profile_id: str, trace: GenerationTrace | None = None
+) -> dict:
     """The durable "which brain wrote this" marker for one creator message.
 
     Persisted inside ``messages.media_context``, which is existing jsonb
@@ -230,6 +266,16 @@ def message_ai_stack_metadata(route, *, profile_id: str) -> dict:
     route it took, and the model that was actually asked. That is enough to
     answer "which AI stack produced this message?" months later, from the row
     alone, without a telemetry join.
+
+    ``model`` and ``provider`` remained the model the router ASKED for even when
+    a retry, another upstream host or the configured fallback is what actually
+    answered — finding H of docs/autonomy_architecture_review.md, and the reason
+    a message-level model comparison could not be trusted. When a
+    ``GenerationTrace`` is supplied those two keys now name the model that
+    served the text, and ``requested_model``/``requested_provider`` keep what
+    was asked for, so both halves of "we asked for Kimi and got Qwen" survive on
+    the row. Without a trace the marker is exactly what it was, so the callers
+    that do not run the recovery ladder are unchanged.
     """
     marker: dict = {"profile": str(profile_id)}
     if route is not None:
@@ -241,6 +287,14 @@ def message_ai_stack_metadata(route, *, profile_id: str) -> dict:
                 "model": route.primary_target.model,
             }
         )
+    if trace is not None and trace.succeeded:
+        marker["requested_provider"] = trace.requested_provider
+        marker["requested_model"] = trace.requested_model
+        marker["provider"] = trace.provider
+        marker["model"] = trace.model
+        marker["served_by_requested_model"] = trace.served_by_requested_model
+        if trace.upstream_provider:
+            marker["upstream_provider"] = trace.upstream_provider
     return {"ai_stack": marker}
 
 
@@ -507,6 +561,8 @@ async def get_suggestions(
         ppv_offers,
         sent_ppv,
         active_session,
+        carried_threads,
+        past_episodes,
     ) = await asyncio.gather(
         get_conversation_history(fan_id),
         get_fan_by_id(fan_id),
@@ -519,7 +575,15 @@ async def get_suggestions(
         get_ppv_offers(creator_id),
         get_sent_ppv(fan_id),
         get_fan_session(fan_id),
+        # Assisted reads the same continuity Full Auto does. Finding A was
+        # exactly this kind of divergence — one mode loading evidence the other
+        # did not — and the fix is the two modes sharing the load, not a second
+        # copy of the logic here.
+        open_threads_for(creator_id, fan_id),
+        recent_episodes_for(creator_id, fan_id),
     )
+    open_thread_lines = summarize_threads(carried_threads)
+    episode_lines = [episode.render() for episode in past_episodes]
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
     if creator_persona is None:
@@ -546,6 +610,8 @@ async def get_suggestions(
 
     ctx_without_situation = ConversationContext(
         fan_message=fan_message,
+        open_threads=open_thread_lines,
+        conversation_episodes=episode_lines,
         conversation_history=conversation_history,
         fan_profile=fan_profile,
         creator_persona=creator_persona,
@@ -700,6 +766,8 @@ async def get_suggestions(
         conversation_director=conversation_director,
         scene=scene_context,
         text_intimacy=text_intimacy_context,
+        open_threads=open_thread_lines,
+        conversation_episodes=episode_lines,
         ai_stack_profile=stack.profile_id,
         writer_prompt_version=stack_profile.writer_prompt_version(),
     )
@@ -717,9 +785,11 @@ async def get_suggestions(
     prompt = build_prompt(
         ctx, prompt_version=route.prompt_version, reply_mode=MODE_ASSISTED
     )
+    assisted_trace = GenerationTrace()
     replies = await generate_replies(
         prompt,
         creator_persona,
+        trace=assisted_trace,
         max_candidates=writer_candidate_count(route.prompt_version, MODE_ASSISTED),
         output_contract=CONTRACT_CANDIDATES,
         retry_policy=writer_retry_policy(route.prompt_version),
@@ -744,6 +814,7 @@ async def get_suggestions(
 
     # Assisted candidates keep their own natural shapes — a human picks one —
     # but the platform's delivery semantics still hold for all of them.
+    raw_candidates = list(replies)
     replies = sanitize_candidates(replies, active_session=active_session)
     # A human approves an assisted candidate, so a promise of media that does
     # not exist is repaired rather than dropped: the operator still sees a
@@ -757,6 +828,60 @@ async def get_suggestions(
         or candidate
         for candidate in replies
     ]
+
+    # Assisted's ground truth is recorded here but finished later: an operator
+    # is between generation and delivery, so the record waits for the send that
+    # redeems its token (services/reply_provenance.py). Candidates the operator
+    # does not pick never become a message and are never attributed.
+    assisted_provenance = ReplyProvenance(
+        creator_id=str(creator_id), fan_id=str(fan_id), mode=PIPELINE_ASSISTED
+    )
+    assisted_provenance.record_trigger(
+        kind="fan_message",
+        text=fan_message,
+        history_position=len(conversation_history) - 1,
+    )
+    assisted_provenance.record_context(
+        history_messages=len(conversation_history),
+        analyzer_window=min(len(conversation_history), ANALYZER_TRANSCRIPT_MESSAGES),
+        writer_window=min(len(conversation_history), WRITER_TRANSCRIPT_MESSAGES),
+        packet=build_context_packet(
+            conversation_history,
+            open_threads=open_thread_lines,
+            episodes=episode_lines,
+        ).fingerprint(),
+        stack_profile=stack.profile_id,
+        writer_prompt_version=stack_profile.writer_prompt_version(),
+        live_state={
+            "creator_legend": bool(creator_legend),
+            "fan_intelligence": bool(fan_intelligence),
+            "buyer_lifecycle": bool(buyer_lifecycle),
+            "affordability": bool(affordability),
+            "price_learning": bool(price_learning),
+            "session_strategy": bool(session_strategy),
+            "conversation_director": bool(conversation_director),
+            "experience_scene": bool(scene_context),
+            "text_intimacy": bool(text_intimacy_context),
+            # Assisted runs no commercial orchestrator: a human decides whether
+            # to sell. Recording the key as absent rather than false would let a
+            # comparison read it as "the orchestrator declined".
+            "active_session": bool(active_session),
+            "media_inventory": bool(media_inventory.authorized_asset_types),
+        },
+    )
+    assisted_provenance.record_decision(
+        source="assisted_operator",
+        purchase_signal=situation.get("purchase_signal"),
+        crisis_signal=situation.get("crisis_signal"),
+        resend_requested=situation.get("resend_requested"),
+        extra={"strategic_move": situation.get("strategic_move")},
+    )
+    assisted_provenance.record_writer(assisted_trace)
+    assisted_provenance.record_transform(
+        TRANSFORM_DELIVERY_LANGUAGE, raw_candidates != replies
+    )
+    suggestion_token = SUGGESTION_PROVENANCE.put(assisted_provenance)
+    print(assisted_trace.describe())
 
     if save_fan_message:
         evidence_message_id = await save_message(
@@ -792,6 +917,7 @@ async def get_suggestions(
         stage=conversation_stage,
         analysis_degraded=assisted_degraded,
         analysis_degraded_reason=assisted_degraded_reason,
+        suggestion_token=suggestion_token,
     )
 
 
@@ -1303,6 +1429,21 @@ async def _debounced_auto_reply(
             return
         latest_message = fan_messages[-1].content
 
+        # Ground truth for this turn starts here, at the event that caused it
+        # (docs/autonomy_architecture_review.md §6 step 1). The recorder is
+        # filled in as the turn makes its decisions and emitted onto each
+        # delivered message. It is a record only: nothing below reads it, and a
+        # turn that returns early simply never emits one.
+        provenance = ReplyProvenance(
+            creator_id=str(creator_id), fan_id=str(fan_id), mode=PIPELINE_AUTO
+        )
+        provenance.record_trigger(
+            kind="fan_message",
+            text=latest_message,
+            sent_at=fan_messages[-1].sent_at,
+            history_position=len(conversation_history) - 1,
+        )
+
         (
             creator_persona,
             creator_legend,
@@ -1310,6 +1451,8 @@ async def _debounced_auto_reply(
             sent_ppv,
             active_session,
             similar_exchanges,
+            carried_threads,
+            past_episodes,
         ) = await asyncio.gather(
             get_creator_persona(creator_id),
             get_creator_legend(creator_id),
@@ -1317,7 +1460,15 @@ async def _debounced_auto_reply(
             get_sent_ppv(fan_id),
             get_fan_session(fan_id),
             find_similar_exchanges(latest_message, creator_id, enabled=False),
+            # What this conversation is still carrying, and what earlier
+            # stretches of it were about. Both get their own allowance in the
+            # context packet, so an unanswered question cannot be evicted by
+            # recent chatter (docs/autonomy_architecture_review.md §4).
+            open_threads_for(creator_id, fan_id),
+            recent_episodes_for(creator_id, fan_id),
         )
+        open_thread_lines = summarize_threads(carried_threads)
+        episode_lines = [episode.render() for episode in past_episodes]
         if creator_persona is None:
             creator_persona = Persona()
 
@@ -1355,6 +1506,8 @@ async def _debounced_auto_reply(
             buyer_lifecycle=buyer_lifecycle,
             affordability=affordability,
             price_learning=price_learning,
+            open_threads=open_thread_lines,
+            conversation_episodes=episode_lines,
             ai_stack_profile=stack.profile_id,
             writer_prompt_version=writer_prompt_version,
         )
@@ -1406,11 +1559,30 @@ async def _debounced_auto_reply(
         # repair can be verified. Never promise a repair that has not happened.
         if str(situation.get("resend_requested", "false")).strip().lower() == "true":
             try:
-                await freeze_fan_for_review(fan_id, "content_access_issue")
+                await freeze_fan_for_review(fan_id, CONTENT_ACCESS_REVIEW_REASON)
             except Exception as exc:
                 raise HumanReviewHandoffError(
                     "could not persist content-access review hold; no reply sent"
                 ) from exc
+            # The complaint becomes an obligation the conversation carries,
+            # not just a flag on a row. Without it, an operator resolving the
+            # hold clears the freeze and the next turn has no idea anything was
+            # ever wrong — which is how a customer gets sold to immediately
+            # after reporting they cannot open what they bought. Recorded after
+            # the hold, because a hold that failed to persist already raised.
+            await record_open_thread(
+                OpenThread(
+                    creator_id=str(creator_id),
+                    fan_id=str(fan_id),
+                    kind=ThreadKind.COMPLAINT,
+                    raised_by=ThreadParty.FAN,
+                    summary="he says he cannot access content he paid for",
+                    resolution_condition="he confirms he can open it",
+                    evidence_type=EvidenceType.STATED,
+                    source_message_fingerprint=fingerprint(latest_message),
+                    source_turn_id=provenance.turn_id,
+                )
+            )
             if outcome_sink is not None:
                 outcome_sink["outcome"] = AUTO_OUTCOME_HUMAN_REVIEW
             print(f"[AUTO SUPPORT] fan={fan_id} reason=content_access_issue review_required=true")
@@ -1786,8 +1958,58 @@ async def _debounced_auto_reply(
             scene=scene_context,
             text_intimacy=text_intimacy_context,
             message_shape=message_shape.to_context() if message_shape else {},
+            open_threads=open_thread_lines,
+            conversation_episodes=episode_lines,
             ai_stack_profile=stack.profile_id,
             writer_prompt_version=writer_prompt_version,
+        )
+
+        # What evidence this turn was allowed to see, and who decided what it
+        # does. Both are recorded before generation, so they describe the inputs
+        # to the reply rather than being reconstructed from its output.
+        provenance.record_context(
+            history_messages=len(conversation_history),
+            analyzer_window=min(
+                len(conversation_history), ANALYZER_TRANSCRIPT_MESSAGES
+            ),
+            writer_window=min(len(conversation_history), WRITER_TRANSCRIPT_MESSAGES),
+            packet=build_context_packet(
+                conversation_history,
+                open_threads=open_thread_lines,
+                episodes=episode_lines,
+            ).fingerprint(),
+            stack_profile=stack.profile_id,
+            writer_prompt_version=writer_prompt_version,
+            live_state={
+                "creator_legend": bool(creator_legend),
+                "fan_intelligence": bool(fan_intelligence),
+                "buyer_lifecycle": bool(buyer_lifecycle),
+                "affordability": bool(affordability),
+                "price_learning": bool(price_learning),
+                "session_strategy": bool(session_strategy),
+                "conversation_director": bool(conversation_director),
+                "experience_scene": bool(scene_context),
+                "text_intimacy": bool(text_intimacy_context),
+                "message_shape": bool(message_shape),
+                "commercial_decision": decision is not None,
+                "ppv_delivery": ppv_delivery is not None,
+                "active_session": bool(active_session),
+                "media_inventory": bool(media_inventory.authorized_asset_types),
+            },
+        )
+        provenance.record_decision(
+            source="commercial_orchestrator" if commercial_enabled else "legacy_session",
+            action=getattr(decision, "action", None),
+            reason=getattr(decision, "reason", None),
+            purchase_signal=situation.get("purchase_signal"),
+            crisis_signal=situation.get("crisis_signal"),
+            resend_requested=situation.get("resend_requested"),
+            extra={
+                "director_phase": conversation_director.get("phase"),
+                "director_action": conversation_director.get("action"),
+                "session_goal": session_strategy.get("goal"),
+                "strategic_move": situation.get("strategic_move"),
+            },
         )
 
         route = select_writer_route(ctx, profile_id=stack.profile_id)
@@ -1810,10 +2032,15 @@ async def _debounced_auto_reply(
         prompt = build_prompt(
             ctx, prompt_version=route.prompt_version, reply_mode=MODE_AUTO
         )
+        # Which model ACTUALLY answers is a different fact from which one the
+        # router asked for, and only the second used to survive to the message
+        # (finding H). The trace is the return channel for the first.
+        writer_trace = GenerationTrace()
         with action_stage("writer_ms"):
             replies = await generate_replies(
                 prompt,
                 creator_persona,
+                trace=writer_trace,
                 max_candidates=auto_candidates,
                 output_contract=auto_contract,
                 retry_policy=writer_retry_policy(route.prompt_version),
@@ -1835,6 +2062,8 @@ async def _debounced_auto_reply(
                 target_override=route.primary_target,
                 fallback_target_override=route.fallback_target,
             )
+
+        provenance.record_writer(writer_trace)
 
         if not replies:
             # generate_replies fails closed: an empty list is never "the writer
@@ -1869,6 +2098,7 @@ async def _debounced_auto_reply(
             if outcome_sink is not None:
                 outcome_sink["outcome"] = AUTO_OUTCOME_INVENTORY_UNSAFE
             return
+        provenance.record_transform(TRANSFORM_INVENTORY_REPAIR, inventory_repaired)
         if inventory_repaired:
             print(
                 f"[INVENTORY GUARD] repaired unavailable-media promise fan={fan_id}"
@@ -1883,12 +2113,14 @@ async def _debounced_auto_reply(
             decision_action=decision_action,
             active_session=active_session,
         )
+        provenance.record_transform(TRANSFORM_DELIVERY_LANGUAGE, link_repaired)
         if link_repaired:
             print(f"[PPV LANGUAGE] repaired delivery-link phrasing fan={fan_id}")
 
         # The tag is no longer a control surface. A writer that still emits one
         # is not obeyed, and the string never reaches the fan.
         reply, tag_stripped = strip_ppv_tags(reply)
+        provenance.record_transform(TRANSFORM_PPV_TAG_STRIPPED, tag_stripped)
         if tag_stripped:
             print(
                 f"[PPV DELIVERY] fan={fan_id} stripped a writer-emitted delivery "
@@ -1906,6 +2138,7 @@ async def _debounced_auto_reply(
             # delivery that failed" true by construction — there is no separate
             # text message that could already have left.
             reply = apply_message_shape(reply, 1)
+            provenance.record_transform(TRANSFORM_PPV_MERGED)
 
         if shape_enforced:
             # Re-resolve the shape now that the copy exists: a reply that turned
@@ -1914,12 +2147,14 @@ async def _debounced_auto_reply(
                 writer_word_count=len(visible_text(reply).replace("|", " ").split())
             )
             reply = apply_message_shape(reply, final_shape.target_bubbles)
+            provenance.record_transform(TRANSFORM_SHAPE_APPLIED)
         elif commercial_max_messages:
             # No shape policy for this writer version, but a commercial
             # decision that caps message parts is commercial authority, not
             # style. apply_message_shape only ever merges, so the cap is honoured
             # without imposing a bubble count the decision did not ask for.
             reply = apply_message_shape(reply, max(1, int(commercial_max_messages)))
+            provenance.record_transform(TRANSFORM_SHAPE_APPLIED)
 
         # Final check — abort if a new message arrived while we were generating
         current_task = _pending_auto_replies.get(fan_id)
@@ -2198,7 +2433,27 @@ async def _debounced_auto_reply(
                 # Every creator message this pipeline writes carries the AI
                 # stack that produced it, PPV and plain alike.
                 stack_marker = message_ai_stack_metadata(
-                    route, profile_id=stack.profile_id
+                    route, profile_id=stack.profile_id, trace=writer_trace
+                )
+                # The whole turn's ground truth, closed with this part's own
+                # delivery receipt: the record cannot claim a delivery the
+                # platform did not acknowledge, because the receipt is read
+                # from the send result rather than from the copy.
+                provenance_marker = provenance.as_metadata(
+                    part=i,
+                    parts=len(parts),
+                    delivery_kind=DELIVERY_PPV if is_ppv_part else DELIVERY_TEXT,
+                    platform_message_id=platform_message_id,
+                    delivery_reference=delivery_reference if is_ppv_part else None,
+                    price_cents=(
+                        ppv_delivery.price_cents
+                        if (is_ppv_part and ppv_delivery is not None)
+                        else None
+                    ),
+                )
+                message_metadata = merge_provenance(
+                    _with_ai_stack(ppv_media_context, stack_marker),
+                    provenance_marker,
                 )
                 if is_ppv_part:
                     await save_ppv_message_receipt(
@@ -2207,7 +2462,7 @@ async def _debounced_auto_reply(
                         content=text_out,
                         was_ai_suggested=True,
                         platform_message_id=platform_message_id,
-                        media_context=_with_ai_stack(ppv_media_context, stack_marker),
+                        media_context=message_metadata,
                     )
                 else:
                     last_plain_message_id = await save_message(
@@ -2217,8 +2472,10 @@ async def _debounced_auto_reply(
                         content=text_out,
                         was_ai_suggested=True,
                         fansly_message_id=platform_message_id,
-                        media_context=_with_ai_stack(ppv_media_context, stack_marker),
+                        media_context=message_metadata,
                     )
+                if i == 0:
+                    print(provenance.describe())
                 if local_test_delivery:
                     print(
                         f"[AUTO TEST DELIVERY] fan={fan_id} "
@@ -2461,17 +2718,94 @@ async def record_ppv_purchase(
                 else None
             ),
         )
-    fan_update = {
-            "total_spent": new_spent,
-            "spend_tier": _tier(new_spent),
-            "sales_log": sales_log,
-            "not_sold_log": not_sold,
-    }
-    if clears_current_pending:
-        fan_update["pending_ppv_check"] = None
-    await asyncio.to_thread(
-        lambda: db.table("fans").update(fan_update).eq("id", fan_id).execute()
-    )
+    def _merge_purchase(current: dict | None) -> dict | None:
+        """Build the fan update from the row as it actually is.
+
+        Called once with ``None`` (meaning: use the snapshot this function
+        already read) and again, with a freshly read row, whenever another
+        purchase event wrote first. Everything it needs is recomputed from
+        ``current`` on those later calls; nothing from the original snapshot
+        survives into them, because merging into a stale total is the exact
+        loss this guards against.
+        """
+        if current is None:
+            merged_spent = new_spent
+            merged_sales = sales_log
+            merged_not_sold = not_sold
+            merged_pending = current_pending
+        else:
+            fresh_sales = list(current.get("sales_log") or [])
+            recorded_now = any(
+                (
+                    str(entry.get("payment_reference") or "") == reference
+                    if reference
+                    else str(entry.get("media_id")) == str(media_id)
+                )
+                for entry in fresh_sales
+            ) or (
+                bool(platform_order_id)
+                and any(
+                    str(entry.get("platform_order_id") or "") == platform_order_id
+                    for entry in fresh_sales
+                )
+            )
+            if recorded_now:
+                # The event that beat us recorded this same purchase. Writing
+                # it again would double the customer's spend.
+                print(
+                    f"[PURCHASE CAS] fan={fan_id} reference={reference or 'none'} "
+                    "already_recorded_by_concurrent_event=true"
+                )
+                return None
+            fresh_spent = int(current.get("total_spent") or 0)
+            merged_spent = fresh_spent + (amount_dollars if not already_recorded else 0)
+            merged_sales = fresh_sales + (
+                [sales_log[-1]] if (not already_recorded and sales_log) else []
+            )
+            merged_not_sold = [
+                entry
+                for entry in (current.get("not_sold_log") or [])
+                if (
+                    str(entry.get("payment_reference") or "") != reference
+                    if reference
+                    else str(media_id) not in str(entry.get("item", ""))
+                )
+            ]
+            merged_pending = current.get("pending_ppv_check") or {}
+
+        update = {
+            "total_spent": merged_spent,
+            "spend_tier": _tier(merged_spent),
+            "sales_log": merged_sales,
+            "not_sold_log": merged_not_sold,
+        }
+        # Recomputed against whichever row this attempt is merging into: the
+        # pending check the caller saw may have been replaced by a newer offer,
+        # and clearing that one would cancel a delivery nobody has resolved.
+        still_clears = bool(
+            merged_pending
+            and (
+                (reference and str(merged_pending.get("reference") or "") == reference)
+                or (not reference and not pending_override)
+            )
+        )
+        if still_clears:
+            update["pending_ppv_check"] = None
+        return update
+
+    try:
+        await apply_purchase_to_fan(
+            fan_id,
+            merge=_merge_purchase,
+            expected_total_spent=old_spent,
+        )
+    except PurchaseAggregateConflict as exc:
+        # The money is real and could not be written down. An operator has to
+        # see that, and automation must not carry on as though the customer's
+        # spend were correct.
+        print(f"[PURCHASE CONFLICT] fan={fan_id} {exc}")
+        await freeze_fan_for_review(fan_id, "purchase_aggregate_conflict")
+        raise
     await mark_ppv_purchased(fan_id, str(media_id))
     if creator_id and reference:
         await cancel_action_by_dedupe_key(
