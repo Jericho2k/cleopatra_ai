@@ -20,6 +20,7 @@ from typing import Any
 from ai.model_providers import complete, get_runtime_target
 from ai.stack_profiles import STAGE_SITUATION_ANALYZER, get_profile
 from ai.prompt_blocks import cacheable_system_blocks
+from services.context_packet import build_context_packet
 from models.model_runtime import ModelTelemetryContext
 from models.schemas import ConversationContext
 from services.analyzer_telemetry import record_analysis_outcome
@@ -32,14 +33,17 @@ DEGRADED_TRANSPORT = "transport_error"
 DEGRADED_PARSE = "parse_error"
 DEGRADED_SHAPE = "unexpected_response"
 
-#: How many message bubbles the analyzer is shown.
+#: How many message bubbles the analyzer used to be shown.
 #:
-#: Finding D of docs/autonomy_architecture_review.md: understanding and writing
-#: see different, short windows, and neither is a count of complete
-#: conversational turns — a multipart reply spends this budget several times
-#: faster than a single one. Named rather than inlined so the number is one
-#: fact, reported in every reply's provenance record and replaceable in one
-#: place by the budgeted context builder.
+#: Kept as the historical constant, no longer the window. Finding D of
+#: docs/autonomy_architecture_review.md named the problem it caused: the
+#: classifier that decides what the turn DOES saw twelve bubbles while the
+#: writer saw sixteen, so an interpretation could be made on less evidence than
+#: the reply was written from. Both now build from
+#: ``services/context_packet.STANDARD_BUDGET`` — complete turns rather than
+#: bubbles, and the same allowance for each. Still exported because
+#: ``services/reply_provenance`` reports the old number alongside the new packet
+#: fingerprint while replies written under both are being compared.
 ANALYZER_TRANSCRIPT_MESSAGES = 12
 
 
@@ -145,15 +149,23 @@ def build_analyzer_prompt(ctx: ConversationContext) -> tuple[str, str]:
     render the exact prompt the provider sees without issuing a paid call.
     """
 
-    recent = ctx.conversation_history[-ANALYZER_TRANSCRIPT_MESSAGES:]
-    convo = "\n".join(
-        f"{'Fan' if message.role == 'fan' else 'Creator'}: {message.content}"
-        for message in recent
+    packet = build_context_packet(
+        ctx.conversation_history,
+        open_threads=getattr(ctx, "open_threads", ()) or (),
+        episodes=getattr(ctx, "conversation_episodes", ()) or (),
     )
+    convo = packet.render_transcript(fan_name="Fan", creator_name="Creator")
+
+    # The obligations block. This is the half of finding D that a wider window
+    # alone would not fix: a question deferred thirty turns ago is not in ANY
+    # transcript window, and a classifier deciding whether this message is a new
+    # request or a return to an old one needs to know the old one exists.
+    continuity = packet.render_continuity()
 
     user_content = (
         f"Conversation so far:\n{convo}\n\n"
-        f'Latest fan message: "{ctx.fan_message}"'
+        + (f"{continuity}\n\n" if continuity else "")
+        + f'Latest fan message: "{ctx.fan_message}"'
     )
 
     return ANALYZER_SYSTEM, user_content
@@ -179,7 +191,13 @@ async def analyze_situation(
     telemetry_context: dict[str, Any] | None = None,
     profile_id: str | None = None,
 ) -> dict:
-    recent = ctx.conversation_history[-ANALYZER_TRANSCRIPT_MESSAGES:]
+    # Same window the prompt was built from, so the repetition check below
+    # measures what the analyzer actually saw.
+    recent = [
+        turn
+        for turn in build_context_packet(ctx.conversation_history).turns
+        if turn.speaker == "creator"
+    ]
     system_content, user_content = build_analyzer_prompt(ctx)
 
     profile = get_profile(profile_id or getattr(ctx, "ai_stack_profile", None))
@@ -252,7 +270,7 @@ async def analyze_situation(
     if _looks_like_self_harm(ctx.fan_message):
         result["crisis_signal"] = "self_harm"
 
-    creator_lines = [message.content for message in recent if message.role == "creator"]
+    creator_lines = [turn.text for turn in recent]
     normalized = normalize_commercial_facts(result, ctx.fan_message, creator_lines)
     # normalize_commercial_facts merges over its own defaults, so re-assert the
     # markers rather than trusting them to survive a future change there.

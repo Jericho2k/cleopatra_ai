@@ -364,3 +364,117 @@ def test_the_access_resolutions_are_reachable_through_the_review_workflow(
 
     assert result["review_cleared"] is True
     assert world.tables["fans"][0]["needs_human_review"] is False
+
+
+# --- 7: the complaint stops being carried once it is answered ---------------
+
+
+def _with_threads(monkeypatch, db):
+    """Point the continuity layer at the same in-memory store."""
+    from services import conversation_continuity
+
+    db.tables.setdefault("conversation_open_threads", [])
+    monkeypatch.setattr(conversation_continuity, "get_supabase", lambda: db)
+    return conversation_continuity
+
+
+def _complaint(creator_id: str = "creator-1", fan_id: str = "fan-1"):
+    from models.conversation_continuity import OpenThread, ThreadKind, ThreadParty
+
+    return OpenThread(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        kind=ThreadKind.COMPLAINT,
+        raised_by=ThreadParty.FAN,
+        summary="he says he cannot access content he paid for",
+        resolution_condition="he confirms he can open it",
+    )
+
+
+def test_a_verified_repair_closes_the_complaint_the_turn_recorded(world, monkeypatch):
+    """Clearing the freeze alone would leave every later reply treating it as live."""
+    continuity = _with_threads(monkeypatch, world)
+    run(continuity.record_open_thread(_complaint()))
+    _stub_platform(monkeypatch, messages=[], account_media=[], sends=[])
+
+    run(
+        content_access.resolve_content_access(
+            "fan-1", resolution=content_access.RESOLUTION_RESEND
+        )
+    )
+
+    assert run(continuity.open_threads_for("creator-1", "fan-1")) == []
+    stored = world.tables["conversation_open_threads"][0]
+    assert stored["status"] == "fulfilled"
+    assert stored["resolved_by"] == "operator"
+
+
+def test_the_analyzer_misreading_it_cancels_rather_than_reports_it_met(
+    world, monkeypatch
+):
+    """"Not an access problem" means the obligation was never real."""
+    continuity = _with_threads(monkeypatch, world)
+    run(continuity.record_open_thread(_complaint()))
+
+    run(
+        content_access.resolve_content_access(
+            "fan-1", resolution=content_access.RESOLUTION_NOT_AN_ACCESS_ISSUE
+        )
+    )
+
+    assert world.tables["conversation_open_threads"][0]["status"] == "cancelled"
+
+
+def test_a_failed_repair_leaves_the_complaint_open_too(monkeypatch):
+    db = _world(status="abandoned")
+    monkeypatch.setattr(content_access, "get_supabase", lambda: db)
+    monkeypatch.setattr("services.ppv_delivery_ledger.get_supabase", lambda: db)
+    monkeypatch.setattr("db.queries.get_supabase", lambda: db)
+    monkeypatch.setattr(content_access, "apifansly_enabled", lambda: True)
+    continuity = _with_threads(monkeypatch, db)
+    run(continuity.record_open_thread(_complaint()))
+    _stub_platform(monkeypatch, messages=[], account_media=[], sends=[])
+
+    with pytest.raises(content_access.ContentAccessError):
+        run(
+            content_access.resolve_content_access(
+                "fan-1", resolution=content_access.RESOLUTION_RESEND
+            )
+        )
+
+    assert len(run(continuity.open_threads_for("creator-1", "fan-1"))) == 1
+
+
+def test_another_customers_complaint_is_not_closed_by_this_resolution(
+    world, monkeypatch
+):
+    continuity = _with_threads(monkeypatch, world)
+    run(continuity.record_open_thread(_complaint(fan_id="fan-1")))
+    run(continuity.record_open_thread(_complaint(fan_id="fan-2")))
+
+    run(
+        content_access.resolve_content_access(
+            "fan-1", resolution=content_access.RESOLUTION_ACCESS_RESTORED
+        )
+    )
+
+    assert len(run(continuity.open_threads_for("creator-1", "fan-2"))) == 1
+
+
+def test_a_continuity_failure_never_blocks_the_operator(world, monkeypatch):
+    """A stale line in a prompt is worse than nothing; a blocked resolution is worse still."""
+    from services import content_access as module
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("continuity store unavailable")
+
+    monkeypatch.setattr(module, "open_threads_for", boom)
+
+    result = run(
+        content_access.resolve_content_access(
+            "fan-1", resolution=content_access.RESOLUTION_ACCESS_RESTORED
+        )
+    )
+
+    assert result["review_cleared"] is True
+    assert world.tables["fans"][0]["needs_human_review"] is False

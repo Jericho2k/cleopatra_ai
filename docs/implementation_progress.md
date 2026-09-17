@@ -60,7 +60,7 @@ review-hold write propagating instead of pretending a handoff succeeded.
 |---|---|---|
 | 0 — ground truth for every visible reply | 1 | **Done** (this branch) |
 | 1 — close execution bypasses | 2 | **Done** except confirming the live deployment |
-| 2 — the general continuity packet | 3 | Not started |
+| 2 — the general continuity packet | 3 | **Done** except semantic extraction |
 | 3 — one decision owner, compared under replay | 4 | Not started |
 | 4 — longitudinal evaluation harness | 5 | Not started |
 | 5 — shadow real interactions | 5 (operational) | Out of scope for code alone |
@@ -279,29 +279,104 @@ runs.
 
 ---
 
-## Sprint 2 — the general continuity packet
+## Sprint 2 — the general continuity packet — DONE (one item carried forward)
 
 > §6.3: *Add open-thread and episode records with provenance, correction
 > semantics, and creator/customer scoping. Share the builder across Assisted,
 > Auto, and evaluation paths.*
 
-Findings D and E. Existing memory is real — `services/fan_intelligence.py`
-evidence validation and merge rules, `services/fan_history_memory.py`
-compaction, saved creator facts, persistent scene state — and the review is
-explicit that saying Cleopatra has no memory would be inaccurate. What is
-missing is a ledger of *unfinished* things: unanswered questions, promised
-actions, deferred topics, unresolved complaints, each persisting until
-fulfilled, cancelled, superseded or expired.
+Findings D and E. The existing memory is real and the review says so —
+`services/fan_intelligence.py` evidence validation and merge rules,
+`services/fan_history_memory.py` compaction, saved creator facts, persistent
+scene state. What none of it held is the state of the interaction.
 
-Seams already in place: `ANALYZER_TRANSCRIPT_MESSAGES` and
-`WRITER_TRANSCRIPT_MESSAGES` are the two fixed slices the budgeted builder
-replaces, and the provenance `context` block already reports them, so the
-before/after is measurable on real replies rather than asserted.
+### What was built
 
-Required properties from review §4: every memory carries source, timestamp,
-evidence type and correction behaviour; "the customer said payment succeeded"
-and "the platform confirmed order X" are different kinds of fact; a correction
-supersedes rather than coexisting; retrieval is scoped by creator AND customer.
+**`db/conversation_continuity_v1.sql`** — two tables, for two different things.
+`conversation_open_threads` is what is unfinished: a question nobody answered, a
+promise nobody kept, a topic put off, a complaint nobody resolved, a correction.
+Each persists until fulfilled, cancelled, superseded or expired — never merely
+because the recent-message window rolled over it. `conversation_episodes` is
+what a completed stretch was about and how it ended, with the source range, so a
+summary can be read back to the messages it describes.
+
+Constraints carry the rules rather than trusting callers: a resolved thread must
+say how and when, only a superseded thread may point at a successor, and
+uniqueness is scoped to (creator, fan) so one creator's conversation cannot
+collide with another's. `conversation_episodes` has **no column that could hold
+money** — the review's "never proof of payment", enforced by the schema, with a
+test that fails if one is ever added.
+
+**`services/conversation_continuity.py`** — recording is idempotent (a question
+mentioned across four turns is one obligation), resolution is guarded on
+`status = 'open'` so two workers cannot both claim to have closed it,
+supersession is a link rather than a delete, and expiry runs on the read path.
+`rank_threads` orders by what a good operator would deal with first — complaints,
+then what he is waiting on us for, oldest within each group, because "he returns
+to the earlier of two subjects" is a §1 failure precisely when the newest is
+treated as the only context.
+
+**`services/context_packet.py`** — the budgeted builder, and the answer to all
+three halves of finding D:
+
+* *Bubbles are not turns.* Consecutive messages from one speaker group into one
+  turn, so a multipart reply no longer spends the window several times faster
+  than a single one. The same exchange now costs the same however it was sent.
+* *The analyzer saw less than the writer.* Both build from
+  `STANDARD_BUDGET` now. The classifier that decides what the turn DOES can no
+  longer decide on less evidence than the reply is written from.
+* *Small talk evicted obligations.* Threads and episodes have their own
+  allowance, taken before the transcript is measured. A conversation can push a
+  question out of the recent window; it cannot push it out of the packet.
+
+It is pure — no database, no clock, no I/O — which is what lets Sprint 4's
+replay comparison build the identical packet the live path builds.
+
+**Wired in.** Full Auto and Assisted both load threads and episodes and pass
+them into both context objects, so finding A's divergence cannot recur here. A
+`content_access_issue` hold now also records a `complaint` thread, and resolving
+that hold closes it: clearing the freeze alone left every later reply written as
+though the problem were still live. Every reply's provenance record carries the
+packet fingerprint, including what was dropped — which is what makes "the model
+never mentioned it" separable from "the model was never told".
+
+`scripts/production_preflight.py` fails when the tables are missing. The
+continuity layer swallows its own failures by design, so a missing table
+otherwise produces no error anybody sees: every reply is simply written as
+though the conversation were carrying nothing, which looks exactly like a model
+that forgets.
+
+### Verification
+
+`2258 passed, 0 skipped` — the whole suite **including every PostgreSQL schema
+test**, run against a real PostgreSQL 16 in this container rather than skipped.
+Up from `2053 passed, 130 skipped` at the end of Sprint 1. The schema pipeline
+applies the full migration order from scratch, and `production_preflight
+--schema-only` reports `29 passed, 0 failed` against that database.
+
+```bash
+# What this session ran; CI provides the same thing via its postgres service.
+TEST_DATABASE_URL=postgresql://... pytest -q
+```
+
+### Carried forward — semantic thread extraction
+
+Threads are currently recorded from events the system knows for certain: an
+access complaint, today. Noticing that *a question went unanswered* or that *a
+preference was corrected* is interpretation, which review §4 assigns to semantic
+reasoning rather than deterministic code — so it belongs in the analyzer.
+
+It is deliberately not done here. Adding an output to the analyzer changes its
+prompt on every turn, and the review is explicit that another authority must not
+be added without measuring it: *"Test the effect by removing duplicate guidance
+under replay; do not assume a shorter prompt is automatically better."* Sprint 3
+builds the replay harness that can measure it; extraction lands there, with a
+before/after rather than an assumption. The storage, the ranking, the budget and
+the prompt wiring are all in place for it.
+
+The same applies to tying PPV promises to threads (a pending delivery is a
+promise; a purchase fulfils it; an expiry cancels it). That one is deterministic
+and could land sooner; it was left out to keep this change reviewable.
 
 ---
 

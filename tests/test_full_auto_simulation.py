@@ -2027,3 +2027,137 @@ def test_a_local_test_delivery_is_not_claimed_as_a_platform_delivery(
     assert delivery["kind"] == "text"
     assert delivery["accepted_by_platform"] is False
     assert delivery["platform_message_id"] is None
+
+
+# --- Sprint 2: what the conversation is carrying reaches the turn -----------
+
+
+@pytest.fixture
+def continuity_store(world, monkeypatch):
+    """Point the continuity layer at the simulator's in-memory database."""
+    from services import conversation_continuity
+
+    db, _ = world
+    db.tables.setdefault("conversation_open_threads", [])
+    db.tables.setdefault("conversation_episodes", [])
+    monkeypatch.setattr(conversation_continuity, "get_supabase", lambda: db)
+    return conversation_continuity
+
+
+def test_an_unanswered_question_reaches_the_writer(world, spy, continuity_store):
+    """A question from thirty turns ago is in no transcript window at all."""
+    from models.conversation_continuity import OpenThread, ThreadKind, ThreadParty
+
+    db, calls = world
+    _run(
+        continuity_store.record_open_thread(
+            OpenThread(
+                creator_id="creator-1",
+                fan_id="fan-test",
+                kind=ThreadKind.QUESTION,
+                raised_by=ThreadParty.FAN,
+                summary="whether you ever visit Chicago",
+                resolution_condition="you answer it",
+            )
+        )
+    )
+
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hey", fast=True
+        )
+    )
+
+    prompt = str(calls["writer"][0]["prompt"])
+    assert "whether you ever visit Chicago" in prompt
+
+
+def test_an_access_complaint_becomes_something_the_conversation_carries(
+    world, spy, continuity_store, monkeypatch
+):
+    """Otherwise the next turn has no idea anything was ever wrong."""
+    db, _ = world
+
+    async def complains(ctx, **kwargs):
+        return {
+            "purchase_signal": "none",
+            "strategic_move": "build_rapport",
+            "resend_requested": "true",
+        }
+
+    monkeypatch.setattr(suggestions, "analyze_situation", complains)
+
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test",
+            creator_id="creator-1",
+            message="i paid but it will not open",
+            fast=True,
+        )
+    )
+
+    threads = db.tables["conversation_open_threads"]
+    assert len(threads) == 1
+    assert threads[0]["kind"] == "complaint"
+    assert threads[0]["status"] == "open"
+    assert _creator_rows(db) == [], "the complaint is answered by a human, not a sale"
+
+
+def test_the_same_complaint_twice_is_one_obligation(
+    world, spy, continuity_store, monkeypatch
+):
+    db, _ = world
+
+    async def complains(ctx, **kwargs):
+        return {
+            "purchase_signal": "none",
+            "strategic_move": "build_rapport",
+            "resend_requested": "true",
+        }
+
+    monkeypatch.setattr(suggestions, "analyze_situation", complains)
+    monkeypatch.setattr(
+        suggestions, "freeze_fan_for_review", lambda *_a, **_k: _value(None)
+    )
+
+    for _ in range(2):
+        _run(
+            suggestions.run_simulated_inbound(
+                fan_id="fan-test",
+                creator_id="creator-1",
+                message="i paid but it will not open",
+                fast=True,
+            )
+        )
+
+    assert len(db.tables["conversation_open_threads"]) == 1
+
+
+def test_a_reply_records_what_the_packet_actually_assembled(
+    world, spy, continuity_store, traced_writer
+):
+    db, _ = world
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    packet = _provenance_rows(db)[0]["context"]["packet"]
+    assert packet["turns"] >= 1
+    assert packet["turn_budget"] >= 1
+    assert "dropped_turns" in packet
+
+
+def test_a_continuity_store_that_is_unavailable_never_stops_a_reply(
+    world, spy, traced_writer
+):
+    """The `world` fixture has no continuity tables at all, which is the test."""
+    db, _ = world
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    assert _creator_rows(db), "losing continuity costs a later turn, never this one"

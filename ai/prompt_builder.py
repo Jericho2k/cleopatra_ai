@@ -23,16 +23,19 @@ from ai.writer_style import (
 from services.session_lifecycle import session_progress
 from models.money import customer_dollars, customer_dollars_or_none
 from models.schemas import ConversationContext, StageType
+from services.context_packet import build_context_packet
 
 
-#: How many message bubbles the writer is shown.
+#: How many message bubbles the writer used to be shown.
 #:
-#: Finding D of docs/autonomy_architecture_review.md. The writer's window is
-#: deliberately wider than the analyzer's (ai/situation_analyzer.py), which is
-#: the evidence asymmetry the review names: the classifier that decides what the
-#: turn DOES sees less than the model that writes it. Named so both numbers are
-#: reported in every reply's provenance record rather than being constants two
-#: modules apart.
+#: Kept as the historical constant, no longer the window. Finding D of
+#: docs/autonomy_architecture_review.md: sixteen BUBBLES is not sixteen turns,
+#: and a multipart reply — which this product sends by design
+#: (services/message_shape.py) — spent the budget several times faster than a
+#: single one. The window is now complete turns, from
+#: ``services/context_packet.STANDARD_BUDGET``, and the analyzer reads the same
+#: allowance so it can no longer decide on less evidence than the reply is
+#: written from.
 WRITER_TRANSCRIPT_MESSAGES = 16
 
 
@@ -1235,16 +1238,27 @@ WELCOME MESSAGE (your opening style):
     # effectively blind to the conversation — working only from the analyzer's
     # summary — which is the root cause of tonal drift, coy loops and "getting lost"
     # mid-session. Give it the real scene.
-    transcript_lines = []
-    for m in ctx.conversation_history[-WRITER_TRANSCRIPT_MESSAGES:]:
-        who = fan.display_name if m.role == "fan" else "You"
-        content = (m.content or "").strip()
-        if content:
-            transcript_lines.append(f"{who}: {content}")
-    transcript_block = (
-        "RECENT CONVERSATION (most recent last):\n" + "\n".join(transcript_lines)
-        if transcript_lines else ""
+    #
+    # Budgeted in complete turns rather than bubbles, and assembled by the same
+    # builder the analyzer uses, so the two cannot see different conversations
+    # (services/context_packet.py, finding D).
+    packet = build_context_packet(
+        ctx.conversation_history,
+        open_threads=getattr(ctx, "open_threads", ()) or (),
+        episodes=getattr(ctx, "conversation_episodes", ()) or (),
     )
+    rendered_transcript = packet.render_transcript(
+        fan_name=fan.display_name, creator_name="You"
+    )
+    transcript_block = (
+        "RECENT CONVERSATION (most recent last):\n" + rendered_transcript
+        if rendered_transcript else ""
+    )
+
+    # Unfinished business, given its own allowance so recent chatter cannot
+    # evict it. §4: "Reserve context space for unresolved obligations; do not
+    # drop them merely because small talk filled a 16-bubble window."
+    continuity_block = packet.render_continuity()
 
     # ---- Ordering for provider-side prefix caching ----
     # The durable fan profile and the transcript are appended to, not rewritten,
@@ -1260,6 +1274,8 @@ WHAT YOU KNOW ABOUT THIS FAN:
 {fan_context if fan_context else "New fan — no profile yet. Focus on learning about them."}{missing_details_block}
 
 {transcript_block}
+
+{continuity_block}
 
 {live_state_block}
 

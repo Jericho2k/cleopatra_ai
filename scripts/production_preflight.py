@@ -328,6 +328,33 @@ def check_schema(catalog: Catalog, report: Report) -> None:
             "apply db/message_platform_identity_v1.sql",
         )
 
+    # --- Sprint 2 continuity: tables the application reads SILENTLY ---------
+    #
+    # services/conversation_continuity.py swallows its own failures on purpose:
+    # a memory layer that can take a conversation down is worse than no memory
+    # layer. The cost of that choice is that a missing table produces no error
+    # anybody sees — every reply is simply written as though the conversation
+    # were carrying nothing, which looks exactly like a model that forgets.
+    # This is the only place that difference is visible before a customer finds
+    # it, so it is a failure rather than a warning.
+    missing_continuity = [
+        table
+        for table in ("conversation_open_threads", "conversation_episodes")
+        if not catalog.table_exists(table)
+    ]
+    if missing_continuity:
+        report.fail(
+            "conversation continuity tables",
+            f"missing {', '.join(missing_continuity)}; apply "
+            "db/conversation_continuity_v1.sql. Until then every reply is "
+            "written as though the conversation had no unfinished business.",
+        )
+    else:
+        report.ok(
+            "conversation continuity tables",
+            "open threads and episodes are available",
+        )
+
     # --- DB drift: columns the application WRITES ---------------------------
     #
     # A failure, not a warning. These are not optional features: the code

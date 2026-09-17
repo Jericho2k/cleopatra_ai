@@ -149,6 +149,16 @@ class ConversationContext(BaseModel):
     ai_stack_profile: str = "cleo_legacy_v1"
     writer_prompt_version: str = "writer_v1"
 
+    # What this conversation is still carrying, already rendered to one line
+    # each (services/conversation_continuity.py). Given their own allowance in
+    # the context packet so recent small talk cannot evict an unanswered
+    # question — docs/autonomy_architecture_review.md §4. Empty is the
+    # pre-Sprint-2 behaviour exactly.
+    open_threads: list[str] = Field(default_factory=list)
+    # What earlier stretches of this conversation were about. Never proof of
+    # payment; ppv_deliveries is the authority on money.
+    conversation_episodes: list[str] = Field(default_factory=list)
+
 
 class SuggestionRequest(BaseModel):
     """Request body for the suggestion API."""

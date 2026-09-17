@@ -24,9 +24,22 @@ from ai.generator import (
 from ai.generation_trace import GenerationTrace
 from ai.prompt_builder import WRITER_TRANSCRIPT_MESSAGES
 from ai.situation_analyzer import ANALYZER_TRANSCRIPT_MESSAGES
+from services.context_packet import build_context_packet
 from ai.writer_router import select_writer_route
 from services.ppv_turn import plan_ppv_step_delivery, strip_ppv_tags
 from services.content_access import REVIEW_REASON as CONTENT_ACCESS_REVIEW_REASON
+from services.conversation_continuity import (
+    open_threads_for,
+    recent_episodes_for,
+    record_open_thread,
+    summarize_threads,
+)
+from models.conversation_continuity import (
+    EvidenceType,
+    OpenThread,
+    ThreadKind,
+    ThreadParty,
+)
 from services.reply_provenance import (
     DELIVERY_PPV,
     DELIVERY_TEXT,
@@ -39,6 +52,7 @@ from services.reply_provenance import (
     TRANSFORM_PPV_TAG_STRIPPED,
     TRANSFORM_SHAPE_APPLIED,
     ReplyProvenance,
+    fingerprint,
     merge_provenance,
 )
 from ai.stack_profiles import STAGE_FAN_SUMMARY, get_profile
@@ -547,6 +561,8 @@ async def get_suggestions(
         ppv_offers,
         sent_ppv,
         active_session,
+        carried_threads,
+        past_episodes,
     ) = await asyncio.gather(
         get_conversation_history(fan_id),
         get_fan_by_id(fan_id),
@@ -559,7 +575,15 @@ async def get_suggestions(
         get_ppv_offers(creator_id),
         get_sent_ppv(fan_id),
         get_fan_session(fan_id),
+        # Assisted reads the same continuity Full Auto does. Finding A was
+        # exactly this kind of divergence — one mode loading evidence the other
+        # did not — and the fix is the two modes sharing the load, not a second
+        # copy of the logic here.
+        open_threads_for(creator_id, fan_id),
+        recent_episodes_for(creator_id, fan_id),
     )
+    open_thread_lines = summarize_threads(carried_threads)
+    episode_lines = [episode.render() for episode in past_episodes]
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
     if creator_persona is None:
@@ -586,6 +610,8 @@ async def get_suggestions(
 
     ctx_without_situation = ConversationContext(
         fan_message=fan_message,
+        open_threads=open_thread_lines,
+        conversation_episodes=episode_lines,
         conversation_history=conversation_history,
         fan_profile=fan_profile,
         creator_persona=creator_persona,
@@ -740,6 +766,8 @@ async def get_suggestions(
         conversation_director=conversation_director,
         scene=scene_context,
         text_intimacy=text_intimacy_context,
+        open_threads=open_thread_lines,
+        conversation_episodes=episode_lines,
         ai_stack_profile=stack.profile_id,
         writer_prompt_version=stack_profile.writer_prompt_version(),
     )
@@ -817,6 +845,11 @@ async def get_suggestions(
         history_messages=len(conversation_history),
         analyzer_window=min(len(conversation_history), ANALYZER_TRANSCRIPT_MESSAGES),
         writer_window=min(len(conversation_history), WRITER_TRANSCRIPT_MESSAGES),
+        packet=build_context_packet(
+            conversation_history,
+            open_threads=open_thread_lines,
+            episodes=episode_lines,
+        ).fingerprint(),
         stack_profile=stack.profile_id,
         writer_prompt_version=stack_profile.writer_prompt_version(),
         live_state={
@@ -1418,6 +1451,8 @@ async def _debounced_auto_reply(
             sent_ppv,
             active_session,
             similar_exchanges,
+            carried_threads,
+            past_episodes,
         ) = await asyncio.gather(
             get_creator_persona(creator_id),
             get_creator_legend(creator_id),
@@ -1425,7 +1460,15 @@ async def _debounced_auto_reply(
             get_sent_ppv(fan_id),
             get_fan_session(fan_id),
             find_similar_exchanges(latest_message, creator_id, enabled=False),
+            # What this conversation is still carrying, and what earlier
+            # stretches of it were about. Both get their own allowance in the
+            # context packet, so an unanswered question cannot be evicted by
+            # recent chatter (docs/autonomy_architecture_review.md §4).
+            open_threads_for(creator_id, fan_id),
+            recent_episodes_for(creator_id, fan_id),
         )
+        open_thread_lines = summarize_threads(carried_threads)
+        episode_lines = [episode.render() for episode in past_episodes]
         if creator_persona is None:
             creator_persona = Persona()
 
@@ -1463,6 +1506,8 @@ async def _debounced_auto_reply(
             buyer_lifecycle=buyer_lifecycle,
             affordability=affordability,
             price_learning=price_learning,
+            open_threads=open_thread_lines,
+            conversation_episodes=episode_lines,
             ai_stack_profile=stack.profile_id,
             writer_prompt_version=writer_prompt_version,
         )
@@ -1519,6 +1564,25 @@ async def _debounced_auto_reply(
                 raise HumanReviewHandoffError(
                     "could not persist content-access review hold; no reply sent"
                 ) from exc
+            # The complaint becomes an obligation the conversation carries,
+            # not just a flag on a row. Without it, an operator resolving the
+            # hold clears the freeze and the next turn has no idea anything was
+            # ever wrong — which is how a customer gets sold to immediately
+            # after reporting they cannot open what they bought. Recorded after
+            # the hold, because a hold that failed to persist already raised.
+            await record_open_thread(
+                OpenThread(
+                    creator_id=str(creator_id),
+                    fan_id=str(fan_id),
+                    kind=ThreadKind.COMPLAINT,
+                    raised_by=ThreadParty.FAN,
+                    summary="he says he cannot access content he paid for",
+                    resolution_condition="he confirms he can open it",
+                    evidence_type=EvidenceType.STATED,
+                    source_message_fingerprint=fingerprint(latest_message),
+                    source_turn_id=provenance.turn_id,
+                )
+            )
             if outcome_sink is not None:
                 outcome_sink["outcome"] = AUTO_OUTCOME_HUMAN_REVIEW
             print(f"[AUTO SUPPORT] fan={fan_id} reason=content_access_issue review_required=true")
@@ -1894,6 +1958,8 @@ async def _debounced_auto_reply(
             scene=scene_context,
             text_intimacy=text_intimacy_context,
             message_shape=message_shape.to_context() if message_shape else {},
+            open_threads=open_thread_lines,
+            conversation_episodes=episode_lines,
             ai_stack_profile=stack.profile_id,
             writer_prompt_version=writer_prompt_version,
         )
@@ -1907,6 +1973,11 @@ async def _debounced_auto_reply(
                 len(conversation_history), ANALYZER_TRANSCRIPT_MESSAGES
             ),
             writer_window=min(len(conversation_history), WRITER_TRANSCRIPT_MESSAGES),
+            packet=build_context_packet(
+                conversation_history,
+                open_threads=open_thread_lines,
+                episodes=episode_lines,
+            ).fingerprint(),
             stack_profile=stack.profile_id,
             writer_prompt_version=writer_prompt_version,
             live_state={

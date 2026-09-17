@@ -56,6 +56,8 @@ from core.apifansly_gate import apifansly_enabled
 from core.supabase import get_supabase
 from db.queries import clear_fan_review, save_message
 from services.db_reliability import retry_transient_db_operation
+from models.conversation_continuity import ResolvedBy, ThreadKind, ThreadStatus
+from services.conversation_continuity import open_threads_for, resolve_thread
 from services.ppv_delivery_ledger import PAID_STATUS, list_fan_deliveries
 
 #: The review reason Full Auto writes when the analyzer reports that a customer
@@ -468,9 +470,55 @@ async def resolve_content_access(
         result = {"status": "not_an_access_issue", "fan_id": str(fan_id)}
         print(f"[CONTENT ACCESS] fan={fan_id} resolution=not_an_access_issue")
 
+    await _close_access_complaints(
+        creator_id=str(fan["creator_id"]),
+        fan_id=str(fan_id),
+        resolution=resolution,
+    )
     await retry_transient_db_operation(
         lambda: clear_fan_review(fan_id),
         label=f"clear content-access review fan={fan_id}",
         log_prefix="ACCESS RETRY",
     )
     return {**result, "review_cleared": True}
+
+
+#: How each resolution closes the obligation the complaint created.
+#:
+#: A resend and an operator-restored fix both DEALT with it. "Not an access
+#: problem" did not: it says the analyzer misread the message, so the
+#: obligation was never real and is cancelled rather than reported as met.
+_THREAD_OUTCOME: dict[str, ThreadStatus] = {
+    RESOLUTION_RESEND: ThreadStatus.FULFILLED,
+    RESOLUTION_ACCESS_RESTORED: ThreadStatus.FULFILLED,
+    RESOLUTION_NOT_AN_ACCESS_ISSUE: ThreadStatus.CANCELLED,
+}
+
+
+async def _close_access_complaints(
+    *, creator_id: str, fan_id: str, resolution: str
+) -> None:
+    """Close the obligation the complaint created, now that it is answered.
+
+    Clearing the review flag alone would leave the conversation still carrying
+    "he cannot access what he paid for" forever, and every later turn would be
+    written as though the problem were live. Best effort: a thread that outlives
+    its resolution is a stale line in a prompt, never a wrong action, so this
+    must not be able to fail the operator's resolution.
+    """
+    status = _THREAD_OUTCOME.get(resolution)
+    if status is None:
+        return
+    try:
+        carried = await open_threads_for(creator_id, fan_id, expire_first=False)
+        for thread in carried:
+            if thread.kind != ThreadKind.COMPLAINT:
+                continue
+            await resolve_thread(
+                thread.id,
+                status=status,
+                resolved_by=ResolvedBy.OPERATOR,
+                note=f"content-access resolution: {resolution}",
+            )
+    except Exception as exc:  # pragma: no cover - continuity is never fatal
+        print(f"[CONTENT ACCESS] could not close the complaint thread fan={fan_id}: {exc}")

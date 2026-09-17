@@ -67,6 +67,12 @@ ai_stack_profile_v1.sql
 # CHECK keeps that identity mandatory for every live row. Must run AFTER
 # simulation_catalog_v1.sql, whose simulation_only column the check references.
 simulation_media_identity_v1.sql
+# Sprint 2 continuity records: conversation_open_threads and
+# conversation_episodes — the unfinished business and the completed stretches a
+# long conversation carries, which fan_facts (a CRM vocabulary) and the scene (a
+# single interaction) do not hold. Additive and independent of every migration
+# above; must precede tenant_isolation_v1, which discovers tables at run time.
+conversation_continuity_v1.sql
 
 # Widens the two ai_stack_profile CHECK constraints to accept cleo_v3. Must run
 # AFTER ai_stack_profile_v1.sql, which created the columns and the constraints

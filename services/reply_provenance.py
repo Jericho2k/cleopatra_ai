@@ -174,6 +174,7 @@ class ReplyProvenance:
         stack_profile: str = "",
         writer_prompt_version: str = "",
         live_state: dict[str, Any] | None = None,
+        packet: dict[str, Any] | None = None,
     ) -> None:
         """Record what evidence this turn had, and how much of it was rendered.
 
@@ -200,6 +201,12 @@ class ReplyProvenance:
         if live_state:
             present = sorted(name for name, on in live_state.items() if on)
             record["live_state_blocks"] = present
+        if packet:
+            # What the budgeted builder actually assembled, including what it
+            # had to drop (services/context_packet.py). This is what makes
+            # "the model never mentioned the thing he asked about" separable
+            # from "the model was never told about it" after the fact.
+            record["packet"] = dict(packet)
         self.context = record
 
     def record_decision(
