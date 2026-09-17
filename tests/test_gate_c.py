@@ -364,3 +364,119 @@ def test_the_packet_reports_obligations_it_could_not_fit(db):
     assert len(packet.open_threads) == 6
     assert packet.dropped_threads == 1
     assert packet.fingerprint()["dropped_threads"] == 1
+
+
+# ===========================================================================
+# A correction displaces obsolete evidence on every surface
+# ===========================================================================
+#
+# Gate C asks for this "across Auto, Assisted, simulation and replay". The
+# useful way to establish it is not four near-identical tests: it is to show
+# that all four read continuity from ONE place, so a correction applied once is
+# invisible to all of them and cannot be invisible to only three.
+#
+# That matters because divergence here has happened before. Finding A of the
+# review was exactly this — Assisted and Full Auto assembling context
+# differently — and the fix was the two modes sharing the load rather than
+# keeping a second copy of the logic.
+
+
+def _corrected_threads(db) -> list[str]:
+    """Record a preference, correct it, and return what is still carried."""
+    _raise_from_a_turn(corrections_stated=["he prefers indoor, not outdoor"])
+    original = run(continuity.open_threads_for("creator-1", "fan-1"))[0]
+    run(
+        continuity.supersede_thread(
+            original.id,
+            original.model_copy(
+                update={"summary": "he prefers hotel shoots, not indoor", "id": ""}
+            ),
+        )
+    )
+    return _carried()
+
+
+def _context(open_thread_lines):
+    """The one object every surface hands to the prompt builders."""
+    from models.schemas import (
+        ConversationContext,
+        Fan,
+        Message,
+        Persona,
+        StageType,
+    )
+
+    history = [
+        Message(role="fan", content="what have you got"),
+        Message(role="creator", content="a few things"),
+    ]
+    return ConversationContext(
+        fan_message=history[-1].content,
+        conversation_history=history,
+        fan_profile=Fan(id="fan-1", display_name="Dan"),
+        creator_persona=Persona(),
+        similar_exchanges=[],
+        conversation_stage=StageType.WARMING_UP,
+        open_threads=tuple(open_thread_lines),
+    )
+
+
+def test_the_writer_sees_the_correction_and_not_what_it_corrected(db):
+    from ai.prompt_builder import build_prompt
+
+    rendered = str(build_prompt(_context(_corrected_threads(db)))).lower()
+
+    assert "hotel" in rendered
+    assert "indoor, not outdoor" not in rendered
+
+
+def test_the_analyzer_sees_the_correction_and_not_what_it_corrected(db):
+    """Finding D was the two readers seeing different evidence.
+
+    A correction the writer honours and the analyzer does not is that bug
+    again, in the one place it would be hardest to notice.
+    """
+    from ai.situation_analyzer import build_analyzer_prompt
+
+    system, user = build_analyzer_prompt(_context(_corrected_threads(db)))
+    rendered = f"{system}\n{user}".lower()
+
+    assert "hotel" in rendered
+    assert "indoor, not outdoor" not in rendered
+
+
+def test_every_surface_reads_continuity_from_the_same_place(db):
+    """The property that makes one correction enough for all four.
+
+    Auto, Assisted and simulation all call open_threads_for + summarize_threads
+    and hand the result to build_context_packet; replay reads the same packet.
+    Asserted by source, because the failure mode is a fifth caller appearing
+    with its own copy — which is what finding A was.
+    """
+    import inspect
+
+    from services import suggestions
+
+    source = inspect.getsource(suggestions)
+
+    # Both live turn paths load it through the shared helpers.
+    assert source.count("open_threads_for(creator_id, fan_id)") >= 2
+    assert source.count("summarize_threads(carried_threads)") >= 2
+
+    # The invariant that actually matters, and the one a divergent fifth
+    # caller would break: nothing here reads the table directly or assembles
+    # thread lines by hand. An exact count of the calls above would also break
+    # on an innocuous refactor, so it is a floor rather than an equality.
+    assert "conversation_open_threads" not in source
+    assert 'table("conversation' not in source
+
+
+def test_the_packet_carries_only_the_current_version(db):
+    """Replay's view, which is the packet and nothing else."""
+    packet = build_context_packet(history=_chatter(20), open_threads=_corrected_threads(db))
+
+    rendered = packet.render_continuity().lower()
+
+    assert "hotel" in rendered
+    assert "indoor, not outdoor" not in rendered
+    assert packet.dropped_threads == 0
