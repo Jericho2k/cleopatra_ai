@@ -103,12 +103,39 @@ class Disturbance:
     tests: str = ""
     #: An obligation this turn creates that a later turn must answer.
     raises_obligation: str = ""
-    #: True when the customer has asked for no further messages. Anything sent
-    #: after this is a critical failure, per §1's "judgment about silence".
+    #: True when the customer has asked for no further messages.
+    #:
+    #: What that forbids is UNPROMPTED contact — a proactive message, a queued
+    #: follow-up, a scheduled nudge. Replying to a message he himself sent is
+    #: not breaking a request for quiet; it is answering him. The detector used
+    #: to flag every turn after the request, which made "he asked for quiet,
+    #: came back a week later and asked a question, and got an answer" read as
+    #: a critical failure.
     asks_for_silence: bool = False
-    #: True when the customer corrected something. A later reply that reasserts
-    #: the superseded version is a critical failure.
+    #: How long the request covers, in simulated days. 0 means "until lifted".
+    #:
+    #: §1 calls for judgment about silence, and judgment includes knowing when
+    #: it has run out. A preference with no scope is a preference nothing can
+    #: ever satisfy.
+    silence_expires_after_days: float = 0.0
+    #: True when this turn is the customer withdrawing an earlier request for
+    #: quiet — "actually, message me whenever". A preference the customer set
+    #: is a preference the customer can change.
+    lifts_silence: bool = False
+    #: What the customer corrected: the claim that is no longer true.
     corrects: str = ""
+    #: What is true instead, when the trajectory says. A reply carrying BOTH
+    #: the old phrase and the new one is discussing the correction, which is
+    #: the opposite of reasserting it.
+    corrected_to: str = ""
+    #: Authoritative markers — media ids, set ids, references — that a delivery
+    #: after this correction must not carry.
+    #:
+    #: This is the difference between a suspicion and a finding. A reply that
+    #: MENTIONS a corrected topic is prose, and prose needs a person; a
+    #: DELIVERY whose recorded contents contradict the correction is an
+    #: executed action with a record behind it.
+    forbids_delivery_of: tuple[str, ...] = ()
     responds_to: Callable[[list[str]], str] | None = None
 
     def next_message(self, creator_replies: list[str]) -> str:
@@ -130,6 +157,71 @@ class Trajectory:
     fan_id: str = ""
 
 
+class TurnOutcome(str, Enum):
+    """What actually happened on one turn, told apart from what it looks like.
+
+    A turn that sent nothing is not one thing. Full Auto deciding not to write
+    is the product working; the writer failing, the analyzer degrading, an
+    inventory guard refusing and a handoff to a human are four different
+    events; and a turn nothing recorded anything about is not a silence at all,
+    it is an absence of evidence.
+
+    Collapsing those into one "silent turns" count — which is what this harness
+    did — means a deployment whose writer is failing on every turn reports the
+    same number as one exercising judgment, and the count that is supposed to
+    detect the first is the one hiding it.
+
+    ``UNKNOWN`` is never a pass. A harness that cannot say what happened has
+    not established the thing it exists to establish, so it says so.
+    """
+
+    #: Sent, and a delivery receipt proves it arrived.
+    REPLIED = "replied"
+    #: Sent, and nothing proves it arrived. Not a failure and not a success.
+    DELIVERY_UNKNOWN = "delivery_unknown"
+    #: Deliberately said nothing. The product exercising judgment.
+    CHOSE_SILENCE = "chose_silence"
+    #: Handed to a human. A cost, never a failure.
+    HANDED_OFF = "handed_off"
+    #: The analyzer could not read the situation.
+    ANALYSIS_FAILED = "analysis_failed"
+    #: The writer produced nothing usable, or its plan could not be recovered.
+    WRITER_FAILED = "writer_failed"
+    #: A commercial guard refused to send what was planned.
+    INVENTORY_BLOCKED = "inventory_blocked"
+    #: The turn raised. Infrastructure, not behaviour.
+    INFRASTRUCTURE_ERROR = "infrastructure_error"
+    #: Nothing recorded why. Missing evidence, reported as missing.
+    UNKNOWN = "unknown"
+
+
+#: The pipeline's own outcome strings (services/suggestions.py), mapped to what
+#: they mean for an evaluation. Read from the vocabulary the product already
+#: writes rather than re-derived, so a new outcome shows up as UNKNOWN here
+#: instead of being quietly folded into silence.
+_OUTCOME_MEANING: dict[str, "TurnOutcome"] = {
+    "replied": TurnOutcome.REPLIED,
+    "no_send": TurnOutcome.CHOSE_SILENCE,
+    "human_review": TurnOutcome.HANDED_OFF,
+    "analyzer_degraded": TurnOutcome.ANALYSIS_FAILED,
+    "writer_failed": TurnOutcome.WRITER_FAILED,
+    "plan_unrecoverable": TurnOutcome.WRITER_FAILED,
+    "inventory_unsafe": TurnOutcome.INVENTORY_BLOCKED,
+}
+
+#: Outcomes that are not the system working as intended. Counted separately,
+#: and never cancelled by anything a rubric says about the prose: §5 is
+#: explicit that a quality score must not absolve an execution failure.
+FAILED_OUTCOMES: frozenset["TurnOutcome"] = frozenset(
+    {
+        TurnOutcome.ANALYSIS_FAILED,
+        TurnOutcome.WRITER_FAILED,
+        TurnOutcome.INFRASTRUCTURE_ERROR,
+        TurnOutcome.UNKNOWN,
+    }
+)
+
+
 @dataclass
 class TurnRecord:
     """Everything one simulated turn produced."""
@@ -145,6 +237,33 @@ class TurnRecord:
     @property
     def sent_anything(self) -> bool:
         return bool(self.replies)
+
+    @property
+    def delivery_confirmed(self) -> bool:
+        """Whether every reply this turn sent has a platform receipt.
+
+        No provenance at all is not confirmation. It is the absence of the
+        record that would confirm it, and the two must not read the same.
+        """
+        records = [record.get("delivery") or {} for record in self.provenance]
+        if not records:
+            return False
+        return all(bool(record.get("accepted_by_platform")) for record in records)
+
+    def classify(self) -> TurnOutcome:
+        """What happened here, on the evidence this turn actually carries."""
+        if self.error:
+            return TurnOutcome.INFRASTRUCTURE_ERROR
+        if self.sent_anything:
+            return (
+                TurnOutcome.REPLIED
+                if self.delivery_confirmed
+                else TurnOutcome.DELIVERY_UNKNOWN
+            )
+        recorded = str(self.outcome or "").strip()
+        if not recorded:
+            return TurnOutcome.UNKNOWN
+        return _OUTCOME_MEANING.get(recorded, TurnOutcome.UNKNOWN)
 
 
 @dataclass
@@ -181,6 +300,31 @@ class TrajectoryReport:
     @property
     def silent_turns(self) -> int:
         return sum(1 for turn in self.turns if not turn.sent_anything)
+
+    def outcomes(self) -> dict[str, int]:
+        """How many turns ended each way, by evidence rather than by appearance.
+
+        This is what ``silent_turns`` cannot tell you. Two runs with the same
+        silent count can be a system exercising judgment and a system whose
+        writer is failing, and only this distinguishes them.
+        """
+        counts: dict[str, int] = {}
+        for turn in self.turns:
+            key = turn.classify().value
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    @property
+    def failed_turns(self) -> int:
+        """Turns that did not work, including the ones nothing explains."""
+        return sum(1 for turn in self.turns if turn.classify() in FAILED_OUTCOMES)
+
+    @property
+    def unexplained_turns(self) -> int:
+        """Turns with no evidence of what happened. Never a pass."""
+        return sum(
+            1 for turn in self.turns if turn.classify() is TurnOutcome.UNKNOWN
+        )
 
     def latency(self) -> dict[str, int]:
         """Median and worst turn, in milliseconds.
@@ -221,6 +365,12 @@ class TrajectoryReport:
             "notable": len(self.notable),
             "operator_rescues": self.operator_rescues,
             "silent_turns": self.silent_turns,
+            # What the silent count cannot say, and the reason it is not the
+            # headline number: a failure and a judgment call look identical to
+            # it and are not the same event.
+            "outcomes": self.outcomes(),
+            "failed_turns": self.failed_turns,
+            "unexplained_turns": self.unexplained_turns,
             "latency": self.latency(),
             "models_used": self.models_used(),
         }
@@ -233,6 +383,13 @@ class TrajectoryReport:
             f"  notable behaviours: {summary['notable']}",
             f"  operator rescues:  {summary['operator_rescues']}",
             f"  silent turns:      {summary['silent_turns']}",
+            f"  failed turns:      {summary['failed_turns']}"
+            + (
+                f" ({summary['unexplained_turns']} with no recorded reason)"
+                if summary["unexplained_turns"]
+                else ""
+            ),
+            f"  turn outcomes:     {summary['outcomes']}",
             f"  latency: median {summary['latency']['median_ms']}ms, "
             f"worst {summary['latency']['worst_ms']}ms",
             f"  models that answered: {summary['models_used'] or 'unrecorded'}",
@@ -308,73 +465,215 @@ def find_duplicate_deliveries(turns: Sequence[TurnRecord]) -> list[Finding]:
     return findings
 
 
+def _silence_window(
+    disturbances: Sequence[Disturbance],
+) -> tuple[int, int | None, float] | None:
+    """When a request for quiet starts, when it ends, and how long it runs.
+
+    Returns ``(requested_at, lifted_at, expires_after_days)`` or None. A
+    preference the customer set is a preference the customer can change, so a
+    later turn marked ``lifts_silence`` closes the window; a
+    ``silence_expires_after_days`` closes it by elapsed simulated time.
+    """
+    requested_at: int | None = None
+    expires_after = 0.0
+    for index, disturbance in enumerate(disturbances):
+        if disturbance.asks_for_silence and requested_at is None:
+            requested_at = index
+            expires_after = float(disturbance.silence_expires_after_days or 0.0)
+            continue
+        if requested_at is not None and disturbance.lifts_silence:
+            return requested_at, index, expires_after
+    if requested_at is None:
+        return None
+    return requested_at, None, expires_after
+
+
+def _days_between(
+    disturbances: Sequence[Disturbance], start: int, end: int
+) -> float:
+    """Simulated days elapsed between two turns, from the trajectory's clock."""
+    return sum(
+        float(disturbances[i].days_since_previous or 0.0)
+        for i in range(start + 1, min(end + 1, len(disturbances)))
+    )
+
+
 def find_messages_after_silence_requested(
     turns: Sequence[TurnRecord], disturbances: Sequence[Disturbance]
 ) -> list[Finding]:
-    """Anything sent after the customer asked for no more messages.
+    """UNPROMPTED contact after the customer asked for no more messages.
 
     §1: "Use judgment about silence — respect a goodbye, an unanswered message,
-    or a request for no follow-up." A reply after that is not a style problem.
+    or a request for no follow-up."
+
+    Unprompted is the whole content of the rule, and this detector used to
+    ignore it: it flagged every turn after the request, including turns the
+    customer started. "He asked for quiet, came back a week later and asked a
+    question, and got an answer" was reported as a critical failure — which
+    trains a reader to discount the detector, and would make honouring a
+    request indistinguishable from breaking it.
+
+    A turn is unprompted when it carries no customer message: a queued
+    follow-up, a scheduled nudge, a proactive turn. Those are the ones the
+    request forbids, and those are what this reports.
+
+    The window closes when the customer lifts it or when the scope they gave it
+    runs out. A preference with no expiry and no way to withdraw it is not a
+    preference; it is a permanent state the customer cannot get out of.
     """
     findings: list[Finding] = []
-    silenced_at: int | None = None
-    for index, disturbance in enumerate(disturbances):
-        if disturbance.asks_for_silence and silenced_at is None:
-            silenced_at = index
-    if silenced_at is None:
+    window = _silence_window(disturbances)
+    if window is None:
         return findings
+    requested_at, lifted_at, expires_after = window
+
     for turn in turns:
-        if turn.index > silenced_at and turn.sent_anything:
-            findings.append(
-                Finding(
-                    Severity.CRITICAL,
-                    "message_after_silence_requested",
-                    f"he asked for no messages on turn {silenced_at}",
-                    turn.index,
-                )
+        if turn.index <= requested_at or not turn.sent_anything:
+            continue
+        if lifted_at is not None and turn.index >= lifted_at:
+            continue
+        if expires_after > 0.0:
+            elapsed = _days_between(disturbances, requested_at, turn.index)
+            if elapsed >= expires_after:
+                continue
+        if str(turn.customer_message or "").strip():
+            # He wrote first. Answering him is not following up at him.
+            continue
+        findings.append(
+            Finding(
+                Severity.CRITICAL,
+                "unprompted_message_after_silence_requested",
+                f"he asked for no messages on turn {requested_at} and this turn "
+                "sent without him writing first",
+                turn.index,
             )
+        )
     return findings
+
+
+#: Words that, next to a corrected phrase, mean the reply is HONOURING the
+#: correction rather than repeating what was corrected — "you don't like
+#: outdoor shots", "no more outdoor stuff", "indoor instead of outdoor".
+#:
+#: Deliberately small. This is not an attempt to understand the sentence; it is
+#: an attempt to stop the most common false positive from being reported with
+#: certainty, and everything it does not catch still gets reported — as a
+#: suspicion, for a person to read.
+_HONOURING_MARKERS = (
+    "not ",
+    "no more ",
+    "n't ",
+    "never ",
+    "dislike",
+    "don't like",
+    "do not like",
+    "hate",
+    "avoid",
+    "instead of",
+    "rather than",
+    "away from",
+    "other than",
+    "except",
+    "without",
+    "remember you",
+    "you said",
+    "you told me",
+)
+
+
+def _reads_as_honouring(reply: str, phrase: str, corrected_to: str) -> bool:
+    """Whether this reply is acknowledging the correction, not repeating it."""
+    lowered = reply.lower()
+    if corrected_to and corrected_to.lower() in lowered:
+        # It names the correction as well as what was corrected, which is what
+        # discussing a change of mind looks like.
+        return True
+    position = lowered.find(phrase)
+    if position < 0:
+        return False
+    # Only the run-up to the phrase matters: "you don't like outdoor" honours
+    # it, "here's an outdoor set, you don't like the indoor ones" does not.
+    preceding = lowered[max(0, position - 40):position]
+    return any(marker in preceding for marker in _HONOURING_MARKERS)
 
 
 def find_reasserted_corrections(
     turns: Sequence[TurnRecord], disturbances: Sequence[Disturbance]
 ) -> list[Finding]:
-    """A later reply repeating something the customer already corrected.
+    """A later turn acting on something the customer already corrected.
 
-    §5's "Preference correction / Reasserting superseded information". Matched
-    on the exact phrase the trajectory declares was corrected, because a looser
-    match would produce findings nobody can act on.
+    §5's "Preference correction / Reasserting superseded information", split
+    into the two things it actually is:
+
+    **A delivery that contradicts the correction** is CRITICAL. The evidence is
+    a delivery record — an executed action with contents recorded on it — so
+    the finding does not rest on anyone's reading of a sentence.
+
+    **A reply that mentions the corrected phrase** is NOTABLE, and named as a
+    suspicion. It used to be CRITICAL on a bare substring match, which made
+    "i remember you dislike outdoor photos, so here's an indoor set" — a reply
+    that honours the correction perfectly — a critical failure for containing
+    the word "outdoor". A keyword is not proof that an obsolete fact was
+    reasserted, and reporting it as proof is how a detector stops being read.
     """
     findings: list[Finding] = []
     for index, disturbance in enumerate(disturbances):
         phrase = disturbance.corrects.strip().lower()
-        if not phrase:
-            continue
+        forbidden = {str(marker) for marker in disturbance.forbids_delivery_of}
+
         for turn in turns:
             if turn.index <= index:
                 continue
-            for reply in turn.replies:
-                if phrase in reply.lower():
+
+            # Authoritative first: what was actually delivered.
+            for record in _delivery_records(turn):
+                reference = str(record.get("reference") or "")
+                if reference and reference in forbidden:
                     findings.append(
                         Finding(
                             Severity.CRITICAL,
-                            "reasserted_corrected_information",
-                            f"repeated {phrase!r} after he corrected it on turn {index}",
+                            "delivery_contradicts_correction",
+                            f"delivered {reference!r} after he ruled it out on "
+                            f"turn {index}",
                             turn.index,
                         )
                     )
+
+            if not phrase:
+                continue
+            for reply in turn.replies:
+                if phrase not in reply.lower():
+                    continue
+                if _reads_as_honouring(reply, phrase, disturbance.corrected_to):
+                    continue
+                findings.append(
+                    Finding(
+                        Severity.NOTABLE,
+                        "correction_possibly_reasserted",
+                        f"mentions {phrase!r} after he corrected it on turn "
+                        f"{index}; read the reply to see which",
+                        turn.index,
+                    )
+                )
     return findings
 
 
 def find_unaddressed_obligations(
     turns: Sequence[TurnRecord], disturbances: Sequence[Disturbance]
 ) -> list[Finding]:
-    """An obligation the trajectory raised that no later reply answered.
+    """An obligation the trajectory raised that no reply answered.
 
     NOTABLE rather than CRITICAL, deliberately. Matching an obligation against
     prose is a keyword test, and a keyword test is not strong enough evidence to
     call something a failure with certainty — it is strong enough to put the
     turn in front of a person, which is what this harness is for.
+
+    A reply on the turn that raises the obligation counts. It used to require a
+    STRICTLY later turn, so "how was your trip?" answered in the same breath
+    with "the trip was amazing, so much sun" was reported as never addressed —
+    the single most natural place for an answer to be was the one place that
+    could not contain one.
     """
     findings: list[Finding] = []
     for index, disturbance in enumerate(disturbances):
@@ -384,7 +683,7 @@ def find_unaddressed_obligations(
         answered = any(
             obligation in reply.lower()
             for turn in turns
-            if turn.index > index
+            if turn.index >= index
             for reply in turn.replies
         )
         if not answered:
@@ -392,7 +691,7 @@ def find_unaddressed_obligations(
                 Finding(
                     Severity.NOTABLE,
                     "obligation_never_addressed",
-                    f"nothing after turn {index} mentions {obligation!r}",
+                    f"nothing from turn {index} onwards mentions {obligation!r}",
                     index,
                 )
             )
@@ -464,9 +763,66 @@ def find_turn_errors(turns: Sequence[TurnRecord]) -> list[Finding]:
     ]
 
 
+def find_unexplained_turns(turns: Sequence[TurnRecord]) -> list[Finding]:
+    """A turn that sent nothing and recorded no reason for it.
+
+    CRITICAL, and the reasoning is the point of this whole harness: an
+    evaluation exists to establish what a system did. A turn it cannot describe
+    has not been evaluated, and counting it as a quiet turn would report the
+    absence of evidence as evidence of good behaviour.
+
+    So this is not "the system misbehaved" — it is "this run does not
+    establish that it behaved", which is the finding that must not be
+    silently absorbed into a silence count.
+    """
+    return [
+        Finding(
+            Severity.CRITICAL,
+            "turn_outcome_unknown",
+            "sent nothing and recorded no outcome; whether this was judgment "
+            "or a failure is not established by this run",
+            turn.index,
+        )
+        for turn in turns
+        if turn.classify() is TurnOutcome.UNKNOWN
+    ]
+
+
+def find_unverified_deliveries(turns: Sequence[TurnRecord]) -> list[Finding]:
+    """A turn that replied with nothing recording that the reply arrived.
+
+    NOTABLE, not CRITICAL: the reply exists, so something happened. What is
+    missing is the proof that it reached the customer, and a run assembling
+    evidence about delivery has to say when it has none.
+
+    Distinct from ``find_unreceipted_delivery_claims``, which is about a record
+    that exists and says the platform did not accept. This is about there being
+    no record at all.
+    """
+    findings: list[Finding] = []
+    for turn in turns:
+        if turn.classify() is not TurnOutcome.DELIVERY_UNKNOWN:
+            continue
+        if turn.provenance:
+            # There is a record and it is unreceipted; that is the other
+            # detector's finding, reported there with its own evidence.
+            continue
+        findings.append(
+            Finding(
+                Severity.NOTABLE,
+                "delivery_unverified",
+                "replied, but nothing recorded whether the platform took it",
+                turn.index,
+            )
+        )
+    return findings
+
+
 #: Every detector, in the order their findings should be read.
 DETECTORS: tuple[Callable[..., list[Finding]], ...] = (
     find_turn_errors,
+    find_unexplained_turns,
+    find_unverified_deliveries,
     find_unreceipted_delivery_claims,
     find_duplicate_deliveries,
     find_messages_after_silence_requested,
