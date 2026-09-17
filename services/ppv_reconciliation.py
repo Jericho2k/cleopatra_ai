@@ -320,6 +320,21 @@ async def _finalize_abandonment(
         if not await abandon_delivery_if_active(reference):
             return False
 
+    if reference and not detached:
+        from services.ppv_delivery_ledger import delivery_is_paid
+
+        # Finding I, the purchase-versus-expiry interleaving. The ledger is the
+        # authority on whether money arrived, and it is asked BEFORE fan
+        # commercial state is written: an expiry sweep that runs after a
+        # purchase has nothing to abandon, and recording "not sold" for an item
+        # the fan paid for is the worst answer available.
+        if await delivery_is_paid(reference):
+            print(
+                f"[PPV EXPIRY] fan={fan_id} reference={reference} "
+                "skipped=already_purchased"
+            )
+            return False
+
     def _update_fan() -> bool:
         db = get_supabase()
         latest = (
@@ -349,7 +364,19 @@ async def _finalize_abandonment(
     if reference and not detached:
         from services.ppv_delivery_ledger import transition_delivery
 
-        await transition_delivery(reference, "abandoned")
+        # The pre-check above closes the common case; this is the narrow window
+        # where a purchase landed while fan state was being written. The ledger
+        # refuses to be moved out of purchased, so what is left is two stores
+        # disagreeing, which an operator has to see rather than a sweep paper
+        # over.
+        if not await transition_delivery(reference, "abandoned"):
+            from db.queries import freeze_fan_for_review
+
+            print(
+                f"[PPV EXPIRY CONFLICT] fan={fan_id} reference={reference} "
+                "commercial_state=not_sold ledger=refused_abandonment"
+            )
+            await freeze_fan_for_review(fan_id, "expiry_lost_to_purchase")
 
     if detached:
         return True

@@ -59,7 +59,7 @@ review-hold write propagating instead of pretending a handoff succeeded.
 | Sprint | Review §6 step | Status |
 |---|---|---|
 | 0 — ground truth for every visible reply | 1 | **Done** (this branch) |
-| 1 — close execution bypasses | 2 | Not started |
+| 1 — close execution bypasses | 2 | **In progress** — payment races done |
 | 2 — the general continuity packet | 3 | Not started |
 | 3 — one decision owner, compared under replay | 4 | Not started |
 | 4 — longitudinal evaluation harness | 5 | Not started |
@@ -175,31 +175,65 @@ python -m pytest -q tests/test_reply_provenance.py tests/test_full_auto_simulati
 
 ---
 
-## Sprint 1 — close execution bypasses — NEXT
+## Sprint 1 — close execution bypasses — IN PROGRESS
 
 > §6.2: *Land the reviewed support/identity fixes; add payment interleaving
 > tests and verified entitlement/access recovery. Confirm dashboard visibility
 > of review holds and access outcomes.*
 
-The reviewed support/identity fixes are already on `main` (PR #48). What remains:
+The reviewed support/identity fixes are already on `main` (PR #48).
+
+### Done — finding I, payment-state concurrency
+
+**`transition_delivery` has an expected-prior-status predicate.** It updated
+`ppv_deliveries` by reference alone while `abandon_delivery_if_active`, in the
+same module, used a status predicate. Four writers reach it from different
+clocks: `ppv_delivery.py` writes `delivered_pending` *after* a platform round
+trip to verify the payment lock, `record_ppv_purchase` writes `purchased`,
+`ppv_reconciliation.py` writes `abandoned` on expiry, `ppv_recovery.py` writes
+`voided`. Unordered, a slow pending write undid a purchase that landed while it
+was verifying.
+
+Nothing may now move a row out of `purchased`. A purchase may still be recorded
+from any other status, including after an expiry or a void: money arriving is a
+fact, and refusing to record it hides a real payment. The function returns
+whether the ledger says the target status, which is also true when it was
+already there — a duplicate webhook and a retry whose response was lost mean the
+same thing about the world, and neither may read as a conflict.
+
+**The expiry sweep asks the ledger before writing commercial state.**
+`_finalize_abandonment` now calls `delivery_is_paid` before touching
+`not_sold_log` and `pending_ppv_check`, so a sweep running after a purchase has
+nothing to abandon. For the narrow window where a purchase lands *during* that
+write, the refused transition freezes the fan with `expiry_lost_to_purchase`
+rather than leaving two stores quietly disagreeing.
+
+**Purchase aggregates use compare-and-set.** `record_ppv_purchase` read
+`total_spent`/`sales_log`/`not_sold_log` near the top and wrote them back after
+awaiting the session, the ledger and the platform. Two events for one fan both
+read $100 and both wrote $125; one $25 purchase disappeared with no exception
+and no log line. `db/queries.apply_purchase_to_fan` guards the write on the
+total it was computed from and re-merges against the row that actually exists,
+declining when the other event already recorded the same purchase. Exhausting
+the budget raises `PurchaseAggregateConflict` and freezes the fan: money that
+could not be written down is an operator's problem, and silence is how it became
+invisible.
+
+A row version column would be cleaner and needs a migration; this deliberately
+needs none. These are **source-level races proven by tests, not reproduced live
+incidents**, and passing them does not mean every payment race in this codebase
+is resolved.
+
+### Remaining
 
 1. **Confirm the deployed SHA and flags** against the running deployment, using
-   `GET /build`. Record the answer here. Several findings are unresolvable
-   without it.
-2. **Finding I — payment-state concurrency.**
-   `services/ppv_delivery_ledger.py::transition_delivery` updates by reference
-   with no expected prior status, while `abandon_delivery_if_active` in the same
-   module uses a status predicate. Add the expected-status guard and race tests
-   for late acknowledgements and purchase-versus-expiry interleavings: a delayed
-   pending update must never reverse a confirmed purchase. Purchase recording
-   also does read/modify/write on aggregate fan state and needs concurrent-event
-   verification. This is a real source-level risk, not a reproduced incident —
-   say so in the commit message.
-3. **Verified content-access recovery.** PR #48 contains the complaint; it does
+   `GET /build` from Sprint 0. Record the answer here. Several findings are
+   unresolvable without it, §3E in particular.
+2. **Verified content-access recovery.** PR #48 contains the complaint; it does
    not repair anything. A safe workflow needs entitlement inspection, URL
    refresh, and an outcome the customer is only told about after it is true.
    Never send a repair claim that has not been verified.
-4. **Dashboard visibility** of review holds and access outcomes, in
+3. **Dashboard visibility** of review holds and access outcomes, in
    `cleopatra-dashboard`. An operator cannot clear a hold they cannot see.
 
 ---

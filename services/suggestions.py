@@ -162,6 +162,8 @@ from ai.situation_analyzer import (
 from ai.rag import find_similar_exchanges
 from ai.stage_classifier import classify_stage
 from db.queries import (
+    PurchaseAggregateConflict,
+    apply_purchase_to_fan,
     get_conversation_history,
     get_creator_persona,
     get_fan_by_id,
@@ -2644,17 +2646,94 @@ async def record_ppv_purchase(
                 else None
             ),
         )
-    fan_update = {
-            "total_spent": new_spent,
-            "spend_tier": _tier(new_spent),
-            "sales_log": sales_log,
-            "not_sold_log": not_sold,
-    }
-    if clears_current_pending:
-        fan_update["pending_ppv_check"] = None
-    await asyncio.to_thread(
-        lambda: db.table("fans").update(fan_update).eq("id", fan_id).execute()
-    )
+    def _merge_purchase(current: dict | None) -> dict | None:
+        """Build the fan update from the row as it actually is.
+
+        Called once with ``None`` (meaning: use the snapshot this function
+        already read) and again, with a freshly read row, whenever another
+        purchase event wrote first. Everything it needs is recomputed from
+        ``current`` on those later calls; nothing from the original snapshot
+        survives into them, because merging into a stale total is the exact
+        loss this guards against.
+        """
+        if current is None:
+            merged_spent = new_spent
+            merged_sales = sales_log
+            merged_not_sold = not_sold
+            merged_pending = current_pending
+        else:
+            fresh_sales = list(current.get("sales_log") or [])
+            recorded_now = any(
+                (
+                    str(entry.get("payment_reference") or "") == reference
+                    if reference
+                    else str(entry.get("media_id")) == str(media_id)
+                )
+                for entry in fresh_sales
+            ) or (
+                bool(platform_order_id)
+                and any(
+                    str(entry.get("platform_order_id") or "") == platform_order_id
+                    for entry in fresh_sales
+                )
+            )
+            if recorded_now:
+                # The event that beat us recorded this same purchase. Writing
+                # it again would double the customer's spend.
+                print(
+                    f"[PURCHASE CAS] fan={fan_id} reference={reference or 'none'} "
+                    "already_recorded_by_concurrent_event=true"
+                )
+                return None
+            fresh_spent = int(current.get("total_spent") or 0)
+            merged_spent = fresh_spent + (amount_dollars if not already_recorded else 0)
+            merged_sales = fresh_sales + (
+                [sales_log[-1]] if (not already_recorded and sales_log) else []
+            )
+            merged_not_sold = [
+                entry
+                for entry in (current.get("not_sold_log") or [])
+                if (
+                    str(entry.get("payment_reference") or "") != reference
+                    if reference
+                    else str(media_id) not in str(entry.get("item", ""))
+                )
+            ]
+            merged_pending = current.get("pending_ppv_check") or {}
+
+        update = {
+            "total_spent": merged_spent,
+            "spend_tier": _tier(merged_spent),
+            "sales_log": merged_sales,
+            "not_sold_log": merged_not_sold,
+        }
+        # Recomputed against whichever row this attempt is merging into: the
+        # pending check the caller saw may have been replaced by a newer offer,
+        # and clearing that one would cancel a delivery nobody has resolved.
+        still_clears = bool(
+            merged_pending
+            and (
+                (reference and str(merged_pending.get("reference") or "") == reference)
+                or (not reference and not pending_override)
+            )
+        )
+        if still_clears:
+            update["pending_ppv_check"] = None
+        return update
+
+    try:
+        await apply_purchase_to_fan(
+            fan_id,
+            merge=_merge_purchase,
+            expected_total_spent=old_spent,
+        )
+    except PurchaseAggregateConflict as exc:
+        # The money is real and could not be written down. An operator has to
+        # see that, and automation must not carry on as though the customer's
+        # spend were correct.
+        print(f"[PURCHASE CONFLICT] fan={fan_id} {exc}")
+        await freeze_fan_for_review(fan_id, "purchase_aggregate_conflict")
+        raise
     await mark_ppv_purchased(fan_id, str(media_id))
     if creator_id and reference:
         await cancel_action_by_dedupe_key(
