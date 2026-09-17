@@ -40,6 +40,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core import clock  # noqa: E402
 from services.trajectory_eval import (  # noqa: E402
     TrajectoryReport,
     TurnRecord,
@@ -126,8 +127,15 @@ async def _run_due_work(creator_id: str, fan_id: str) -> dict:
     }
 
 
-async def _run_all(trajectories, creator_id: str, fan_id: str) -> list:
+async def _run_all(trajectories, creator_id: str, fan_id: str, *, use_clock: bool) -> list:
     from services.suggestions import run_simulated_inbound
+
+    # None when the clock is not enabled, which run_trajectory records as "no
+    # clock was injected" and the coverage check reports as an uncovered
+    # elapsed-time claim. That is the honest outcome: refusing to advance is
+    # not the same as a week having passed, and this harness used to report
+    # them identically.
+    advance_clock = clock.advance if use_clock else None
 
     reports = []
     for trajectory in trajectories:
@@ -141,13 +149,17 @@ async def _run_all(trajectories, creator_id: str, fan_id: str) -> list:
                 fan_id=_fan, creator_id=_creator, message=message, fast=True
             )
 
-        # advance_clock is deliberately NOT supplied. There is no seam in the
-        # backend that moves expiry, scheduling and continuity together, so
-        # anything passed here would advance a number and nothing else — which
-        # is worse than not advancing it, because the report would then claim
-        # the week passed. run_trajectory records that no clock was injected
-        # and reports the elapsed-time claims as uncovered.
-        reports.append(await run_trajectory(trajectory, send_turn=send_turn))
+        # Fresh state between independent scenarios. A clock carried over
+        # from the previous trajectory is state, and the brief asks for
+        # scenarios not to inherit each other's.
+        clock.reset()
+
+        reports.append(
+            await run_trajectory(
+                trajectory, send_turn=send_turn, advance_clock=advance_clock
+            )
+        )
+    clock.reset()
     return reports
 
 
@@ -171,6 +183,17 @@ def main() -> int:
         "--fail-on-critical",
         action="store_true",
         help="exit non-zero if any trajectory produced a critical execution failure",
+    )
+    parser.add_argument(
+        "--simulate-time",
+        action="store_true",
+        help=(
+            "advance a simulated clock for days_since_previous, so a return "
+            "after a day or a week is actually tested. Requires APP_ENV != "
+            "production and EVAL_CLOCK_ENABLED=1 (core/clock.py); without it "
+            "the elapsed-time claims are reported as uncovered rather than "
+            "quietly assumed"
+        ),
     )
     parser.add_argument(
         "--fail-on-uncovered",
@@ -218,7 +241,17 @@ def main() -> int:
         )
         return 2
 
-    reports = asyncio.run(_run_all(trajectories, args.creator, args.fan))
+    if args.simulate_time and not clock.movable():
+        print(
+            "--simulate-time was asked for and this process cannot move its "
+            f"clock. It needs APP_ENV != production and {clock.EVAL_CLOCK_FLAG}=1.",
+            file=sys.stderr,
+        )
+        return 2
+
+    reports = asyncio.run(
+        _run_all(trajectories, args.creator, args.fan, use_clock=args.simulate_time)
+    )
 
     if args.json:
         print(

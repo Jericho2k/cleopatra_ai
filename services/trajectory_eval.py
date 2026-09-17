@@ -959,8 +959,25 @@ async def run_trajectory(
             if advance_clock is not None:
                 # Simulated absence. §1 tests a return after one day and one
                 # week, and no evaluation waits for either.
-                advance_clock(disturbance.days_since_previous)
-                report.elapsed_days += float(disturbance.days_since_previous)
+                try:
+                    advance_clock(disturbance.days_since_previous)
+                except Exception as exc:
+                    # A clock that refuses (core.clock.ClockNotMovable in a
+                    # process that may not simulate time) must not abort the
+                    # conversation. The turns still run and the report says
+                    # the time did not pass, which is the honest outcome and
+                    # the one the coverage check reads.
+                    report.clock_injected = False
+                    report.findings.append(
+                        Finding(
+                            Severity.NOTABLE,
+                            "clock_did_not_advance",
+                            f"{type(exc).__name__}: {exc}",
+                            index,
+                        )
+                    )
+                else:
+                    report.elapsed_days += float(disturbance.days_since_previous)
             # Without a clock, the turn still runs — and the report says the
             # week did not pass, rather than the trajectory's label implying
             # it did. `days_since_previous` was previously a no-op whenever
@@ -1004,7 +1021,9 @@ async def run_trajectory(
                 record.provenance.append(provenance)
         report.turns.append(record)
 
-    report.findings = evaluate_turns(report.turns, trajectory.disturbances)
+    # Extended, not replaced: a clock refusal recorded during the loop is a
+    # finding about the run and must survive the detectors being run.
+    report.findings.extend(evaluate_turns(report.turns, trajectory.disturbances))
     report.coverage_gaps = coverage_gaps(trajectory, report)
     return report
 

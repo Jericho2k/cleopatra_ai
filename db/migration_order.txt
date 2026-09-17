@@ -115,6 +115,12 @@ vault_classification_persistence_v1.sql
 # creator-owned table, before tenant_isolation_v1.
 simulation_turn_durability_v1.sql
 
+# claim_due_actions gains an optional p_now, so the evaluation harness can
+# simulate a queued follow-up becoming due. Replaces the function created by
+# scheduled_action_claim_v1.sql, so it must run after it. No table, so its
+# position relative to tenant_isolation_v1 does not matter.
+eval_clock_claim_v1.sql
+
 # Durable content-access repair claims: public.content_access_repairs and
 # fans.review_case_id. Stops a retry or a second operator sending a second free
 # copy, and stops a repair clearing a newer hold. Creates a creator-owned
