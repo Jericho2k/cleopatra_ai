@@ -179,6 +179,13 @@ class SuggestionResponse(BaseModel):
     # as a normally analysed suggestion.
     analysis_degraded: bool = False
     analysis_degraded_reason: str = ""
+    # An opaque handle to this turn's provenance record, held in memory by the
+    # backend until the operator sends one of these candidates
+    # (services/reply_provenance.py). The dashboard returns it on POST /reply so
+    # the sent message can be attributed to the turn, the context and the model
+    # attempt that actually produced it. Empty when provenance is unavailable;
+    # the dashboard treats it as opaque and never displays it.
+    suggestion_token: str = ""
 
     @field_validator("suggestions")
     @classmethod

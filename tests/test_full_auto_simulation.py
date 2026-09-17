@@ -1838,3 +1838,192 @@ def test_the_simulator_marker_and_the_stack_marker_coexist():
 
     assert is_simulation_message(merged) is True
     assert merged["ai_stack"]["profile"] == "cleo_v2"
+
+
+# --- Sprint 0: ground truth travels with the message it explains ------------
+
+
+@pytest.fixture
+def traced_writer(monkeypatch):
+    """A writer stub that fills the trace the way the real ladder does.
+
+    The default ``world`` stub ignores the trace, which is correct for tests
+    that do not care. These ones assert that the model which ANSWERED reaches
+    the persisted row, so the stub has to answer as a specific model — and it
+    deliberately answers as the FALLBACK, which is the case finding H says the
+    old marker got wrong.
+    """
+    from ai.writer_recovery import ROLE_FALLBACK
+    from models.model_runtime import ModelTarget
+
+    async def fake_generate(prompt, persona, **kwargs):
+        trace = kwargs.get("trace")
+        if trace is not None:
+            trace.record_request(
+                primary_target=ModelTarget(
+                    name="kimi", provider="openrouter", model="moonshotai/kimi-k2.6"
+                ),
+                fallback_target=None,
+                profile="cleo_legacy_v1",
+                policy="legacy",
+                deadline_seconds=30.0,
+            )
+            trace.record_success(
+                target=ModelTarget(
+                    name="qwen", provider="together", model="Qwen/Qwen3.7-Plus"
+                ),
+                role=ROLE_FALLBACK,
+                attempt_index=3,
+                upstream_provider="together",
+                outcome="qwen_emergency_fallback",
+                attempts=3,
+                pinned_attempts=2,
+                alternate_attempts=0,
+                elapsed_ms=900,
+            )
+        return ["hey"]
+
+    monkeypatch.setattr(suggestions, "generate_replies", fake_generate)
+
+
+def _provenance_rows(db) -> list[dict]:
+    from services.reply_provenance import provenance_of
+
+    return [
+        provenance_of(row.get("media_context"))
+        for row in _creator_rows(db)
+        if provenance_of(row.get("media_context"))
+    ]
+
+
+def test_a_sent_reply_records_the_event_that_caused_it(world, spy, traced_writer):
+    db, _ = world
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="are you there?", fast=True
+        )
+    )
+
+    from services.reply_provenance import fingerprint
+
+    records = _provenance_rows(db)
+    assert records, "every reply this pipeline sends carries its provenance"
+    assert records[0]["trigger"]["kind"] == "fan_message"
+    assert records[0]["trigger"]["text_fingerprint"] == fingerprint("are you there?")
+    assert records[0]["mode"] == "auto"
+
+
+def test_a_sent_reply_records_the_model_that_actually_answered(
+    world, spy, traced_writer
+):
+    """Finding H, end to end: the row names Qwen because Qwen answered."""
+    db, _ = world
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    record = _provenance_rows(db)[0]
+    assert record["writer"]["requested"]["model"] == "moonshotai/kimi-k2.6"
+    assert record["writer"]["actual"]["model"] == "Qwen/Qwen3.7-Plus"
+    assert record["writer"]["served_by_requested_model"] is False
+
+    # And the compact stack marker on the same row agrees with it, rather than
+    # still naming the model the router asked for.
+    stack = _creator_rows(db)[0]["media_context"]["ai_stack"]
+    assert stack["model"] == "Qwen/Qwen3.7-Plus"
+    assert stack["requested_model"] == "moonshotai/kimi-k2.6"
+
+
+def test_a_sent_reply_records_the_context_it_was_allowed_to_see(
+    world, spy, traced_writer
+):
+    db, _ = world
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    context = _provenance_rows(db)[0]["context"]
+    assert context["history_messages"] >= 1
+    # Finding D: the analyzer never sees more than the writer.
+    assert context["analyzer_window"] <= context["writer_window"]
+    assert context["stack_profile"]
+
+
+def test_a_sent_reply_records_the_commit_and_flag_digest_that_produced_it(
+    world, spy, traced_writer
+):
+    db, _ = world
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    build = _provenance_rows(db)[0]["build"]
+    assert build["sha"]
+    assert build["flags_digest"]
+    assert "flags" not in build, "the mapping lives on /build, not on every row"
+
+
+def test_the_bubbles_of_one_reply_share_one_turn(
+    world, spy, two_bubble_turn, monkeypatch
+):
+    async def fake_generate(prompt, persona, **kwargs):
+        return ["hey | what are you doing?"]
+
+    monkeypatch.setattr(suggestions, "generate_replies", fake_generate)
+    db, _ = world
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    records = _provenance_rows(db)
+    assert len(records) == 2
+    assert records[0]["turn_id"] == records[1]["turn_id"]
+    assert [r["part"] for r in records] == [0, 1]
+    assert records[0]["parts"] == 2
+
+
+def test_a_reply_the_code_rewrote_is_not_attributed_to_the_model(
+    world, spy, monkeypatch
+):
+    """A writer-emitted delivery tag is stripped; the record has to say so."""
+
+    async def tagged_reply(prompt, persona, **kwargs):
+        return ["here you go [PPV:set-1]"]
+
+    monkeypatch.setattr(suggestions, "generate_replies", tagged_reply)
+    db, _ = world
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    from services.reply_provenance import TRANSFORM_PPV_TAG_STRIPPED
+
+    record = _provenance_rows(db)[0]
+    assert TRANSFORM_PPV_TAG_STRIPPED in record["transforms"]
+
+
+def test_a_local_test_delivery_is_not_claimed_as_a_platform_delivery(
+    world, spy, traced_writer
+):
+    """The simulator's text path gets no platform receipt, so it claims none."""
+    db, _ = world
+    _run(
+        suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message="hi", fast=True
+        )
+    )
+
+    delivery = _provenance_rows(db)[0]["delivery"]
+    assert delivery["kind"] == "text"
+    assert delivery["accepted_by_platform"] is False
+    assert delivery["platform_message_id"] is None

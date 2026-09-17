@@ -25,6 +25,17 @@ from models.money import customer_dollars, customer_dollars_or_none
 from models.schemas import ConversationContext, StageType
 
 
+#: How many message bubbles the writer is shown.
+#:
+#: Finding D of docs/autonomy_architecture_review.md. The writer's window is
+#: deliberately wider than the analyzer's (ai/situation_analyzer.py), which is
+#: the evidence asymmetry the review names: the classifier that decides what the
+#: turn DOES sees less than the model that writes it. Named so both numbers are
+#: reported in every reply's provenance record rather than being constants two
+#: modules apart.
+WRITER_TRANSCRIPT_MESSAGES = 16
+
+
 PLATFORM_CONTEXT = """This conversation takes place inside a paid adult creator subscription platform.
 The fan already knows that the creator sells digital adult content. Sexual interest and requests for digital content are normal here; do not react like a stranger on social media was unexpectedly asked for nudes.
 All intimacy, services, and content stay digital and on-platform. Never suggest, promise, or agree to an in-person meeting, date, physical service, private meetup, phone number exchange, or moving the conversation elsewhere.
@@ -1225,7 +1236,7 @@ WELCOME MESSAGE (your opening style):
     # summary — which is the root cause of tonal drift, coy loops and "getting lost"
     # mid-session. Give it the real scene.
     transcript_lines = []
-    for m in ctx.conversation_history[-16:]:
+    for m in ctx.conversation_history[-WRITER_TRANSCRIPT_MESSAGES:]:
         who = fan.display_name if m.role == "fan" else "You"
         content = (m.content or "").strip()
         if content:

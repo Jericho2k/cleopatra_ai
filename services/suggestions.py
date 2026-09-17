@@ -21,8 +21,25 @@ from ai.generator import (
     PERSISTENT_PRIMARY_RETRY_POLICY,
     generate_replies,
 )
+from ai.generation_trace import GenerationTrace
+from ai.prompt_builder import WRITER_TRANSCRIPT_MESSAGES
+from ai.situation_analyzer import ANALYZER_TRANSCRIPT_MESSAGES
 from ai.writer_router import select_writer_route
 from services.ppv_turn import plan_ppv_step_delivery, strip_ppv_tags
+from services.reply_provenance import (
+    DELIVERY_PPV,
+    DELIVERY_TEXT,
+    PIPELINE_ASSISTED,
+    PIPELINE_AUTO,
+    SUGGESTION_PROVENANCE,
+    TRANSFORM_DELIVERY_LANGUAGE,
+    TRANSFORM_INVENTORY_REPAIR,
+    TRANSFORM_PPV_MERGED,
+    TRANSFORM_PPV_TAG_STRIPPED,
+    TRANSFORM_SHAPE_APPLIED,
+    ReplyProvenance,
+    merge_provenance,
+)
 from ai.stack_profiles import STAGE_FAN_SUMMARY, get_profile
 from openai import AsyncOpenAI
 from core.config import get_settings
@@ -221,7 +238,9 @@ def _release_auto_reply_slot(fan_id: str) -> bool:
     return True
 
 
-def message_ai_stack_metadata(route, *, profile_id: str) -> dict:
+def message_ai_stack_metadata(
+    route, *, profile_id: str, trace: GenerationTrace | None = None
+) -> dict:
     """The durable "which brain wrote this" marker for one creator message.
 
     Persisted inside ``messages.media_context``, which is existing jsonb
@@ -230,6 +249,16 @@ def message_ai_stack_metadata(route, *, profile_id: str) -> dict:
     route it took, and the model that was actually asked. That is enough to
     answer "which AI stack produced this message?" months later, from the row
     alone, without a telemetry join.
+
+    ``model`` and ``provider`` remained the model the router ASKED for even when
+    a retry, another upstream host or the configured fallback is what actually
+    answered — finding H of docs/autonomy_architecture_review.md, and the reason
+    a message-level model comparison could not be trusted. When a
+    ``GenerationTrace`` is supplied those two keys now name the model that
+    served the text, and ``requested_model``/``requested_provider`` keep what
+    was asked for, so both halves of "we asked for Kimi and got Qwen" survive on
+    the row. Without a trace the marker is exactly what it was, so the callers
+    that do not run the recovery ladder are unchanged.
     """
     marker: dict = {"profile": str(profile_id)}
     if route is not None:
@@ -241,6 +270,14 @@ def message_ai_stack_metadata(route, *, profile_id: str) -> dict:
                 "model": route.primary_target.model,
             }
         )
+    if trace is not None and trace.succeeded:
+        marker["requested_provider"] = trace.requested_provider
+        marker["requested_model"] = trace.requested_model
+        marker["provider"] = trace.provider
+        marker["model"] = trace.model
+        marker["served_by_requested_model"] = trace.served_by_requested_model
+        if trace.upstream_provider:
+            marker["upstream_provider"] = trace.upstream_provider
     return {"ai_stack": marker}
 
 
@@ -717,9 +754,11 @@ async def get_suggestions(
     prompt = build_prompt(
         ctx, prompt_version=route.prompt_version, reply_mode=MODE_ASSISTED
     )
+    assisted_trace = GenerationTrace()
     replies = await generate_replies(
         prompt,
         creator_persona,
+        trace=assisted_trace,
         max_candidates=writer_candidate_count(route.prompt_version, MODE_ASSISTED),
         output_contract=CONTRACT_CANDIDATES,
         retry_policy=writer_retry_policy(route.prompt_version),
@@ -744,6 +783,7 @@ async def get_suggestions(
 
     # Assisted candidates keep their own natural shapes — a human picks one —
     # but the platform's delivery semantics still hold for all of them.
+    raw_candidates = list(replies)
     replies = sanitize_candidates(replies, active_session=active_session)
     # A human approves an assisted candidate, so a promise of media that does
     # not exist is repaired rather than dropped: the operator still sees a
@@ -757,6 +797,55 @@ async def get_suggestions(
         or candidate
         for candidate in replies
     ]
+
+    # Assisted's ground truth is recorded here but finished later: an operator
+    # is between generation and delivery, so the record waits for the send that
+    # redeems its token (services/reply_provenance.py). Candidates the operator
+    # does not pick never become a message and are never attributed.
+    assisted_provenance = ReplyProvenance(
+        creator_id=str(creator_id), fan_id=str(fan_id), mode=PIPELINE_ASSISTED
+    )
+    assisted_provenance.record_trigger(
+        kind="fan_message",
+        text=fan_message,
+        history_position=len(conversation_history) - 1,
+    )
+    assisted_provenance.record_context(
+        history_messages=len(conversation_history),
+        analyzer_window=min(len(conversation_history), ANALYZER_TRANSCRIPT_MESSAGES),
+        writer_window=min(len(conversation_history), WRITER_TRANSCRIPT_MESSAGES),
+        stack_profile=stack.profile_id,
+        writer_prompt_version=stack_profile.writer_prompt_version(),
+        live_state={
+            "creator_legend": bool(creator_legend),
+            "fan_intelligence": bool(fan_intelligence),
+            "buyer_lifecycle": bool(buyer_lifecycle),
+            "affordability": bool(affordability),
+            "price_learning": bool(price_learning),
+            "session_strategy": bool(session_strategy),
+            "conversation_director": bool(conversation_director),
+            "experience_scene": bool(scene_context),
+            "text_intimacy": bool(text_intimacy_context),
+            # Assisted runs no commercial orchestrator: a human decides whether
+            # to sell. Recording the key as absent rather than false would let a
+            # comparison read it as "the orchestrator declined".
+            "active_session": bool(active_session),
+            "media_inventory": bool(media_inventory.authorized_asset_types),
+        },
+    )
+    assisted_provenance.record_decision(
+        source="assisted_operator",
+        purchase_signal=situation.get("purchase_signal"),
+        crisis_signal=situation.get("crisis_signal"),
+        resend_requested=situation.get("resend_requested"),
+        extra={"strategic_move": situation.get("strategic_move")},
+    )
+    assisted_provenance.record_writer(assisted_trace)
+    assisted_provenance.record_transform(
+        TRANSFORM_DELIVERY_LANGUAGE, raw_candidates != replies
+    )
+    suggestion_token = SUGGESTION_PROVENANCE.put(assisted_provenance)
+    print(assisted_trace.describe())
 
     if save_fan_message:
         evidence_message_id = await save_message(
@@ -792,6 +881,7 @@ async def get_suggestions(
         stage=conversation_stage,
         analysis_degraded=assisted_degraded,
         analysis_degraded_reason=assisted_degraded_reason,
+        suggestion_token=suggestion_token,
     )
 
 
@@ -1303,6 +1393,21 @@ async def _debounced_auto_reply(
             return
         latest_message = fan_messages[-1].content
 
+        # Ground truth for this turn starts here, at the event that caused it
+        # (docs/autonomy_architecture_review.md §6 step 1). The recorder is
+        # filled in as the turn makes its decisions and emitted onto each
+        # delivered message. It is a record only: nothing below reads it, and a
+        # turn that returns early simply never emits one.
+        provenance = ReplyProvenance(
+            creator_id=str(creator_id), fan_id=str(fan_id), mode=PIPELINE_AUTO
+        )
+        provenance.record_trigger(
+            kind="fan_message",
+            text=latest_message,
+            sent_at=fan_messages[-1].sent_at,
+            history_position=len(conversation_history) - 1,
+        )
+
         (
             creator_persona,
             creator_legend,
@@ -1790,6 +1895,49 @@ async def _debounced_auto_reply(
             writer_prompt_version=writer_prompt_version,
         )
 
+        # What evidence this turn was allowed to see, and who decided what it
+        # does. Both are recorded before generation, so they describe the inputs
+        # to the reply rather than being reconstructed from its output.
+        provenance.record_context(
+            history_messages=len(conversation_history),
+            analyzer_window=min(
+                len(conversation_history), ANALYZER_TRANSCRIPT_MESSAGES
+            ),
+            writer_window=min(len(conversation_history), WRITER_TRANSCRIPT_MESSAGES),
+            stack_profile=stack.profile_id,
+            writer_prompt_version=writer_prompt_version,
+            live_state={
+                "creator_legend": bool(creator_legend),
+                "fan_intelligence": bool(fan_intelligence),
+                "buyer_lifecycle": bool(buyer_lifecycle),
+                "affordability": bool(affordability),
+                "price_learning": bool(price_learning),
+                "session_strategy": bool(session_strategy),
+                "conversation_director": bool(conversation_director),
+                "experience_scene": bool(scene_context),
+                "text_intimacy": bool(text_intimacy_context),
+                "message_shape": bool(message_shape),
+                "commercial_decision": decision is not None,
+                "ppv_delivery": ppv_delivery is not None,
+                "active_session": bool(active_session),
+                "media_inventory": bool(media_inventory.authorized_asset_types),
+            },
+        )
+        provenance.record_decision(
+            source="commercial_orchestrator" if commercial_enabled else "legacy_session",
+            action=getattr(decision, "action", None),
+            reason=getattr(decision, "reason", None),
+            purchase_signal=situation.get("purchase_signal"),
+            crisis_signal=situation.get("crisis_signal"),
+            resend_requested=situation.get("resend_requested"),
+            extra={
+                "director_phase": conversation_director.get("phase"),
+                "director_action": conversation_director.get("action"),
+                "session_goal": session_strategy.get("goal"),
+                "strategic_move": situation.get("strategic_move"),
+            },
+        )
+
         route = select_writer_route(ctx, profile_id=stack.profile_id)
         print(
             f"[WRITER ROUTE] fan={fan_id} mode=auto profile={stack.profile_id} "
@@ -1810,10 +1958,15 @@ async def _debounced_auto_reply(
         prompt = build_prompt(
             ctx, prompt_version=route.prompt_version, reply_mode=MODE_AUTO
         )
+        # Which model ACTUALLY answers is a different fact from which one the
+        # router asked for, and only the second used to survive to the message
+        # (finding H). The trace is the return channel for the first.
+        writer_trace = GenerationTrace()
         with action_stage("writer_ms"):
             replies = await generate_replies(
                 prompt,
                 creator_persona,
+                trace=writer_trace,
                 max_candidates=auto_candidates,
                 output_contract=auto_contract,
                 retry_policy=writer_retry_policy(route.prompt_version),
@@ -1835,6 +1988,8 @@ async def _debounced_auto_reply(
                 target_override=route.primary_target,
                 fallback_target_override=route.fallback_target,
             )
+
+        provenance.record_writer(writer_trace)
 
         if not replies:
             # generate_replies fails closed: an empty list is never "the writer
@@ -1869,6 +2024,7 @@ async def _debounced_auto_reply(
             if outcome_sink is not None:
                 outcome_sink["outcome"] = AUTO_OUTCOME_INVENTORY_UNSAFE
             return
+        provenance.record_transform(TRANSFORM_INVENTORY_REPAIR, inventory_repaired)
         if inventory_repaired:
             print(
                 f"[INVENTORY GUARD] repaired unavailable-media promise fan={fan_id}"
@@ -1883,12 +2039,14 @@ async def _debounced_auto_reply(
             decision_action=decision_action,
             active_session=active_session,
         )
+        provenance.record_transform(TRANSFORM_DELIVERY_LANGUAGE, link_repaired)
         if link_repaired:
             print(f"[PPV LANGUAGE] repaired delivery-link phrasing fan={fan_id}")
 
         # The tag is no longer a control surface. A writer that still emits one
         # is not obeyed, and the string never reaches the fan.
         reply, tag_stripped = strip_ppv_tags(reply)
+        provenance.record_transform(TRANSFORM_PPV_TAG_STRIPPED, tag_stripped)
         if tag_stripped:
             print(
                 f"[PPV DELIVERY] fan={fan_id} stripped a writer-emitted delivery "
@@ -1906,6 +2064,7 @@ async def _debounced_auto_reply(
             # delivery that failed" true by construction — there is no separate
             # text message that could already have left.
             reply = apply_message_shape(reply, 1)
+            provenance.record_transform(TRANSFORM_PPV_MERGED)
 
         if shape_enforced:
             # Re-resolve the shape now that the copy exists: a reply that turned
@@ -1914,12 +2073,14 @@ async def _debounced_auto_reply(
                 writer_word_count=len(visible_text(reply).replace("|", " ").split())
             )
             reply = apply_message_shape(reply, final_shape.target_bubbles)
+            provenance.record_transform(TRANSFORM_SHAPE_APPLIED)
         elif commercial_max_messages:
             # No shape policy for this writer version, but a commercial
             # decision that caps message parts is commercial authority, not
             # style. apply_message_shape only ever merges, so the cap is honoured
             # without imposing a bubble count the decision did not ask for.
             reply = apply_message_shape(reply, max(1, int(commercial_max_messages)))
+            provenance.record_transform(TRANSFORM_SHAPE_APPLIED)
 
         # Final check — abort if a new message arrived while we were generating
         current_task = _pending_auto_replies.get(fan_id)
@@ -2198,7 +2359,27 @@ async def _debounced_auto_reply(
                 # Every creator message this pipeline writes carries the AI
                 # stack that produced it, PPV and plain alike.
                 stack_marker = message_ai_stack_metadata(
-                    route, profile_id=stack.profile_id
+                    route, profile_id=stack.profile_id, trace=writer_trace
+                )
+                # The whole turn's ground truth, closed with this part's own
+                # delivery receipt: the record cannot claim a delivery the
+                # platform did not acknowledge, because the receipt is read
+                # from the send result rather than from the copy.
+                provenance_marker = provenance.as_metadata(
+                    part=i,
+                    parts=len(parts),
+                    delivery_kind=DELIVERY_PPV if is_ppv_part else DELIVERY_TEXT,
+                    platform_message_id=platform_message_id,
+                    delivery_reference=delivery_reference if is_ppv_part else None,
+                    price_cents=(
+                        ppv_delivery.price_cents
+                        if (is_ppv_part and ppv_delivery is not None)
+                        else None
+                    ),
+                )
+                message_metadata = merge_provenance(
+                    _with_ai_stack(ppv_media_context, stack_marker),
+                    provenance_marker,
                 )
                 if is_ppv_part:
                     await save_ppv_message_receipt(
@@ -2207,7 +2388,7 @@ async def _debounced_auto_reply(
                         content=text_out,
                         was_ai_suggested=True,
                         platform_message_id=platform_message_id,
-                        media_context=_with_ai_stack(ppv_media_context, stack_marker),
+                        media_context=message_metadata,
                     )
                 else:
                     last_plain_message_id = await save_message(
@@ -2217,8 +2398,10 @@ async def _debounced_auto_reply(
                         content=text_out,
                         was_ai_suggested=True,
                         fansly_message_id=platform_message_id,
-                        media_context=_with_ai_stack(ppv_media_context, stack_marker),
+                        media_context=message_metadata,
                     )
+                if i == 0:
+                    print(provenance.describe())
                 if local_test_delivery:
                     print(
                         f"[AUTO TEST DELIVERY] fan={fan_id} "

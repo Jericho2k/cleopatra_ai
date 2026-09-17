@@ -32,6 +32,16 @@ DEGRADED_TRANSPORT = "transport_error"
 DEGRADED_PARSE = "parse_error"
 DEGRADED_SHAPE = "unexpected_response"
 
+#: How many message bubbles the analyzer is shown.
+#:
+#: Finding D of docs/autonomy_architecture_review.md: understanding and writing
+#: see different, short windows, and neither is a count of complete
+#: conversational turns — a multipart reply spends this budget several times
+#: faster than a single one. Named rather than inlined so the number is one
+#: fact, reported in every reply's provenance record and replaceable in one
+#: place by the budgeted context builder.
+ANALYZER_TRANSCRIPT_MESSAGES = 12
+
 
 def analysis_is_degraded(situation: dict | None) -> bool:
     """True when this analysis was fabricated rather than returned by the model."""
@@ -135,7 +145,7 @@ def build_analyzer_prompt(ctx: ConversationContext) -> tuple[str, str]:
     render the exact prompt the provider sees without issuing a paid call.
     """
 
-    recent = ctx.conversation_history[-12:]
+    recent = ctx.conversation_history[-ANALYZER_TRANSCRIPT_MESSAGES:]
     convo = "\n".join(
         f"{'Fan' if message.role == 'fan' else 'Creator'}: {message.content}"
         for message in recent
@@ -169,7 +179,7 @@ async def analyze_situation(
     telemetry_context: dict[str, Any] | None = None,
     profile_id: str | None = None,
 ) -> dict:
-    recent = ctx.conversation_history[-12:]
+    recent = ctx.conversation_history[-ANALYZER_TRANSCRIPT_MESSAGES:]
     system_content, user_content = build_analyzer_prompt(ctx)
 
     profile = get_profile(profile_id or getattr(ctx, "ai_stack_profile", None))
