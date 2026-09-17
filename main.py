@@ -6966,6 +6966,115 @@ async def resolve_review(fan_id: str, request: ResolveFanReviewRequest) -> dict:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+class ResolveThreadRequest(BaseModel):
+    """An operator closing or correcting one remembered obligation."""
+
+    #: True when the record was never real — a bad extraction — rather than
+    #: dealt with. Recording an invention as "handled" would teach anyone
+    #: reading the history that the system did something it did not.
+    cancelled: bool = False
+    #: What it should have said. Supersedes rather than edits, so the obsolete
+    #: version is kept and stops being carried.
+    corrected_summary: str = ""
+    note: str = ""
+    resolved_by: str | None = None
+
+
+@app.get(
+    "/fan/{fan_id}/conversation-memory",
+    dependencies=[Depends(require_fan_path_access)],
+)
+async def read_conversation_memory(fan_id: str) -> dict:
+    """What this conversation remembers, and where each part came from.
+
+    These records are fed to a model on every turn. A wrong one keeps being fed
+    to it and shows up as the model behaving strangely for reasons nobody can
+    trace, and until this existed an operator had no way to see that the system
+    was carrying an obligation at all, let alone that it was wrong.
+
+    Reads the same retrieval a turn does, so what an operator sees is what the
+    model gets. A separate query would eventually disagree with the one that
+    matters.
+    """
+    from services.content_access import ContentAccessError, _load_fan
+    from services.conversation_memory_view import load_memory
+
+    try:
+        fan = await _load_fan(fan_id)
+    except ContentAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return await load_memory(str(fan["creator_id"]), str(fan_id))
+
+
+@app.post(
+    "/fan/{fan_id}/conversation-memory/threads/{thread_id}",
+    dependencies=[Depends(require_fan_path_access)],
+)
+async def resolve_conversation_thread(
+    fan_id: str, thread_id: str, request: ResolveThreadRequest
+) -> dict:
+    """Close or correct one remembered obligation, as an operator.
+
+    Both paths go through the existing lifecycle rather than editing rows, so
+    an operator's change carries the same provenance as the machine's. There is
+    deliberately no delete: a record somebody disagrees with is resolved or
+    corrected, both of which say what happened, and a deleted one leaves the
+    next reader wondering whether it was ever there.
+    """
+    from services.content_access import ContentAccessError, _load_fan
+    from services.conversation_continuity import open_threads_for
+    from services.conversation_memory_view import (
+        correct_as_operator,
+        resolve_as_operator,
+        thread_view,
+    )
+
+    try:
+        fan = await _load_fan(fan_id)
+    except ContentAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    creator_id = str(fan["creator_id"])
+    # Read the thread through the tenancy-scoped retrieval, so a thread id
+    # belonging to another conversation cannot be resolved by guessing it.
+    carried = await open_threads_for(creator_id, str(fan_id), expire_first=False)
+    thread = next((item for item in carried if item.id == thread_id), None)
+    if thread is None:
+        raise HTTPException(
+            status_code=404,
+            detail="that obligation is not being carried by this conversation",
+        )
+
+    note = " ".join(str(request.note or "").split())[:280]
+    if request.corrected_summary.strip():
+        corrected = await correct_as_operator(
+            thread, summary=request.corrected_summary.strip()[:280], note=note
+        )
+        if corrected is None:
+            raise HTTPException(
+                status_code=409, detail="that obligation could not be corrected"
+            )
+        print(
+            f"[CONTINUITY] fan={fan_id} thread={thread_id} corrected_by_operator "
+            f"actor={request.resolved_by or 'unknown'}"
+        )
+        return {"status": "corrected", "thread": thread_view(corrected)}
+
+    closed = await resolve_as_operator(
+        thread_id, note=note, cancelled=bool(request.cancelled)
+    )
+    if not closed:
+        raise HTTPException(
+            status_code=409, detail="that obligation was already closed"
+        )
+    print(
+        f"[CONTINUITY] fan={fan_id} thread={thread_id} "
+        f"{'cancelled' if request.cancelled else 'resolved'}_by_operator "
+        f"actor={request.resolved_by or 'unknown'}"
+    )
+    return {"status": "cancelled" if request.cancelled else "resolved"}
+
+
 @app.get(
     "/fan/{fan_id}/content-access",
     dependencies=[Depends(require_fan_path_access)],
