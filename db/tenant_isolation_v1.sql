@@ -114,7 +114,18 @@ do $$
 declare
     target_table text;
     existing_policy record;
+    -- Tables registered in public.owner_only_tables (db/owner_only_diagnostics_v1.sql)
+    -- are skipped: they carry a creator_id, so this loop would otherwise
+    -- discover them and give `authenticated` a FOR ALL policy on model routing
+    -- and trace detail. Read into an array rather than joined, so this file
+    -- still runs against a database that predates the registry.
+    owner_only text[] := '{}';
 begin
+    if to_regclass('public.owner_only_tables') is not null then
+        select coalesce(array_agg(o.table_name), '{}')
+          into owner_only
+          from public.owner_only_tables o;
+    end if;
     for target_table in
         select c.table_name
           from information_schema.columns c
@@ -125,6 +136,7 @@ begin
            and t.table_type = 'BASE TABLE'
            and c.column_name = 'creator_id'
            and c.table_name not in ('chatter_creators')
+           and not (c.table_name = any(owner_only))
     loop
         execute format(
             'alter table public.%I enable row level security',
@@ -158,7 +170,14 @@ do $$
 declare
     target_table text;
     existing_policy record;
+    -- Same exclusion as the creator_id loop above.
+    owner_only text[] := '{}';
 begin
+    if to_regclass('public.owner_only_tables') is not null then
+        select coalesce(array_agg(o.table_name), '{}')
+          into owner_only
+          from public.owner_only_tables o;
+    end if;
     for target_table in
         select c.table_name
           from information_schema.columns c
@@ -168,6 +187,7 @@ begin
          where c.table_schema = 'public'
            and t.table_type = 'BASE TABLE'
            and c.column_name = 'fan_id'
+           and not (c.table_name = any(owner_only))
            and not exists (
                select 1
                  from information_schema.columns creator_column

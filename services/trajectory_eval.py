@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Sequence
 
+from services.message_diagnostics import read_diagnostics
 from services.reply_provenance import PROVENANCE_KEY, provenance_of
 
 
@@ -546,12 +547,25 @@ async def run_trajectory(
             continue
         record.latency_ms = int((time.monotonic() - started) * 1000)
         record.outcome = str((result or {}).get("outcome") or "")
-        for row in (result or {}).get("creator_messages") or []:
+        rows = (result or {}).get("creator_messages") or []
+        # Provenance moved off the message row into the owner-only
+        # message_diagnostics table (db/owner_only_diagnostics_v1.sql), because
+        # media_context is a column agency browsers select directly. An
+        # evaluation runs as the owner, so it reads the table.
+        traces = await read_diagnostics(
+            [str(row.get("id")) for row in rows if row.get("id")]
+        )
+        for row in rows:
             content = str(row.get("content") or "")
             if content:
                 record.replies.append(content)
                 creator_replies.append(content)
-            provenance = provenance_of(row.get("media_context"))
+            trace = traces.get(str(row.get("id"))) or {}
+            provenance = (trace.get("record") or {}).get(PROVENANCE_KEY) or {}
+            # A row written before the migration still carries it inline. Read
+            # both, so an evaluation over mixed history is not silently missing
+            # the attribution for half of it.
+            provenance = provenance or provenance_of(row.get("media_context"))
             if provenance:
                 record.provenance.append(provenance)
         report.turns.append(record)

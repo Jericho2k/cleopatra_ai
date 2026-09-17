@@ -9187,6 +9187,73 @@ async def health_ready(response: Response, request: Request = None) -> dict:
     return _health_payload(document, request)
 
 
+@app.get("/creator/{creator_id}/fan/{fan_id}/reply-trace")
+async def reply_trace(
+    creator_id: str,
+    fan_id: str,
+    request: Request,
+    limit: int = 20,
+) -> dict:
+    """The owner's trace inspector: what actually produced these replies.
+
+    Moving diagnostics out of ``messages.media_context``
+    (db/owner_only_diagnostics_v1.sql) closed a real disclosure and would
+    otherwise have taken the owner's own access with it — the record was only
+    ever readable because it sat in a row the browser could select. This is the
+    authorized way back to it.
+
+    Gated on ``request_is_platform_operator``: the identity allowlist, the same
+    check that gates ``operator_diagnostics`` and the profile registry, and
+    deliberately not ``require_simulation_user``. An agency operator gets 403
+    here and nothing partial — a trace with the routing removed is not a
+    smaller trace, it is a different and misleading document.
+
+    Reads the creator/fan pair from ``messages`` first, so a trace can only be
+    fetched for messages that actually belong to the requested conversation.
+    The diagnostics table is read through the service role, which bypasses RLS,
+    so the tenancy check has to happen here rather than being inherited.
+    """
+    from core.simulation import request_is_platform_operator
+    from core.supabase import get_supabase
+    from services.message_diagnostics import read_diagnostics
+
+    if not request_is_platform_operator(request):
+        raise HTTPException(status_code=403, detail="Platform owner only")
+
+    bounded = max(1, min(int(limit or 20), 100))
+
+    def _messages() -> list[dict]:
+        result = (
+            get_supabase().table("messages")
+            .select("id, role, sent_at, fansly_message_id")
+            .eq("creator_id", creator_id)
+            .eq("fan_id", fan_id)
+            .eq("role", "creator")
+            .order("sent_at", desc=True)
+            .limit(bounded)
+            .execute()
+        )
+        return list(result.data or [])
+
+    rows = await asyncio.to_thread(_messages)
+    traces = await read_diagnostics([str(row["id"]) for row in rows if row.get("id")])
+
+    return {
+        "creator_id": creator_id,
+        "fan_id": fan_id,
+        "messages": [
+            {
+                **row,
+                # Absence is stated rather than left to a missing key. "No
+                # trace was recorded" and "this build did not look" must not
+                # read the same on a record whose purpose is attribution.
+                "trace": traces.get(str(row.get("id"))) or None,
+            }
+            for row in rows
+        ],
+    }
+
+
 @app.get("/model-runtime-health")
 async def model_runtime_health(request: Request) -> dict:
     """Cached writer availability, without spending AI tokens.

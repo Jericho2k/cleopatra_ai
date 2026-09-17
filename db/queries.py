@@ -371,7 +371,30 @@ async def save_message_result(
     (creator_id, fansly_message_id). The loser of a race gets inserted=False
     rather than a second row, so the pipeline runs at most once per platform
     message.
+
+    This is also where owner-only diagnostics leave the row. Every message
+    write in the codebase funnels through here — services.ppv_persistence
+    included — so splitting here is what makes the boundary hold for paths
+    nobody remembered, which is precisely how reply_provenance ended up
+    readable by every agency browser in the first place. See
+    services/message_diagnostics.py.
     """
+    from services.message_diagnostics import (
+        record_diagnostics,
+        split_media_context,
+        unrecognised_keys,
+    )
+
+    diverted = unrecognised_keys(media_context)
+    if diverted:
+        # Not an error: an unreviewed key is owner-only by design. It is worth
+        # a line because it is also how a new product field silently stops
+        # appearing in the dashboard.
+        print(
+            "[DIAGNOSTICS] media_context keys not on the public allowlist, "
+            f"stored owner-only: {', '.join(diverted)} (creator={creator_id})"
+        )
+    media_context, owner_only = split_media_context(media_context)
 
     def _row() -> dict:
         row = {
@@ -468,7 +491,18 @@ async def save_message_result(
         # need provenance, but report inserted=False so the pipeline stays put.
         return MessageWriteResult(message_id=_existing_id(), inserted=False)
 
-    return await asyncio.to_thread(_save)
+    result = await asyncio.to_thread(_save)
+    if owner_only:
+        # Deliberately after the message is durable and deliberately unchecked:
+        # the sensitive keys have already left the row by this point, so a
+        # failure here costs a diagnostic and never a conversation.
+        await record_diagnostics(
+            message_id=result.message_id,
+            creator_id=creator_id,
+            fan_id=fan_id,
+            record=owner_only,
+        )
+    return result
 
 
 async def update_message_media_context(message_id: str, media_context: dict) -> None:
@@ -478,16 +512,51 @@ async def update_message_media_context(message_id: str, media_context: dict) -> 
     costs a live API Fansly call. That call no longer runs inside the webhook
     request, so the row is written first and enriched by the durable ingestion
     worker moments later.
+
+    Splits like save_message_result does. This path enriches fan messages and
+    has no reason to carry owner-only detail, which is exactly why it must
+    split too: a boundary that only holds on the paths that need it is a
+    boundary that holds until someone reuses the other one.
     """
+    from services.message_diagnostics import record_diagnostics, split_media_context
+
+    public_context, owner_only = split_media_context(media_context)
+
     def _update():
         (
             get_supabase().table("messages")
-            .update({"media_context": media_context})
+            .update({"media_context": public_context})
             .eq("id", message_id)
             .execute()
         )
 
     await asyncio.to_thread(_update)
+
+    if owner_only:
+        def _owners() -> tuple[str, str] | None:
+            result = (
+                get_supabase().table("messages")
+                .select("creator_id, fan_id")
+                .eq("id", message_id)
+                .limit(1)
+                .execute()
+            )
+            rows = result.data or []
+            if not rows:
+                return None
+            return str(rows[0].get("creator_id")), str(rows[0].get("fan_id"))
+
+        try:
+            owners = await asyncio.to_thread(_owners)
+        except Exception:
+            owners = None
+        if owners:
+            await record_diagnostics(
+                message_id=message_id,
+                creator_id=owners[0],
+                fan_id=owners[1],
+                record=owner_only,
+            )
 
 
 async def get_creator_persona(creator_id: str) -> Persona | None:

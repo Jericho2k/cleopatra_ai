@@ -115,6 +115,13 @@ vault_classification_persistence_v1.sql
 # creator-owned table, before tenant_isolation_v1.
 simulation_turn_durability_v1.sql
 
+# Owner-only diagnostics: public.message_diagnostics and the
+# public.owner_only_tables registry that keeps the two migrations below from
+# granting the browser SELECT on it. Creates a creator-owned table and rewrites
+# messages.media_context, so it must run AFTER the base schema and BEFORE the
+# pair below — which read the registry.
+owner_only_diagnostics_v1.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each
