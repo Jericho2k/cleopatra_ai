@@ -102,6 +102,10 @@ def auto(monkeypatch):
     monkeypatch.setattr(suggestions, "get_affordability_context", fake_gather_fan)
     monkeypatch.setattr(suggestions, "get_price_learning_context", fake_gather_fan)
     monkeypatch.setattr(suggestions, "get_creator_persona", lambda _c: a(Persona()))
+    # Full Auto loads durable creator facts as part of the turn context. Keep
+    # this fixture at the service boundary so analyzer fail-closed tests never
+    # depend on a configured Supabase client or network access.
+    monkeypatch.setattr(suggestions, "get_creator_legend", lambda _c: a({}))
     monkeypatch.setattr(suggestions, "get_ppv_offers", lambda _c: a([]))
     monkeypatch.setattr(suggestions, "get_sent_ppv", lambda _f: a([]))
     monkeypatch.setattr(suggestions, "get_fan_session", lambda _f: a(None))
