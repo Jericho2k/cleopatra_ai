@@ -139,6 +139,58 @@ class ReplyProvenance:
     # What was done to the writer's text before anyone saw it.
     transforms: list[str] = field(default_factory=list)
 
+    def as_state(self) -> dict[str, Any]:
+        """The recorder's fields, for storing between two HTTP requests.
+
+        Every field is already a fingerprint, a count or an identifier —
+        ``ReplyProvenance`` never holds message text — so persisting this adds
+        no content anywhere that content was not already going.
+        """
+        return {
+            "creator_id": self.creator_id,
+            "fan_id": self.fan_id,
+            "mode": self.mode,
+            "turn_id": self.turn_id,
+            "started_at": self.started_at,
+            "trigger": dict(self.trigger),
+            "context": dict(self.context),
+            "decision": dict(self.decision),
+            "writer": dict(self.writer),
+            "transforms": list(self.transforms),
+        }
+
+    @classmethod
+    def from_state(cls, state: Any) -> "ReplyProvenance | None":
+        """Rebuild a recorder stored by ``as_state``, or None.
+
+        Total: a row written by an older build, or a partial one, returns None
+        rather than raising. A reply must never fail to send because its
+        evidence trail could not be rebuilt.
+        """
+        if not isinstance(state, dict):
+            return None
+        creator_id = str(state.get("creator_id") or "")
+        fan_id = str(state.get("fan_id") or "")
+        if not creator_id or not fan_id:
+            return None
+        restored = cls(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            mode=str(state.get("mode") or PIPELINE_ASSISTED),
+        )
+        if state.get("turn_id"):
+            restored.turn_id = str(state["turn_id"])
+        if state.get("started_at"):
+            restored.started_at = str(state["started_at"])
+        for key in ("trigger", "context", "decision", "writer"):
+            value = state.get(key)
+            if isinstance(value, dict):
+                setattr(restored, key, dict(value))
+        transforms = state.get("transforms")
+        if isinstance(transforms, list):
+            restored.transforms = [str(item) for item in transforms if str(item)]
+        return restored
+
     def record_trigger(
         self,
         *,

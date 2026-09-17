@@ -46,7 +46,6 @@ from services.reply_provenance import (
     DELIVERY_TEXT,
     PIPELINE_ASSISTED,
     PIPELINE_AUTO,
-    SUGGESTION_PROVENANCE,
     TRANSFORM_DELIVERY_LANGUAGE,
     TRANSFORM_INVENTORY_REPAIR,
     TRANSFORM_PPV_MERGED,
@@ -881,7 +880,13 @@ async def get_suggestions(
     assisted_provenance.record_transform(
         TRANSFORM_DELIVERY_LANGUAGE, raw_candidates != replies
     )
-    suggestion_token = SUGGESTION_PROVENANCE.put(assisted_provenance)
+    # Stored durably as well as in process. The in-process store is one per
+    # replica, so a deploy or an autoscale event between generating and sending
+    # used to lose the record and leave the reply unattributable with nothing
+    # saying so (services/assisted_provenance.py).
+    from services.assisted_provenance import remember as _remember_provenance
+
+    suggestion_token = await _remember_provenance(assisted_provenance)
     print(assisted_trace.describe())
 
     if save_fan_message:

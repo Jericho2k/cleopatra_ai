@@ -655,7 +655,21 @@ def test_a_reply_typed_from_scratch_sends_with_no_invented_provenance(monkeypatc
     )
 
     assert response.status_code == 200
-    assert sent[0]["kwargs"]["media_context"] is None
+
+    # "No invented provenance" is the point, and it still holds: the record
+    # names no model, no turn and no decision. What changed is that there IS a
+    # record, saying attribution is unavailable and why.
+    #
+    # Saving nothing made a hand-typed reply indistinguishable from one whose
+    # record was lost, and from one written by a build that never recorded
+    # provenance at all — so an evaluation counting attributable replies
+    # counted all three the same way.
+    record = sent[0]["kwargs"]["media_context"]["reply_provenance"]
+    assert record["attribution_available"] is False
+    assert "without a provenance token" in record["attribution_unavailable_because"]
+    assert "writer" not in record
+    assert "turn_id" not in record
+    assert "decision" not in record
 
 
 def test_an_expired_token_does_not_stop_the_operator_sending(monkeypatch):
@@ -673,4 +687,11 @@ def test_an_expired_token_does_not_stop_the_operator_sending(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert sent[0]["kwargs"]["media_context"] is None
+
+    # The message went. And the loss is admitted rather than silent: before
+    # this, a token that could not be redeemed produced a row that looked
+    # exactly like a reply nobody ever tried to attribute.
+    record = sent[0]["kwargs"]["media_context"]["reply_provenance"]
+    assert record["attribution_available"] is False
+    assert record["attribution_unavailable_because"]
+    assert "writer" not in record

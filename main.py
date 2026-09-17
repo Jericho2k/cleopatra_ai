@@ -72,7 +72,6 @@ from core.build_info import build_snapshot, describe_build, short_sha
 from services.ai_stack import resolve_ai_stack
 from services.reply_provenance import (
     DELIVERY_TEXT,
-    SUGGESTION_PROVENANCE,
     TRANSFORM_OPERATOR_EDIT,
 )
 from services.fan_intelligence import learn_from_fan_message
@@ -1675,9 +1674,24 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
     # expired token means no record at all — an operator's message must never
     # fail to send because its evidence trail could not be completed.
     media_context: dict | None = None
-    provenance = SUGGESTION_PROVENANCE.take(
+    from services.assisted_provenance import redeem as _redeem_provenance
+    from services.assisted_provenance import unavailable_metadata
+
+    provenance, unavailable = await _redeem_provenance(
         req.suggestion_token, creator_id=req.creator_id, fan_id=req.fan_id
     )
+    if provenance is None:
+        # An admitted absence rather than no record at all. A message saved
+        # with no provenance key is indistinguishable from one written by a
+        # build that never recorded any, so an evaluation counting attributable
+        # replies would count both the same way.
+        media_context = unavailable_metadata(
+            unavailable, creator_id=req.creator_id, fan_id=req.fan_id
+        )
+        print(
+            f"[PROVENANCE] fan={req.fan_id} assisted reply unattributable: "
+            f"{unavailable}"
+        )
     if provenance is not None:
         if req.suggestion_index is not None:
             provenance.record_decision(

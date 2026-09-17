@@ -134,6 +134,12 @@ content_access_repair_v1.sql
 # pair below — which read the registry.
 owner_only_diagnostics_v1.sql
 
+# Assisted provenance that survives a restart or a second replica. Registers
+# itself in public.owner_only_tables, so it must run AFTER
+# owner_only_diagnostics_v1.sql (which creates that registry) and before the
+# tenant_isolation_v1 / browser_least_privilege_v1 pair that reads it.
+assisted_provenance_v1.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each
