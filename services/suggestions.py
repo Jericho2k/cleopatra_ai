@@ -28,6 +28,7 @@ from services.context_packet import build_context_packet
 from ai.writer_router import select_writer_route
 from services.ppv_turn import plan_ppv_step_delivery, strip_ppv_tags
 from services.content_access import REVIEW_REASON as CONTENT_ACCESS_REVIEW_REASON
+from services.episode_recording import close_finished_episode
 from services.conversation_continuity import (
     open_threads_for,
     recent_episodes_for,
@@ -1469,6 +1470,29 @@ async def _debounced_auto_reply(
         )
         open_thread_lines = summarize_threads(carried_threads)
         episode_lines = [episode.render() for episode in past_episodes]
+
+        # If this turn is a return after a silence, the stretch before it is
+        # now knowably over and gets closed. Nothing wrote to
+        # conversation_episodes before this, so "we talked about this before"
+        # was a table shape rather than something the system could say.
+        #
+        # Its subjects come from the obligations that conversation raised —
+        # rows with source turn ids behind them — rather than from a model
+        # asked to summarise, because this record is read back to a model
+        # later and an invented one would launder a belief into a fact.
+        closed = await close_finished_episode(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            history=conversation_history,
+            subjects=[thread.summary for thread in carried_threads],
+        )
+        if closed is not None:
+            print(
+                f"[CONTINUITY] fan={fan_id} episode_closed "
+                f"messages={closed.message_count} ending={closed.ended_with.value}"
+            )
+            episode_lines = [closed.render(), *episode_lines]
+
         if creator_persona is None:
             creator_persona = Persona()
 
