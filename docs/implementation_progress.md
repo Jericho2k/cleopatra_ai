@@ -59,7 +59,7 @@ review-hold write propagating instead of pretending a handoff succeeded.
 | Sprint | Review §6 step | Status |
 |---|---|---|
 | 0 — ground truth for every visible reply | 1 | **Done** (this branch) |
-| 1 — close execution bypasses | 2 | **In progress** — payment races done |
+| 1 — close execution bypasses | 2 | **Done** except confirming the live deployment |
 | 2 — the general continuity packet | 3 | Not started |
 | 3 — one decision owner, compared under replay | 4 | Not started |
 | 4 — longitudinal evaluation harness | 5 | Not started |
@@ -175,7 +175,7 @@ python -m pytest -q tests/test_reply_provenance.py tests/test_full_auto_simulati
 
 ---
 
-## Sprint 1 — close execution bypasses — IN PROGRESS
+## Sprint 1 — close execution bypasses — DONE (one item carried forward)
 
 > §6.2: *Land the reviewed support/identity fixes; add payment interleaving
 > tests and verified entitlement/access recovery. Confirm dashboard visibility
@@ -224,17 +224,58 @@ needs none. These are **source-level races proven by tests, not reproduced live
 incidents**, and passing them does not mean every payment race in this codebase
 is resolved.
 
-### Remaining
+### Done — verified content-access recovery (§3B)
 
-1. **Confirm the deployed SHA and flags** against the running deployment, using
-   `GET /build` from Sprint 0. Record the answer here. Several findings are
-   unresolvable without it, §3E in particular.
-2. **Verified content-access recovery.** PR #48 contains the complaint; it does
-   not repair anything. A safe workflow needs entitlement inspection, URL
-   refresh, and an outcome the customer is only told about after it is true.
-   Never send a repair claim that has not been verified.
-3. **Dashboard visibility** of review holds and access outcomes, in
-   `cleopatra-dashboard`. An operator cannot clear a hold they cannot see.
+PR #48 contained the complaint and said so: *this is containment, not autonomous
+repair [...] a safe verified access-recovery workflow remains necessary.*
+`services/content_access.py` is that workflow, in two halves.
+
+**The evidence half is read-only.** `inspect_content_access` joins the delivery
+ledger — the only authority on whether money arrived — to what the platform
+currently shows for the message it arrived in: still listed, still carrying
+media, media still resolvable. It sends nothing, clears nothing, and reports
+"could not check" as its own answer rather than as "fine". A purchase older than
+the newest page of the conversation is `unknown`, not `missing`: a full page may
+simply not reach back that far, and that is not evidence of removal.
+
+**The repair half is bounded by what was paid for.** `resend_paid_content`
+re-sends exactly the `media_ids` the ledger row records, **unpriced**, and only
+when that row says `purchased`. Three properties, each enforced rather than
+assumed: a complaint is not proof of payment, a repair cannot become a second
+charge, and a repair cannot quietly become a different offer. The message is
+persisted as `content_access_repair` with `price_cents: 0`, so it can never be
+read back as a second PPV against the same media. If the platform returns no
+receipt, nothing is recorded as repaired and the hold stays — the review's rule
+that a delivery claim is tied to the operation result, applied to the repair
+itself.
+
+The one customer-facing sentence is a constant, not a writer call. A model asked
+to phrase an apology could promise a fix that has not happened.
+
+**Plain "Resume AI" is now refused on an access hold.** That path put automation
+back in front of an unanswered complaint, which is how the baseline came to treat
+an access problem as an opening for another sale. "Not an access problem" is the
+recorded way to say the analyzer misread it, and clears the hold just as fast.
+
+Nothing here decides on its own: Full Auto still stops at the hold, and every
+function is called by an operator.
+
+### Done — dashboard visibility (cleopatra-dashboard)
+
+`GET /fan/{fan_id}/content-access` backs a reason-specific panel in `FanPanel`.
+`lib/contentAccess.ts` turns the evidence into the operator's sentence and,
+critically, decides whether to offer the resend at all: offering a repair the
+backend would refuse trains an operator to click through errors. Uncertainty is
+shown as uncertainty.
+
+### Carried forward
+
+**Confirm the deployed SHA and flags** against the running deployment, using
+`GET /build` from Sprint 0, and record the answer here. This needs someone with
+access to the deployment; it is not something this branch can do. Several review
+findings are unresolvable without it, §3E in particular — live fact extraction is
+flag-gated and the code default is off, which says nothing about what production
+runs.
 
 ---
 

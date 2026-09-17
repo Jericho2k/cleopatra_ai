@@ -19,6 +19,7 @@ from services.ppv_persistence import (
     pending_from_message_receipt,
     persist_ppv_reconciliation,
 )
+from services.content_access import REVIEW_REASON as CONTENT_ACCESS_REVIEW_REASON
 from services.vault_operations import normalize_media_ids
 
 
@@ -301,7 +302,21 @@ async def resolve_fan_review(
     *,
     resolution: str,
     amount: float | None = None,
+    reference: str = "",
 ) -> dict[str, Any]:
+    from services.content_access import (
+        RESOLUTIONS as CONTENT_ACCESS_RESOLUTIONS,
+        resolve_content_access,
+    )
+
+    if resolution in CONTENT_ACCESS_RESOLUTIONS:
+        # A customer who cannot reach what they bought is a support problem
+        # with its own evidence and its own safe repair (services/content_access.py),
+        # not a PPV delivery outcome. Routed here so an operator has one place
+        # to resolve a frozen conversation whatever froze it.
+        return await resolve_content_access(
+            fan_id, resolution=resolution, reference=reference
+        )
     if resolution == "repair_ppv":
         return await repair_ppv_reconciliation(fan_id)
     if resolution == "mark_purchased":
@@ -357,6 +372,17 @@ async def resolve_fan_review(
             raise PPVRecoveryError(
                 "This PPV has an ambiguous delivery outcome. Repair it, mark it purchased, "
                 "or confirm the appropriate not-sent/not-purchased outcome before resuming AI."
+            )
+        if reason == CONTENT_ACCESS_REVIEW_REASON:
+            # Resuming here would put automation back in front of a customer
+            # whose complaint nothing has answered — which is how the baseline
+            # came to treat an access problem as an opening for another sale.
+            # "Not an access issue" is the recorded way to say the analyzer
+            # misread it, and it clears the hold just as fast.
+            raise PPVRecoveryError(
+                "This customer reported they cannot access paid content. Resend "
+                "the paid item, confirm you restored access, or record that it "
+                "was not an access problem before resuming AI."
             )
         await retry_transient_db_operation(
             lambda: clear_fan_review(fan_id),

@@ -6908,6 +6908,9 @@ class ResolvePPVApprovalRequest(BaseModel):
 class ResolveFanReviewRequest(BaseModel):
     resolution: str
     amount: float | None = None
+    # Which confirmed purchase a content-access repair restores. Omitted means
+    # the most recent one (services/content_access.py).
+    reference: str = ""
 
 
 @app.get(
@@ -6936,6 +6939,7 @@ async def read_full_auto_status(fan_id: str) -> dict:
 )
 async def resolve_review(fan_id: str, request: ResolveFanReviewRequest) -> dict:
     """Resolve a frozen conversation through a deterministic backend action."""
+    from services.content_access import ContentAccessError
     from services.ppv_recovery import PPVRecoveryError, resolve_fan_review
 
     try:
@@ -6943,9 +6947,30 @@ async def resolve_review(fan_id: str, request: ResolveFanReviewRequest) -> dict:
             fan_id,
             resolution=request.resolution,
             amount=request.amount,
+            reference=request.reference,
         )
-    except PPVRecoveryError as exc:
+    except (PPVRecoveryError, ContentAccessError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get(
+    "/fan/{fan_id}/content-access",
+    dependencies=[Depends(require_fan_path_access)],
+)
+async def read_content_access(fan_id: str) -> dict:
+    """What this customer paid for, and what the platform shows for it now.
+
+    Read-only. It is what an operator opening a ``content_access_issue`` hold
+    sees instead of having to take the customer's word for what happened
+    (docs/autonomy_architecture_review.md §3B).
+    """
+    from services.content_access import ContentAccessError, inspect_content_access
+
+    try:
+        evidence = await inspect_content_access(fan_id)
+    except ContentAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return evidence.as_dict()
 
 
 @app.get(

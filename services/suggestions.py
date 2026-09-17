@@ -26,6 +26,7 @@ from ai.prompt_builder import WRITER_TRANSCRIPT_MESSAGES
 from ai.situation_analyzer import ANALYZER_TRANSCRIPT_MESSAGES
 from ai.writer_router import select_writer_route
 from services.ppv_turn import plan_ppv_step_delivery, strip_ppv_tags
+from services.content_access import REVIEW_REASON as CONTENT_ACCESS_REVIEW_REASON
 from services.reply_provenance import (
     DELIVERY_PPV,
     DELIVERY_TEXT,
@@ -1513,7 +1514,7 @@ async def _debounced_auto_reply(
         # repair can be verified. Never promise a repair that has not happened.
         if str(situation.get("resend_requested", "false")).strip().lower() == "true":
             try:
-                await freeze_fan_for_review(fan_id, "content_access_issue")
+                await freeze_fan_for_review(fan_id, CONTENT_ACCESS_REVIEW_REASON)
             except Exception as exc:
                 raise HumanReviewHandoffError(
                     "could not persist content-access review hold; no reply sent"
