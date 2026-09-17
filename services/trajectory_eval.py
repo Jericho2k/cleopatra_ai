@@ -1020,21 +1020,35 @@ async def run_trajectory(
         # Provenance moved off the message row into the owner-only
         # message_diagnostics table (db/owner_only_diagnostics_v1.sql), because
         # media_context is a column agency browsers select directly. An
-        # evaluation runs as the owner, so it reads the table.
-        traces = await read_diagnostics(
-            [str(row.get("id")) for row in rows if row.get("id")]
-        )
+        # evaluation runs as the owner, so it reads the table — but only for
+        # the rows that need it.
+        #
+        # A row written before the migration, or by a harness that builds the
+        # result itself, still carries the record inline. Asking the database
+        # about those spends a round trip per turn to be told what the row
+        # already said, which over a 40-turn trajectory is 40 of them.
+        inline = {
+            str(row.get("id")): provenance_of(row.get("media_context"))
+            for row in rows
+        }
+        unresolved = [
+            str(row.get("id"))
+            for row in rows
+            if row.get("id") and not inline.get(str(row.get("id")))
+        ]
+        traces = await read_diagnostics(unresolved) if unresolved else {}
         for row in rows:
             content = str(row.get("content") or "")
             if content:
                 record.replies.append(content)
                 creator_replies.append(content)
-            trace = traces.get(str(row.get("id"))) or {}
-            provenance = (trace.get("record") or {}).get(PROVENANCE_KEY) or {}
-            # A row written before the migration still carries it inline. Read
-            # both, so an evaluation over mixed history is not silently missing
-            # the attribution for half of it.
-            provenance = provenance or provenance_of(row.get("media_context"))
+            row_id = str(row.get("id"))
+            trace = traces.get(row_id) or {}
+            # Inline first, then the table. Mixed history is read completely
+            # rather than half-attributed.
+            provenance = inline.get(row_id) or (trace.get("record") or {}).get(
+                PROVENANCE_KEY
+            ) or {}
             if provenance:
                 record.provenance.append(provenance)
         report.turns.append(record)
