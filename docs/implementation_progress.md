@@ -42,9 +42,22 @@ on its own, but the numbering may need renaming.
 
 | | |
 |---|---|
-| `Jericho2k/cleopatra_ai` `main` | `4c4f58f` — PR #48 merged 2026-09-17T08:31Z |
-| `Jericho2k/cleopatra-dashboard` `main` | `1b8c0c1` — PR #31 |
+| `Jericho2k/cleopatra_ai` `main` at session start | `4c4f58f` — PR #48 merged 2026-09-17T08:31Z |
+| `Jericho2k/cleopatra-dashboard` `main` at session start | `1b8c0c1` — PR #31 |
 | PR #48 | **Merged.** Everything it landed is on `main`; do not re-implement it. |
+
+### What this session landed
+
+| | |
+|---|---|
+| [cleopatra_ai#49](https://github.com/Jericho2k/cleopatra_ai/pull/49) | **Merged** (squash, `a7549dd`) — Sprints 0, 1, 2 and 3 |
+| [cleopatra-dashboard#32](https://github.com/Jericho2k/cleopatra-dashboard/pull/32) | **Merged** (squash, `8ff38c0`) — the dashboard halves of Sprints 0 and 1 |
+| Sprint 4 | Pushed to `claude/cleopatra-implementation-sprints-53j1xa` **after** #49 merged, so it is not on `main` yet and needs its own pull request. |
+
+Because #49 was squash-merged, none of this session's original commit SHAs are
+ancestors of `main` — check for the FILES, not the SHAs, before concluding
+something is missing. The branch was restarted from `main` and carries only the
+Sprint 4 commit.
 
 What PR #48 already did, and must not be proposed again: saved creator facts
 loaded in Full Auto; the direct paid resend replaced by a persisted
@@ -62,7 +75,7 @@ review-hold write propagating instead of pretending a handoff succeeded.
 | 1 — close execution bypasses | 2 | **Done** except confirming the live deployment |
 | 2 — the general continuity packet | 3 | **Done** except semantic extraction |
 | 3 — one decision owner, compared under replay | 4 | **Done** (offline; nothing wired live) |
-| 4 — longitudinal evaluation harness | 5 | Not started |
+| 4 — longitudinal evaluation harness | 5 | **Done** (scripted customer only) |
 | 5 — shadow real interactions | 5 (operational) | Out of scope for code alone |
 | 6 — bounded supervised pilot | 6 (operational) | Out of scope for code alone |
 
@@ -476,19 +489,109 @@ review, not for this branch.
 
 ---
 
-## Sprint 4 — longitudinal evaluation harness
+## Sprint 4 — longitudinal evaluation harness — DONE (scripted customer only)
 
 > §6.5 and review §5.
 
-`scripts/run_model_eval.py` compares replies; it does not run the orchestration,
-state transitions, delivery or weeks of interaction. The simulator does, and
-should become the basis of a separate non-explicit longitudinal evaluation.
-Both fixed-prefix replay and adaptive trajectories are required. The trajectory
-table in review §5 is a proposed test design, not a measured distribution.
+`scripts/run_model_eval.py` compares replies; the review says it "does not run
+the complete autonomous orchestration, real state transitions, delivery, or
+weeks of interaction", and that the simulator should become the basis of a
+separate non-explicit longitudinal evaluation. It now is.
 
-Score complete trajectories; count critical execution failures separately, since
-a high average prose score cannot cancel an unauthorized transaction. Keep the
-unseen evaluation set separate from prompt tuning.
+### What was built
+
+**`services/trajectory_eval.py`** — drives whole conversations through
+`run_simulated_inbound`, which is the real Full Auto turn: real analyzer, real
+commercial orchestrator, real writer routing, real delivery boundary. A
+`Disturbance` is one thing the customer does, optionally after a simulated
+absence (`days_since_previous` advances the clock rather than sleeping), and
+optionally declaring what it is testing: an obligation it raises, a request for
+silence, a correction it makes.
+
+**Deterministic detectors, counted separately.** Every CRITICAL finding is read
+off state or provenance, never off prose: a paid delivery with no platform
+receipt, the same platform message id recorded twice, a message sent after the
+customer asked for none, a reply reasserting something he corrected, a turn that
+raised. NOTABLE findings — an obligation nothing answered, a question in every
+single reply, verbatim repetition — are countable behaviours for a person to
+read, because matching an obligation against prose is a keyword test and a
+keyword test is not certainty.
+
+**There is no quality score, and a test asserts there never is one.** §5: *"A
+scripted cooperative customer and a model grading its own text are insufficient
+substitutes for expert human review."* The output is the findings, the countable
+behaviours, latency including the tail, which models actually answered (finding
+H across a whole conversation), and the transcript with each reply's provenance
+— the record an expert reviews. `test_the_report_has_no_quality_score` fails if
+`score`, `quality`, `grade` or `rating` ever appears in the summary, because
+adding one later would look like an improvement and would be the thing the
+review rules out.
+
+A turn that raises is recorded and the run continues: §5 asks for tail behaviour
+during errors, which a run that aborts at the first one cannot measure.
+
+**`eval/trajectories.json`** — ten trajectories, one per row of §5's table, each
+declaring what it covers, with tests that fail if a row loses its last
+trajectory. Non-explicit, and the file states its own caveats in the same words
+the review uses.
+
+**`scripts/run_trajectory_eval.py`** — `--describe` inspects the trajectories
+with no backend at all; a real run needs an owner-only simulation test fan.
+
+### Verification
+
+`2337 passed, 0 skipped`, up from 2297. Four of the new tests drive the harness
+through the **real** Full Auto pipeline rather than a stub, and assert at the
+httpx transport that a longitudinal run makes **zero remote calls**.
+
+```bash
+python scripts/run_trajectory_eval.py --describe
+python scripts/run_decision_replay.py
+```
+
+### What this does not establish
+
+* **The customer is scripted.** §5 asks for adaptive trajectories too, because
+  "adaptive trajectories expose the consequences of earlier choices", and a
+  script says the same thing whatever the system replied.
+  `Disturbance.responds_to` is the seam an adaptive customer plugs into and is
+  tested, but nothing in this repository supplies one. Every result from
+  `eval/trajectories.json` is bounded by what the script happened to say.
+* **No real model has been run through it.** The harness reaches the real
+  orchestration; the tests stub model and platform behaviour, as the whole
+  suite does. Quality, cost and latency against a live provider are unmeasured.
+* **The 40–80 turn row is represented by a shorter conversation.** The shape is
+  right; the length is a parameter of a run, not of the file.
+* **Nothing here is a commercial measurement.** §5 is explicit that parity needs
+  a prospective controlled comparison against the agency's human baseline over a
+  meaningful return window, including refunds, complaints, retention, operator
+  time and inference cost. That is an operational exercise, not a harness.
+
+---
+
+## Sprints 5 and 6 — shadow, then a bounded supervised pilot
+
+> §6.5: *Shadow representative real interactions. Generate no live autonomous
+> actions. Have operators review complete trajectories and disagreements.*
+>
+> §6.6: *Run a bounded supervised pilot. Expand autonomy only after agreed
+> quality, reliability, and economic criteria hold. Keep takeover and rollback
+> operable.*
+
+Both are operational, not code, and neither can be done from this branch. What
+the code now provides for them:
+
+* complete per-reply provenance, so a shadowed reply is attributable (Sprint 0);
+* a decision object and a replay comparison, so "disagreements" is a thing that
+  can be listed rather than a thing reviewers must find (Sprint 3);
+* a trajectory harness that produces exactly the transcript-plus-provenance
+  record an operator review needs (Sprint 4).
+
+The gate the review sets for calling any of this a human replacement is
+unchanged and is not met: longitudinal human-reviewed quality evidence, no
+critical unauthorized or duplicate operation in the defined fault matrix,
+reliable recovery and takeover, acceptable tail latency and cost, and a measured
+comparison with the human baseline.
 
 ---
 

@@ -2161,3 +2161,126 @@ def test_a_continuity_store_that_is_unavailable_never_stops_a_reply(
     )
 
     assert _creator_rows(db), "losing continuity costs a later turn, never this one"
+
+
+# --- Sprint 4: a whole conversation through the real pipeline ---------------
+
+
+def test_a_trajectory_runs_the_real_full_auto_turn_end_to_end(world, spy, traced_writer):
+    """The harness drives the production path, not a model of it.
+
+    §5: the existing reply-level eval "does not run the complete autonomous
+    orchestration, real state transitions, delivery, or weeks of interaction".
+    This is the check that the trajectory runner actually reaches all of it —
+    the same `run_simulated_inbound` the durable worker drives, with zero remote
+    calls, asserted at the transport.
+    """
+    from services.trajectory_eval import Disturbance, Trajectory, run_trajectory
+
+    db, _ = world
+
+    async def send_turn(message: str) -> dict:
+        return await suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message=message, fast=True
+        )
+
+    trajectory = Trajectory(
+        name="ordinary conversation",
+        covers="40-80 turns of ordinary conversation",
+        disturbances=(
+            Disturbance(message="hey, long week"),
+            Disturbance(message="finally finished that project"),
+            Disturbance(message="the dog got into the bins again"),
+        ),
+    )
+
+    report = _run(run_trajectory(trajectory, send_turn=send_turn))
+
+    assert len(report.turns) == 3
+    assert all(turn.outcome == "replied" for turn in report.turns)
+    assert all(turn.replies for turn in report.turns)
+    assert spy.requests == [], "a longitudinal run must make no remote call"
+
+
+def test_a_trajectory_reads_the_model_that_actually_answered(
+    world, spy, traced_writer
+):
+    """Finding H over a whole conversation, from the real provenance records."""
+    from services.trajectory_eval import Disturbance, Trajectory, run_trajectory
+
+    async def send_turn(message: str) -> dict:
+        return await suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message=message, fast=True
+        )
+
+    report = _run(
+        run_trajectory(
+            Trajectory(
+                name="t",
+                disturbances=(
+                    Disturbance(message="hey"),
+                    Disturbance(message="you there"),
+                ),
+            ),
+            send_turn=send_turn,
+        )
+    )
+
+    # traced_writer answers as the FALLBACK, and the trajectory can say so.
+    assert report.models_used() == {"Qwen/Qwen3.7-Plus": 2}
+
+
+def test_a_real_run_reports_no_critical_execution_failure(world, spy, traced_writer):
+    """The always-on half: deterministic checks over a real conversation.
+
+    Not a quality claim. It says no duplicate delivery, no unreceipted paid
+    delivery and no turn raised — which is what §5 means by counting critical
+    execution failures separately.
+    """
+    from services.trajectory_eval import Disturbance, Trajectory, run_trajectory
+
+    async def send_turn(message: str) -> dict:
+        return await suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message=message, fast=True
+        )
+
+    report = _run(
+        run_trajectory(
+            Trajectory(
+                name="t",
+                disturbances=tuple(
+                    Disturbance(message=f"message number {i}") for i in range(4)
+                ),
+            ),
+            send_turn=send_turn,
+        )
+    )
+
+    assert report.critical == [], report.render()
+
+
+def test_a_real_run_records_latency_including_its_worst_turn(
+    world, spy, traced_writer
+):
+    from services.trajectory_eval import Disturbance, Trajectory, run_trajectory
+
+    async def send_turn(message: str) -> dict:
+        return await suggestions.run_simulated_inbound(
+            fan_id="fan-test", creator_id="creator-1", message=message, fast=True
+        )
+
+    report = _run(
+        run_trajectory(
+            Trajectory(
+                name="t",
+                disturbances=(
+                    Disturbance(message="hey"),
+                    Disturbance(message="you there"),
+                ),
+            ),
+            send_turn=send_turn,
+        )
+    )
+
+    latency = report.latency()
+    assert latency["worst_ms"] >= latency["median_ms"] >= 0
