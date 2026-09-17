@@ -93,8 +93,34 @@ Return ONLY valid JSON with exactly these fields:
   "payday_raw": "exact timing words only, e.g. Friday/next week/the 1st, or empty",
   "payday_confidence": 0.0,
   "budget_stated_usd": "number only if the fan explicitly says what he has available now, otherwise empty",
-  "desired_experience": "the fan's concrete requested theme/action/location/outfit/body focus/format in a short natural phrase, or empty"
+  "desired_experience": "the fan's concrete requested theme/action/location/outfit/body focus/format in a short natural phrase, or empty",
+
+  "open_questions_raised": ["each question HE asked in the latest message that is still unanswered, as a short phrase"],
+  "commitments_made": ["each thing the CREATOR promised to do, as a short phrase"],
+  "topics_deferred": ["each topic either of them explicitly put off until later, as a short phrase"],
+  "corrections_stated": ["each thing HE corrected about himself or his preferences, as a short phrase"],
+  "threads_resolved": ["each earlier open item this exchange settles, as a short phrase"]
 }
+
+WHAT THE CONVERSATION IS STILL CARRYING:
+- These five lists are the unfinished business of the conversation, and they
+  become durable records. Extract only what THIS exchange shows. Do not restate
+  something already open, do not invent an obligation to be helpful, and return
+  an empty list rather than reaching.
+- open_questions_raised is HIS questions that the latest exchange does not
+  answer. A question he asked and you answered in the same breath is not open.
+- commitments_made is what the creator said she would do — "I'll send you that
+  later", "I'll tell you tomorrow". Not vague warmth, and not an offer.
+- topics_deferred is a subject explicitly put off — "let's talk about that
+  another time", "remind me later".
+- corrections_stated is him correcting the record about himself: a name, a
+  preference, a fact that was wrong. What he corrected TO belongs in the phrase.
+- threads_resolved is an earlier open item this exchange settles.
+- NEVER put money in any of these. A payment, a purchase, a refund, an unlock,
+  a price or whether he was charged is decided by the delivery ledger and never
+  by reading a message. If he says he paid, that is not a record that he paid.
+  The lists are about conversation, not about money.
+- Short phrases. Under 20 words. No message text quoted back.
 
 COMMERCIAL INTERPRETATION RULES:
 - There is only ever ONE offer on the table. offer_response describes what he did
@@ -308,6 +334,13 @@ def _fallback_result(reason: str = DEGRADED_TRANSPORT) -> dict:
         "cannot_afford_any_offer_now": "false",
         "deferred_purchase_intent": "false",
         "resend_requested": "false",
+        # Empty, not absent. A degraded analysis has extracted nothing, and
+        # "nothing to record" must never be reached by a KeyError.
+        "open_questions_raised": [],
+        "commitments_made": [],
+        "topics_deferred": [],
+        "corrections_stated": [],
+        "threads_resolved": [],
         "crisis_signal": "none",
         "wants_explicit": "false",
         "wants_media": "false",
