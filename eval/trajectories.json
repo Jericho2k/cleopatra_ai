@@ -30,21 +30,32 @@
     "    the opposite of what they are meant to test. They need a seeded",
     "    ppv_deliveries row the ledger shows as purchased.",
     "",
-    "The customer here is SCRIPTED. \u00a75 asks for adaptive trajectories too \u2014",
-    "'adaptive trajectories expose the consequences of earlier choices' \u2014 and a",
-    "script cannot do that, because it says the same thing whatever the system",
-    "replied. Disturbance.responds_to in the harness is where an adaptive",
-    "customer plugs in; nothing in this repository supplies one yet, so every",
-    "result from this file is bounded by what the script happened to say.",
     "",
     "Nothing here is explicit. \u00a75 asks for the longitudinal evaluation to be",
     "non-explicit, and what is being measured \u2014 continuity, silence, recovery,",
-    "respecting a correction \u2014 does not require any of it."
+    "respecting a correction \u2014 does not require any of it.",
+    "",
+    "SCRIPTED AND ADAPTIVE ROWS",
+    "",
+    "Rows with `turns` are scripted: they say the same thing whatever the",
+    "system replied, which makes them good regression seeds and useless for",
+    "\u00a75's 'adaptive trajectories expose the consequences of earlier choices'.",
+    "",
+    "Rows with `adaptive` generate their turns from services/adaptive_customer.py",
+    "\u2014 a rule-driven customer that carries state, re-asks what nobody answered,",
+    "pushes back when sold to after declining, and calls out a repeated reply.",
+    "Same seed, same conversation, every time.",
+    "",
+    "It is rules, not a model, and it is not a realistic customer: a small",
+    "vocabulary reacting to shallow features of the creator's text. It makes",
+    "earlier choices have later consequences, which is what \u00a75 asks for, and it",
+    "is not a substitute for expert human review \u2014 which \u00a75 also says, and is",
+    "why nothing here produces a score."
   ],
   "trajectories": [
     {
       "name": "ordinary conversation with no purchase goal",
-      "covers": "40-80 turns of ordinary conversation; several topic changes; no purchase request. Catches forced commercial pivots and repetitive questioning.",
+      "covers": "Regression seed: several topic changes and no purchase request, in a short scripted conversation. Catches a forced commercial pivot in the small. The 40-80 turn row it used to claim is covered by 'ordinary conversation, adaptive' below.",
       "turns": [
         {
           "message": "hey, long week",
@@ -75,10 +86,7 @@
           "tests": "he asks, we answer",
           "raises_obligation": "been"
         }
-      ],
-      "requires": {
-        "turns": 40
-      }
+      ]
     },
     {
       "name": "he comes back a day later, then a week later",
@@ -110,7 +118,7 @@
     },
     {
       "name": "a question deferred behind two other topics",
-      "covers": "A question deferred across 30+ turns; two unrelated topics intervene. Catches a forgotten obligation or a wrong referent.",
+      "covers": "Regression seed: a question with two intervening topics, scripted and short. Catches the obvious forgotten obligation. The 30+ turn row it used to claim is covered by 'a question deferred across a long conversation' below.",
       "turns": [
         {
           "message": "do you ever get out to chicago",
@@ -133,10 +141,7 @@
           "message": "so anyway",
           "tests": "an opening to return to the question"
         }
-      ],
-      "requires": {
-        "turns": 30
-      }
+      ]
     },
     {
       "name": "he corrects a preference",
@@ -298,6 +303,48 @@
           "tests": "he abandons his own thread"
         }
       ]
+    },
+    {
+      "name": "ordinary conversation, adaptive",
+      "covers": "40-80 turns of ordinary conversation; several topic changes; no purchase request. Catches forced commercial pivots and repetitive questioning. The customer reacts: it pushes back when sold to after declining, and calls out a reply it has already seen.",
+      "adaptive": {
+        "seed": 20260917,
+        "turns": 45,
+        "decline_at_turn": 6
+      },
+      "requires": {
+        "turns": 40
+      }
+    },
+    {
+      "name": "a question deferred across a long conversation",
+      "covers": "A question deferred across 30+ turns with unrelated topics intervening. Catches a forgotten obligation. The customer re-asks what nobody answered, so dropping it has a visible consequence rather than only a finding.",
+      "adaptive": {
+        "seed": 31415926,
+        "turns": 34,
+        "decline_at_turn": 0,
+        "low_engagement_rate": 0.4
+      },
+      "requires": {
+        "turns": 30
+      }
+    },
+    {
+      "name": "he returns after a day and a week, adaptive",
+      "covers": "Return after one day and one week across a long conversation, with a customer that notices what was left unfinished. Catches restarting introductions or inventing what happened while he was gone.",
+      "adaptive": {
+        "seed": 8675309,
+        "turns": 40,
+        "decline_at_turn": 5,
+        "gaps": {
+          "18": 1.0,
+          "30": 7.0
+        }
+      },
+      "requires": {
+        "turns": 40,
+        "elapsed_days": 8
+      }
     }
   ]
 }

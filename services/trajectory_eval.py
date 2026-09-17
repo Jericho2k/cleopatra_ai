@@ -1154,6 +1154,28 @@ def load_trajectories(payload: Sequence[dict[str, Any]]) -> list[Trajectory]:
             if isinstance(item, dict)
         )
         requires = raw.get("requires") or {}
+
+        adaptive = raw.get("adaptive") or {}
+        if adaptive:
+            # A generated conversation, not a scripted one. One customer object
+            # across every turn, so it carries what it has been told and can
+            # react to it — a fresh one per turn would be a script again.
+            from services.adaptive_customer import build as build_customer
+
+            customer = build_customer(adaptive)
+            length = max(1, int(adaptive.get("turns") or 40))
+            gaps = {
+                int(index): float(days)
+                for index, days in (adaptive.get("gaps") or {}).items()
+            }
+            disturbances = tuple(
+                Disturbance(
+                    responds_to=customer.next_message,
+                    days_since_previous=gaps.get(index, 0.0),
+                    tests="adaptive",
+                )
+                for index in range(length)
+            )
         trajectories.append(
             Trajectory(
                 name=str(raw.get("name") or f"trajectory-{len(trajectories) + 1}"),

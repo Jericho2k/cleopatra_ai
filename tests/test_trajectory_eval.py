@@ -1012,18 +1012,22 @@ def test_the_rendered_report_prints_the_gap_under_the_findings():
 def test_the_shipped_trajectories_declare_what_they_need():
     """The file's own claims, checked against the file.
 
-    This does not assert the gaps are closed — they are not, and the fixture
-    file says so in prose. It asserts that every long-conversation, elapsed-time
-    and paid-content row DECLARES its requirement, so closing one is visible and
-    dropping one is not silent.
+    Every long-conversation, elapsed-time, due-worker and paid-content row
+    DECLARES its requirement, so closing a gap is a visible change and dropping
+    a requirement is not a silent one.
+
+    The long-conversation claims moved: they used to sit on short scripted
+    rows, which is what made them false. They now sit on the adaptive rows that
+    are genuinely that long, and the scripted rows are named as regression
+    seeds.
     """
     trajectories = load_trajectories(
         json.loads(TRAJECTORIES.read_text())["trajectories"]
     )
     by_name = {t.name: t for t in trajectories}
 
-    assert by_name["ordinary conversation with no purchase goal"].requires_turns == 40
-    assert by_name["a question deferred behind two other topics"].requires_turns == 30
+    assert by_name["ordinary conversation, adaptive"].requires_turns == 40
+    assert by_name["a question deferred across a long conversation"].requires_turns == 30
     assert by_name[
         "he comes back a day later, then a week later"
     ].requires_elapsed_days == 8
@@ -1033,20 +1037,54 @@ def test_the_shipped_trajectories_declare_what_they_need():
     ].requires_authoritative_purchase
 
 
-def test_the_long_conversation_claims_are_currently_uncovered():
-    """Pinned deliberately, so closing the gap is a visible change.
+def test_a_long_conversation_claim_is_made_by_a_conversation_that_long():
+    """What the pinned-open version of this test was waiting for.
 
-    If somebody lengthens the fixtures, this test fails and they update it —
-    which is the point. The alternative is a harness that silently keeps
-    claiming forty turns whatever the file holds.
+    It used to assert the gap was OPEN — deliberately, so closing it would be a
+    visible change rather than a silent one. This is that change: the rows
+    claiming 40 and 30 turns now have 40 and 30 turns, so a run of them reports
+    no length gap at all.
     """
     trajectories = load_trajectories(
         json.loads(TRAJECTORIES.read_text())["trajectories"]
     )
-    long_form = next(
-        t for t in trajectories if t.name == "ordinary conversation with no purchase goal"
+    by_name = {t.name: t for t in trajectories}
+
+    for name in (
+        "ordinary conversation, adaptive",
+        "a question deferred across a long conversation",
+    ):
+        row = by_name[name]
+        ran = _ran(len(row.disturbances))
+        assert len(row.disturbances) >= row.requires_turns, name
+        assert [gap.claim for gap in coverage_gaps(row, ran)] == [], name
+
+
+def test_every_claim_in_the_file_is_reachable_by_some_run():
+    """No row claims something no invocation could cover.
+
+    The elapsed-time rows need --simulate-time and the purchase row needs its
+    seed applied, so this models the best case the CLI can actually produce. A
+    claim that fails here is one nothing can satisfy, which is the state the
+    whole coverage mechanism exists to make impossible to ship quietly.
+    """
+    trajectories = load_trajectories(
+        json.loads(TRAJECTORIES.read_text())["trajectories"]
     )
 
-    gaps = coverage_gaps(long_form, _ran(len(long_form.disturbances)))
-
-    assert [gap.claim for gap in gaps] == ["conversation length"]
+    for row in trajectories:
+        best_case = TrajectoryReport(
+            trajectory=row.name,
+            turns=[
+                _turn(index, "ok") for index in range(len(row.disturbances))
+            ],
+            clock_injected=True,
+            elapsed_days=sum(
+                float(d.days_since_previous or 0.0) for d in row.disturbances
+            ),
+            due_worker_runs=sum(
+                1 for d in row.disturbances if not str(d.message or "").strip()
+            ),
+            seeded_purchases=list(row.seed.get("purchases") or []),
+        )
+        assert coverage_gaps(row, best_case) == [], row.name
