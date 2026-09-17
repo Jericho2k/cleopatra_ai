@@ -559,6 +559,23 @@ async def _run_auto_reply(action: dict) -> HandlerResult:
     if not sent:
         from core.supabase import get_supabase
 
+        # A review hold established during the turn is a successful handoff,
+        # not a writer failure. Re-read persisted state: generation may have
+        # stopped specifically to let an operator resolve an access problem.
+        review = await asyncio.to_thread(
+            lambda: get_supabase().table("fans")
+            .select("needs_human_review")
+            .eq("id", action["fan_id"])
+            .eq("creator_id", action["creator_id"])
+            .limit(1)
+            .execute()
+        )
+        if review.data and review.data[0].get("needs_human_review"):
+            return HandlerResult(
+                sent_message=False,
+                reason="durable Auto reply handed off for human review",
+            )
+
         pending_approval = await asyncio.to_thread(
             lambda: get_supabase().table("ppv_approval_requests")
             .select("id")

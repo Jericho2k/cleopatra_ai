@@ -180,6 +180,32 @@ def test_ppv_reconcile_keeps_its_long_budget(worker, monkeypatch):
 # --- the cost the classification exists to avoid ---------------------------
 
 
+@pytest.mark.parametrize("frozen", [True, False])
+def test_review_handoff_is_not_reported_as_writer_failure(worker, monkeypatch, frozen):
+    db = FakeSupabase({
+        "creators": [{"id": CREATOR_ID, "apifansly_account_id": "acct-1"}],
+        "fans": [{"id": FAN_ID, "creator_id": CREATOR_ID, "needs_human_review": frozen}],
+        "ppv_approval_requests": [],
+    })
+    monkeypatch.setattr("core.supabase.get_supabase", lambda: db)
+
+    async def no_message(_action):
+        return False
+
+    from services import suggestions
+
+    monkeypatch.setattr(suggestions, "deliver_scheduled_auto_reply", no_message)
+    outcome = _resolve(_action())
+    if frozen:
+        assert outcome == "completed"
+        assert worker["completed"] == ["action-1"]
+        assert worker["failed"] == []
+    else:
+        assert outcome == "failed_writer_quality"
+        assert worker["completed"] == []
+    assert worker["failed_terminal"] == []
+
+
 def test_a_disconnected_creator_never_reaches_the_model_pipeline(
     worker, monkeypatch
 ):
