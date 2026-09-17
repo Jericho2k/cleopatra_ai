@@ -303,6 +303,8 @@ async def resolve_fan_review(
     resolution: str,
     amount: float | None = None,
     reference: str = "",
+    review_case_id: str = "",
+    actor: str = "",
 ) -> dict[str, Any]:
     from services.content_access import (
         RESOLUTIONS as CONTENT_ACCESS_RESOLUTIONS,
@@ -315,7 +317,11 @@ async def resolve_fan_review(
         # not a PPV delivery outcome. Routed here so an operator has one place
         # to resolve a frozen conversation whatever froze it.
         return await resolve_content_access(
-            fan_id, resolution=resolution, reference=reference
+            fan_id,
+            resolution=resolution,
+            reference=reference,
+            review_case_id=review_case_id,
+            actor=actor,
         )
     if resolution == "repair_ppv":
         return await repair_ppv_reconciliation(fan_id)

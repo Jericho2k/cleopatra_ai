@@ -115,6 +115,31 @@ vault_classification_persistence_v1.sql
 # creator-owned table, before tenant_isolation_v1.
 simulation_turn_durability_v1.sql
 
+# claim_due_actions gains an optional p_now, so the evaluation harness can
+# simulate a queued follow-up becoming due. Replaces the function created by
+# scheduled_action_claim_v1.sql, so it must run after it. No table, so its
+# position relative to tenant_isolation_v1 does not matter.
+eval_clock_claim_v1.sql
+
+# Durable content-access repair claims: public.content_access_repairs and
+# fans.review_case_id. Stops a retry or a second operator sending a second free
+# copy, and stops a repair clearing a newer hold. Creates a creator-owned
+# table, so it must run before tenant_isolation_v1.
+content_access_repair_v1.sql
+
+# Owner-only diagnostics: public.message_diagnostics and the
+# public.owner_only_tables registry that keeps the two migrations below from
+# granting the browser SELECT on it. Creates a creator-owned table and rewrites
+# messages.media_context, so it must run AFTER the base schema and BEFORE the
+# pair below — which read the registry.
+owner_only_diagnostics_v1.sql
+
+# Assisted provenance that survives a restart or a second replica. Registers
+# itself in public.owner_only_tables, so it must run AFTER
+# owner_only_diagnostics_v1.sql (which creates that registry) and before the
+# tenant_isolation_v1 / browser_least_privilege_v1 pair that reads it.
+assisted_provenance_v1.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each

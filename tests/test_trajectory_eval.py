@@ -23,9 +23,13 @@ from pathlib import Path
 import pytest
 
 from services.trajectory_eval import (
+    CoverageGap,
     Disturbance,
+    FAILED_OUTCOMES,
     Finding,
     Severity,
+    TurnOutcome,
+    coverage_gaps,
     Trajectory,
     TrajectoryReport,
     TurnRecord,
@@ -46,11 +50,36 @@ def run(coro):
 
 
 def _turn(index: int, *replies: str, **overrides) -> TurnRecord:
+    """An ordinary turn: it replied and the platform took it, or it chose not to.
+
+    Both halves of that default are deliberate. The harness now tells a turn
+    that went well from one nothing recorded anything about, so a fixture has to
+    say which it is — a turn with replies and no delivery record is "we do not
+    know whether this arrived", and a turn with no replies and no outcome is
+    "we do not know why it said nothing". Neither is the ordinary case these
+    fixtures mean, so the helper supplies the evidence and the tests that are
+    ABOUT missing evidence override it.
+    """
     record = TurnRecord(
         index=index,
         customer_message=overrides.pop("customer_message", f"message {index}"),
         replies=list(replies),
     )
+    if replies:
+        record.outcome = "replied"
+        record.provenance = [
+            {
+                "delivery": {
+                    "kind": "text",
+                    "accepted_by_platform": True,
+                    "platform_message_id": f"platform-{index}-{part}",
+                }
+            }
+            for part, _ in enumerate(replies)
+        ]
+    else:
+        # Full Auto deciding not to write. The product working, not a gap.
+        record.outcome = "no_send"
     for key, value in overrides.items():
         setattr(record, key, value)
     return record
@@ -129,15 +158,97 @@ def test_two_different_deliveries_are_not_a_duplicate():
     assert _critical(evaluate_turns(turns, [])) == []
 
 
-def test_a_message_after_he_asked_for_none_is_a_critical_failure():
-    """§1: respect a goodbye or a request for no follow-up."""
+def test_an_unprompted_message_after_he_asked_for_none_is_a_critical_failure():
+    """§1: respect a goodbye or a request for no follow-up.
+
+    The turn carries no customer message, which is what a queued follow-up or a
+    proactive nudge looks like. That is the thing he asked not to happen.
+    """
     disturbances = [
         Disturbance(message="night, dont message me tonight", asks_for_silence=True),
         Disturbance(message=""),
     ]
-    turns = [_turn(0, "night you"), _turn(1, "hey are you up")]
+    turns = [
+        _turn(0, "night you"),
+        _turn(1, "hey are you up", customer_message=""),
+    ]
 
-    assert "message_after_silence_requested" in _critical(
+    assert "unprompted_message_after_silence_requested" in _critical(
+        evaluate_turns(turns, disturbances)
+    )
+
+
+def test_answering_him_when_he_writes_first_is_not_breaking_the_silence():
+    """The distinction the detector used to miss entirely.
+
+    "Don't message me" forbids being messaged. It does not forbid being
+    answered — a customer who comes back and asks a question has started the
+    conversation himself, and reporting the reply as a critical failure would
+    make honouring the request indistinguishable from breaking it.
+    """
+    disturbances = [
+        Disturbance(message="dont message me for a while", asks_for_silence=True),
+        Disturbance(message="ok im back, what do you have?", days_since_previous=7.0),
+    ]
+    turns = [
+        _turn(0, "okay, talk soon"),
+        _turn(1, "welcome back! i have a new set",
+              customer_message="ok im back, what do you have?"),
+    ]
+
+    assert _critical(evaluate_turns(turns, disturbances)) == []
+
+
+def test_a_silence_request_the_customer_withdraws_stops_applying():
+    """A preference he set is a preference he can change."""
+    disturbances = [
+        Disturbance(message="stop messaging me", asks_for_silence=True),
+        Disturbance(message="actually message me whenever", lifts_silence=True),
+        Disturbance(message=""),
+    ]
+    turns = [
+        _turn(0, "understood"),
+        _turn(1, "will do!"),
+        _turn(2, "thinking of you", customer_message=""),
+    ]
+
+    assert _critical(evaluate_turns(turns, disturbances)) == []
+
+
+def test_a_silence_request_with_a_scope_runs_out():
+    """"Not tonight" is not "not ever", and a preference with no expiry is a
+    state the customer cannot get out of."""
+    disturbances = [
+        Disturbance(
+            message="dont message me tonight",
+            asks_for_silence=True,
+            silence_expires_after_days=1.0,
+        ),
+        Disturbance(message="", days_since_previous=2.0),
+    ]
+    turns = [
+        _turn(0, "night!"),
+        _turn(1, "morning you", customer_message=""),
+    ]
+
+    assert _critical(evaluate_turns(turns, disturbances)) == []
+
+
+def test_the_scope_only_runs_out_once_the_time_has_passed():
+    disturbances = [
+        Disturbance(
+            message="dont message me tonight",
+            asks_for_silence=True,
+            silence_expires_after_days=1.0,
+        ),
+        Disturbance(message="", days_since_previous=0.1),
+    ]
+    turns = [
+        _turn(0, "night!"),
+        _turn(1, "you up?", customer_message=""),
+    ]
+
+    assert "unprompted_message_after_silence_requested" in _critical(
         evaluate_turns(turns, disturbances)
     )
 
@@ -152,17 +263,88 @@ def test_staying_quiet_after_a_goodbye_produces_no_finding():
     assert evaluate_turns(turns, disturbances) == []
 
 
-def test_reasserting_something_he_corrected_is_a_critical_failure():
-    """§5: preference correction; catches reasserting superseded information."""
+def test_delivering_what_he_ruled_out_is_a_critical_failure():
+    """The authoritative half: an executed action, with a record behind it.
+
+    This is CRITICAL because the evidence is a delivery record naming what went
+    out, not a reading of a sentence.
+    """
+    disturbances = [
+        Disturbance(
+            message="not the outdoor ones",
+            corrects="outdoor",
+            forbids_delivery_of=("outdoor-set-1",),
+        ),
+        Disturbance(message="so anyway"),
+    ]
+    turns = [_turn(0, "got it"), _turn(1, "here you go")]
+    turns[1].provenance = [
+        {
+            "delivery": {
+                "kind": "ppv",
+                "accepted_by_platform": True,
+                "platform_message_id": "p-1",
+                "reference": "outdoor-set-1",
+            }
+        }
+    ]
+
+    assert "delivery_contradicts_correction" in _critical(
+        evaluate_turns(turns, disturbances)
+    )
+
+
+def test_mentioning_a_corrected_topic_is_a_suspicion_not_a_verdict():
+    """The prose half, and the reason it is not CRITICAL.
+
+    A keyword is not proof that an obsolete fact was reasserted. It is enough
+    to put the reply in front of a person, which is what NOTABLE means here.
+    """
     disturbances = [
         Disturbance(message="not the outdoor ones", corrects="outdoor"),
         Disturbance(message="so anyway"),
     ]
     turns = [_turn(0, "got it"), _turn(1, "you would love the outdoor set")]
 
-    assert "reasserted_corrected_information" in _critical(
-        evaluate_turns(turns, disturbances)
-    )
+    findings = evaluate_turns(turns, disturbances)
+    assert "correction_possibly_reasserted" in _notable(findings)
+    assert _critical(findings) == []
+
+
+def test_honouring_a_correction_out_loud_is_not_reasserting_it():
+    """The false positive that made this detector unreadable.
+
+    "i remember you dislike outdoor photos, so here's an indoor set" honours
+    the correction exactly, and was reported as a CRITICAL failure for
+    containing the word it was honouring.
+    """
+    disturbances = [
+        Disturbance(message="not the outdoor ones", corrects="outdoor"),
+        Disturbance(message="what do you have?"),
+    ]
+    turns = [
+        _turn(0, "got it"),
+        _turn(1, "i remember you dislike outdoor photos, so heres an indoor set"),
+    ]
+
+    assert evaluate_turns(turns, disturbances) == []
+
+
+def test_naming_the_correction_alongside_the_old_version_is_discussing_it():
+    disturbances = [
+        Disturbance(
+            message="not the outdoor ones",
+            corrects="outdoor",
+            corrected_to="hotel",
+        ),
+        Disturbance(message="so anyway"),
+    ]
+    turns = [
+        _turn(0, "got it"),
+        _turn(1, "swapping the outdoor pick for the hotel one"),
+    ]
+
+    assert evaluate_turns(turns, disturbances) == []
 
 
 def test_respecting_a_correction_produces_no_finding():
@@ -325,8 +507,17 @@ def test_the_report_says_which_models_actually_answered():
     }
 
 
-def test_a_reply_with_no_provenance_is_reported_as_unrecorded():
+def test_a_reply_whose_provenance_names_no_model_is_reported_as_unrecorded():
+    """Finding H: "we do not know which model answered" has to be sayable."""
     report = TrajectoryReport(trajectory="t", turns=[_turn(0, "hey")])
+
+    assert report.models_used() == {"unrecorded": 1}
+
+
+def test_a_reply_with_no_provenance_at_all_reports_nothing():
+    turn = _turn(0, "hey")
+    turn.provenance = []
+    report = TrajectoryReport(trajectory="t", turns=[turn])
 
     assert report.models_used() == {}
 
@@ -529,3 +720,371 @@ def test_the_file_states_that_its_customer_is_scripted():
 @pytest.mark.parametrize("required", ["proposed test design", "non-explicit"])
 def test_the_file_repeats_the_reviews_own_caveat(required):
     assert required in TRAJECTORIES.read_text(encoding="utf-8")
+
+
+# ===========================================================================
+# Telling one silence from another
+# ===========================================================================
+#
+# The continuation brief: "Distinguish legitimate silence, handoff, failed
+# analysis, writer failure, unknown delivery and infrastructure errors even
+# when no exception was raised. Missing trace/state evidence is unknown, never
+# a pass."
+#
+# This harness reported one number, `silent_turns`, for all of it. A deployment
+# whose writer was failing on every turn and one exercising judgment on every
+# turn produced the same count — so the number meant to detect the first was
+# the thing concealing it.
+
+
+def _classified(*turns: TurnRecord) -> list[str]:
+    return [turn.classify().value for turn in turns]
+
+
+def test_a_deliberate_no_send_is_not_a_failure():
+    """Full Auto choosing not to write is the product working."""
+    turn = TurnRecord(index=0, customer_message="k", outcome="no_send")
+
+    assert turn.classify() is TurnOutcome.CHOSE_SILENCE
+    assert turn.classify() not in FAILED_OUTCOMES
+
+
+def test_a_writer_failure_is_not_a_deliberate_silence():
+    for recorded in ("writer_failed", "plan_unrecoverable"):
+        turn = TurnRecord(index=0, customer_message="hi", outcome=recorded)
+        assert turn.classify() is TurnOutcome.WRITER_FAILED
+        assert turn.classify() in FAILED_OUTCOMES
+
+
+def test_each_kind_of_quiet_turn_is_told_apart():
+    assert _classified(
+        TurnRecord(index=0, customer_message="a", outcome="no_send"),
+        TurnRecord(index=1, customer_message="b", outcome="human_review"),
+        TurnRecord(index=2, customer_message="c", outcome="analyzer_degraded"),
+        TurnRecord(index=3, customer_message="d", outcome="writer_failed"),
+        TurnRecord(index=4, customer_message="e", outcome="inventory_unsafe"),
+        TurnRecord(index=5, customer_message="f", error="RuntimeError: boom"),
+    ) == [
+        "chose_silence",
+        "handed_off",
+        "analysis_failed",
+        "writer_failed",
+        "inventory_blocked",
+        "infrastructure_error",
+    ]
+
+
+def test_a_turn_with_no_recorded_outcome_is_unknown_and_never_a_pass():
+    """The rule the brief states outright. An absence of evidence is not evidence."""
+    turn = TurnRecord(index=0, customer_message="hi")
+
+    assert turn.classify() is TurnOutcome.UNKNOWN
+    assert turn.classify() in FAILED_OUTCOMES
+    assert "turn_outcome_unknown" in _critical(evaluate_turns([turn], []))
+
+
+def test_an_outcome_this_harness_does_not_know_is_unknown_not_silence():
+    """A new pipeline outcome must surface, not be absorbed.
+
+    Mapping the unrecognised case to "chose silence" would mean every outcome
+    added to services/suggestions.py in future silently counted as the product
+    working.
+    """
+    turn = TurnRecord(index=0, customer_message="hi", outcome="some_new_outcome")
+
+    assert turn.classify() is TurnOutcome.UNKNOWN
+
+
+def test_a_reply_with_a_receipt_is_a_delivered_reply():
+    turn = TurnRecord(index=0, customer_message="hi", replies=["hey"])
+    turn.provenance = [
+        {"delivery": {"accepted_by_platform": True, "platform_message_id": "p-1"}}
+    ]
+
+    assert turn.classify() is TurnOutcome.REPLIED
+    assert turn.classify() not in FAILED_OUTCOMES
+
+
+def test_a_reply_the_platform_did_not_accept_is_not_a_delivered_reply():
+    turn = TurnRecord(index=0, customer_message="hi", replies=["hey"])
+    turn.provenance = [
+        {"delivery": {"accepted_by_platform": False, "platform_message_id": None}}
+    ]
+
+    assert turn.classify() is TurnOutcome.DELIVERY_UNKNOWN
+
+
+def test_a_reply_with_no_delivery_record_is_unverified_rather_than_delivered():
+    """No record is not a record saying yes."""
+    turn = TurnRecord(index=0, customer_message="hi", replies=["hey"])
+
+    assert turn.classify() is TurnOutcome.DELIVERY_UNKNOWN
+    assert "delivery_unverified" in _notable(evaluate_turns([turn], []))
+
+
+def test_the_report_counts_outcomes_rather_than_lumping_them():
+    """Two runs with the same silent count, telling different stories."""
+    judgment = TrajectoryReport(
+        trajectory="judgment",
+        turns=[TurnRecord(index=i, customer_message="x", outcome="no_send")
+               for i in range(3)],
+    )
+    broken = TrajectoryReport(
+        trajectory="broken",
+        turns=[TurnRecord(index=i, customer_message="x", outcome="writer_failed")
+               for i in range(3)],
+    )
+
+    assert judgment.silent_turns == broken.silent_turns == 3
+    assert judgment.failed_turns == 0
+    assert broken.failed_turns == 3
+    assert judgment.outcomes() == {"chose_silence": 3}
+    assert broken.outcomes() == {"writer_failed": 3}
+
+
+def test_unexplained_turns_are_counted_on_their_own():
+    report = TrajectoryReport(
+        trajectory="t",
+        turns=[
+            TurnRecord(index=0, customer_message="a", outcome="no_send"),
+            TurnRecord(index=1, customer_message="b"),
+        ],
+    )
+
+    assert report.unexplained_turns == 1
+    assert report.failed_turns == 1
+    assert report.summary()["unexplained_turns"] == 1
+
+
+def test_the_summary_still_has_no_quality_score():
+    """Adding outcome counts must not have smuggled a verdict in with them."""
+    report = TrajectoryReport(trajectory="t", turns=[_turn(0, "hey")])
+    summary = report.summary()
+
+    assert "score" not in json.dumps(summary).lower()
+    assert "grade" not in json.dumps(summary).lower()
+
+
+# ===========================================================================
+# A claim the run did not reach is reported, not printed over
+# ===========================================================================
+#
+# `covers` on the first trajectory reads "40-80 turns of ordinary
+# conversation" and the script is seven turns. The deferred-question row says
+# "30+ turns" and has five. Nothing compared the sentence to the thing, so the
+# sentence was all a reader ever saw — including in --describe, whose whole job
+# is to say what these cover.
+#
+# CoverageGap does not make the fixtures longer. It stops the report claiming
+# they are.
+
+
+def _ran(count: int, **report_kwargs) -> TrajectoryReport:
+    return TrajectoryReport(
+        trajectory="t",
+        turns=[_turn(index, "ok") for index in range(count)],
+        **report_kwargs,
+    )
+
+
+def test_a_short_run_against_a_long_claim_is_reported_as_uncovered():
+    trajectory = Trajectory(name="t", disturbances=(), requires_turns=40)
+
+    gaps = coverage_gaps(trajectory, _ran(7))
+
+    assert [gap.claim for gap in gaps] == ["conversation length"]
+    assert "40 turns" in gaps[0].required
+    assert gaps[0].actual == "7"
+
+
+def test_a_run_that_reaches_the_claim_has_no_gap():
+    trajectory = Trajectory(name="t", disturbances=(), requires_turns=3)
+
+    assert coverage_gaps(trajectory, _ran(3)) == []
+
+
+def test_elapsed_days_without_a_clock_is_uncovered_rather_than_assumed():
+    """The failure mode this is really for.
+
+    days_since_previous was a no-op whenever the caller supplied no
+    advance_clock, silently — and the CLI supplied none. So "he comes back a
+    week later" ran its turns back to back while the label said a week passed.
+    """
+    trajectory = Trajectory(name="t", disturbances=(), requires_elapsed_days=8)
+
+    gaps = coverage_gaps(trajectory, _ran(4, clock_injected=False))
+
+    assert [gap.claim for gap in gaps] == ["elapsed time"]
+    assert "no clock was injected" in gaps[0].actual
+
+
+def test_a_clock_that_did_not_advance_far_enough_is_uncovered():
+    trajectory = Trajectory(name="t", disturbances=(), requires_elapsed_days=8)
+
+    gaps = coverage_gaps(trajectory, _ran(4, clock_injected=True, elapsed_days=1.0))
+
+    assert gaps[0].actual == "1"
+
+
+def test_a_clock_that_advanced_far_enough_covers_the_claim():
+    trajectory = Trajectory(name="t", disturbances=(), requires_elapsed_days=8)
+
+    report = _ran(4, clock_injected=True, elapsed_days=8.0)
+
+    assert coverage_gaps(trajectory, report) == []
+
+
+def test_a_queued_follow_up_claim_needs_a_cycle_to_have_run():
+    """The goodbye trajectory's one turn that mattered used to be a no-op.
+
+    An unprompted turn returned {"outcome": "no_message"} without running
+    anything, so the row claiming "a previously queued follow-up becomes due"
+    could not detect the behaviour it existed for.
+    """
+    trajectory = Trajectory(name="t", disturbances=(), requires_due_worker=True)
+
+    gaps = coverage_gaps(trajectory, _ran(4))
+
+    assert [gap.claim for gap in gaps] == ["queued work becoming due"]
+    assert coverage_gaps(trajectory, _ran(4, due_worker_runs=1)) == []
+
+
+def test_a_claim_of_payment_is_not_a_purchase():
+    """A complaint is not proof of payment, and neither is a fixture line."""
+    trajectory = Trajectory(
+        name="t", disturbances=(), requires_authoritative_purchase=True
+    )
+
+    gaps = coverage_gaps(trajectory, _ran(3))
+
+    assert [gap.claim for gap in gaps] == ["a purchase the ledger records"]
+    assert "the customer's own claim of payment" in gaps[0].actual
+
+
+def test_a_seeded_paid_delivery_covers_the_purchase_claim():
+    trajectory = Trajectory(
+        name="t", disturbances=(), requires_authoritative_purchase=True
+    )
+    report = _ran(3)
+    report.turns[1].provenance = [
+        {
+            "delivery": {
+                "kind": "ppv",
+                "accepted_by_platform": True,
+                "platform_message_id": "p-1",
+                "price_cents": 2500,
+            }
+        }
+    ]
+
+    assert coverage_gaps(trajectory, report) == []
+
+
+def test_a_trajectory_claiming_nothing_in_particular_has_no_gaps():
+    assert coverage_gaps(Trajectory(name="t", disturbances=()), _ran(2)) == []
+
+
+def test_the_summary_says_whether_the_run_covered_its_claim():
+    report = _ran(7)
+    report.coverage_gaps = [
+        CoverageGap(claim="conversation length", required="40 turns", actual="7")
+    ]
+
+    summary = report.summary()
+
+    assert summary["fully_covered"] is False
+    assert summary["coverage_gaps"][0]["required"] == "40 turns"
+
+
+def test_the_rendered_report_prints_the_gap_under_the_findings():
+    """A clean findings list above an uncovered claim is the misreading."""
+    report = _ran(7)
+    report.coverage_gaps = [
+        CoverageGap(claim="conversation length", required="40 turns", actual="7")
+    ]
+
+    rendered = report.render()
+
+    assert "NOT COVERED" in rendered
+    assert "40 turns" in rendered
+
+
+def test_the_shipped_trajectories_declare_what_they_need():
+    """The file's own claims, checked against the file.
+
+    Every long-conversation, elapsed-time, due-worker and paid-content row
+    DECLARES its requirement, so closing a gap is a visible change and dropping
+    a requirement is not a silent one.
+
+    The long-conversation claims moved: they used to sit on short scripted
+    rows, which is what made them false. They now sit on the adaptive rows that
+    are genuinely that long, and the scripted rows are named as regression
+    seeds.
+    """
+    trajectories = load_trajectories(
+        json.loads(TRAJECTORIES.read_text())["trajectories"]
+    )
+    by_name = {t.name: t for t in trajectories}
+
+    assert by_name["ordinary conversation, adaptive"].requires_turns == 40
+    assert by_name["a question deferred across a long conversation"].requires_turns == 30
+    assert by_name[
+        "he comes back a day later, then a week later"
+    ].requires_elapsed_days == 8
+    assert by_name["he says goodnight and asks for no follow-up"].requires_due_worker
+    assert by_name[
+        "he cannot open something he paid for, then asks for more"
+    ].requires_authoritative_purchase
+
+
+def test_a_long_conversation_claim_is_made_by_a_conversation_that_long():
+    """What the pinned-open version of this test was waiting for.
+
+    It used to assert the gap was OPEN — deliberately, so closing it would be a
+    visible change rather than a silent one. This is that change: the rows
+    claiming 40 and 30 turns now have 40 and 30 turns, so a run of them reports
+    no length gap at all.
+    """
+    trajectories = load_trajectories(
+        json.loads(TRAJECTORIES.read_text())["trajectories"]
+    )
+    by_name = {t.name: t for t in trajectories}
+
+    for name in (
+        "ordinary conversation, adaptive",
+        "a question deferred across a long conversation",
+    ):
+        row = by_name[name]
+        ran = _ran(len(row.disturbances))
+        assert len(row.disturbances) >= row.requires_turns, name
+        assert [gap.claim for gap in coverage_gaps(row, ran)] == [], name
+
+
+def test_every_claim_in_the_file_is_reachable_by_some_run():
+    """No row claims something no invocation could cover.
+
+    The elapsed-time rows need --simulate-time and the purchase row needs its
+    seed applied, so this models the best case the CLI can actually produce. A
+    claim that fails here is one nothing can satisfy, which is the state the
+    whole coverage mechanism exists to make impossible to ship quietly.
+    """
+    trajectories = load_trajectories(
+        json.loads(TRAJECTORIES.read_text())["trajectories"]
+    )
+
+    for row in trajectories:
+        best_case = TrajectoryReport(
+            trajectory=row.name,
+            turns=[
+                _turn(index, "ok") for index in range(len(row.disturbances))
+            ],
+            clock_injected=True,
+            elapsed_days=sum(
+                float(d.days_since_previous or 0.0) for d in row.disturbances
+            ),
+            due_worker_runs=sum(
+                1 for d in row.disturbances if not str(d.message or "").strip()
+            ),
+            seeded_purchases=list(row.seed.get("purchases") or []),
+        )
+        assert coverage_gaps(row, best_case) == [], row.name

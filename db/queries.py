@@ -371,7 +371,30 @@ async def save_message_result(
     (creator_id, fansly_message_id). The loser of a race gets inserted=False
     rather than a second row, so the pipeline runs at most once per platform
     message.
+
+    This is also where owner-only diagnostics leave the row. Every message
+    write in the codebase funnels through here — services.ppv_persistence
+    included — so splitting here is what makes the boundary hold for paths
+    nobody remembered, which is precisely how reply_provenance ended up
+    readable by every agency browser in the first place. See
+    services/message_diagnostics.py.
     """
+    from services.message_diagnostics import (
+        record_diagnostics,
+        split_media_context,
+        unrecognised_keys,
+    )
+
+    diverted = unrecognised_keys(media_context)
+    if diverted:
+        # Not an error: an unreviewed key is owner-only by design. It is worth
+        # a line because it is also how a new product field silently stops
+        # appearing in the dashboard.
+        print(
+            "[DIAGNOSTICS] media_context keys not on the public allowlist, "
+            f"stored owner-only: {', '.join(diverted)} (creator={creator_id})"
+        )
+    media_context, owner_only = split_media_context(media_context)
 
     def _row() -> dict:
         row = {
@@ -468,7 +491,18 @@ async def save_message_result(
         # need provenance, but report inserted=False so the pipeline stays put.
         return MessageWriteResult(message_id=_existing_id(), inserted=False)
 
-    return await asyncio.to_thread(_save)
+    result = await asyncio.to_thread(_save)
+    if owner_only:
+        # Deliberately after the message is durable and deliberately unchecked:
+        # the sensitive keys have already left the row by this point, so a
+        # failure here costs a diagnostic and never a conversation.
+        await record_diagnostics(
+            message_id=result.message_id,
+            creator_id=creator_id,
+            fan_id=fan_id,
+            record=owner_only,
+        )
+    return result
 
 
 async def update_message_media_context(message_id: str, media_context: dict) -> None:
@@ -478,16 +512,51 @@ async def update_message_media_context(message_id: str, media_context: dict) -> 
     costs a live API Fansly call. That call no longer runs inside the webhook
     request, so the row is written first and enriched by the durable ingestion
     worker moments later.
+
+    Splits like save_message_result does. This path enriches fan messages and
+    has no reason to carry owner-only detail, which is exactly why it must
+    split too: a boundary that only holds on the paths that need it is a
+    boundary that holds until someone reuses the other one.
     """
+    from services.message_diagnostics import record_diagnostics, split_media_context
+
+    public_context, owner_only = split_media_context(media_context)
+
     def _update():
         (
             get_supabase().table("messages")
-            .update({"media_context": media_context})
+            .update({"media_context": public_context})
             .eq("id", message_id)
             .execute()
         )
 
     await asyncio.to_thread(_update)
+
+    if owner_only:
+        def _owners() -> tuple[str, str] | None:
+            result = (
+                get_supabase().table("messages")
+                .select("creator_id, fan_id")
+                .eq("id", message_id)
+                .limit(1)
+                .execute()
+            )
+            rows = result.data or []
+            if not rows:
+                return None
+            return str(rows[0].get("creator_id")), str(rows[0].get("fan_id"))
+
+        try:
+            owners = await asyncio.to_thread(_owners)
+        except Exception:
+            owners = None
+        if owners:
+            await record_diagnostics(
+                message_id=message_id,
+                creator_id=owners[0],
+                fan_id=owners[1],
+                record=owner_only,
+            )
 
 
 async def get_creator_persona(creator_id: str) -> Persona | None:
@@ -997,29 +1066,75 @@ async def update_fan_ai_summary(fan_id: str, summary: dict) -> None:
 
 # --- Creator autonomy caps (per-creator, agency-configurable) ---
 
-async def freeze_fan_for_review(fan_id: str, reason: str) -> None:
+async def freeze_fan_for_review(fan_id: str, reason: str) -> str:
     """Mark a fan's conversation as frozen and needing human intervention.
-    Auto-mode will skip frozen fans until a human clears the flag in the dashboard."""
+
+    Auto-mode will skip frozen fans until a human clears the flag in the
+    dashboard.
+
+    Returns the new hold's ``review_case_id``. Every freeze mints a fresh one,
+    so two holds are never the same hold: a content-access hold that is cleared
+    and re-raised, and a crisis hold raised while a repair is in flight, both
+    used to be indistinguishable from "the hold this resolution was about". See
+    db/content_access_repair_v1.sql.
+    """
     from datetime import datetime, timezone
+
+    from services.content_access_repairs import new_case_id
+
+    case_id = new_case_id()
+
     def _update():
         get_supabase().table("fans").update({
             "needs_human_review": True,
             "review_reason": reason,
+            "review_case_id": case_id,
             "frozen_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", fan_id).execute()
     await asyncio.to_thread(_update)
+    return case_id
 
 
-async def clear_fan_review(fan_id: str) -> None:
-    """Clear a review hold only after its backend resolution has completed."""
+async def clear_fan_review(fan_id: str, *, expected_case_id: str | None = None) -> bool:
+    """Clear a review hold only after its backend resolution has completed.
+
+    ``expected_case_id`` makes this a compare-and-set against the hold the
+    caller actually resolved. Without it this was an unconditional update by
+    fan id, and a content-access repair that finished after a crisis hold had
+    been raised cleared the crisis hold — reproduced at backend 4a1683a, where
+    a conversation frozen for crisis language silently resumed.
+
+    Returns whether a hold was cleared. False means the hold moved underneath
+    the caller and is deliberately left alone; the caller reports the
+    resolution honestly rather than claiming a hold it did not clear.
+
+    The argument is optional because not every caller resolves a specific case
+    — an operator clearing a hold from the dashboard is acting on whatever is
+    there now, which is the unconditional behaviour and correct for them.
+    """
+    payload = {
+        "needs_human_review": False,
+        "review_reason": None,
+        "review_case_id": "",
+        "frozen_at": None,
+    }
+
     def _update():
-        get_supabase().table("fans").update({
-            "needs_human_review": False,
-            "review_reason": None,
-            "frozen_at": None,
-        }).eq("id", fan_id).execute()
+        query = get_supabase().table("fans").update(payload).eq("id", fan_id)
+        if expected_case_id is not None:
+            query = query.eq("review_case_id", expected_case_id)
+        return query.execute()
 
-    await asyncio.to_thread(_update)
+    result = await asyncio.to_thread(_update)
+    if expected_case_id is None:
+        return True
+    cleared = bool(getattr(result, "data", None))
+    if not cleared:
+        print(
+            f"[REVIEW] hold not cleared fan={fan_id}: the hold changed while "
+            f"the resolution was running (expected case={expected_case_id})"
+        )
+    return cleared
 
 
 async def set_fan_decline_lock(fan_id: str, price: float | None) -> None:

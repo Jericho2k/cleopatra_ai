@@ -309,8 +309,28 @@ def test_reaction_prompt_is_purchase_gated_in_send_orchestration():
     ).read_text(encoding="utf-8")
     assert "_send_reaction_fishing" not in source
     assert 'action_type="POST_PURCHASE_REACTION"' in source
-    assert '"_delivery": {"text": line}' in source
     assert "if creator_id and not already_recorded:" in source
+
+    # It used to assert that the payload froze a line:
+    #
+    #     assert '"_delivery": {"text": line}' in source
+    #
+    # That pinned the defect. The line came from random.choice over seven
+    # sentences at SCHEDULE time, and setting _delivery.text short-circuits
+    # generation in services/proactive.py — so the one proactive message that
+    # follows money changing hands was the only one that never read the
+    # conversation. The property worth pinning is the opposite: nothing is
+    # frozen, and what to say (or whether to say anything) is decided when the
+    # action comes due.
+    assert "_REACTION_FISHING_LINES" not in source.replace(
+        "# Removed: _REACTION_FISHING_LINES.", ""
+    )
+    # The dict-key literal, not the bare word. A first draft asserted
+    # `"_delivery" not in scheduling` and failed on the COMMENT explaining why
+    # there is no _delivery — the third time on this branch that a substring
+    # assertion over prose has misfired, after the health-check timestamp and
+    # the context digest. Matching a quoted key matches code and not English.
+    assert '"_delivery"' not in source
     persistence = (
         Path(__file__).resolve().parents[1] / "services" / "ppv_persistence.py"
     ).read_text(encoding="utf-8")

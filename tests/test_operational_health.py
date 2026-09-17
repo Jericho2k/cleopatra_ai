@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime
 
 import pytest
 
@@ -315,10 +316,119 @@ class _Request:
         self.headers = headers or {}
 
 
+# --- the anonymous redaction gate -------------------------------------------
+#
+# What an anonymous prober may receive is a fixed, small schema: the verdict and
+# the reason categories, plus the build identity that answers "which commit is
+# this". Everything else in the document is operational detail.
+#
+# These sets are written out here rather than imported from ``main`` on purpose.
+# Importing the allowlist would make the test agree with whatever the allowlist
+# says, so widening it would silently widen the gate too. Spelled out, adding a
+# public key fails this test until someone confirms the new key is safe to serve
+# to an unauthenticated caller.
+_PUBLIC_HEALTH_KEYS = {
+    "status",
+    "liveness",
+    "checked_at",
+    "degraded_reasons",
+    "fatal_reasons",
+    "vault_classifier_version",
+    "vault_semantics_configured",
+    "build_sha",
+    "flags_digest",
+}
+
+# Sections of the document that carry deployment state. None of these key names
+# may appear at ANY depth of an anonymous response.
+_OPERATIONAL_SECTIONS = {
+    "integrations",
+    "thresholds",
+    "database",
+    "queue",
+    "scheduler",
+    "model",
+    "vault",
+    "db_executor",
+    "db_transport",
+}
+
+# Typed sentinels planted in the probes below. They are compared by value AND
+# type, never as digit substrings of the serialized document: the previous
+# ``"4321" not in json.dumps(payload)`` form matched the microseconds of an
+# ordinary ``checked_at`` timestamp and failed CI run 35219091193 with nothing
+# leaked. ``test_an_ordinary_timestamp_is_not_a_leak`` pins that exact value.
+_QUEUE_DEPTH = 4321
+_SCHEDULER_CYCLES = 9271
+_DB_LATENCY = 8143
+_PROBE_ERROR = "postgres://operator:hunter2@db.internal/cleopatra"
+_SENTINELS = (_QUEUE_DEPTH, _SCHEDULER_CYCLES, _DB_LATENCY, _PROBE_ERROR)
+
+
+class _FrozenClock(datetime):
+    """``checked_at`` exactly as CI run 35219091193 produced it."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return datetime(2026, 9, 8, 12, 8, 25, 432182, tzinfo=tz)
+
+
+def _scalars(node, path="$"):
+    """Every leaf value in a JSON-able document, with the path that reached it."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _scalars(value, f"{path}.{key}")
+    elif isinstance(node, (list, tuple)):
+        for index, value in enumerate(node):
+            yield from _scalars(value, f"{path}[{index}]")
+    else:
+        yield path, node
+
+
+def _keys(node):
+    """Every key name in a JSON-able document, at any depth."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield key
+            yield from _keys(value)
+    elif isinstance(node, (list, tuple)):
+        for value in node:
+            yield from _keys(value)
+
+
+def _leaks(payload) -> list[str]:
+    """Operational detail found in ``payload``, as human-readable findings.
+
+    Two independent checks, because either alone has a hole: a section could be
+    renamed (so key names are not enough), and a value could be reshaped (so
+    value matching is not enough).
+    """
+    findings = []
+    for key in _keys(payload):
+        if key in _OPERATIONAL_SECTIONS:
+            findings.append(f"operational section {key!r} present")
+    for path, value in _scalars(payload):
+        for sentinel in _SENTINELS:
+            # `type(...) is type(...)` first: in Python `True == 1`, so a bare
+            # `==` would let a boolean field trip an integer sentinel.
+            if type(value) is type(sentinel) and value == sentinel:
+                findings.append(f"{path} == {value!r} (planted operational value)")
+    return findings
+
+
+def _wire_with_sentinels(monkeypatch):
+    wire(
+        monkeypatch,
+        db={"reachable": True, "latency_ms": _DB_LATENCY, "error": _PROBE_ERROR},
+        queue={**HEALTHY_QUEUE, "pending": _QUEUE_DEPTH},
+        scheduler={**HEALTHY_SCHEDULER, "cycles_completed": _SCHEDULER_CYCLES},
+    )
+
+
 def test_anonymous_probe_gets_status_without_operational_detail(monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
     monkeypatch.setenv("DASHBOARD_API_SECRET", "dashboard-secret")
-    wire(monkeypatch, queue={**HEALTHY_QUEUE, "pending": 4321})
+    _wire_with_sentinels(monkeypatch)
 
     payload = run(main.health(_Request()))
 
@@ -326,9 +436,74 @@ def test_anonymous_probe_gets_status_without_operational_detail(monkeypatch):
     assert payload["liveness"] == "ok"
     assert payload["degraded_reasons"]
     # A healthcheck needs the verdict, not the deployment's queue depth.
-    assert "queue" not in payload
-    assert "scheduler" not in payload
-    assert "4321" not in json.dumps(payload)
+    assert set(payload) == _PUBLIC_HEALTH_KEYS
+    assert _leaks(payload) == []
+
+
+def test_anonymous_readiness_is_redacted_on_the_same_terms(monkeypatch):
+    """/health/ready shares the redaction, so it needs the same gate.
+
+    It returns the public document without the build identity ``/health`` adds,
+    so its schema is the allowlist alone.
+    """
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("DASHBOARD_API_SECRET", "dashboard-secret")
+    _wire_with_sentinels(monkeypatch)
+
+    class Resp:
+        status_code = 200
+
+    payload = run(main.health_ready(Resp(), _Request()))
+
+    assert set(payload) <= _PUBLIC_HEALTH_KEYS
+    assert _leaks(payload) == []
+
+
+def test_the_redaction_gate_can_actually_fail(monkeypatch):
+    """The negative tests above must not be able to pass vacuously.
+
+    Two ways they could: the sentinels never reach the document at all, or
+    ``_leaks`` finds nothing anywhere. The authenticated document proves the
+    first, and it is itself the proof of the second — every planted value is
+    in it, so the same scan that returns clean for an anonymous caller returns
+    findings here.
+    """
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("DASHBOARD_API_SECRET", "dashboard-secret")
+    _wire_with_sentinels(monkeypatch)
+
+    document = run(main.health(_Request({"x-api-key": "dashboard-secret"})))
+
+    assert document["queue"]["pending"] == _QUEUE_DEPTH
+    assert document["scheduler"]["cycles_completed"] == _SCHEDULER_CYCLES
+    assert document["database"]["latency_ms"] == _DB_LATENCY
+    findings = _leaks(document)
+    assert any("queue" in finding for finding in findings)
+    assert any(repr(_PROBE_ERROR) in finding for finding in findings)
+
+
+def test_an_ordinary_timestamp_is_not_a_leak(monkeypatch):
+    """Regression for CI run 35219091193 — 1 failed, 2336 passed.
+
+    ``checked_at`` was ``2026-09-08T12:08:25.432182+00:00``. Its microseconds
+    contain the digits of the planted queue depth, so asserting on the
+    serialized document's digits reported a redaction failure on a correctly
+    redacted response. The timestamp is pinned here so that assertion shape
+    cannot come back.
+    """
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("DASHBOARD_API_SECRET", "dashboard-secret")
+    monkeypatch.setattr(operational_health, "datetime", _FrozenClock)
+    _wire_with_sentinels(monkeypatch)
+
+    payload = run(main.health(_Request()))
+
+    assert payload["checked_at"] == "2026-09-08T12:08:25.432182+00:00"
+    # The digits are right there in the serialized document ...
+    assert str(_QUEUE_DEPTH) in json.dumps(payload)
+    # ... and the response is correctly redacted all the same.
+    assert set(payload) == _PUBLIC_HEALTH_KEYS
+    assert _leaks(payload) == []
 
 
 def test_dashboard_caller_gets_the_full_document(monkeypatch):

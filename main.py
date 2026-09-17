@@ -72,7 +72,6 @@ from core.build_info import build_snapshot, describe_build, short_sha
 from services.ai_stack import resolve_ai_stack
 from services.reply_provenance import (
     DELIVERY_TEXT,
-    SUGGESTION_PROVENANCE,
     TRANSFORM_OPERATOR_EDIT,
 )
 from services.fan_intelligence import learn_from_fan_message
@@ -1675,9 +1674,24 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
     # expired token means no record at all — an operator's message must never
     # fail to send because its evidence trail could not be completed.
     media_context: dict | None = None
-    provenance = SUGGESTION_PROVENANCE.take(
+    from services.assisted_provenance import redeem as _redeem_provenance
+    from services.assisted_provenance import unavailable_metadata
+
+    provenance, unavailable = await _redeem_provenance(
         req.suggestion_token, creator_id=req.creator_id, fan_id=req.fan_id
     )
+    if provenance is None:
+        # An admitted absence rather than no record at all. A message saved
+        # with no provenance key is indistinguishable from one written by a
+        # build that never recorded any, so an evaluation counting attributable
+        # replies would count both the same way.
+        media_context = unavailable_metadata(
+            unavailable, creator_id=req.creator_id, fan_id=req.fan_id
+        )
+        print(
+            f"[PROVENANCE] fan={req.fan_id} assisted reply unattributable: "
+            f"{unavailable}"
+        )
     if provenance is not None:
         if req.suggestion_index is not None:
             provenance.record_decision(
@@ -6908,9 +6922,20 @@ class ResolvePPVApprovalRequest(BaseModel):
 class ResolveFanReviewRequest(BaseModel):
     resolution: str
     amount: float | None = None
-    # Which confirmed purchase a content-access repair restores. Omitted means
-    # the most recent one (services/content_access.py).
+    # Which confirmed purchase a content-access repair restores.
+    #
+    # Required when the customer has more than one repairable purchase: the
+    # backend refuses rather than assuming the most recent, because assuming
+    # resends a working item and leaves the broken one broken
+    # (services/content_access.py).
     reference: str = ""
+    # The hold the operator was looking at when they decided. Sent back from
+    # the access panel so the resolution clears THAT hold and not whatever hold
+    # exists by the time it lands (db/content_access_repair_v1.sql).
+    review_case_id: str = ""
+    # Who resolved it. Same convention as ResolvePPVApprovalRequest: an
+    # auditable resolution needs an actor, and "the backend did it" is not one.
+    resolved_by: str | None = None
 
 
 @app.get(
@@ -6948,9 +6973,120 @@ async def resolve_review(fan_id: str, request: ResolveFanReviewRequest) -> dict:
             resolution=request.resolution,
             amount=request.amount,
             reference=request.reference,
+            review_case_id=request.review_case_id,
+            actor=request.resolved_by or "",
         )
     except (PPVRecoveryError, ContentAccessError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+class ResolveThreadRequest(BaseModel):
+    """An operator closing or correcting one remembered obligation."""
+
+    #: True when the record was never real — a bad extraction — rather than
+    #: dealt with. Recording an invention as "handled" would teach anyone
+    #: reading the history that the system did something it did not.
+    cancelled: bool = False
+    #: What it should have said. Supersedes rather than edits, so the obsolete
+    #: version is kept and stops being carried.
+    corrected_summary: str = ""
+    note: str = ""
+    resolved_by: str | None = None
+
+
+@app.get(
+    "/fan/{fan_id}/conversation-memory",
+    dependencies=[Depends(require_fan_path_access)],
+)
+async def read_conversation_memory(fan_id: str) -> dict:
+    """What this conversation remembers, and where each part came from.
+
+    These records are fed to a model on every turn. A wrong one keeps being fed
+    to it and shows up as the model behaving strangely for reasons nobody can
+    trace, and until this existed an operator had no way to see that the system
+    was carrying an obligation at all, let alone that it was wrong.
+
+    Reads the same retrieval a turn does, so what an operator sees is what the
+    model gets. A separate query would eventually disagree with the one that
+    matters.
+    """
+    from services.content_access import ContentAccessError, _load_fan
+    from services.conversation_memory_view import load_memory
+
+    try:
+        fan = await _load_fan(fan_id)
+    except ContentAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return await load_memory(str(fan["creator_id"]), str(fan_id))
+
+
+@app.post(
+    "/fan/{fan_id}/conversation-memory/threads/{thread_id}",
+    dependencies=[Depends(require_fan_path_access)],
+)
+async def resolve_conversation_thread(
+    fan_id: str, thread_id: str, request: ResolveThreadRequest
+) -> dict:
+    """Close or correct one remembered obligation, as an operator.
+
+    Both paths go through the existing lifecycle rather than editing rows, so
+    an operator's change carries the same provenance as the machine's. There is
+    deliberately no delete: a record somebody disagrees with is resolved or
+    corrected, both of which say what happened, and a deleted one leaves the
+    next reader wondering whether it was ever there.
+    """
+    from services.content_access import ContentAccessError, _load_fan
+    from services.conversation_continuity import open_threads_for
+    from services.conversation_memory_view import (
+        correct_as_operator,
+        resolve_as_operator,
+        thread_view,
+    )
+
+    try:
+        fan = await _load_fan(fan_id)
+    except ContentAccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    creator_id = str(fan["creator_id"])
+    # Read the thread through the tenancy-scoped retrieval, so a thread id
+    # belonging to another conversation cannot be resolved by guessing it.
+    carried = await open_threads_for(creator_id, str(fan_id), expire_first=False)
+    thread = next((item for item in carried if item.id == thread_id), None)
+    if thread is None:
+        raise HTTPException(
+            status_code=404,
+            detail="that obligation is not being carried by this conversation",
+        )
+
+    note = " ".join(str(request.note or "").split())[:280]
+    if request.corrected_summary.strip():
+        corrected = await correct_as_operator(
+            thread, summary=request.corrected_summary.strip()[:280], note=note
+        )
+        if corrected is None:
+            raise HTTPException(
+                status_code=409, detail="that obligation could not be corrected"
+            )
+        print(
+            f"[CONTINUITY] fan={fan_id} thread={thread_id} corrected_by_operator "
+            f"actor={request.resolved_by or 'unknown'}"
+        )
+        return {"status": "corrected", "thread": thread_view(corrected)}
+
+    closed = await resolve_as_operator(
+        thread_id, note=note, cancelled=bool(request.cancelled)
+    )
+    if not closed:
+        raise HTTPException(
+            status_code=409, detail="that obligation was already closed"
+        )
+    print(
+        f"[CONTINUITY] fan={fan_id} thread={thread_id} "
+        f"{'cancelled' if request.cancelled else 'resolved'}_by_operator "
+        f"actor={request.resolved_by or 'unknown'}"
+    )
+    return {"status": "cancelled" if request.cancelled else "resolved"}
 
 
 @app.get(
@@ -9185,6 +9321,73 @@ async def health_ready(response: Response, request: Request = None) -> dict:
     if document.get("fatal_reasons"):
         response.status_code = 503
     return _health_payload(document, request)
+
+
+@app.get("/creator/{creator_id}/fan/{fan_id}/reply-trace")
+async def reply_trace(
+    creator_id: str,
+    fan_id: str,
+    request: Request,
+    limit: int = 20,
+) -> dict:
+    """The owner's trace inspector: what actually produced these replies.
+
+    Moving diagnostics out of ``messages.media_context``
+    (db/owner_only_diagnostics_v1.sql) closed a real disclosure and would
+    otherwise have taken the owner's own access with it — the record was only
+    ever readable because it sat in a row the browser could select. This is the
+    authorized way back to it.
+
+    Gated on ``request_is_platform_operator``: the identity allowlist, the same
+    check that gates ``operator_diagnostics`` and the profile registry, and
+    deliberately not ``require_simulation_user``. An agency operator gets 403
+    here and nothing partial — a trace with the routing removed is not a
+    smaller trace, it is a different and misleading document.
+
+    Reads the creator/fan pair from ``messages`` first, so a trace can only be
+    fetched for messages that actually belong to the requested conversation.
+    The diagnostics table is read through the service role, which bypasses RLS,
+    so the tenancy check has to happen here rather than being inherited.
+    """
+    from core.simulation import request_is_platform_operator
+    from core.supabase import get_supabase
+    from services.message_diagnostics import read_diagnostics
+
+    if not request_is_platform_operator(request):
+        raise HTTPException(status_code=403, detail="Platform owner only")
+
+    bounded = max(1, min(int(limit or 20), 100))
+
+    def _messages() -> list[dict]:
+        result = (
+            get_supabase().table("messages")
+            .select("id, role, sent_at, fansly_message_id")
+            .eq("creator_id", creator_id)
+            .eq("fan_id", fan_id)
+            .eq("role", "creator")
+            .order("sent_at", desc=True)
+            .limit(bounded)
+            .execute()
+        )
+        return list(result.data or [])
+
+    rows = await asyncio.to_thread(_messages)
+    traces = await read_diagnostics([str(row["id"]) for row in rows if row.get("id")])
+
+    return {
+        "creator_id": creator_id,
+        "fan_id": fan_id,
+        "messages": [
+            {
+                **row,
+                # Absence is stated rather than left to a missing key. "No
+                # trace was recorded" and "this build did not look" must not
+                # read the same on a record whose purpose is attribution.
+                "trace": traces.get(str(row.get("id"))) or None,
+            }
+            for row in rows
+        ],
+    }
 
 
 @app.get("/model-runtime-health")

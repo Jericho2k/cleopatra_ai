@@ -36,6 +36,12 @@
 -- allowlist was built by inventorying every .from(...).insert/update/upsert/
 -- delete call in the dashboard — not by guessing what might be needed.
 --
+-- What is deliberately NOT READABLE from a browser after this:
+--   every table in public.owner_only_tables — model routing, fallback attempts
+--   and internal trace detail (db/owner_only_diagnostics_v1.sql). Read access
+--   is otherwise granted wherever a tenancy policy exists, so an owner-only
+--   table needs an explicit exclusion or the loop below re-grants it.
+--
 -- What is deliberately NOT writable from a browser after this:
 --   scheduled_actions      durable work; forging or cancelling it is severe
 --   ppv_deliveries         the PPV ledger and its single-flight invariant
@@ -92,7 +98,19 @@ do $$
 declare
     target_table text;
     policy_row record;
+    -- Tables registered in public.owner_only_tables
+    -- (db/owner_only_diagnostics_v1.sql) are skipped. They are creator-owned
+    -- and would otherwise be discovered here and granted SELECT, which is
+    -- exactly the hole that registry exists to close: model routing and trace
+    -- detail must not be readable by a browser client at all. The revoke in
+    -- step 1 above is therefore final for them.
+    owner_only text[] := '{}';
 begin
+    if to_regclass('public.owner_only_tables') is not null then
+        select coalesce(array_agg(o.table_name), '{}')
+          into owner_only
+          from public.owner_only_tables o;
+    end if;
     for target_table in
         select c.table_name
           from information_schema.columns c
@@ -103,6 +121,7 @@ begin
            and t.table_type = 'BASE TABLE'
            and c.column_name in ('creator_id', 'fan_id')
            and c.table_name <> 'chatter_creators'
+           and not (c.table_name = any(owner_only))
          group by c.table_name
     loop
         -- Replace the FOR ALL policy tenant_isolation_v1 created with a

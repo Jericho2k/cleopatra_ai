@@ -40,11 +40,61 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from core import clock  # noqa: E402
+from services.trajectory_fixtures import (  # noqa: E402
+    FixtureRefused,
+    apply_seed,
+    clear_seeded,
+)
 from services.trajectory_eval import (  # noqa: E402
+    TrajectoryReport,
+    TurnRecord,
+    coverage_gaps,
     load_trajectories,
     render_reports,
     run_trajectory,
 )
+
+
+def _declared_gaps(trajectory, *, use_clock: bool = False):
+    """What this trajectory could not cover even if every turn succeeded.
+
+    Built by asking the same function the real run uses, against a report
+    describing the best case: every declared turn runs, every declared seed is
+    applied, a due-work cycle happens for each unprompted turn, and time
+    advances only if this invocation would advance it. One definition of
+    "covered", used by both paths, so --describe cannot drift from what a run
+    actually reports.
+
+    ``use_clock`` mirrors --simulate-time, because whether the elapsed-time
+    claims are covered is a property of the invocation and not of the file.
+    """
+    elapsed = sum(
+        float(disturbance.days_since_previous or 0.0)
+        for disturbance in trajectory.disturbances
+    )
+    best_case = TrajectoryReport(
+        trajectory=trajectory.name,
+        covers=trajectory.covers,
+        turns=[
+            TurnRecord(index=index, customer_message=disturbance.message)
+            for index, disturbance in enumerate(trajectory.disturbances)
+        ],
+        due_worker_runs=sum(
+            1
+            for disturbance in trajectory.disturbances
+            if not str(disturbance.message or "").strip()
+        ),
+        clock_injected=use_clock,
+        elapsed_days=elapsed if use_clock else 0.0,
+        # The seed has not been applied — nothing has run — but the file
+        # declares it, and describing a claim as uncovered when the very next
+        # run would cover it is the same class of wrong answer as the labels
+        # this whole mechanism exists to fix.
+        seeded_purchases=list(trajectory.seed.get("purchases") or []),
+    )
+    return coverage_gaps(trajectory, best_case)
+
 
 DEFAULT_TRAJECTORIES = ROOT / "eval" / "trajectories.json"
 
@@ -56,8 +106,57 @@ def _load(path: Path) -> list[dict]:
     return list(payload or [])
 
 
-async def _run_all(trajectories, creator_id: str, fan_id: str) -> list:
+async def _run_due_work(creator_id: str, fan_id: str) -> dict:
+    """Run one due-work cycle and report what the customer received from it.
+
+    A turn with no customer message is not "nothing happens". It is the moment
+    a queued follow-up becomes due, which is precisely what the goodbye
+    trajectory exists to test: a customer asked for no follow-up, and something
+    was already scheduled.
+
+    This used to return ``{"outcome": "no_message"}`` without running anything,
+    so that trajectory could not detect the behaviour it claimed to cover — the
+    one turn that mattered was the one guaranteed to do nothing.
+
+    Messages the cycle sends are read back off the conversation, because the
+    worker delivers them rather than returning them.
+    """
+    from services.suggestions import _recent_creator_message_rows
+    from workers.scheduled_actions import process_cycle
+
+    # The same reader the simulated turn uses, so a message the worker sent and
+    # a message a turn sent are identified the same way — by row id, which is
+    # what keeps multipart replies ordered and complete.
+    before = {str(row.get("id")) for row in await _recent_creator_message_rows(fan_id)}
+    result = await process_cycle(limit=20)
+    fresh = [
+        row
+        for row in await _recent_creator_message_rows(fan_id)
+        if str(row.get("id")) not in before
+    ]
+    return {
+        # Named for what it is. The turn ran queued work; whether that work
+        # sent anything is the finding, not the label.
+        "outcome": "due_work_ran" if fresh else "due_work_sent_nothing",
+        "creator_messages": fresh,
+        "due_worker_ran": True,
+        "due_work": {
+            "claimed": getattr(result, "claimed", 0),
+            "processed": getattr(result, "processed", 0),
+            "errors": getattr(result, "errors", 0),
+        },
+    }
+
+
+async def _run_all(trajectories, creator_id: str, fan_id: str, *, use_clock: bool) -> list:
     from services.suggestions import run_simulated_inbound
+
+    # None when the clock is not enabled, which run_trajectory records as "no
+    # clock was injected" and the coverage check reports as an uncovered
+    # elapsed-time claim. That is the honest outcome: refusing to advance is
+    # not the same as a week having passed, and this harness used to report
+    # them identically.
+    advance_clock = clock.advance if use_clock else None
 
     reports = []
     for trajectory in trajectories:
@@ -66,15 +165,41 @@ async def _run_all(trajectories, creator_id: str, fan_id: str) -> list:
 
         async def send_turn(message: str, _creator=creator, _fan=fan) -> dict:
             if not message.strip():
-                # A turn where the customer says nothing. The system is not
-                # asked anything, so nothing should happen — which is exactly
-                # what the goodbye trajectory is checking.
-                return {"outcome": "no_message", "creator_messages": []}
+                return await _run_due_work(_creator, _fan)
             return await run_simulated_inbound(
                 fan_id=_fan, creator_id=_creator, message=message, fast=True
             )
 
-        reports.append(await run_trajectory(trajectory, send_turn=send_turn))
+        # Fresh state between independent scenarios. A clock carried over
+        # from the previous trajectory is state, and so is a purchase the last
+        # one seeded — the brief asks for scenarios not to inherit each
+        # other's, and the next trajectory would read a leftover delivery as
+        # a real one.
+        clock.reset()
+        seeded: list[dict] = []
+        try:
+            await clear_seeded(creator, fan)
+            if trajectory.seed:
+                seeded = await apply_seed(
+                    creator_id=creator, fan_id=fan, seed=trajectory.seed
+                )
+        except FixtureRefused as refused:
+            # Refusing to seed is never a reason to fabricate the state
+            # anyway, and never a reason to run the trajectory as though the
+            # state were there. Say so and move on; the coverage check reports
+            # the purchase claim as uncovered.
+            print(f"[FIXTURE] {trajectory.name}: {refused}", file=sys.stderr)
+
+        report = await run_trajectory(
+            trajectory, send_turn=send_turn, advance_clock=advance_clock
+        )
+        report.seeded_purchases = seeded
+        # Recomputed: the seed is what decides whether the purchase claim is
+        # covered, and run_trajectory could not know about it.
+        report.coverage_gaps = coverage_gaps(trajectory, report)
+        reports.append(report)
+
+    clock.reset()
     return reports
 
 
@@ -99,6 +224,26 @@ def main() -> int:
         action="store_true",
         help="exit non-zero if any trajectory produced a critical execution failure",
     )
+    parser.add_argument(
+        "--simulate-time",
+        action="store_true",
+        help=(
+            "advance a simulated clock for days_since_previous, so a return "
+            "after a day or a week is actually tested. Requires APP_ENV != "
+            "production and EVAL_CLOCK_ENABLED=1 (core/clock.py); without it "
+            "the elapsed-time claims are reported as uncovered rather than "
+            "quietly assumed"
+        ),
+    )
+    parser.add_argument(
+        "--fail-on-uncovered",
+        action="store_true",
+        help=(
+            "exit non-zero if any trajectory did not cover what it claims. "
+            "Separate from --fail-on-critical: an uncovered claim is not a "
+            "system failure, it is a run that did not test what it says"
+        ),
+    )
     args = parser.parse_args()
 
     trajectories = load_trajectories(_load(args.trajectories))
@@ -110,6 +255,11 @@ def main() -> int:
         for trajectory in trajectories:
             print(f"{trajectory.name} ({len(trajectory.disturbances)} turns)")
             print(f"  covers: {trajectory.covers}")
+            # The claim next to what the fixture can actually reach. Printing
+            # the claim alone is how "40-80 turns of ordinary conversation"
+            # came to sit above a seven-turn script for as long as it did.
+            for gap in _declared_gaps(trajectory, use_clock=args.simulate_time):
+                print(f"  {gap.render()}")
             for index, disturbance in enumerate(trajectory.disturbances):
                 marks = []
                 if disturbance.days_since_previous:
@@ -131,7 +281,17 @@ def main() -> int:
         )
         return 2
 
-    reports = asyncio.run(_run_all(trajectories, args.creator, args.fan))
+    if args.simulate_time and not clock.movable():
+        print(
+            "--simulate-time was asked for and this process cannot move its "
+            f"clock. It needs APP_ENV != production and {clock.EVAL_CLOCK_FLAG}=1.",
+            file=sys.stderr,
+        )
+        return 2
+
+    reports = asyncio.run(
+        _run_all(trajectories, args.creator, args.fan, use_clock=args.simulate_time)
+    )
 
     if args.json:
         print(
@@ -139,6 +299,14 @@ def main() -> int:
                 [
                     {
                         "summary": report.summary(),
+                        "coverage_gaps": [
+                            {
+                                "claim": gap.claim,
+                                "required": gap.required,
+                                "actual": gap.actual,
+                            }
+                            for gap in report.coverage_gaps
+                        ],
                         "findings": [
                             {
                                 "severity": finding.severity.value,
@@ -170,6 +338,8 @@ def main() -> int:
         print(render_reports(reports))
 
     if args.fail_on_critical and any(report.critical for report in reports):
+        return 1
+    if args.fail_on_uncovered and any(report.coverage_gaps for report in reports):
         return 1
     return 0
 

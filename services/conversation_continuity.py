@@ -42,9 +42,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
+from core import clock
 from core.supabase import get_supabase
 from models.conversation_continuity import (
     ConversationEpisode,
@@ -75,7 +76,15 @@ DEFAULT_THREAD_TTL = timedelta(days=45)
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    """Now, as the evaluation clock sees it.
+
+    Thread expiry and "is this obligation still current" are two of the three
+    surfaces core/clock.py exists for: a trajectory testing a return after a
+    week cannot test anything if a week never passes. Identical to the wall
+    clock in every deployment that has not explicitly enabled the eval clock,
+    which is all of them by default.
+    """
+    return clock.now()
 
 
 _SUBJECT_NOISE = re.compile(r"[^a-z0-9 ]+")

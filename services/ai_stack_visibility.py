@@ -60,6 +60,35 @@ from ai.stack_profiles import describe_profiles, profile_directory
 PUBLIC_MARKER_KEYS: frozenset[str] = frozenset({"profile"})
 
 
+# The top-level ``media_context`` keys an agency may see. Each is the agency's
+# own operational record of its own fan — what was sold, what was attached,
+# that a turn was simulated, that access was repaired. None names a provider,
+# a model or a route.
+#
+# An allowlist rather than a denylist, for the reason this whole module exists,
+# and ``reply_provenance`` is the proof it was needed: it was added next to
+# ``ai_stack``, under the rule that already governed ``ai_stack``, and was not
+# covered by the denial that named ``ai_stack`` alone.
+#
+# services/message_diagnostics.py applies the same set at the STORAGE boundary,
+# which is the one that actually holds — the dashboard reads
+# ``messages.media_context`` straight out of Supabase, so a response-level
+# redaction alone never saw those reads. This copy stays because a deployment
+# whose migration has not run yet still has the old rows.
+PUBLIC_MEDIA_CONTEXT_KEYS: frozenset[str] = frozenset(
+    {
+        "ppv",
+        "attachments",
+        "ai_stack",
+        "simulation",
+        "simulation_source",
+        "scheduled",
+        "content_access_repair",
+        "delivery_status",
+    }
+)
+
+
 def registry_view(*, diagnostics: bool) -> list[dict[str, Any]]:
     """The profile registry as this caller may see it.
 
@@ -85,22 +114,31 @@ def public_ai_stack_marker(marker: Any) -> dict[str, Any] | None:
 
 
 def public_media_context(media_context: Any) -> Any:
-    """A message's ``media_context`` with its AI stack marker redacted.
+    """A message's ``media_context`` reduced to what an agency may see.
 
-    Everything else in the document — PPV state, attachments, the simulation
-    marker — is untouched: this is a stack-routing boundary, not a general
-    scrubber. A context carrying no marker is returned unchanged, so the common
-    case allocates nothing.
+    Rewrites down to ``PUBLIC_MEDIA_CONTEXT_KEYS`` rather than deleting the
+    keys known to be sensitive. It previously did the opposite — it redacted
+    ``ai_stack`` and returned every sibling untouched — and
+    ``media_context.reply_provenance`` was added as one of those siblings,
+    carrying ``writer.actual.provider``, ``writer.actual.model`` and the whole
+    ``writer.attempts`` fallback ladder straight through it.
+
+    A dropped key is a dropped key, not an emptied one: a client must not be
+    able to tell a redacted document from one that never had the field.
     """
-    if not isinstance(media_context, dict) or "ai_stack" not in media_context:
+    if not isinstance(media_context, dict):
         return media_context
-    redacted = dict(media_context)
-    marker = public_ai_stack_marker(redacted.get("ai_stack"))
-    if marker is None:
-        redacted.pop("ai_stack", None)
-    else:
-        redacted["ai_stack"] = marker
-    return redacted
+    public: dict[str, Any] = {}
+    for key, value in media_context.items():
+        if key not in PUBLIC_MEDIA_CONTEXT_KEYS:
+            continue
+        if key != "ai_stack":
+            public[key] = value
+            continue
+        marker = public_ai_stack_marker(value)
+        if marker is not None:
+            public["ai_stack"] = marker
+    return public
 
 
 def public_message_rows(rows: Any) -> list[dict[str, Any]]:

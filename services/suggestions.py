@@ -28,6 +28,7 @@ from services.context_packet import build_context_packet
 from ai.writer_router import select_writer_route
 from services.ppv_turn import plan_ppv_step_delivery, strip_ppv_tags
 from services.content_access import REVIEW_REASON as CONTENT_ACCESS_REVIEW_REASON
+from services.episode_recording import close_finished_episode
 from services.conversation_continuity import (
     open_threads_for,
     recent_episodes_for,
@@ -45,7 +46,6 @@ from services.reply_provenance import (
     DELIVERY_TEXT,
     PIPELINE_ASSISTED,
     PIPELINE_AUTO,
-    SUGGESTION_PROVENANCE,
     TRANSFORM_DELIVERY_LANGUAGE,
     TRANSFORM_INVENTORY_REPAIR,
     TRANSFORM_PPV_MERGED,
@@ -880,7 +880,13 @@ async def get_suggestions(
     assisted_provenance.record_transform(
         TRANSFORM_DELIVERY_LANGUAGE, raw_candidates != replies
     )
-    suggestion_token = SUGGESTION_PROVENANCE.put(assisted_provenance)
+    # Stored durably as well as in process. The in-process store is one per
+    # replica, so a deploy or an autoscale event between generating and sending
+    # used to lose the record and leave the reply unattributable with nothing
+    # saying so (services/assisted_provenance.py).
+    from services.assisted_provenance import remember as _remember_provenance
+
+    suggestion_token = await _remember_provenance(assisted_provenance)
     print(assisted_trace.describe())
 
     if save_fan_message:
@@ -1469,6 +1475,29 @@ async def _debounced_auto_reply(
         )
         open_thread_lines = summarize_threads(carried_threads)
         episode_lines = [episode.render() for episode in past_episodes]
+
+        # If this turn is a return after a silence, the stretch before it is
+        # now knowably over and gets closed. Nothing wrote to
+        # conversation_episodes before this, so "we talked about this before"
+        # was a table shape rather than something the system could say.
+        #
+        # Its subjects come from the obligations that conversation raised —
+        # rows with source turn ids behind them — rather than from a model
+        # asked to summarise, because this record is read back to a model
+        # later and an invented one would launder a belief into a fact.
+        closed = await close_finished_episode(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            history=conversation_history,
+            subjects=[thread.summary for thread in carried_threads],
+        )
+        if closed is not None:
+            print(
+                f"[CONTINUITY] fan={fan_id} episode_closed "
+                f"messages={closed.message_count} ending={closed.ended_with.value}"
+            )
+            episode_lines = [closed.render(), *episode_lines]
+
         if creator_persona is None:
             creator_persona = Persona()
 
@@ -1605,6 +1634,25 @@ async def _debounced_auto_reply(
         )
         situation["price_learning"] = price_learning
         print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} crisis={situation.get('crisis_signal', 'none')}")
+
+        # What this exchange leaves the conversation carrying.
+        #
+        # Until now the only thing that ever became an open thread was a
+        # content-access complaint, so an ordinary unanswered question, a
+        # promise, a deferred topic and a correction had no durable lifecycle
+        # at all — the tables existed and nothing wrote to them.
+        #
+        # Deliberately after the situation is complete and before anything
+        # decides or sends: this records what happened, and nothing reads it
+        # back to choose this turn's reply. A recorder that could change the
+        # reply is a recorder that can break one.
+        await _record_conversation_threads(
+            situation,
+            creator_id=creator_id,
+            fan_id=fan_id,
+            latest_message=latest_message,
+            turn_id=provenance.turn_id,
+        )
 
         # Commercial layer: deterministic policy decides what happens next
         # (sell / pause / tease / schedule). Flag-gated so it can be turned off
@@ -2593,15 +2641,15 @@ async def _debounced_auto_reply(
         _release_auto_reply_slot(fan_id)
 
 
-_REACTION_FISHING_LINES = [
-    "let me know what you think 🙈",
-    "tell me how you feel about it...",
-    "dying to know your reaction 😏",
-    "don't leave me hanging",
-    "what do you think? 👀",
-    "hope it was worth the wait",
-    "your reaction is everything to me rn",
-]
+# Removed: _REACTION_FISHING_LINES.
+#
+# Seven sentences, one picked at random at schedule time and frozen into the
+# queued action, sent to every customer after every purchase. It bypassed the
+# writer entirely — services/proactive.py generates from a goal and the
+# conversation unless _delivery.text is already set — so the message that
+# follows money changing hands was the only proactive message that never read
+# the conversation it was about. services/post_purchase.py decides at execute
+# time whether to say anything at all, and the writer says it.
 
 
 async def record_ppv_purchase(
@@ -2931,17 +2979,22 @@ async def record_ppv_purchase(
         from datetime import datetime, timedelta, timezone
 
         purchased_at = datetime.now(timezone.utc)
-        line = random.choice(_REACTION_FISHING_LINES)
         reaction_key = platform_order_id or reference or f"{media_id}:{purchased_at.isoformat()}"
         await schedule_action(
             creator_id=creator_id,
             fan_id=fan_id,
             action_type="POST_PURCHASE_REACTION",
             execute_at=purchased_at + timedelta(seconds=random.uniform(20.0, 55.0)),
+            # No _delivery.text. It used to carry one of seven sentences picked
+            # by random.choice at THIS moment — before he had a chance to
+            # react, before an operator could take over — and setting it
+            # short-circuits generation in services/proactive.py, so the one
+            # proactive message that follows money changing hands was the only
+            # one that never saw the conversation. The goal is decided at
+            # execute time instead (services/post_purchase.py).
             payload={
                 "purchase_at": purchased_at.isoformat(),
                 "media_id": str(media_id),
-                "_delivery": {"text": line},
             },
             dedupe_key=f"post-purchase-reaction:{fan_id}:{reaction_key}",
         )
@@ -3243,6 +3296,62 @@ def _should_update_memory(conversation_history: list[Message]) -> bool:
 #
 # Only two things are simulated: delivery transport (the ``test_`` fan branch
 # persists locally instead of calling the platform) and waiting.
+
+
+async def _record_conversation_threads(
+    situation: dict,
+    *,
+    creator_id: str,
+    fan_id: str,
+    latest_message: str,
+    turn_id: str,
+) -> None:
+    """Persist the unfinished business this turn created or settled.
+
+    Never raises and never blocks a reply. Continuity is memory: losing a
+    record costs the next turn some context, and raising here would cost the
+    customer their answer. services/reply_provenance.py takes the same position
+    for the same reason.
+
+    The extraction is semantic (ai/situation_analyzer.py) and the validation is
+    not (services/continuity_extraction.py) — in particular a proposal that
+    makes a claim about money is refused in code, because ppv_deliveries is the
+    only authority on that and the analyzer reads customer-supplied text.
+    """
+    from services.continuity_extraction import extract_threads
+
+    try:
+        extracted = extract_threads(
+            situation,
+            creator_id=str(creator_id),
+            fan_id=str(fan_id),
+            source_turn_id=str(turn_id or ""),
+            source_message_fingerprint=fingerprint(latest_message),
+        )
+    except Exception as exc:  # pragma: no cover - extraction never blocks a turn
+        print(f"[CONTINUITY] extraction failed fan={fan_id}: {type(exc).__name__}")
+        return
+
+    recorded = 0
+    for thread in extracted.threads:
+        try:
+            if await record_open_thread(thread):
+                recorded += 1
+        except Exception as exc:
+            print(
+                f"[CONTINUITY] could not record {thread.kind.value} "
+                f"fan={fan_id}: {type(exc).__name__}"
+            )
+
+    if recorded or extracted.rejected:
+        # The rejection counts are the interesting half. A rate that climbs is
+        # how somebody notices the analyzer has started proposing things it
+        # should not, which no amount of prompt wording would tell them.
+        print(
+            f"[CONTINUITY] fan={fan_id} recorded={recorded} "
+            f"proposed={len(extracted.threads)} "
+            f"rejected={extracted.rejected or 'none'}"
+        )
 
 
 async def _recent_creator_message_rows(fan_id: str) -> list[dict]:

@@ -315,6 +315,7 @@ def world(monkeypatch):
 
     monkeypatch.setattr(suggestions, "get_supabase", lambda: db)
     monkeypatch.setattr("db.queries.get_supabase", lambda: db)
+    monkeypatch.setattr("services.message_diagnostics.get_supabase", lambda: db)
     # The Experience Director and the commercial policy/state reads behind the
     # text-intimacy decision run for real against this fake, rather than being
     # stubbed out: the scene is now part of what a Full Auto turn IS, and a
@@ -1790,9 +1791,16 @@ def test_a_generated_creator_message_records_the_effective_profile(
         marker = (row.get("media_context") or {}).get("ai_stack")
         assert marker is not None, "every creator message names the stack that wrote it"
         assert marker["profile"] == "cleo_v2"
-        # Enough to debug a bad reply without a telemetry join.
-        assert marker["route"]
-        assert marker["model"]
+        # And nothing else. `profile` is the product-level fact; route, model
+        # and provider are the supply chain behind it, and this row is what an
+        # agency operator's browser selects.
+        assert set(marker) == {"profile"}
+
+    # The routing is still recorded — enough to debug a bad reply without a
+    # telemetry join — in the table only the platform owner can read.
+    routing = _diagnostics_ai_stack(db)
+    assert routing["route"]
+    assert routing["model"]
 
 
 def test_the_marker_travels_alongside_a_ppv_rather_than_replacing_it():
@@ -1887,13 +1895,30 @@ def traced_writer(monkeypatch):
 
 
 def _provenance_rows(db) -> list[dict]:
-    from services.reply_provenance import provenance_of
+    """Every reply's provenance record, read from where it is now stored.
+
+    It used to live in ``messages.media_context``, which is a column the
+    dashboard selects straight out of Supabase with the operator's own JWT —
+    so the record was in every agency browser. It now lands in
+    ``message_diagnostics``, which db/owner_only_diagnostics_v1.sql registers
+    as owner-only. See services/message_diagnostics.py.
+    """
+    from services.reply_provenance import PROVENANCE_KEY
 
     return [
-        provenance_of(row.get("media_context"))
-        for row in _creator_rows(db)
-        if provenance_of(row.get("media_context"))
+        row["record"][PROVENANCE_KEY]
+        for row in db.tables.get("message_diagnostics", [])
+        if isinstance(row.get("record"), dict) and PROVENANCE_KEY in row["record"]
     ]
+
+
+def _diagnostics_ai_stack(db) -> dict:
+    """The routing half of the stack marker, from the owner-only table."""
+    for row in db.tables.get("message_diagnostics", []):
+        marker = (row.get("record") or {}).get("ai_stack")
+        if marker:
+            return marker
+    return {}
 
 
 def test_a_sent_reply_records_the_event_that_caused_it(world, spy, traced_writer):
@@ -1929,11 +1954,17 @@ def test_a_sent_reply_records_the_model_that_actually_answered(
     assert record["writer"]["actual"]["model"] == "Qwen/Qwen3.7-Plus"
     assert record["writer"]["served_by_requested_model"] is False
 
-    # And the compact stack marker on the same row agrees with it, rather than
-    # still naming the model the router asked for.
-    stack = _creator_rows(db)[0]["media_context"]["ai_stack"]
+    # And the compact stack marker agrees with it, rather than still naming the
+    # model the router asked for.
+    stack = _diagnostics_ai_stack(db)
     assert stack["model"] == "Qwen/Qwen3.7-Plus"
     assert stack["requested_model"] == "moonshotai/kimi-k2.6"
+
+    # None of which is on the message row any more. This is the assertion that
+    # matters for an agency operator: the row is what their browser reads.
+    row_marker = _creator_rows(db)[0]["media_context"]["ai_stack"]
+    assert set(row_marker) == {"profile"}
+    assert "reply_provenance" not in _creator_rows(db)[0]["media_context"]
 
 
 def test_a_sent_reply_records_the_context_it_was_allowed_to_see(

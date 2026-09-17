@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from core.pagination import fetch_all_rows
 from core.simulation_catalog import exclude_simulation_only, run_live_catalog_query
+from core import clock
 from core.supabase import get_supabase
 from models.commercial import CreatorPolicy, FanCommercialState, Offer
 from services.media_packages import build_next_offer, usable_sets
@@ -524,13 +525,21 @@ async def claim_due_actions(limit: int = 20, stale_minutes: int = 10) -> list[di
 
     if _ATOMIC_CLAIM_AVAILABLE:
         try:
+            arguments: dict[str, object] = {
+                "p_limit": int(limit),
+                "p_stale_minutes": int(stale_minutes),
+            }
+            # Only while an evaluation is actually simulating time. None the
+            # rest of the time, which is every deployment: the call then
+            # carries exactly the arguments it always did and the function
+            # uses the database's own now(). Without this, a Python-side
+            # clock moved everything EXCEPT the one thing "a queued follow-up
+            # becomes due" is about, because due-ness is decided in SQL.
+            simulated_now = clock.simulated_now_for_sql()
+            if simulated_now is not None:
+                arguments["p_now"] = simulated_now
             response = await asyncio.to_thread(
-                lambda: get_supabase()
-                .rpc(
-                    "claim_due_actions",
-                    {"p_limit": int(limit), "p_stale_minutes": int(stale_minutes)},
-                )
-                .execute()
+                lambda: get_supabase().rpc("claim_due_actions", arguments).execute()
             )
             return list(response.data or [])
         except Exception as error:
@@ -547,7 +556,9 @@ async def claim_due_actions(limit: int = 20, stale_minutes: int = 10) -> list[di
 
 
 async def _claim_due_actions_by_cas(limit: int, stale_minutes: int) -> list[dict]:
-    now = datetime.now(timezone.utc)
+    # The same clock the RPC path passes as p_now, so the fallback and the
+    # atomic claim agree about what time it is.
+    now = clock.now()
     stale_before = (now - timedelta(minutes=stale_minutes)).isoformat()
 
     def _claim():

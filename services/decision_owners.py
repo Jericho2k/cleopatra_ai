@@ -40,6 +40,8 @@ than negotiated here.
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from models.conversation_decision import (
@@ -52,6 +54,7 @@ from services.context_packet import ContextPacket
 
 SOURCE_CURRENT_STACK = "current_stack"
 SOURCE_SEMANTIC = "semantic_owner"
+SOURCE_REPLY_PLUS_INTENT = "reply_plus_intent"
 
 
 class DecisionOwner(Protocol):
@@ -276,13 +279,68 @@ Rules:
 - More than one active need is normal. Do not collapse a mixed message into one."""
 
 
-def parse_semantic_decision(text: str, *, source: str = SOURCE_SEMANTIC) -> ConversationDecision | None:
-    """Read the semantic owner's answer, or refuse it.
+#: The fields the contract in SEMANTIC_SYSTEM asks for and a decision cannot be
+#: read without. `active_needs` and the other lists may legitimately be empty,
+#: so their absence is tolerated; these three ARE the decision — what the turn
+#: proposes, whether it waits, and how far to trust either.
+REQUIRED_DECISION_FIELDS: tuple[str, ...] = ("operation", "hold", "confidence")
 
-    Returns ``None`` for anything unparseable. There is no partial credit and no
-    repair pass: a decision assembled out of a half-read response is exactly the
-    fabricated-analysis problem REL-001 was, and this candidate is being
-    measured, so a failure to answer must count as a failure to answer.
+
+@dataclass(frozen=True)
+class DecisionParse:
+    """A read of the semantic owner's answer, or a named refusal.
+
+    The reason is the point. ``parse_semantic_decision`` returned a bare None,
+    so every different way of failing — a truncated response, an invented
+    enum, a missing field — became the same "did not answer in the required
+    shape" line, and a comparison could not say WHICH candidate failed how.
+    """
+
+    decision: "ConversationDecision | None" = None
+    reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.decision is not None
+
+
+def _refuse(reason: str) -> DecisionParse:
+    return DecisionParse(decision=None, reason=reason)
+
+
+def parse_semantic_decision_result(
+    text: str, *, source: str = SOURCE_SEMANTIC
+) -> DecisionParse:
+    """Read the semantic owner's answer strictly, or say why it was refused.
+
+    STRICT, AND IT WAS NOT
+    ----------------------
+    The docstring of the version this replaces said "Returns None for anything
+    unparseable. There is no partial credit and no repair pass." The code did
+    the opposite for the cases that matter most: an unrecognised enum was
+    silently coerced to NONE and a missing ``confidence`` defaulted to 1.0, so
+
+        {"hold": "typo", "operation": "typo"}
+
+    produced a decision that proposed nothing, held nothing, and claimed FULL
+    confidence in that reading. Reproduced against backend 4a1683a. That is a
+    fabricated confident decision assembled from a response the parser could
+    not understand — REL-001's shape exactly, in the component whose entire
+    purpose is to be trusted enough to compare.
+
+    So every one of these is a refusal, and each says which it was:
+
+    * the response is not a JSON object;
+    * a required field is missing — a response that does not say what it
+      proposes or whether it holds has not answered;
+    * an enum is not one of the values the contract lists;
+    * a field is the wrong type;
+    * confidence is not a finite number, or is outside 0..1.
+
+    Out-of-range confidence is refused rather than clamped, which is the one
+    choice here worth arguing about. Clamping 1.5 to 1.0 RAISES a malformed
+    claim to maximum confidence — the failure mode this function exists to
+    prevent, applied by the repair.
     """
     raw = str(text or "").strip()
     if raw.startswith("```"):
@@ -291,47 +349,89 @@ def parse_semantic_decision(text: str, *, source: str = SOURCE_SEMANTIC) -> Conv
             raw = raw[4:]
     start, end = raw.find("{"), raw.rfind("}")
     if start < 0 or end <= start:
-        return None
+        return _refuse("the response contained no JSON object")
     try:
         payload = json.loads(raw[start : end + 1])
     except (ValueError, TypeError):
-        return None
+        return _refuse("the response was not valid JSON")
     if not isinstance(payload, dict):
-        return None
+        return _refuse("the response was not a JSON object")
 
-    def _list(key: str) -> tuple[str, ...]:
-        value = payload.get(key)
-        if not isinstance(value, list):
+    missing = [key for key in REQUIRED_DECISION_FIELDS if key not in payload]
+    if missing:
+        return _refuse(f"the response left out {', '.join(missing)}")
+
+    def _list(key: str) -> tuple[str, ...] | None:
+        value = payload.get(key, [])
+        if value is None:
             return ()
+        if not isinstance(value, list):
+            return None
         return tuple(str(item).strip() for item in value if str(item).strip())
 
-    try:
-        kind = OperationKind(str(payload.get("operation") or "none"))
-    except ValueError:
-        kind = OperationKind.NONE
-    try:
-        hold = HoldReason(str(payload.get("hold") or "none"))
-    except ValueError:
-        hold = HoldReason.NONE
-    try:
-        confidence = float(payload.get("confidence", 1.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
+    lists: dict[str, tuple[str, ...]] = {}
+    for key in (
+        "active_needs",
+        "unresolved_references",
+        "must_address",
+        "supporting_messages",
+    ):
+        parsed = _list(key)
+        if parsed is None:
+            return _refuse(f"{key} was not a list")
+        lists[key] = parsed
 
-    return ConversationDecision(
-        active_needs=_list("active_needs"),
-        unresolved_references=_list("unresolved_references"),
-        must_address=_list("must_address"),
-        proposed_operation=ProposedOperation(
-            kind=kind,
-            subject=str(payload.get("operation_subject") or "").strip(),
-            because=str(payload.get("operation_because") or "").strip(),
-        ),
-        hold=hold,
-        hold_detail=str(payload.get("hold_detail") or "").strip(),
-        source=source,
-        confidence=min(1.0, max(0.0, confidence)),
+    for key in ("operation", "hold"):
+        if not isinstance(payload.get(key), str):
+            return _refuse(f"{key} was not a string")
+    try:
+        kind = OperationKind(payload["operation"].strip() or "none")
+    except ValueError:
+        return _refuse(f"operation {payload['operation']!r} is not one this system knows")
+    try:
+        hold = HoldReason(payload["hold"].strip() or "none")
+    except ValueError:
+        return _refuse(f"hold {payload['hold']!r} is not one this system knows")
+
+    confidence_raw = payload["confidence"]
+    if isinstance(confidence_raw, bool) or not isinstance(confidence_raw, (int, float)):
+        # `bool` first: it is a subclass of int, and True would otherwise read
+        # as a confidence of 1.0 — the exact fabrication being prevented.
+        return _refuse("confidence was not a number")
+    confidence = float(confidence_raw)
+    if not math.isfinite(confidence):
+        return _refuse("confidence was not a finite number")
+    if not 0.0 <= confidence <= 1.0:
+        return _refuse(f"confidence {confidence} is outside 0..1")
+
+    for key in ("operation_subject", "operation_because", "hold_detail"):
+        if key in payload and payload[key] is not None and not isinstance(payload[key], str):
+            return _refuse(f"{key} was not a string")
+
+    return DecisionParse(
+        decision=ConversationDecision(
+            active_needs=lists["active_needs"],
+            supporting_messages=lists["supporting_messages"],
+            unresolved_references=lists["unresolved_references"],
+            must_address=lists["must_address"],
+            proposed_operation=ProposedOperation(
+                kind=kind,
+                subject=str(payload.get("operation_subject") or "").strip(),
+                because=str(payload.get("operation_because") or "").strip(),
+            ),
+            hold=hold,
+            hold_detail=str(payload.get("hold_detail") or "").strip(),
+            source=source,
+            confidence=confidence,
+        )
     )
+
+
+def parse_semantic_decision(
+    text: str, *, source: str = SOURCE_SEMANTIC
+) -> ConversationDecision | None:
+    """The decision, or None. ``parse_semantic_decision_result`` says why."""
+    return parse_semantic_decision_result(text, source=source).decision
 
 
 def build_semantic_prompt(packet: ContextPacket, state: dict[str, Any]) -> tuple[str, str]:
@@ -391,15 +491,220 @@ class SemanticDecisionOwner:
                 source=self.name,
                 confidence=0.0,
             )
-        decision = parse_semantic_decision(
+        parsed = parse_semantic_decision_result(
             getattr(result, "text", "") or "", source=self.name
         )
-        if decision is None:
+        if not parsed.ok:
+            # Naming the failure rather than flattening every one of them into
+            # "did not answer in the required shape": a comparison that cannot
+            # say WHICH candidate failed HOW is not much of a comparison.
             return ConversationDecision(
                 active_needs=(),
                 hold=HoldReason.INSUFFICIENT_EVIDENCE,
-                hold_detail="the semantic owner did not answer in the required shape",
+                hold_detail=f"the semantic owner did not answer usably: {parsed.reason}",
                 source=self.name,
                 confidence=0.0,
             )
-        return decision
+        return parsed.decision
+
+
+# ---------------------------------------------------------------------------
+# Candidate 1: one call that writes the reply AND states the intent
+# ---------------------------------------------------------------------------
+#
+# The review found this absent: "The one-call reply-plus-intent candidate is
+# absent." Without it there was nothing to compare the two-call arrangement
+# AGAINST, so the comparison could only ever have one answer.
+#
+# The architectural question it exists to settle is whether splitting reading
+# from writing buys anything. The two-call path reads the conversation, states
+# what the turn needs, and then a writer writes to that statement; the one-call
+# path does both at once and can therefore never disagree with itself, at the
+# cost of the intent being a description of a reply already written rather than
+# a constraint on one.
+#
+# Neither is obviously right, which is why they are compared rather than chosen.
+
+REPLY_PLUS_INTENT_SYSTEM = """You are the creator, replying to one customer on a paid content platform. You write the message AND state what it is doing.
+
+Answer with a JSON object and nothing else:
+
+{
+  "reply": "the message you are sending him, in your own voice",
+  "active_needs": ["what he actually wants right now, in plain words"],
+  "unresolved_references": ["anything he referred to that the conversation does not make clear"],
+  "must_address": ["questions or obligations this reply has to answer"],
+  "operation": "none" | "offer_content" | "deliver_paid_content" | "repair_content_access" | "hand_off_to_human",
+  "operation_subject": "what that operation is about, in his words, or \"\"",
+  "operation_because": "why, or \"\"",
+  "hold": "none" | "waiting_on_customer" | "waiting_on_payment" | "needs_human" | "respect_silence" | "insufficient_evidence",
+  "hold_detail": "why this turn waits or hands over, or \"\"",
+  "confidence": 0.0 to 1.0
+}
+
+Rules:
+- The reply is the message itself. Do not describe it, do not write stage directions, do not write more than a person would send.
+- A request to fix access to something already paid for outranks any suggestion to sell.
+- Never state a price. Never say something was sent, delivered or paid unless the conversation shows a confirmation.
+- An operation is a request for someone else to check and carry out, never permission. Writing "here it is" does not send anything.
+- If the evidence does not support a reading, say so with "insufficient_evidence" rather than guessing.
+- If the right move is to say nothing, set hold and leave reply as "\"\"".
+"""
+
+
+@dataclass(frozen=True)
+class CandidateAnswer:
+    """One candidate's complete answer for one turn.
+
+    Both halves, because a comparison of decisions alone cannot see the thing
+    that reaches the customer. §5 asks for the candidates to be compared on
+    what they actually produce, and the review's objection was precisely that
+    replay "does not compare two complete new conversational cores".
+    """
+
+    decision: "ConversationDecision"
+    reply: str = ""
+    #: True when the candidate wrote the reply itself in the same call that
+    #: produced the decision, rather than a separate writer being asked to.
+    wrote_its_own_reply: bool = False
+    #: Why there is no reply, when there is none.
+    reason: str = ""
+
+
+def parse_reply_plus_intent(
+    text: str, *, source: str
+) -> "tuple[CandidateAnswer | None, str]":
+    """Read a one-call answer strictly, or say why it was refused.
+
+    The decision half goes through exactly the same validator as the two-call
+    candidate — same required fields, same enum checks, same refusal of a
+    non-finite or out-of-range confidence. A candidate that got a laxer parser
+    would win comparisons by being marked wrong less often, which would make
+    the comparison measure the parsers rather than the architectures.
+    """
+    parsed = parse_semantic_decision_result(text, source=source)
+    if not parsed.ok:
+        return None, parsed.reason
+
+    raw = str(text or "").strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    payload = json.loads(raw[start : end + 1])
+
+    if "reply" not in payload:
+        return None, "the response left out reply"
+    reply = payload["reply"]
+    if reply is None:
+        reply = ""
+    if not isinstance(reply, str):
+        return None, "reply was not a string"
+
+    reply = reply.strip()
+    decision = parsed.decision
+    if not reply and not decision.is_hold:
+        # Saying nothing is a legitimate answer, and this is how the contract
+        # says to express it. An empty reply with no hold is not that; it is a
+        # candidate that failed to answer while appearing to succeed.
+        return None, "an empty reply needs a hold saying why"
+
+    return (
+        CandidateAnswer(
+            decision=decision,
+            reply=reply,
+            wrote_its_own_reply=True,
+            reason="" if reply else decision.hold_detail or decision.hold.value,
+        ),
+        "",
+    )
+
+
+class ReplyPlusIntentOwner:
+    """Candidate 1. One model call produces the reply and the typed intent.
+
+    Offline only, like the semantic owner, and constructed with an explicit
+    ``complete`` callable for the same reason: a replay must be able to run it
+    against a stub, a recorded response or a real provider without that choice
+    leaking into what is being compared.
+    """
+
+    name = SOURCE_REPLY_PLUS_INTENT
+
+    def __init__(self, complete, *, target=None) -> None:
+        self._complete = complete
+        self._target = target
+
+    def _build(self, packet: ContextPacket, state: dict[str, Any]) -> tuple[str, str]:
+        # The SAME user half the semantic owner gets. §5: "Replay gives
+        # candidates the same evidence" — and evidence assembled twice is two
+        # pieces of evidence, however similar they look.
+        _, user = build_semantic_prompt(packet, state)
+        return REPLY_PLUS_INTENT_SYSTEM, user
+
+    async def answer(
+        self, packet: ContextPacket, state: dict[str, Any]
+    ) -> CandidateAnswer:
+        system, user = self._build(packet, state)
+        try:
+            result = await self._complete(
+                system=system, user=user, target=self._target
+            )
+        except Exception as exc:
+            return CandidateAnswer(
+                decision=ConversationDecision(
+                    hold=HoldReason.INSUFFICIENT_EVIDENCE,
+                    hold_detail=f"the one-call candidate could not be reached: {exc}",
+                    source=self.name,
+                    confidence=0.0,
+                ),
+                reason="not reached",
+            )
+
+        answer, refusal = parse_reply_plus_intent(
+            getattr(result, "text", "") or "", source=self.name
+        )
+        if answer is None:
+            return CandidateAnswer(
+                decision=ConversationDecision(
+                    hold=HoldReason.INSUFFICIENT_EVIDENCE,
+                    hold_detail=f"the one-call candidate did not answer usably: {refusal}",
+                    source=self.name,
+                    confidence=0.0,
+                ),
+                reason=refusal,
+            )
+        return answer
+
+    async def decide(
+        self, packet: ContextPacket, state: dict[str, Any]
+    ) -> "ConversationDecision":
+        """The decision half alone, so this satisfies DecisionOwner too."""
+        return (await self.answer(packet, state)).decision
+
+
+class DecideThenWrite:
+    """Candidate 2 as a candidate: a decision owner plus the shared writer.
+
+    A thin adapter so both candidates present the same surface to the executor
+    — and thin on purpose. The architectural difference between the two is
+    supposed to be WHEN the reply is written, not what else happens on the way,
+    so anything this adapter did beyond deferring the writing would be a third
+    difference contaminating the comparison.
+
+    It leaves ``reply`` empty and ``wrote_its_own_reply`` False, which is the
+    executor's signal to call the shared writer. That asymmetry is the thing
+    being measured, and it lives in the executor where it is visible.
+    """
+
+    def __init__(self, owner) -> None:
+        self._owner = owner
+        self.name = owner.name
+
+    async def answer(
+        self, packet: ContextPacket, state: dict[str, Any]
+    ) -> CandidateAnswer:
+        decision = await self._owner.decide(packet, state)
+        return CandidateAnswer(decision=decision, reply="", wrote_its_own_reply=False)
+
+    async def decide(
+        self, packet: ContextPacket, state: dict[str, Any]
+    ) -> "ConversationDecision":
+        return await self._owner.decide(packet, state)

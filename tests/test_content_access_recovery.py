@@ -49,6 +49,10 @@ def _world(
                     "fansly_group_id": "group-1",
                     "needs_human_review": True,
                     "review_reason": review_reason,
+                    # The identity of THIS hold. A repair clears the hold it
+                    # was about and not whatever hold is there when it
+                    # finishes; see db/content_access_repair_v1.sql.
+                    "review_case_id": "case-1",
                 }
             ],
             "creators": [
@@ -68,6 +72,9 @@ def _world(
                 }
             ],
             "messages": [],
+            # The durable repair claim. Empty, because these worlds start
+            # before any repair has been attempted.
+            "content_access_repairs": [],
         }
     )
 
@@ -78,6 +85,8 @@ def world(monkeypatch):
     monkeypatch.setattr(content_access, "get_supabase", lambda: db)
     monkeypatch.setattr("services.ppv_delivery_ledger.get_supabase", lambda: db)
     monkeypatch.setattr("db.queries.get_supabase", lambda: db)
+    monkeypatch.setattr("services.content_access_repairs.get_supabase", lambda: db)
+    monkeypatch.setattr("services.message_diagnostics.get_supabase", lambda: db)
     monkeypatch.setattr(content_access, "apifansly_enabled", lambda: True)
     return db
 
@@ -283,6 +292,8 @@ def test_a_failed_repair_leaves_the_conversation_frozen(monkeypatch):
     monkeypatch.setattr(content_access, "get_supabase", lambda: db)
     monkeypatch.setattr("services.ppv_delivery_ledger.get_supabase", lambda: db)
     monkeypatch.setattr("db.queries.get_supabase", lambda: db)
+    monkeypatch.setattr("services.content_access_repairs.get_supabase", lambda: db)
+    monkeypatch.setattr("services.message_diagnostics.get_supabase", lambda: db)
     monkeypatch.setattr(content_access, "apifansly_enabled", lambda: True)
     _stub_platform(monkeypatch, messages=[], account_media=[], sends=[])
 
@@ -430,6 +441,8 @@ def test_a_failed_repair_leaves_the_complaint_open_too(monkeypatch):
     monkeypatch.setattr(content_access, "get_supabase", lambda: db)
     monkeypatch.setattr("services.ppv_delivery_ledger.get_supabase", lambda: db)
     monkeypatch.setattr("db.queries.get_supabase", lambda: db)
+    monkeypatch.setattr("services.content_access_repairs.get_supabase", lambda: db)
+    monkeypatch.setattr("services.message_diagnostics.get_supabase", lambda: db)
     monkeypatch.setattr(content_access, "apifansly_enabled", lambda: True)
     continuity = _with_threads(monkeypatch, db)
     run(continuity.record_open_thread(_complaint()))

@@ -10,6 +10,57 @@ Last updated: 2026-09-17.
 
 ---
 
+## The current specification is the continuation brief
+
+[`docs/continuation_brief_2026-09-17.md`](continuation_brief_2026-09-17.md) is
+the brief this work now follows, reproduced verbatim. It is organised as Phases
+A–E with an explicit gate per phase, and **it supersedes the Sprint 0–5
+numbering below.**
+
+Two corrections it forces on this file, both recorded here rather than by
+deleting the history:
+
+1. **"Done" against a sprint is not a passed gate.** The sprint table was
+   written against §6 of the in-repo review by a session working without the
+   original handoff. The brief's gates are stated differently and mostly
+   stricter. A sprint marked Done below is a statement about the work that
+   landed, never evidence that the corresponding phase gate has been met.
+2. **Sprint 4 is merged.** The line below saying it was pushed and still needed
+   its own pull request was true when written and is now stale:
+   [cleopatra_ai#50](https://github.com/Jericho2k/cleopatra_ai/pull/50) and
+   [cleopatra-dashboard#33](https://github.com/Jericho2k/cleopatra-dashboard/pull/33)
+   are merged, and `main` was `4a1683a` / `9c47543` when the brief was written.
+
+**The local handoff is still unread.** `Cleopatra_Claude_Code_Implementation_Handoff.md`
+has never been supplied to any session. The note further down that says so
+remains accurate and should not be removed until the file is actually provided.
+
+---
+
+## Phase status against the continuation brief
+
+| Phase | Gate | Status |
+|---|---|---|
+| A — repair the concrete correctness gaps | reproductions fail before, pass after; CI evidence | **A1–A4 implemented.** Gate A partly met: reproductions and local suite are evidenced below, remote CI on this branch is not yet observed |
+| B — an evaluation harness that can disprove readiness | injected faults are actually detected | **Not started** |
+| C — durable ordinary-conversation memory and context | two deferred subjects survive 30+ turns and a return | **Not started** |
+| D — complete and compare conversational cores | baseline/candidate evidence with inspectable disagreement | **Not started** |
+| E — operator flows and controlled evaluation | reproducible bundle; the three claims kept separate | **Not started.** The owner trace inspector's backend half landed under A2 |
+
+### Phase A — what landed, and what each item was
+
+| Item | What was wrong | What was done |
+|---|---|---|
+| A1 | `tests/test_operational_health.py` asserted `"4321" not in json.dumps(payload)`. 4321 is the planted queue depth and it matched the microseconds of an ordinary `checked_at`, failing [CI run 35219091193](https://github.com/Jericho2k/cleopatra_ai/actions/runs/35219091193) with 1 failed, 2336 passed on a correctly redacted response | The gate is now the response's key schema plus typed sentinel values, matched on type and value rather than on digits. `/health/ready` gets the same gate; the authenticated document asserts the sentinels ARE present so the negative tests cannot pass vacuously; the exact failing timestamp is pinned |
+| A2 | `public_media_context` redacted `ai_stack` and passed every sibling key through, so `reply_provenance.writer.actual` survived it. More seriously, the dashboard reads `messages` with `select('*')` straight from Supabase (`app/simulator/page.tsx:205`, `app/page.tsx` ×4) on a table `authenticated` is granted SELECT over, so the routing was in every agency browser whatever the routes did | Owner-only diagnostics moved out of the row entirely into `public.message_diagnostics`, with `public.owner_only_tables` as a registry both discovery migrations consult — without it they would have re-granted the browser SELECT automatically. Existing rows backfilled and stripped. Split applied at `save_message_result`, the one chokepoint. `GET /creator/{id}/fan/{id}/reply-trace` is the owner's authorized way back to it |
+| A3 | The platform adapter was called with no durable claim: a DB failure plus a retry sent twice, two concurrent operators sent twice, and `clear_fan_review` was an unconditional update by fan id, so a repair cleared a newer crisis hold | `public.content_access_repairs`, unique on (creator, fan, reference, review case), claimed and committed before the send and never held across it. Four outcomes with `unknown` first-class and never auto-retried. `clear_fan_review` takes an expected case id and reports whether it cleared |
+| A4 | The panel showed several paid items and posted only `{resolution}`; the backend defaulted to the most recent paid delivery | An unqualified resend with more than one repairable purchase is refused, naming the options. The panel asks, with nothing pre-selected when there is a choice, and sends back the reference, the review case id and the actor. Per-item repair state is shown, with `unknown` surfaced as a decision |
+
+Exactly-once external delivery is **not** claimed anywhere in A3; the platform
+offers no such guarantee. What is claimed is exactly-once attempt.
+
+---
+
 ## Source of the plan
 
 The implementation brief for this programme is
@@ -52,7 +103,7 @@ on its own, but the numbering may need renaming.
 |---|---|
 | [cleopatra_ai#49](https://github.com/Jericho2k/cleopatra_ai/pull/49) | **Merged** (squash, `a7549dd`) — Sprints 0, 1, 2 and 3 |
 | [cleopatra-dashboard#32](https://github.com/Jericho2k/cleopatra-dashboard/pull/32) | **Merged** (squash, `8ff38c0`) — the dashboard halves of Sprints 0 and 1 |
-| Sprint 4 | Pushed to `claude/cleopatra-implementation-sprints-53j1xa` **after** #49 merged, so it is not on `main` yet and needs its own pull request. |
+| Sprint 4 | **Stale as written.** It was pushed to `claude/cleopatra-implementation-sprints-53j1xa` after #49 merged and did need its own pull request; that pull request is [#50](https://github.com/Jericho2k/cleopatra_ai/pull/50) and it is merged. |
 
 Because #49 was squash-merged, none of this session's original commit SHAs are
 ancestors of `main` — check for the FILES, not the SHAs, before concluding
@@ -68,6 +119,10 @@ review-hold write propagating instead of pretending a handoff succeeded.
 ---
 
 ## Sprint status
+
+**Read this table as history.** It records what landed under the §6-derived
+plan. The gates that decide whether this product is finished are the phase
+gates in the continuation brief, and this table is not evidence about them.
 
 | Sprint | Review §6 step | Status |
 |---|---|---|
@@ -110,10 +165,15 @@ existing `outcome_sink`) and fills it in on success and total failure alike.
 The return type and every existing call site are unchanged.
 
 **`services/reply_provenance.py`** — the per-turn recorder. Created at the top
-of a turn, filled in as the turn decides, and emitted once per delivered bubble
-into `messages.media_context` under `reply_provenance`. **No migration**: it
-reuses the existing jsonb column, next to the `ai_stack` marker, for the reason
-that marker gives. It stores fingerprints and counts, never message text. Parts
+of a turn, filled in as the turn decides, and emitted once per delivered bubble.
+
+> **Superseded by Phase A2.** This originally landed in
+> `messages.media_context` under `reply_provenance`, with "no migration" as an
+> explicit design constraint. That column is readable by any agency operator's
+> browser — the dashboard selects it directly from Supabase — so the record was
+> being handed to the tier it is redacted from. It now lands in
+> `public.message_diagnostics` (`db/owner_only_diagnostics_v1.sql`), which the
+> browser roles hold no grant on. The record itself is unchanged. It stores fingerprints and counts, never message text. Parts
 of one reply share a `turn_id`.
 
 **`SuggestionProvenanceStore`** — Assisted generates in one request and sends in

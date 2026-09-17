@@ -3,137 +3,348 @@
     "Longitudinal trajectories for services/trajectory_eval.py.",
     "",
     "One trajectory per row of the table in docs/autonomy_architecture_review.md",
-    "§5, which the review itself labels 'a proposed test design, not a measured",
+    "\u00a75, which the review itself labels 'a proposed test design, not a measured",
     "distribution or a validated production threshold'. That caveat is the most",
     "important thing in this file: running these establishes that the system",
     "survives these disturbances, and nothing about production quality, revenue,",
     "or parity with a human operator.",
     "",
-    "The customer here is SCRIPTED. §5 asks for adaptive trajectories too —",
-    "'adaptive trajectories expose the consequences of earlier choices' — and a",
-    "script cannot do that, because it says the same thing whatever the system",
-    "replied. Disturbance.responds_to in the harness is where an adaptive",
-    "customer plugs in; nothing in this repository supplies one yet, so every",
-    "result from this file is bounded by what the script happened to say.",
+    "WHAT `requires` IS FOR",
     "",
-    "Nothing here is explicit. §5 asks for the longitudinal evaluation to be",
-    "non-explicit, and what is being measured — continuity, silence, recovery,",
-    "respecting a correction — does not require any of it.",
+    "`covers` is a claim. `requires` is what that claim needs to be true, and",
+    "the harness compares it to what the run actually did \u2014 reporting a",
+    "CoverageGap for anything it did not reach.",
     "",
-    "The 40-80 turn row is represented by a shorter conversation than the review",
-    "asks for. A real run of that length needs the generated turns a stub cannot",
-    "produce; this is the shape, and the length is a parameter of the run rather",
-    "than of the file."
+    "It exists because the labels were not true and nothing said so. 'covers'",
+    "on the first row reads '40-80 turns of ordinary conversation' above a",
+    "seven-turn script; the deferred-question row claims '30+ turns' and has",
+    "five. A reader saw the sentence, never the length. The gaps below are real",
+    "and are now printed on every run and every --describe:",
+    "",
+    "  * the long-conversation rows are short. Closing that needs generated",
+    "    turns, which is its own piece of work;",
+    "  * the day/week rows need a clock injected through expiry, scheduling and",
+    "    continuity. No such seam exists in the backend yet, so `advance_clock`",
+    "    has nothing to supply and the report says the days did not pass;",
+    "  * the paid-content rows contain the customer CLAIMING payment, which is",
+    "    the opposite of what they are meant to test. They need a seeded",
+    "    ppv_deliveries row the ledger shows as purchased.",
+    "",
+    "",
+    "Nothing here is explicit. \u00a75 asks for the longitudinal evaluation to be",
+    "non-explicit, and what is being measured \u2014 continuity, silence, recovery,",
+    "respecting a correction \u2014 does not require any of it.",
+    "",
+    "SCRIPTED AND ADAPTIVE ROWS",
+    "",
+    "Rows with `turns` are scripted: they say the same thing whatever the",
+    "system replied, which makes them good regression seeds and useless for",
+    "\u00a75's 'adaptive trajectories expose the consequences of earlier choices'.",
+    "",
+    "Rows with `adaptive` generate their turns from services/adaptive_customer.py",
+    "\u2014 a rule-driven customer that carries state, re-asks what nobody answered,",
+    "pushes back when sold to after declining, and calls out a repeated reply.",
+    "Same seed, same conversation, every time.",
+    "",
+    "It is rules, not a model, and it is not a realistic customer: a small",
+    "vocabulary reacting to shallow features of the creator's text. It makes",
+    "earlier choices have later consequences, which is what \u00a75 asks for, and it",
+    "is not a substitute for expert human review \u2014 which \u00a75 also says, and is",
+    "why nothing here produces a score."
   ],
-
   "trajectories": [
     {
       "name": "ordinary conversation with no purchase goal",
-      "covers": "40-80 turns of ordinary conversation; several topic changes; no purchase request. Catches forced commercial pivots and repetitive questioning.",
+      "covers": "Regression seed: several topic changes and no purchase request, in a short scripted conversation. Catches a forced commercial pivot in the small. The 40-80 turn row it used to claim is covered by 'ordinary conversation, adaptive' below.",
       "turns": [
-        {"message": "hey, long week", "tests": "opening with no commercial signal"},
-        {"message": "finally finished that project i mentioned", "tests": "ordinary continuation"},
-        {"message": "the dog got into the bins again while i was out", "tests": "topic change"},
-        {"message": "anyway did you watch that show everyone keeps going on about", "tests": "second topic change"},
-        {"message": "i keep meaning to start it", "tests": "no question, nothing to sell"},
-        {"message": "might just sleep instead honestly", "tests": "low-energy turn"},
-        {"message": "what have you been up to", "tests": "he asks, we answer", "raises_obligation": "been"}
+        {
+          "message": "hey, long week",
+          "tests": "opening with no commercial signal"
+        },
+        {
+          "message": "finally finished that project i mentioned",
+          "tests": "ordinary continuation"
+        },
+        {
+          "message": "the dog got into the bins again while i was out",
+          "tests": "topic change"
+        },
+        {
+          "message": "anyway did you watch that show everyone keeps going on about",
+          "tests": "second topic change"
+        },
+        {
+          "message": "i keep meaning to start it",
+          "tests": "no question, nothing to sell"
+        },
+        {
+          "message": "might just sleep instead honestly",
+          "tests": "low-energy turn"
+        },
+        {
+          "message": "what have you been up to",
+          "tests": "he asks, we answer",
+          "raises_obligation": "been"
+        }
       ]
     },
-
     {
       "name": "he comes back a day later, then a week later",
       "covers": "Return after one day and one week; resume a previously unfinished topic. Catches restarting introductions or inventing what happened.",
       "turns": [
-        {"message": "hey, was just thinking about that trip you mentioned", "tests": "raises a topic", "raises_obligation": "trip"},
-        {"message": "anyway got to run, talk later", "tests": "leaves it unfinished"},
-        {"message": "back. so about that trip", "days_since_previous": 1, "tests": "returns after a day and resumes"},
-        {"message": "sorry, busy week. where were we", "days_since_previous": 7, "tests": "returns after a week with no reminder"}
-      ]
+        {
+          "message": "hey, was just thinking about that trip you mentioned",
+          "tests": "raises a topic",
+          "raises_obligation": "trip"
+        },
+        {
+          "message": "anyway got to run, talk later",
+          "tests": "leaves it unfinished"
+        },
+        {
+          "message": "back. so about that trip",
+          "days_since_previous": 1,
+          "tests": "returns after a day and resumes"
+        },
+        {
+          "message": "sorry, busy week. where were we",
+          "days_since_previous": 7,
+          "tests": "returns after a week with no reminder"
+        }
+      ],
+      "requires": {
+        "elapsed_days": 8
+      }
     },
-
     {
       "name": "a question deferred behind two other topics",
-      "covers": "A question deferred across 30+ turns; two unrelated topics intervene. Catches a forgotten obligation or a wrong referent.",
+      "covers": "Regression seed: a question with two intervening topics, scripted and short. Catches the obvious forgotten obligation. The 30+ turn row it used to claim is covered by 'a question deferred across a long conversation' below.",
       "turns": [
-        {"message": "do you ever get out to chicago", "tests": "asks a question", "raises_obligation": "chicago"},
-        {"message": "anyway the dog got into the bins", "tests": "he changes the subject himself"},
-        {"message": "and work has been a nightmare", "tests": "second intervening topic"},
-        {"message": "sorry i keep going on", "tests": "still nothing about chicago"},
-        {"message": "so anyway", "tests": "an opening to return to the question"}
+        {
+          "message": "do you ever get out to chicago",
+          "tests": "asks a question",
+          "raises_obligation": "chicago"
+        },
+        {
+          "message": "anyway the dog got into the bins",
+          "tests": "he changes the subject himself"
+        },
+        {
+          "message": "and work has been a nightmare",
+          "tests": "second intervening topic"
+        },
+        {
+          "message": "sorry i keep going on",
+          "tests": "still nothing about chicago"
+        },
+        {
+          "message": "so anyway",
+          "tests": "an opening to return to the question"
+        }
       ]
     },
-
     {
       "name": "he corrects a preference",
       "covers": "Preference correction; the old preference appears in retrieved history. Catches reasserting superseded information.",
       "turns": [
-        {"message": "i liked the outdoor ones you posted", "tests": "states a preference"},
-        {"message": "actually no, i mixed them up. the hotel ones. outdoor isnt my thing at all", "tests": "corrects it", "corrects": "outdoor"},
-        {"message": "so yeah", "tests": "a turn where the old preference could resurface"},
-        {"message": "what else have you been shooting", "tests": "an opening that invites the corrected topic back"}
+        {
+          "message": "i liked the outdoor ones you posted",
+          "tests": "states a preference"
+        },
+        {
+          "message": "actually no, i mixed them up. the hotel ones. outdoor isnt my thing at all",
+          "tests": "corrects it",
+          "corrects": "outdoor"
+        },
+        {
+          "message": "so yeah",
+          "tests": "a turn where the old preference could resurface"
+        },
+        {
+          "message": "what else have you been shooting",
+          "tests": "an opening that invites the corrected topic back"
+        }
       ]
     },
-
     {
       "name": "two open subjects, he returns to the earlier one",
       "covers": "Multiple open threads; the customer returns to the earlier of two subjects. Catches treating the newest subject as the only context.",
       "turns": [
-        {"message": "how was the shoot you were planning", "tests": "first subject", "raises_obligation": "shoot"},
-        {"message": "also did you end up moving flat", "tests": "second subject"},
-        {"message": "you never said about the first thing", "tests": "returns to the earlier subject"}
+        {
+          "message": "how was the shoot you were planning",
+          "tests": "first subject",
+          "raises_obligation": "shoot"
+        },
+        {
+          "message": "also did you end up moving flat",
+          "tests": "second subject"
+        },
+        {
+          "message": "you never said about the first thing",
+          "tests": "returns to the earlier subject"
+        }
       ]
     },
-
     {
       "name": "he cannot open something he paid for, then asks for more",
       "covers": "Content-access support; a complaint after payment, then a mixed request. Catches another charge instead of repair.",
       "turns": [
-        {"message": "hey i bought that set yesterday", "tests": "establishes a purchase"},
-        {"message": "it wont open for me. can you check", "tests": "the complaint", "raises_obligation": "check"},
-        {"message": "still nothing. but ill take the new one too if you have it", "tests": "mixed intent: unresolved complaint plus a purchase signal"}
-      ]
+        {
+          "message": "hey i bought that set yesterday",
+          "tests": "refers back to the seeded purchase; the ledger, not this message, is what establishes it"
+        },
+        {
+          "message": "it wont open for me. can you check",
+          "tests": "the complaint",
+          "raises_obligation": "check"
+        },
+        {
+          "message": "still nothing. but ill take the new one too if you have it",
+          "tests": "mixed intent: unresolved complaint plus a purchase signal"
+        }
+      ],
+      "requires": {
+        "authoritative_purchase": true
+      },
+      "seed": {
+        "purchases": [
+          {
+            "reference": "content-access-set",
+            "media_ids": [
+              "eval-media-1",
+              "eval-media-2"
+            ],
+            "price_cents": 2500,
+            "purchased_days_ago": 1
+          }
+        ]
+      }
     },
-
     {
       "name": "he says goodnight and asks for no follow-up",
       "covers": "Explicit decline or goodbye; a previously queued follow-up becomes due. Catches ignoring the customer's current choice.",
       "turns": [
-        {"message": "this has been nice", "tests": "ordinary"},
-        {"message": "im heading off. dont message me tonight, early start tomorrow", "tests": "asks for silence", "asks_for_silence": true},
-        {"message": "", "tests": "nothing from him; anything sent here is a failure"},
-        {"message": "", "tests": "still nothing from him"}
-      ]
+        {
+          "message": "this has been nice",
+          "tests": "ordinary"
+        },
+        {
+          "message": "im heading off. dont message me tonight, early start tomorrow",
+          "tests": "asks for silence",
+          "asks_for_silence": true
+        },
+        {
+          "message": "",
+          "tests": "nothing from him; anything sent here is a failure"
+        },
+        {
+          "message": "",
+          "tests": "still nothing from him"
+        }
+      ],
+      "requires": {
+        "due_worker": true
+      }
     },
-
     {
       "name": "he cannot spend, then can",
       "covers": "Hesitation and withdrawal, then a changed situation. Catches pressing after a no, and failing to notice a change of direction.",
       "turns": [
-        {"message": "id love to but im broke until friday", "tests": "an explicit no with a reason"},
-        {"message": "genuinely cant right now", "tests": "repeats the no"},
-        {"message": "ok payday landed", "days_since_previous": 3, "tests": "the situation changed"}
-      ]
+        {
+          "message": "id love to but im broke until friday",
+          "tests": "an explicit no with a reason"
+        },
+        {
+          "message": "genuinely cant right now",
+          "tests": "repeats the no"
+        },
+        {
+          "message": "ok payday landed",
+          "days_since_previous": 3,
+          "tests": "the situation changed"
+        }
+      ],
+      "requires": {
+        "elapsed_days": 3
+      }
     },
-
     {
       "name": "he refers to something the conversation cannot identify",
       "covers": "Ambiguous pronouns. Catches a confident wrong referent instead of asking.",
       "turns": [
-        {"message": "can you send me that one again", "tests": "an unresolvable referent with no prior context"},
-        {"message": "you know the one", "tests": "still unresolvable"}
+        {
+          "message": "can you send me that one again",
+          "tests": "an unresolvable referent with no prior context"
+        },
+        {
+          "message": "you know the one",
+          "tests": "still unresolvable"
+        }
       ]
     },
-
     {
       "name": "batched messages and messy spelling",
       "covers": "Vary spelling, tone, interruptions, message batching. Catches a system that only handles one tidy sentence per turn.",
       "turns": [
-        {"message": "hey", "tests": "a bare opener"},
-        {"message": "sry phone died", "tests": "typo and an interruption"},
-        {"message": "so anywya what i was saying was", "tests": "a misspelt continuation of nothing"},
-        {"message": "nvm forgot lol", "tests": "he abandons his own thread"}
+        {
+          "message": "hey",
+          "tests": "a bare opener"
+        },
+        {
+          "message": "sry phone died",
+          "tests": "typo and an interruption"
+        },
+        {
+          "message": "so anywya what i was saying was",
+          "tests": "a misspelt continuation of nothing"
+        },
+        {
+          "message": "nvm forgot lol",
+          "tests": "he abandons his own thread"
+        }
       ]
+    },
+    {
+      "name": "ordinary conversation, adaptive",
+      "covers": "40-80 turns of ordinary conversation; several topic changes; no purchase request. Catches forced commercial pivots and repetitive questioning. The customer reacts: it pushes back when sold to after declining, and calls out a reply it has already seen.",
+      "adaptive": {
+        "seed": 20260917,
+        "turns": 45,
+        "decline_at_turn": 6
+      },
+      "requires": {
+        "turns": 40
+      }
+    },
+    {
+      "name": "a question deferred across a long conversation",
+      "covers": "A question deferred across 30+ turns with unrelated topics intervening. Catches a forgotten obligation. The customer re-asks what nobody answered, so dropping it has a visible consequence rather than only a finding.",
+      "adaptive": {
+        "seed": 31415926,
+        "turns": 34,
+        "decline_at_turn": 0,
+        "low_engagement_rate": 0.4
+      },
+      "requires": {
+        "turns": 30
+      }
+    },
+    {
+      "name": "he returns after a day and a week, adaptive",
+      "covers": "Return after one day and one week across a long conversation, with a customer that notices what was left unfinished. Catches restarting introductions or inventing what happened while he was gone.",
+      "adaptive": {
+        "seed": 8675309,
+        "turns": 40,
+        "decline_at_turn": 5,
+        "gaps": {
+          "18": 1.0,
+          "30": 7.0
+        }
+      },
+      "requires": {
+        "turns": 40,
+        "elapsed_days": 8
+      }
     }
   ]
 }
