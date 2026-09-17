@@ -23,6 +23,7 @@ from ai.prompt_builder import build_prompt
 from ai.situation_analyzer import build_analyzer_prompt
 from models.schemas import ConversationContext, Fan, Message, Persona, StageType
 from services.context_packet import (
+    STANDARD_BUDGET,
     ContextBudget,
     build_context_packet,
     group_into_turns,
@@ -299,3 +300,160 @@ def test_the_same_inputs_always_produce_the_same_packet():
     second = build_context_packet(history, open_threads=["a", "b"])
 
     assert first == second
+
+
+# ===========================================================================
+# A message too big for the budget
+# ===========================================================================
+#
+# The guard was `if kept and used + cost > ceiling`, so the newest turn was
+# admitted whole however large it was: a single 10,000-character message
+# rendered a 10,005-character transcript against a 6,000 budget. It also took
+# the exchange it was pasted into with it, because nothing could follow.
+#
+# Both extremes are wrong. Dropping it loses the message the reply is
+# answering; keeping it whole makes the budget a suggestion. So it is
+# shortened, and the shortening is recorded — a turn that was cut is not the
+# same as one that arrived whole, and a reply attributed to "the model had the
+# message" needs to know which happened.
+
+
+def _oversized_history(size: int = 10_000) -> list[dict]:
+    return [
+        {"role": "fan", "content": "hey"},
+        {"role": "creator", "content": "hi!"},
+        {"role": "fan", "content": "x" * size},
+    ]
+
+
+def test_one_enormous_message_cannot_blow_the_character_budget():
+    packet = build_context_packet(history=_oversized_history())
+
+    assert len(packet.render_transcript()) <= STANDARD_BUDGET.transcript_chars
+
+
+def test_an_enormous_message_is_shortened_rather_than_dropped():
+    """It is the message the reply has to answer."""
+    packet = build_context_packet(history=_oversized_history())
+
+    assert packet.turns, "the newest turn survives"
+    assert packet.truncated_turns == 1
+    assert packet.truncated_chars > 0
+
+
+def test_a_shortened_message_says_it_was_shortened():
+    """A reader must not answer an abridgement as though it were the whole."""
+    rendered = build_context_packet(history=_oversized_history()).render_transcript()
+
+    assert "characters omitted" in rendered
+
+
+def test_shortening_keeps_both_ends():
+    """A long message often puts its point at the end.
+
+    "…and anyway, can you send me the other one?" is the part a reply must
+    answer, and a head-only cut would reliably discard exactly that.
+    """
+    history = [
+        {"role": "fan", "content": "FIRST " + ("x" * 10_000) + " LAST-QUESTION"},
+    ]
+
+    rendered = build_context_packet(history=history).render_transcript()
+
+    assert "FIRST" in rendered
+    assert "LAST-QUESTION" in rendered
+
+
+def test_an_ordinary_conversation_is_not_reported_as_shortened():
+    packet = build_context_packet(
+        history=[{"role": "fan", "content": "hey"}, {"role": "creator", "content": "hi"}]
+    )
+
+    assert packet.truncated_turns == 0
+    assert packet.truncated_chars == 0
+    assert "characters omitted" not in packet.render_transcript()
+
+
+def test_a_budget_too_small_for_any_message_drops_rather_than_emitting_a_marker():
+    """A marker with no message around it is worse than nothing."""
+    packet = build_context_packet(
+        history=_oversized_history(), budget=ContextBudget(transcript_chars=10)
+    )
+
+    assert packet.turns == ()
+    assert packet.truncated_turns == 0
+
+
+def test_obligations_still_survive_an_enormous_message():
+    """They are reserved before the transcript is measured, and must stay so.
+
+    This is the "do not silently drop a hard constraint" case: the wall of text
+    must not be able to evict what the conversation is still carrying.
+    """
+    packet = build_context_packet(
+        history=_oversized_history(),
+        open_threads=["he asked about chicago and nobody answered"],
+    )
+
+    assert packet.open_threads == ("he asked about chicago and nobody answered",)
+
+
+# ===========================================================================
+# A fingerprint that can tell two packets apart
+# ===========================================================================
+
+
+def test_two_different_conversations_do_not_share_a_fingerprint():
+    """Counts alone could not distinguish them.
+
+    Chicago and Boston are both "1 turn, 1 message, 0 threads, 0 episodes", so
+    two provenance records could agree in every field while the model saw
+    entirely different evidence — which makes §5's replay comparison
+    unverifiable, because nothing could confirm the evidence was held fixed.
+    """
+    chicago = build_context_packet(history=[{"role": "fan", "content": "i live in chicago"}])
+    boston = build_context_packet(history=[{"role": "fan", "content": "i live in boston"}])
+
+    assert chicago.fingerprint() != boston.fingerprint()
+    assert chicago.content_digest() != boston.content_digest()
+
+
+def test_the_same_conversation_has_the_same_fingerprint():
+    """What makes "these two replies saw the same input" a statement of fact."""
+    history = [{"role": "fan", "content": "hey"}, {"role": "creator", "content": "hi"}]
+
+    assert (
+        build_context_packet(history=history).content_digest()
+        == build_context_packet(history=list(history)).content_digest()
+    )
+
+
+def test_the_digest_covers_obligations_and_episodes_too():
+    """Two packets with an identical transcript are not identical packets."""
+    history = [{"role": "fan", "content": "hey"}]
+
+    bare = build_context_packet(history=history)
+    carrying = build_context_packet(history=history, open_threads=["chicago, unanswered"])
+
+    assert bare.content_digest() != carrying.content_digest()
+
+
+def test_the_digest_is_not_the_conversation():
+    """A hash stores no message text and cannot be reversed into any.
+
+    Asserted by shape, not by hunting for digits in it. A 16-character hex
+    digest contains a given four-hex-digit run about 0.1% of the time by pure
+    chance — the first draft of this test asserted `"4111" not in digest` and
+    failed on a digest of `4a14111f86701006`, which leaked nothing at all.
+    That is the same mistake as the health-redaction assertion this branch
+    opened by fixing, made by the person who fixed it.
+    """
+    secret = "my card number is 4111 1111 1111 1111"
+    digest = build_context_packet(
+        history=[{"role": "fan", "content": secret}]
+    ).content_digest()
+
+    # Fixed-width hex and nothing else: there is no room for content in it.
+    assert len(digest) == 16
+    assert all(character in "0123456789abcdef" for character in digest)
+    assert secret not in digest

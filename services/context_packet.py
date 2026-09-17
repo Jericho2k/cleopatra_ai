@@ -38,6 +38,8 @@ every rule here testable without a fixture.
 
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Sequence
@@ -123,6 +125,12 @@ class ContextPacket:
     dropped_turns: int = 0
     dropped_threads: int = 0
     dropped_episodes: int = 0
+    #: Turns shortened to fit, and how many characters went. A turn that was
+    #: cut is not the same as one that was dropped and not the same as one that
+    #: arrived whole, and a reply attributed to "the model had the message"
+    #: needs to know which of the three happened.
+    truncated_turns: int = 0
+    truncated_chars: int = 0
     budget: ContextBudget = field(default_factory=ContextBudget)
 
     @property
@@ -161,11 +169,37 @@ class ContextPacket:
             )
         return "\n\n".join(sections)
 
+    def content_digest(self) -> str:
+        """A hash of what this packet actually contains.
+
+        The counts below cannot tell two packets apart: a conversation about
+        Chicago and a conversation about Boston are both "1 turn, 1 message, 0
+        threads, 0 episodes", so two provenance records could agree in every
+        field while the model saw entirely different evidence. That makes the
+        replay comparison §5 asks for — hold the evidence fixed, change the
+        thing under test — unverifiable, because nothing could confirm the
+        evidence was held fixed.
+
+        A digest is not content. It stores no message text, cannot be reversed
+        into any, and keeps the same discipline ``services/reply_provenance.py``
+        keeps for the same reason. What it adds is the ability to say "these two
+        replies were produced from the same input" and be right.
+        """
+        material = "\n".join(
+            [
+                self.render_transcript(),
+                "\u0000threads\u0000",
+                *self.open_threads,
+                "\u0000episodes\u0000",
+                *self.episodes,
+            ]
+        )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
     def fingerprint(self) -> dict[str, Any]:
         """What went into this packet, for a reply's provenance record.
 
-        Counts and budgets only — never content. ``services/reply_provenance.py``
-        keeps the same discipline for the same reason.
+        Counts, budgets and a content digest — never content itself.
         """
         return {
             "turns": len(self.turns),
@@ -175,8 +209,13 @@ class ContextPacket:
             "dropped_turns": self.dropped_turns,
             "dropped_threads": self.dropped_threads,
             "dropped_episodes": self.dropped_episodes,
+            "truncated_turns": self.truncated_turns,
+            "truncated_chars": self.truncated_chars,
             "turn_budget": self.budget.turns,
             "transcript_char_budget": self.budget.transcript_chars,
+            # The one field that distinguishes two packets with identical
+            # counts, which is most of them.
+            "content_digest": self.content_digest(),
         }
 
 
@@ -265,13 +304,34 @@ def build_context_packet(
 
     windowed = all_turns[-budget.turns :]
 
-    # The character ceiling, applied oldest-first. One pasted wall of text must
+    # The character ceiling, applied newest-first. One pasted wall of text must
     # not be able to push out the exchange it was pasted into.
+    ceiling = max(0, budget.transcript_chars)
     kept: list[ConversationTurn] = []
     used = 0
+    truncated_turns = 0
+    truncated_chars = 0
     for turn in reversed(windowed):
         cost = len(turn.render()) + 1
-        if kept and used + cost > max(0, budget.transcript_chars):
+        if not kept and cost > ceiling:
+            # The newest turn does not fit on its own. It used to be admitted
+            # whole anyway — the guard was `if kept and ...` — so a single
+            # 10,000-character message rendered a 10,005-character transcript
+            # against a 6,000 budget, AND took the exchange it was pasted into
+            # down with it, since nothing else could follow.
+            #
+            # Neither extreme is right: dropping it loses the message the reply
+            # is answering, and keeping it whole makes the budget a suggestion.
+            # So it is shortened, and the shortening is recorded.
+            shortened = _shorten(turn, ceiling)
+            if shortened is None:
+                break
+            truncated_turns += 1
+            truncated_chars += len(turn.text) - len(shortened.text)
+            kept.append(shortened)
+            used += len(shortened.render()) + 1
+            continue
+        if kept and used + cost > ceiling:
             break
         kept.append(turn)
         used += cost
@@ -284,5 +344,39 @@ def build_context_packet(
         dropped_turns=max(0, len(all_turns) - len(kept)),
         dropped_threads=dropped_threads,
         dropped_episodes=dropped_episodes,
+        truncated_turns=truncated_turns,
+        truncated_chars=truncated_chars,
         budget=budget,
     )
+
+
+#: Marks where a turn was shortened, and by how much. Visible on purpose: a
+#: reader — human or model — must be able to tell an abridged message from a
+#: complete one, or it will answer the abridgement as though it were the whole.
+ELISION = "[… {count} characters omitted …]"
+
+
+def _shorten(turn: ConversationTurn, ceiling: int) -> ConversationTurn | None:
+    """One turn cut to fit, keeping both ends.
+
+    Head AND tail, not just the head. A long message very often puts its point
+    at the end — "…and anyway, can you send me the other one?" — and a head-only
+    cut would reliably discard exactly the part the reply has to answer.
+
+    Returns None when the ceiling cannot fit even the scaffolding, in which case
+    the caller drops the turn rather than emitting a marker with no message
+    around it.
+    """
+    prefix = len(turn.render()) - len(turn.text)
+    room = ceiling - prefix - len(ELISION.format(count=999999)) - 1
+    if room < 40:
+        return None
+
+    head = room * 2 // 3
+    tail = room - head
+    text = turn.text
+    removed = len(text) - head - tail
+    if removed <= 0:
+        return turn
+    cut = f"{text[:head]} {ELISION.format(count=removed)} {text[-tail:]}"
+    return ConversationTurn(speaker=turn.speaker, bubbles=(cut,), at=turn.at)
