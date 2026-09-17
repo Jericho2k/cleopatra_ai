@@ -315,16 +315,21 @@ async def _should_still_send(action: dict) -> ActionCheck:
     if getattr(fan, "needs_human_review", False):
         return ActionCheck(False, "fan frozen for human review")
 
-    if action_type != "POST_PURCHASE_REACTION":
-        # Auto mode must still be on for this fan.
-        fan_auto = getattr(fan, "auto_mode", None)
-        if fan_auto is None:
-            try:
-                fan_auto = await _creator_auto_mode_default(creator_id)
-            except Exception:
-                fan_auto = False
-        if not fan_auto:
-            return ActionCheck(False, "auto mode off")
+    # Auto mode must still be on for this fan.
+    #
+    # POST_PURCHASE_REACTION used to be exempt from this, so a customer whose
+    # creator had switched automation OFF still received an automated message
+    # about their purchase. Auto off means an operator has the conversation,
+    # and money having just changed hands is the worst moment to message over
+    # the top of them.
+    fan_auto = getattr(fan, "auto_mode", None)
+    if fan_auto is None:
+        try:
+            fan_auto = await _creator_auto_mode_default(creator_id)
+        except Exception:
+            fan_auto = False
+    if not fan_auto:
+        return ActionCheck(False, "auto mode off")
 
     if action_type == "AUTO_REPLY":
         from main import _creator_auto_availability
@@ -641,10 +646,56 @@ async def _require_delivery_route(action: dict) -> None:
 
 
 async def _run_post_purchase_reaction(action: dict) -> HandlerResult:
-    return await _send_goal(
-        action,
-        "A purchase was just confirmed; send the already prepared short reaction.",
+    """Nudge after a purchase, or deliberately say nothing.
+
+    Mostly nothing. The nudge exists to catch a customer who bought and then
+    went quiet, and the commonest case by the time it comes due is that he did
+    not — he replied, which makes "don't leave me hanging" read as not having
+    been listened to.
+
+    Re-decided here rather than at schedule time because everything it depends
+    on can change inside the thirty-second window: he can reply, an operator
+    can take over, a hold can be raised.
+    """
+    from datetime import datetime as _datetime
+
+    from db.queries import get_conversation_history
+    from services.conversation_continuity import open_threads_for
+    from services.post_purchase import REACTION_GOAL, decide
+
+    payload = action.get("payload") or {}
+    fan_id = str(action["fan_id"])
+    creator_id = str(action["creator_id"])
+
+    purchased_at = None
+    raw = str(payload.get("purchase_at") or "")
+    if raw:
+        try:
+            purchased_at = _datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            purchased_at = None
+
+    try:
+        history = await get_conversation_history(fan_id, limit=20)
+        threads = await open_threads_for(creator_id, fan_id, expire_first=False)
+    except Exception as exc:
+        # Could not establish whether he replied. Staying quiet is the safe
+        # direction: a nudge that should not have gone cannot be taken back,
+        # and one that did not go can be sent by a person.
+        return HandlerResult(
+            reason=f"could not check whether he replied ({type(exc).__name__})"
+        )
+
+    eligibility = decide(
+        history=history,
+        open_threads=threads,
+        purchased_at=purchased_at,
     )
+    if eligibility.silent:
+        print(f"[POST PURCHASE] fan={fan_id} silent: {eligibility.reason}")
+        return HandlerResult(reason=eligibility.reason)
+
+    return await _send_goal(action, REACTION_GOAL)
 
 
 async def _run_offer_expiry(action: dict) -> HandlerResult:

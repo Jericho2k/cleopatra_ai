@@ -2636,15 +2636,15 @@ async def _debounced_auto_reply(
         _release_auto_reply_slot(fan_id)
 
 
-_REACTION_FISHING_LINES = [
-    "let me know what you think 🙈",
-    "tell me how you feel about it...",
-    "dying to know your reaction 😏",
-    "don't leave me hanging",
-    "what do you think? 👀",
-    "hope it was worth the wait",
-    "your reaction is everything to me rn",
-]
+# Removed: _REACTION_FISHING_LINES.
+#
+# Seven sentences, one picked at random at schedule time and frozen into the
+# queued action, sent to every customer after every purchase. It bypassed the
+# writer entirely — services/proactive.py generates from a goal and the
+# conversation unless _delivery.text is already set — so the message that
+# follows money changing hands was the only proactive message that never read
+# the conversation it was about. services/post_purchase.py decides at execute
+# time whether to say anything at all, and the writer says it.
 
 
 async def record_ppv_purchase(
@@ -2974,17 +2974,22 @@ async def record_ppv_purchase(
         from datetime import datetime, timedelta, timezone
 
         purchased_at = datetime.now(timezone.utc)
-        line = random.choice(_REACTION_FISHING_LINES)
         reaction_key = platform_order_id or reference or f"{media_id}:{purchased_at.isoformat()}"
         await schedule_action(
             creator_id=creator_id,
             fan_id=fan_id,
             action_type="POST_PURCHASE_REACTION",
             execute_at=purchased_at + timedelta(seconds=random.uniform(20.0, 55.0)),
+            # No _delivery.text. It used to carry one of seven sentences picked
+            # by random.choice at THIS moment — before he had a chance to
+            # react, before an operator could take over — and setting it
+            # short-circuits generation in services/proactive.py, so the one
+            # proactive message that follows money changing hands was the only
+            # one that never saw the conversation. The goal is decided at
+            # execute time instead (services/post_purchase.py).
             payload={
                 "purchase_at": purchased_at.isoformat(),
                 "media_id": str(media_id),
-                "_delivery": {"text": line},
             },
             dedupe_key=f"post-purchase-reaction:{fan_id}:{reaction_key}",
         )
