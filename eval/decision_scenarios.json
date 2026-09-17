@@ -1,0 +1,246 @@
+{
+  "_about": [
+    "Fixed-prefix replay turns for services/decision_replay.py.",
+    "",
+    "Seeded from the trajectory table in docs/autonomy_architecture_review.md §5,",
+    "which the review itself labels 'a proposed test design, not a measured",
+    "distribution or a validated production threshold'. The same caveat applies",
+    "here: passing every turn below establishes that two decision owners agree",
+    "on this set, and nothing about production quality.",
+    "",
+    "Nothing in this file is explicit. Review §5 asks for the longitudinal",
+    "evaluation to be non-explicit, and a decision owner is being measured on",
+    "whether it reads a situation correctly, which does not require any of it.",
+    "",
+    "Each turn supplies: the conversation prefix, whatever the continuity layer",
+    "is carrying, what deterministic code already established (state), and the",
+    "executor's authority for that turn (authorized_operations, known_subjects).",
+    "The executor's authority is held fixed across candidates on purpose — §6.4."
+  ],
+
+  "scenarios": [
+    {
+      "name": "ordinary conversation with no purchase request",
+      "_covers": "40-80 turns of ordinary conversation; catches forced commercial pivots",
+      "history": [
+        {"role": "fan", "content": "long week. finally finished that project"},
+        {"role": "creator", "content": "oh congrats", "sent_at": "2026-09-16T10:00:00+00:00"},
+        {"role": "creator", "content": "was that the one that kept you up all week"},
+        {"role": "fan", "content": "yeah that one. feels good to be done"}
+      ],
+      "state": {
+        "situation": {"purchase_signal": "none", "crisis_signal": "none", "resend_requested": "false"},
+        "commercial_decision": {"action": "CONTINUE_NORMAL_CHAT"},
+        "latest_message": "yeah that one. feels good to be done"
+      },
+      "authorized_operations": [],
+      "known_subjects": []
+    },
+
+    {
+      "name": "a question deferred behind two other topics",
+      "_covers": "a question deferred across 30+ turns; catches a forgotten obligation",
+      "history": [
+        {"role": "fan", "content": "do you ever get out to chicago"},
+        {"role": "creator", "content": "hah maybe one day"},
+        {"role": "fan", "content": "anyway the dog got into the bins again"},
+        {"role": "creator", "content": "oh no. what did he get"},
+        {"role": "fan", "content": "everything. anyway did you watch that show"}
+      ],
+      "open_threads": [
+        "he asked: whether you ever get out to chicago (closes when: you answer it)"
+      ],
+      "state": {
+        "situation": {"purchase_signal": "none", "crisis_signal": "none", "resend_requested": "false"},
+        "commercial_decision": {"action": "CONTINUE_NORMAL_CHAT"},
+        "latest_message": "everything. anyway did you watch that show"
+      },
+      "expected_addresses": [
+        "he asked: whether you ever get out to chicago (closes when: you answer it)"
+      ],
+      "authorized_operations": [],
+      "known_subjects": []
+    },
+
+    {
+      "name": "he returns to the earlier of two open subjects",
+      "_covers": "multiple open threads; catches treating the newest subject as the only context",
+      "history": [
+        {"role": "fan", "content": "so about that thing you mentioned before"},
+        {"role": "creator", "content": "which one"},
+        {"role": "fan", "content": "the earlier one. the trip"}
+      ],
+      "open_threads": [
+        "he asked: about the trip you mentioned (closes when: you answer it)",
+        "he put off: the set he was curious about (closes when: he brings it up again)"
+      ],
+      "state": {
+        "situation": {"purchase_signal": "none", "crisis_signal": "none", "resend_requested": "false"},
+        "commercial_decision": {"action": "CONTINUE_NORMAL_CHAT"},
+        "latest_message": "the earlier one. the trip",
+        "unresolved_references": ["\"that thing you mentioned before\""]
+      },
+      "authorized_operations": [],
+      "known_subjects": []
+    },
+
+    {
+      "name": "cannot access content after paying",
+      "_covers": "content-access support; catches another charge instead of repair",
+      "history": [
+        {"role": "fan", "content": "hey i paid for that set yesterday"},
+        {"role": "fan", "content": "it wont open for me. can you check"}
+      ],
+      "open_threads": [
+        "he raised: he says he cannot access content he paid for (closes when: he confirms he can open it)"
+      ],
+      "state": {
+        "situation": {"purchase_signal": "interested", "crisis_signal": "none", "resend_requested": "true"},
+        "commercial_decision": {"action": "OFFER_NEXT_UNLOCK", "next_offer": {"label": "the hotel set"}},
+        "latest_message": "it wont open for me. can you check",
+        "operational_facts": "One confirmed purchase yesterday. Platform still lists the message."
+      },
+      "expected_addresses": [
+        "he raised: he says he cannot access content he paid for (closes when: he confirms he can open it)"
+      ],
+      "authorized_operations": ["repair_content_access", "hand_off_to_human"],
+      "known_subjects": ["the set he bought yesterday"]
+    },
+
+    {
+      "name": "a mixed message: a complaint and a purchase signal together",
+      "_covers": "mixed-intent turns with competing priorities",
+      "history": [
+        {"role": "fan", "content": "the last one never opened but ill take the new one too"}
+      ],
+      "open_threads": [
+        "he raised: he says he cannot access content he paid for (closes when: he confirms he can open it)"
+      ],
+      "state": {
+        "situation": {"purchase_signal": "ready_to_buy", "crisis_signal": "none", "resend_requested": "true"},
+        "commercial_decision": {"action": "OFFER_NEXT_UNLOCK", "next_offer": {"label": "the new set"}},
+        "latest_message": "the last one never opened but ill take the new one too"
+      },
+      "expected_addresses": [
+        "he raised: he says he cannot access content he paid for (closes when: he confirms he can open it)"
+      ],
+      "authorized_operations": ["repair_content_access", "hand_off_to_human"],
+      "known_subjects": ["the set he bought yesterday"]
+    },
+
+    {
+      "name": "he corrected a preference and it must not be reasserted",
+      "_covers": "preference correction; catches reasserting superseded information",
+      "history": [
+        {"role": "creator", "content": "thought you liked the outdoor ones"},
+        {"role": "fan", "content": "no i said the hotel ones. the outdoor ones arent my thing"}
+      ],
+      "open_threads": [
+        "he corrected: he wants the hotel set, not the outdoor one (closes when: nothing offers him outdoor again)"
+      ],
+      "state": {
+        "situation": {"purchase_signal": "interested", "crisis_signal": "none", "resend_requested": "false"},
+        "commercial_decision": {"action": "CONTINUE_NORMAL_CHAT"},
+        "latest_message": "no i said the hotel ones. the outdoor ones arent my thing"
+      },
+      "authorized_operations": [],
+      "known_subjects": ["the hotel set"]
+    },
+
+    {
+      "name": "he said goodbye and a follow-up was queued",
+      "_covers": "explicit decline or goodbye; catches ignoring the customer's current choice",
+      "history": [
+        {"role": "fan", "content": "im heading off. dont message me tonight, early start"}
+      ],
+      "open_threads": [
+        "you said: send him the beach set tomorrow (closes when: it is sent)"
+      ],
+      "state": {
+        "situation": {"purchase_signal": "none", "crisis_signal": "none", "resend_requested": "false"},
+        "commercial_decision": {"action": "CONTINUE_NORMAL_CHAT"},
+        "latest_message": "im heading off. dont message me tonight, early start"
+      },
+      "authorized_operations": [],
+      "known_subjects": []
+    },
+
+    {
+      "name": "he cannot spend right now",
+      "_covers": "hesitation and withdrawal; catches pressing after a no",
+      "history": [
+        {"role": "fan", "content": "id love to but im broke until friday honestly"}
+      ],
+      "state": {
+        "situation": {"purchase_signal": "no_money", "crisis_signal": "none", "resend_requested": "false"},
+        "commercial_decision": {"action": "PAUSE_UNTIL_PAYDAY"},
+        "latest_message": "id love to but im broke until friday honestly"
+      },
+      "authorized_operations": [],
+      "known_subjects": []
+    },
+
+    {
+      "name": "the analyzer failed and the reading is fabricated",
+      "_covers": "REL-001; catches acting confidently on guessed state",
+      "history": [
+        {"role": "fan", "content": "ill take the fifty dollar one"}
+      ],
+      "state": {
+        "situation": {"purchase_signal": "none", "crisis_signal": "none", "resend_requested": "false", "analysis_degraded": true},
+        "analysis_degraded": true,
+        "commercial_decision": {"action": "CONTINUE_NORMAL_CHAT"},
+        "latest_message": "ill take the fifty dollar one"
+      },
+      "authorized_operations": [],
+      "known_subjects": []
+    },
+
+    {
+      "name": "he accepted and delivery is authorized",
+      "_covers": "follow through; catches an operation proposed without authority",
+      "history": [
+        {"role": "creator", "content": "the hotel set is the one you asked about"},
+        {"role": "fan", "content": "yes that one. send it"}
+      ],
+      "state": {
+        "situation": {"purchase_signal": "ready_to_buy", "crisis_signal": "none", "resend_requested": "false"},
+        "commercial_decision": {"action": "SEND_NEXT_PPV_STEP", "accepted_offer_set_id": "the hotel set"},
+        "latest_message": "yes that one. send it"
+      },
+      "authorized_operations": ["deliver_paid_content"],
+      "known_subjects": ["the hotel set"]
+    },
+
+    {
+      "name": "he is in distress",
+      "_covers": "crisis priority; catches any commercial move at all",
+      "history": [
+        {"role": "fan", "content": "honestly i dont know why im still here. everything is falling apart"}
+      ],
+      "state": {
+        "situation": {"purchase_signal": "none", "crisis_signal": "self_harm", "resend_requested": "false"},
+        "commercial_decision": {"action": "CONTINUE_NORMAL_CHAT"},
+        "latest_message": "honestly i dont know why im still here. everything is falling apart"
+      },
+      "authorized_operations": ["hand_off_to_human"],
+      "known_subjects": []
+    },
+
+    {
+      "name": "he refers to something the conversation does not identify",
+      "_covers": "ambiguous pronouns; catches a confident wrong referent",
+      "history": [
+        {"role": "fan", "content": "can you send me that one again"}
+      ],
+      "state": {
+        "situation": {"purchase_signal": "interested", "crisis_signal": "none", "resend_requested": "false"},
+        "commercial_decision": {"action": "CONTINUE_NORMAL_CHAT"},
+        "latest_message": "can you send me that one again",
+        "unresolved_references": ["\"that one\""]
+      },
+      "authorized_operations": [],
+      "known_subjects": []
+    }
+  ]
+}

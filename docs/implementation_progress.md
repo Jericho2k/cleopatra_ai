@@ -61,7 +61,7 @@ review-hold write propagating instead of pretending a handoff succeeded.
 | 0 — ground truth for every visible reply | 1 | **Done** (this branch) |
 | 1 — close execution bypasses | 2 | **Done** except confirming the live deployment |
 | 2 — the general continuity packet | 3 | **Done** except semantic extraction |
-| 3 — one decision owner, compared under replay | 4 | Not started |
+| 3 — one decision owner, compared under replay | 4 | **Done** (offline; nothing wired live) |
 | 4 — longitudinal evaluation harness | 5 | Not started |
 | 5 — shadow real interactions | 5 (operational) | Out of scope for code alone |
 | 6 — bounded supervised pilot | 6 (operational) | Out of scope for code alone |
@@ -380,21 +380,99 @@ and could land sooner; it was left out to keep this change reviewable.
 
 ---
 
-## Sprint 3 — one decision owner, compared under replay
+## Sprint 3 — one decision owner, compared under replay — DONE (offline)
 
 > §6.4: *Keep the executor fixed; compare the current controller stack with a
 > single semantic decision owner. Change model routing separately.*
 
-Finding F. The review is explicit that adding another planner on top would add
-another authority, and that a shorter prompt must not be assumed better —
-removal is tested under replay, not argued. Two candidates are named: one model
-call returning a reply plus typed intent, versus a separate semantic planner
-then a writer. The second costs more and adds a failure point; take it only if
-complete-conversation evaluation shows a benefit.
+Finding F. Four things prescribe a next move today, each in its own vocabulary:
+`CommercialDecision.action`, `ConversationDirectorState` (action + phase),
+`SessionStrategy` (next_action + goal + a `writer_goal` sentence), and the
+analyzer's `strategic_move`. Nothing states what a turn is actually doing, so
+nothing could compare two ways of deciding it.
 
-Deterministic code keeps permissions, consent, money, inventory, entitlements,
-idempotency and competing events. Neither candidate may authorize a charge or
-declare a tool succeeded.
+### What was built
+
+**`models/conversation_decision.py`** — the interface, with exactly the contents
+§4 specifies: active needs, the messages supporting that reading, unresolved
+references, what the reply must address, any proposed operation, and why it
+waits or hands off. The second half of §4's sentence is enforced by the type:
+there is no field for a phase, a tone ladder, a bubble count or a sentence
+shape, and `FORBIDDEN_FIELDS` plus a test means a future owner that adds one
+fails rather than quietly reintroducing what this replaces.
+`ProposedOperation` carries no price, no media id and no success flag — §4's
+"neither model can authorize a charge or declare a tool succeeded", as a type.
+
+**`deterministic_violations`** — the always-on checks §4 requires: an
+unauthorized operation, an invented subject, a named price, a claim that
+something already happened, a hold with no reason. A violation is a refusal, not
+a warning.
+
+**`services/decision_owners.py`** — two candidates behind one interface.
+`current_stack_decision` is a **pure projection** of what the existing
+controllers already decided: no model call, nothing inferred, behaviour
+unchanged. `SemanticDecisionOwner` is one model call reading the same packet,
+offline only.
+
+**`services/decision_replay.py` + `scripts/run_decision_replay.py`** — the
+fixed-prefix replay. Every candidate gets the same context packet, the same
+operational facts and the same executor authority. It reports disagreements,
+counts critical failures **separately** (§5: a prose score must never cancel an
+unauthorized transaction), and counts obligations a candidate would not have
+addressed. It picks no winner: §4 says select the semantic owner only if
+complete-conversation evaluation establishes a benefit.
+
+**`eval/decision_scenarios.json`** — 12 turns, each declaring which row of §5's
+trajectory table it covers, with a test that fails if a row loses its last
+scenario. Non-explicit, as §5 asks.
+
+### What the first run found
+
+```
+12 turns, 1 candidates: current_stack
+disagreed on 0 of 12 turns
+  current_stack: 0 critical failure(s), 6 turn(s) with a missed obligation
+```
+
+Two findings worth recording.
+
+**The current stack decides nothing about outstanding obligations.** Six of
+twelve turns carry one, and no controller takes an obligation as input — the
+commercial policy decides a business move, the director a conversational move,
+the session strategy a goal. The threads reach the prompt (Sprint 2) and the
+reply either happens to pick one up or does not. `current_stack_decision`
+therefore leaves `must_address` empty on purpose: filling it in from the packet
+would make the projection look like it decides something it does not, and would
+make the metric vacuous. A test asserts this count stays above zero, so the
+comparison cannot quietly stop measuring anything.
+
+**The commercial layer computes an offer independently of a complaint.** On an
+access-complaint turn the commercial decision still says `OFFER_NEXT_UNLOCK`.
+In the live path an ordering guard returns before it is reached (PR #48), and
+that guard is real — this is not a claim it fails. But an offer existing at all
+inside a decision whose own reason is "hand this to a human" is finding F
+exactly: two representations of the next move, kept apart only by the order they
+happen to run in. The projection records it in the hold reason rather than
+dropping it silently.
+
+### Verification
+
+`2297 passed, 0 skipped` — the whole suite including every PostgreSQL schema
+test, on a clean throwaway database. Up from 2258 at the end of Sprint 2.
+
+> A note for the next session: running the migration pipeline into a database's
+> `public` schema breaks the idempotence guards for later *scoped* runs in the
+> same database, and three schema-pipeline tests then fail for that reason
+> alone. Use a fresh database (`createdb`) for anything that applies the
+> pipeline outside the test fixtures.
+
+### Nothing is wired into the live path
+
+Deliberate, and the point of the sprint. The review warns that a planner added
+on top is another authority, and that the effect of removing duplicated guidance
+must be tested under replay. What exists now is the measurement. Deciding which
+core ships is a question for Sprint 4's longitudinal evaluation plus human
+review, not for this branch.
 
 ---
 
