@@ -90,7 +90,15 @@ def test_the_same_question_mentioned_four_times_is_one_obligation(db):
     )
 
 
-def test_rewording_the_same_question_still_collapses_to_one(db):
+def test_recasing_and_repunctuating_the_same_question_collapses_to_one(db):
+    """Named for what it actually covers.
+
+    It was called "rewording", which claims more than it tests: these two
+    strings differ only in case and a trailing "!". `subject_key` keeps word
+    ORDER, so a genuine rewording — "whether you ever visit Chicago" against
+    "whether you visit Chicago ever" — produces two threads, deliberately.
+    tests/test_gate_c.py asserts that limit directly.
+    """
     run(continuity.record_open_thread(_thread(summary="whether you ever visit Chicago")))
     run(continuity.record_open_thread(_thread(summary="Whether you ever visit Chicago!")))
 
