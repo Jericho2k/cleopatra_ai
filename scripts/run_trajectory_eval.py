@@ -41,10 +41,38 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from services.trajectory_eval import (  # noqa: E402
+    TrajectoryReport,
+    TurnRecord,
+    coverage_gaps,
     load_trajectories,
     render_reports,
     run_trajectory,
 )
+
+
+def _declared_gaps(trajectory):
+    """What this trajectory could not cover even if every turn succeeded.
+
+    Built by asking the same function the real run uses, against a report
+    describing the best case: every declared turn ran, no clock was injected
+    (none exists), and no due-work cycle happened unless the fixture has an
+    unprompted turn. One definition of "covered", used by both paths.
+    """
+    best_case = TrajectoryReport(
+        trajectory=trajectory.name,
+        covers=trajectory.covers,
+        turns=[
+            TurnRecord(index=index, customer_message=disturbance.message)
+            for index, disturbance in enumerate(trajectory.disturbances)
+        ],
+        due_worker_runs=sum(
+            1
+            for disturbance in trajectory.disturbances
+            if not str(disturbance.message or "").strip()
+        ),
+    )
+    return coverage_gaps(trajectory, best_case)
+
 
 DEFAULT_TRAJECTORIES = ROOT / "eval" / "trajectories.json"
 
@@ -54,6 +82,48 @@ def _load(path: Path) -> list[dict]:
     if isinstance(payload, dict):
         return list(payload.get("trajectories") or [])
     return list(payload or [])
+
+
+async def _run_due_work(creator_id: str, fan_id: str) -> dict:
+    """Run one due-work cycle and report what the customer received from it.
+
+    A turn with no customer message is not "nothing happens". It is the moment
+    a queued follow-up becomes due, which is precisely what the goodbye
+    trajectory exists to test: a customer asked for no follow-up, and something
+    was already scheduled.
+
+    This used to return ``{"outcome": "no_message"}`` without running anything,
+    so that trajectory could not detect the behaviour it claimed to cover — the
+    one turn that mattered was the one guaranteed to do nothing.
+
+    Messages the cycle sends are read back off the conversation, because the
+    worker delivers them rather than returning them.
+    """
+    from services.suggestions import _recent_creator_message_rows
+    from workers.scheduled_actions import process_cycle
+
+    # The same reader the simulated turn uses, so a message the worker sent and
+    # a message a turn sent are identified the same way — by row id, which is
+    # what keeps multipart replies ordered and complete.
+    before = {str(row.get("id")) for row in await _recent_creator_message_rows(fan_id)}
+    result = await process_cycle(limit=20)
+    fresh = [
+        row
+        for row in await _recent_creator_message_rows(fan_id)
+        if str(row.get("id")) not in before
+    ]
+    return {
+        # Named for what it is. The turn ran queued work; whether that work
+        # sent anything is the finding, not the label.
+        "outcome": "due_work_ran" if fresh else "due_work_sent_nothing",
+        "creator_messages": fresh,
+        "due_worker_ran": True,
+        "due_work": {
+            "claimed": getattr(result, "claimed", 0),
+            "processed": getattr(result, "processed", 0),
+            "errors": getattr(result, "errors", 0),
+        },
+    }
 
 
 async def _run_all(trajectories, creator_id: str, fan_id: str) -> list:
@@ -66,14 +136,17 @@ async def _run_all(trajectories, creator_id: str, fan_id: str) -> list:
 
         async def send_turn(message: str, _creator=creator, _fan=fan) -> dict:
             if not message.strip():
-                # A turn where the customer says nothing. The system is not
-                # asked anything, so nothing should happen — which is exactly
-                # what the goodbye trajectory is checking.
-                return {"outcome": "no_message", "creator_messages": []}
+                return await _run_due_work(_creator, _fan)
             return await run_simulated_inbound(
                 fan_id=_fan, creator_id=_creator, message=message, fast=True
             )
 
+        # advance_clock is deliberately NOT supplied. There is no seam in the
+        # backend that moves expiry, scheduling and continuity together, so
+        # anything passed here would advance a number and nothing else — which
+        # is worse than not advancing it, because the report would then claim
+        # the week passed. run_trajectory records that no clock was injected
+        # and reports the elapsed-time claims as uncovered.
         reports.append(await run_trajectory(trajectory, send_turn=send_turn))
     return reports
 
@@ -99,6 +172,15 @@ def main() -> int:
         action="store_true",
         help="exit non-zero if any trajectory produced a critical execution failure",
     )
+    parser.add_argument(
+        "--fail-on-uncovered",
+        action="store_true",
+        help=(
+            "exit non-zero if any trajectory did not cover what it claims. "
+            "Separate from --fail-on-critical: an uncovered claim is not a "
+            "system failure, it is a run that did not test what it says"
+        ),
+    )
     args = parser.parse_args()
 
     trajectories = load_trajectories(_load(args.trajectories))
@@ -110,6 +192,11 @@ def main() -> int:
         for trajectory in trajectories:
             print(f"{trajectory.name} ({len(trajectory.disturbances)} turns)")
             print(f"  covers: {trajectory.covers}")
+            # The claim next to what the fixture can actually reach. Printing
+            # the claim alone is how "40-80 turns of ordinary conversation"
+            # came to sit above a seven-turn script for as long as it did.
+            for gap in _declared_gaps(trajectory):
+                print(f"  {gap.render()}")
             for index, disturbance in enumerate(trajectory.disturbances):
                 marks = []
                 if disturbance.days_since_previous:
@@ -139,6 +226,14 @@ def main() -> int:
                 [
                     {
                         "summary": report.summary(),
+                        "coverage_gaps": [
+                            {
+                                "claim": gap.claim,
+                                "required": gap.required,
+                                "actual": gap.actual,
+                            }
+                            for gap in report.coverage_gaps
+                        ],
                         "findings": [
                             {
                                 "severity": finding.severity.value,
@@ -170,6 +265,8 @@ def main() -> int:
         print(render_reports(reports))
 
     if args.fail_on_critical and any(report.critical for report in reports):
+        return 1
+    if args.fail_on_uncovered and any(report.coverage_gaps for report in reports):
         return 1
     return 0
 

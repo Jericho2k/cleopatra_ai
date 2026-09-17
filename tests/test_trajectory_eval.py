@@ -23,11 +23,13 @@ from pathlib import Path
 import pytest
 
 from services.trajectory_eval import (
+    CoverageGap,
     Disturbance,
     FAILED_OUTCOMES,
     Finding,
     Severity,
     TurnOutcome,
+    coverage_gaps,
     Trajectory,
     TrajectoryReport,
     TurnRecord,
@@ -861,3 +863,190 @@ def test_the_summary_still_has_no_quality_score():
 
     assert "score" not in json.dumps(summary).lower()
     assert "grade" not in json.dumps(summary).lower()
+
+
+# ===========================================================================
+# A claim the run did not reach is reported, not printed over
+# ===========================================================================
+#
+# `covers` on the first trajectory reads "40-80 turns of ordinary
+# conversation" and the script is seven turns. The deferred-question row says
+# "30+ turns" and has five. Nothing compared the sentence to the thing, so the
+# sentence was all a reader ever saw — including in --describe, whose whole job
+# is to say what these cover.
+#
+# CoverageGap does not make the fixtures longer. It stops the report claiming
+# they are.
+
+
+def _ran(count: int, **report_kwargs) -> TrajectoryReport:
+    return TrajectoryReport(
+        trajectory="t",
+        turns=[_turn(index, "ok") for index in range(count)],
+        **report_kwargs,
+    )
+
+
+def test_a_short_run_against_a_long_claim_is_reported_as_uncovered():
+    trajectory = Trajectory(name="t", disturbances=(), requires_turns=40)
+
+    gaps = coverage_gaps(trajectory, _ran(7))
+
+    assert [gap.claim for gap in gaps] == ["conversation length"]
+    assert "40 turns" in gaps[0].required
+    assert gaps[0].actual == "7"
+
+
+def test_a_run_that_reaches_the_claim_has_no_gap():
+    trajectory = Trajectory(name="t", disturbances=(), requires_turns=3)
+
+    assert coverage_gaps(trajectory, _ran(3)) == []
+
+
+def test_elapsed_days_without_a_clock_is_uncovered_rather_than_assumed():
+    """The failure mode this is really for.
+
+    days_since_previous was a no-op whenever the caller supplied no
+    advance_clock, silently — and the CLI supplied none. So "he comes back a
+    week later" ran its turns back to back while the label said a week passed.
+    """
+    trajectory = Trajectory(name="t", disturbances=(), requires_elapsed_days=8)
+
+    gaps = coverage_gaps(trajectory, _ran(4, clock_injected=False))
+
+    assert [gap.claim for gap in gaps] == ["elapsed time"]
+    assert "no clock was injected" in gaps[0].actual
+
+
+def test_a_clock_that_did_not_advance_far_enough_is_uncovered():
+    trajectory = Trajectory(name="t", disturbances=(), requires_elapsed_days=8)
+
+    gaps = coverage_gaps(trajectory, _ran(4, clock_injected=True, elapsed_days=1.0))
+
+    assert gaps[0].actual == "1"
+
+
+def test_a_clock_that_advanced_far_enough_covers_the_claim():
+    trajectory = Trajectory(name="t", disturbances=(), requires_elapsed_days=8)
+
+    report = _ran(4, clock_injected=True, elapsed_days=8.0)
+
+    assert coverage_gaps(trajectory, report) == []
+
+
+def test_a_queued_follow_up_claim_needs_a_cycle_to_have_run():
+    """The goodbye trajectory's one turn that mattered used to be a no-op.
+
+    An unprompted turn returned {"outcome": "no_message"} without running
+    anything, so the row claiming "a previously queued follow-up becomes due"
+    could not detect the behaviour it existed for.
+    """
+    trajectory = Trajectory(name="t", disturbances=(), requires_due_worker=True)
+
+    gaps = coverage_gaps(trajectory, _ran(4))
+
+    assert [gap.claim for gap in gaps] == ["queued work becoming due"]
+    assert coverage_gaps(trajectory, _ran(4, due_worker_runs=1)) == []
+
+
+def test_a_claim_of_payment_is_not_a_purchase():
+    """A complaint is not proof of payment, and neither is a fixture line."""
+    trajectory = Trajectory(
+        name="t", disturbances=(), requires_authoritative_purchase=True
+    )
+
+    gaps = coverage_gaps(trajectory, _ran(3))
+
+    assert [gap.claim for gap in gaps] == ["a purchase the ledger records"]
+    assert "the customer's own claim of payment" in gaps[0].actual
+
+
+def test_a_seeded_paid_delivery_covers_the_purchase_claim():
+    trajectory = Trajectory(
+        name="t", disturbances=(), requires_authoritative_purchase=True
+    )
+    report = _ran(3)
+    report.turns[1].provenance = [
+        {
+            "delivery": {
+                "kind": "ppv",
+                "accepted_by_platform": True,
+                "platform_message_id": "p-1",
+                "price_cents": 2500,
+            }
+        }
+    ]
+
+    assert coverage_gaps(trajectory, report) == []
+
+
+def test_a_trajectory_claiming_nothing_in_particular_has_no_gaps():
+    assert coverage_gaps(Trajectory(name="t", disturbances=()), _ran(2)) == []
+
+
+def test_the_summary_says_whether_the_run_covered_its_claim():
+    report = _ran(7)
+    report.coverage_gaps = [
+        CoverageGap(claim="conversation length", required="40 turns", actual="7")
+    ]
+
+    summary = report.summary()
+
+    assert summary["fully_covered"] is False
+    assert summary["coverage_gaps"][0]["required"] == "40 turns"
+
+
+def test_the_rendered_report_prints_the_gap_under_the_findings():
+    """A clean findings list above an uncovered claim is the misreading."""
+    report = _ran(7)
+    report.coverage_gaps = [
+        CoverageGap(claim="conversation length", required="40 turns", actual="7")
+    ]
+
+    rendered = report.render()
+
+    assert "NOT COVERED" in rendered
+    assert "40 turns" in rendered
+
+
+def test_the_shipped_trajectories_declare_what_they_need():
+    """The file's own claims, checked against the file.
+
+    This does not assert the gaps are closed — they are not, and the fixture
+    file says so in prose. It asserts that every long-conversation, elapsed-time
+    and paid-content row DECLARES its requirement, so closing one is visible and
+    dropping one is not silent.
+    """
+    trajectories = load_trajectories(
+        json.loads(TRAJECTORIES.read_text())["trajectories"]
+    )
+    by_name = {t.name: t for t in trajectories}
+
+    assert by_name["ordinary conversation with no purchase goal"].requires_turns == 40
+    assert by_name["a question deferred behind two other topics"].requires_turns == 30
+    assert by_name[
+        "he comes back a day later, then a week later"
+    ].requires_elapsed_days == 8
+    assert by_name["he says goodnight and asks for no follow-up"].requires_due_worker
+    assert by_name[
+        "he cannot open something he paid for, then asks for more"
+    ].requires_authoritative_purchase
+
+
+def test_the_long_conversation_claims_are_currently_uncovered():
+    """Pinned deliberately, so closing the gap is a visible change.
+
+    If somebody lengthens the fixtures, this test fails and they update it —
+    which is the point. The alternative is a harness that silently keeps
+    claiming forty turns whatever the file holds.
+    """
+    trajectories = load_trajectories(
+        json.loads(TRAJECTORIES.read_text())["trajectories"]
+    )
+    long_form = next(
+        t for t in trajectories if t.name == "ordinary conversation with no purchase goal"
+    )
+
+    gaps = coverage_gaps(long_form, _ran(len(long_form.disturbances)))
+
+    assert [gap.claim for gap in gaps] == ["conversation length"]

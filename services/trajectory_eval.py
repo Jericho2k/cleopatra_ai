@@ -145,6 +145,30 @@ class Disturbance:
 
 
 @dataclass(frozen=True)
+class CoverageGap:
+    """Something a trajectory claims to cover that the run did not establish.
+
+    Deliberately not a ``Finding``. A finding is about the system's behaviour;
+    this is about the evaluation's reach. "The conversation forced a commercial
+    pivot" and "this run was seven turns long and the claim says forty" are
+    different kinds of statement, and merging them would let a clean findings
+    list read as a covered claim.
+
+    This exists because the labels were not true. ``--describe`` printed
+    "40-80 turns of ordinary conversation" above a seven-turn script, and
+    "a question deferred across 30+ turns" above a five-turn one. Nothing
+    compared the two, so the claim was the only thing a reader ever saw.
+    """
+
+    claim: str
+    required: str
+    actual: str
+
+    def render(self) -> str:
+        return f"[NOT COVERED] {self.claim}: needs {self.required}, run had {self.actual}"
+
+
+@dataclass(frozen=True)
 class Trajectory:
     """A whole conversation to run, and what it is testing."""
 
@@ -155,6 +179,24 @@ class Trajectory:
     covers: str = ""
     creator_id: str = ""
     fan_id: str = ""
+
+    # --- what the claim above actually needs, to be checked against the run --
+    #
+    # Declared per trajectory rather than parsed out of `covers`, because prose
+    # is not a specification and a regex over it would be a second thing that
+    # can disagree with reality.
+
+    #: Turns the claim needs. A "40-80 turn" row needs 40.
+    requires_turns: int = 0
+    #: Simulated days the claim needs to have elapsed.
+    requires_elapsed_days: float = 0.0
+    #: Whether the claim needs queued work to have actually become due and run.
+    requires_due_worker: bool = False
+    #: Whether the claim needs a purchase the ledger records, rather than a
+    #: customer message asserting one. A complaint is not proof of payment, and
+    #: a fixture that only says "i paid" tests the complaint handling and not
+    #: the thing the row claims.
+    requires_authoritative_purchase: bool = False
 
 
 class TurnOutcome(str, Enum):
@@ -278,6 +320,18 @@ class TrajectoryReport:
     covers: str = ""
     turns: list[TurnRecord] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
+    #: What this run did NOT establish, against what the trajectory claims.
+    coverage_gaps: list[CoverageGap] = field(default_factory=list)
+    #: Simulated days the run actually advanced. Zero when no clock was
+    #: injected, which is not the same as a conversation that happened in one
+    #: sitting — hence `clock_injected` below.
+    elapsed_days: float = 0.0
+    #: Whether a clock was supplied at all. Without one, a trajectory declaring
+    #: "he comes back a week later" ran its turns back to back, and every
+    #: expiry, schedule and continuity window saw one continuous session.
+    clock_injected: bool = False
+    #: How many turns ran queued work instead of delivering a customer message.
+    due_worker_runs: int = 0
 
     @property
     def critical(self) -> list[Finding]:
@@ -373,6 +427,16 @@ class TrajectoryReport:
             "unexplained_turns": self.unexplained_turns,
             "latency": self.latency(),
             "models_used": self.models_used(),
+            # What this run does not establish, stated in the summary rather
+            # than left for a reader to notice from the transcript's length.
+            "coverage_gaps": [
+                {"claim": gap.claim, "required": gap.required, "actual": gap.actual}
+                for gap in self.coverage_gaps
+            ],
+            "fully_covered": not self.coverage_gaps,
+            "elapsed_days": self.elapsed_days,
+            "clock_injected": self.clock_injected,
+            "due_worker_runs": self.due_worker_runs,
         }
 
     def render(self) -> str:
@@ -396,6 +460,10 @@ class TrajectoryReport:
         ]
         for finding in self.findings:
             lines.append(f"  {finding.render()}")
+        # Last, and never omitted when present: a clean findings list above an
+        # uncovered claim is the exact misreading this section exists to stop.
+        for gap in self.coverage_gaps:
+            lines.append(f"  {gap.render()}")
         return "\n".join(lines)
 
 
@@ -883,13 +951,21 @@ async def run_trajectory(
     measure the error rather than what the conversation did afterwards.
     """
     report = TrajectoryReport(trajectory=trajectory.name, covers=trajectory.covers)
+    report.clock_injected = advance_clock is not None
     creator_replies: list[str] = []
 
     for index, disturbance in enumerate(trajectory.disturbances):
-        if disturbance.days_since_previous and advance_clock is not None:
-            # Simulated absence. §1 tests a return after one day and one week,
-            # and no evaluation waits for either.
-            advance_clock(disturbance.days_since_previous)
+        if disturbance.days_since_previous:
+            if advance_clock is not None:
+                # Simulated absence. §1 tests a return after one day and one
+                # week, and no evaluation waits for either.
+                advance_clock(disturbance.days_since_previous)
+                report.elapsed_days += float(disturbance.days_since_previous)
+            # Without a clock, the turn still runs — and the report says the
+            # week did not pass, rather than the trajectory's label implying
+            # it did. `days_since_previous` was previously a no-op whenever
+            # the caller supplied nothing, silently, and the CLI supplied
+            # nothing.
 
         message = disturbance.next_message(creator_replies)
         record = TurnRecord(index=index, customer_message=message)
@@ -903,6 +979,8 @@ async def run_trajectory(
             continue
         record.latency_ms = int((time.monotonic() - started) * 1000)
         record.outcome = str((result or {}).get("outcome") or "")
+        if (result or {}).get("due_worker_ran"):
+            report.due_worker_runs += 1
         rows = (result or {}).get("creator_messages") or []
         # Provenance moved off the message row into the owner-only
         # message_diagnostics table (db/owner_only_diagnostics_v1.sql), because
@@ -927,7 +1005,86 @@ async def run_trajectory(
         report.turns.append(record)
 
     report.findings = evaluate_turns(report.turns, trajectory.disturbances)
+    report.coverage_gaps = coverage_gaps(trajectory, report)
     return report
+
+
+def coverage_gaps(
+    trajectory: Trajectory, report: "TrajectoryReport"
+) -> list[CoverageGap]:
+    """What this run did not establish about what the trajectory claims.
+
+    Compared against the RUN, not against the fixture. A fixture can declare
+    forty turns and still produce seven if turns failed, and the claim is about
+    what was exercised rather than what was written down.
+
+    This is the direct answer to the labels being wrong. "40-80 turns of
+    ordinary conversation" sat above a seven-turn script and "a question
+    deferred across 30+ turns" above a five-turn one, and nothing anywhere
+    compared the sentence to the thing. Reporting the gap does not make the
+    fixture longer; it stops the report claiming it is.
+    """
+    gaps: list[CoverageGap] = []
+    ran = len(report.turns)
+
+    if trajectory.requires_turns and ran < trajectory.requires_turns:
+        gaps.append(
+            CoverageGap(
+                claim="conversation length",
+                required=f"{trajectory.requires_turns} turns",
+                actual=f"{ran}",
+            )
+        )
+
+    if trajectory.requires_elapsed_days:
+        if not report.clock_injected:
+            gaps.append(
+                CoverageGap(
+                    claim="elapsed time",
+                    required=(
+                        f"{trajectory.requires_elapsed_days:g} simulated days, "
+                        "through expiry, scheduling and continuity"
+                    ),
+                    actual="no clock was injected; the turns ran back to back",
+                )
+            )
+        elif report.elapsed_days < trajectory.requires_elapsed_days:
+            gaps.append(
+                CoverageGap(
+                    claim="elapsed time",
+                    required=f"{trajectory.requires_elapsed_days:g} simulated days",
+                    actual=f"{report.elapsed_days:g}",
+                )
+            )
+
+    if trajectory.requires_due_worker and report.due_worker_runs == 0:
+        gaps.append(
+            CoverageGap(
+                claim="queued work becoming due",
+                required="a due-worker cycle to actually run",
+                actual="no cycle ran, so a queued follow-up could not fire",
+            )
+        )
+
+    if trajectory.requires_authoritative_purchase:
+        recorded = any(
+            record.get("delivery", {}).get("price_cents")
+            for turn in report.turns
+            for record in turn.provenance
+        )
+        if not recorded:
+            gaps.append(
+                CoverageGap(
+                    claim="a purchase the ledger records",
+                    required="a seeded delivery the ledger shows as paid",
+                    actual=(
+                        "only the customer's own claim of payment, which is "
+                        "what this row exists to distinguish from a purchase"
+                    ),
+                )
+            )
+
+    return gaps
 
 
 def load_trajectories(payload: Sequence[dict[str, Any]]) -> list[Trajectory]:
@@ -943,11 +1100,20 @@ def load_trajectories(payload: Sequence[dict[str, Any]]) -> list[Trajectory]:
                 tests=str(item.get("tests") or ""),
                 raises_obligation=str(item.get("raises_obligation") or ""),
                 asks_for_silence=bool(item.get("asks_for_silence")),
+                silence_expires_after_days=float(
+                    item.get("silence_expires_after_days") or 0.0
+                ),
+                lifts_silence=bool(item.get("lifts_silence")),
                 corrects=str(item.get("corrects") or ""),
+                corrected_to=str(item.get("corrected_to") or ""),
+                forbids_delivery_of=tuple(
+                    str(value) for value in (item.get("forbids_delivery_of") or [])
+                ),
             )
             for item in (raw.get("turns") or [])
             if isinstance(item, dict)
         )
+        requires = raw.get("requires") or {}
         trajectories.append(
             Trajectory(
                 name=str(raw.get("name") or f"trajectory-{len(trajectories) + 1}"),
@@ -955,6 +1121,12 @@ def load_trajectories(payload: Sequence[dict[str, Any]]) -> list[Trajectory]:
                 covers=str(raw.get("covers") or ""),
                 creator_id=str(raw.get("creator_id") or ""),
                 fan_id=str(raw.get("fan_id") or ""),
+                requires_turns=int(requires.get("turns") or 0),
+                requires_elapsed_days=float(requires.get("elapsed_days") or 0.0),
+                requires_due_worker=bool(requires.get("due_worker")),
+                requires_authoritative_purchase=bool(
+                    requires.get("authoritative_purchase")
+                ),
             )
         )
     return trajectories
