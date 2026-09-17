@@ -40,6 +40,8 @@ than negotiated here.
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from models.conversation_decision import (
@@ -276,13 +278,68 @@ Rules:
 - More than one active need is normal. Do not collapse a mixed message into one."""
 
 
-def parse_semantic_decision(text: str, *, source: str = SOURCE_SEMANTIC) -> ConversationDecision | None:
-    """Read the semantic owner's answer, or refuse it.
+#: The fields the contract in SEMANTIC_SYSTEM asks for and a decision cannot be
+#: read without. `active_needs` and the other lists may legitimately be empty,
+#: so their absence is tolerated; these three ARE the decision — what the turn
+#: proposes, whether it waits, and how far to trust either.
+REQUIRED_DECISION_FIELDS: tuple[str, ...] = ("operation", "hold", "confidence")
 
-    Returns ``None`` for anything unparseable. There is no partial credit and no
-    repair pass: a decision assembled out of a half-read response is exactly the
-    fabricated-analysis problem REL-001 was, and this candidate is being
-    measured, so a failure to answer must count as a failure to answer.
+
+@dataclass(frozen=True)
+class DecisionParse:
+    """A read of the semantic owner's answer, or a named refusal.
+
+    The reason is the point. ``parse_semantic_decision`` returned a bare None,
+    so every different way of failing — a truncated response, an invented
+    enum, a missing field — became the same "did not answer in the required
+    shape" line, and a comparison could not say WHICH candidate failed how.
+    """
+
+    decision: "ConversationDecision | None" = None
+    reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.decision is not None
+
+
+def _refuse(reason: str) -> DecisionParse:
+    return DecisionParse(decision=None, reason=reason)
+
+
+def parse_semantic_decision_result(
+    text: str, *, source: str = SOURCE_SEMANTIC
+) -> DecisionParse:
+    """Read the semantic owner's answer strictly, or say why it was refused.
+
+    STRICT, AND IT WAS NOT
+    ----------------------
+    The docstring of the version this replaces said "Returns None for anything
+    unparseable. There is no partial credit and no repair pass." The code did
+    the opposite for the cases that matter most: an unrecognised enum was
+    silently coerced to NONE and a missing ``confidence`` defaulted to 1.0, so
+
+        {"hold": "typo", "operation": "typo"}
+
+    produced a decision that proposed nothing, held nothing, and claimed FULL
+    confidence in that reading. Reproduced against backend 4a1683a. That is a
+    fabricated confident decision assembled from a response the parser could
+    not understand — REL-001's shape exactly, in the component whose entire
+    purpose is to be trusted enough to compare.
+
+    So every one of these is a refusal, and each says which it was:
+
+    * the response is not a JSON object;
+    * a required field is missing — a response that does not say what it
+      proposes or whether it holds has not answered;
+    * an enum is not one of the values the contract lists;
+    * a field is the wrong type;
+    * confidence is not a finite number, or is outside 0..1.
+
+    Out-of-range confidence is refused rather than clamped, which is the one
+    choice here worth arguing about. Clamping 1.5 to 1.0 RAISES a malformed
+    claim to maximum confidence — the failure mode this function exists to
+    prevent, applied by the repair.
     """
     raw = str(text or "").strip()
     if raw.startswith("```"):
@@ -291,47 +348,89 @@ def parse_semantic_decision(text: str, *, source: str = SOURCE_SEMANTIC) -> Conv
             raw = raw[4:]
     start, end = raw.find("{"), raw.rfind("}")
     if start < 0 or end <= start:
-        return None
+        return _refuse("the response contained no JSON object")
     try:
         payload = json.loads(raw[start : end + 1])
     except (ValueError, TypeError):
-        return None
+        return _refuse("the response was not valid JSON")
     if not isinstance(payload, dict):
-        return None
+        return _refuse("the response was not a JSON object")
 
-    def _list(key: str) -> tuple[str, ...]:
-        value = payload.get(key)
-        if not isinstance(value, list):
+    missing = [key for key in REQUIRED_DECISION_FIELDS if key not in payload]
+    if missing:
+        return _refuse(f"the response left out {', '.join(missing)}")
+
+    def _list(key: str) -> tuple[str, ...] | None:
+        value = payload.get(key, [])
+        if value is None:
             return ()
+        if not isinstance(value, list):
+            return None
         return tuple(str(item).strip() for item in value if str(item).strip())
 
-    try:
-        kind = OperationKind(str(payload.get("operation") or "none"))
-    except ValueError:
-        kind = OperationKind.NONE
-    try:
-        hold = HoldReason(str(payload.get("hold") or "none"))
-    except ValueError:
-        hold = HoldReason.NONE
-    try:
-        confidence = float(payload.get("confidence", 1.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
+    lists: dict[str, tuple[str, ...]] = {}
+    for key in (
+        "active_needs",
+        "unresolved_references",
+        "must_address",
+        "supporting_messages",
+    ):
+        parsed = _list(key)
+        if parsed is None:
+            return _refuse(f"{key} was not a list")
+        lists[key] = parsed
 
-    return ConversationDecision(
-        active_needs=_list("active_needs"),
-        unresolved_references=_list("unresolved_references"),
-        must_address=_list("must_address"),
-        proposed_operation=ProposedOperation(
-            kind=kind,
-            subject=str(payload.get("operation_subject") or "").strip(),
-            because=str(payload.get("operation_because") or "").strip(),
-        ),
-        hold=hold,
-        hold_detail=str(payload.get("hold_detail") or "").strip(),
-        source=source,
-        confidence=min(1.0, max(0.0, confidence)),
+    for key in ("operation", "hold"):
+        if not isinstance(payload.get(key), str):
+            return _refuse(f"{key} was not a string")
+    try:
+        kind = OperationKind(payload["operation"].strip() or "none")
+    except ValueError:
+        return _refuse(f"operation {payload['operation']!r} is not one this system knows")
+    try:
+        hold = HoldReason(payload["hold"].strip() or "none")
+    except ValueError:
+        return _refuse(f"hold {payload['hold']!r} is not one this system knows")
+
+    confidence_raw = payload["confidence"]
+    if isinstance(confidence_raw, bool) or not isinstance(confidence_raw, (int, float)):
+        # `bool` first: it is a subclass of int, and True would otherwise read
+        # as a confidence of 1.0 — the exact fabrication being prevented.
+        return _refuse("confidence was not a number")
+    confidence = float(confidence_raw)
+    if not math.isfinite(confidence):
+        return _refuse("confidence was not a finite number")
+    if not 0.0 <= confidence <= 1.0:
+        return _refuse(f"confidence {confidence} is outside 0..1")
+
+    for key in ("operation_subject", "operation_because", "hold_detail"):
+        if key in payload and payload[key] is not None and not isinstance(payload[key], str):
+            return _refuse(f"{key} was not a string")
+
+    return DecisionParse(
+        decision=ConversationDecision(
+            active_needs=lists["active_needs"],
+            supporting_messages=lists["supporting_messages"],
+            unresolved_references=lists["unresolved_references"],
+            must_address=lists["must_address"],
+            proposed_operation=ProposedOperation(
+                kind=kind,
+                subject=str(payload.get("operation_subject") or "").strip(),
+                because=str(payload.get("operation_because") or "").strip(),
+            ),
+            hold=hold,
+            hold_detail=str(payload.get("hold_detail") or "").strip(),
+            source=source,
+            confidence=confidence,
+        )
     )
+
+
+def parse_semantic_decision(
+    text: str, *, source: str = SOURCE_SEMANTIC
+) -> ConversationDecision | None:
+    """The decision, or None. ``parse_semantic_decision_result`` says why."""
+    return parse_semantic_decision_result(text, source=source).decision
 
 
 def build_semantic_prompt(packet: ContextPacket, state: dict[str, Any]) -> tuple[str, str]:
@@ -391,15 +490,18 @@ class SemanticDecisionOwner:
                 source=self.name,
                 confidence=0.0,
             )
-        decision = parse_semantic_decision(
+        parsed = parse_semantic_decision_result(
             getattr(result, "text", "") or "", source=self.name
         )
-        if decision is None:
+        if not parsed.ok:
+            # Naming the failure rather than flattening every one of them into
+            # "did not answer in the required shape": a comparison that cannot
+            # say WHICH candidate failed HOW is not much of a comparison.
             return ConversationDecision(
                 active_needs=(),
                 hold=HoldReason.INSUFFICIENT_EVIDENCE,
-                hold_detail="the semantic owner did not answer in the required shape",
+                hold_detail=f"the semantic owner did not answer usably: {parsed.reason}",
                 source=self.name,
                 confidence=0.0,
             )
-        return decision
+        return parsed.decision

@@ -353,7 +353,19 @@ def test_a_well_formed_answer_becomes_a_typed_decision():
 
 
 def test_an_answer_wrapped_in_a_code_fence_is_still_read():
-    decision = parse_semantic_decision('```json\n{"active_needs": ["chat"]}\n```')
+    """A complete payload, because this test is about the fence.
+
+    It used to pass `{"active_needs": ["chat"]}` — incomplete under the strict
+    parser, which now requires the three fields that ARE the decision. Kept
+    testing what it was named for rather than doubling as a "partial payloads
+    are fine" test, which is the behaviour the review found wrong.
+    """
+    decision = parse_semantic_decision(
+        '```json\n'
+        '{"active_needs": ["chat"], "operation": "none", "hold": "none", '
+        '"confidence": 0.7}\n'
+        '```'
+    )
 
     assert decision is not None
     assert decision.active_needs == ("chat",)
@@ -365,11 +377,28 @@ def test_an_unparseable_answer_is_refused_rather_than_repaired(bad):
     assert parse_semantic_decision(bad) is None
 
 
-def test_an_unknown_operation_degrades_to_proposing_nothing():
-    decision = parse_semantic_decision('{"operation": "charge_his_card"}')
+def test_an_unknown_operation_is_refused_rather_than_degraded():
+    """Inverted deliberately. The old behaviour was the defect.
 
-    assert decision is not None
-    assert decision.proposed_operation.kind == OperationKind.NONE
+    This test asserted that an operation the system does not know silently
+    became NONE. Combined with `confidence` defaulting to 1.0 when absent,
+    that made
+
+        {"hold": "typo", "operation": "typo"}
+
+    a decision proposing nothing, holding nothing, and claiming FULL
+    confidence in that reading — a fabricated confident decision assembled
+    from a response the parser could not understand.
+
+    "Degrades to proposing nothing" also sounds safe and is not: the caller
+    treats a returned decision as an answer, so the candidate is scored as
+    having read the conversation when it did not answer at all. Refusing makes
+    it a visible insufficient-evidence outcome instead.
+    """
+    assert parse_semantic_decision('{"operation": "charge_his_card"}') is None
+    assert parse_semantic_decision(
+        '{"operation": "charge_his_card", "hold": "none", "confidence": 0.9}'
+    ) is None
 
 
 def test_a_candidate_that_cannot_answer_says_so_rather_than_guessing():
@@ -585,3 +614,187 @@ def test_no_scenario_contains_explicit_material():
 
     for word in ("nude", "nudes", "pussy", "cock", "cum", "fuck"):
         assert word not in raw
+
+
+# ===========================================================================
+# Strict typed parsing
+# ===========================================================================
+#
+#     missing required fields, invalid enums, wrong types, non-finite
+#     confidence and malformed output must result in a visible
+#     failed/insufficient-evidence outcome, never a fabricated confident
+#     decision.
+#                     — docs/continuation_brief_2026-09-17.md, Phase D
+#
+# The version this replaces documented itself as strict — "Returns None for
+# anything unparseable. There is no partial credit and no repair pass" — and
+# did the opposite for the cases that matter most. A docstring is not a
+# behaviour, and these are.
+
+
+def _complete(**overrides) -> str:
+    payload = {"operation": "none", "hold": "none", "confidence": 0.8}
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def test_a_complete_answer_is_read():
+    """The control. Without it every refusal below could be a broken parser."""
+    from services.decision_owners import parse_semantic_decision_result
+
+    parsed = parse_semantic_decision_result(_complete(active_needs=["chat"]))
+
+    assert parsed.ok
+    assert parsed.reason == ""
+    assert parsed.decision.confidence == 0.8
+
+
+@pytest.mark.parametrize("missing", ["operation", "hold", "confidence"])
+def test_a_response_that_leaves_out_the_decision_is_refused(missing):
+    """These three ARE the decision: what it proposes, whether it waits, and
+    how far to trust either."""
+    from services.decision_owners import parse_semantic_decision_result
+
+    payload = json.loads(_complete())
+    payload.pop(missing)
+
+    parsed = parse_semantic_decision_result(json.dumps(payload))
+
+    assert not parsed.ok
+    assert missing in parsed.reason
+
+
+def test_an_empty_object_is_refused():
+    assert parse_semantic_decision("{}") is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"operation": "typo", "hold": "typo", "confidence": 1.0},
+        {"operation": "none", "hold": "typo", "confidence": 1.0},
+        {"operation": "typo", "hold": "none", "confidence": 1.0},
+    ],
+)
+def test_an_invented_enum_is_refused(payload):
+    """The review's exact reproduction, and its two halves separately."""
+    assert parse_semantic_decision(json.dumps(payload)) is None
+
+
+@pytest.mark.parametrize(
+    "confidence", [float("nan"), float("inf"), float("-inf")]
+)
+def test_a_non_finite_confidence_is_refused(confidence):
+    from services.decision_owners import parse_semantic_decision_result
+
+    parsed = parse_semantic_decision_result(
+        '{"operation":"none","hold":"none","confidence":%s}'
+        % ("NaN" if confidence != confidence else ("Infinity" if confidence > 0 else "-Infinity"))
+    )
+
+    assert not parsed.ok
+    assert "finite" in parsed.reason
+
+
+@pytest.mark.parametrize("confidence", [1.5, -0.2, 100])
+def test_a_confidence_outside_the_range_is_refused_rather_than_clamped(confidence):
+    """The one choice here worth arguing about.
+
+    Clamping 1.5 to 1.0 RAISES a malformed claim to maximum confidence — the
+    failure this function exists to prevent, applied by the repair.
+    """
+    assert parse_semantic_decision(_complete(confidence=confidence)) is None
+
+
+def test_a_boolean_confidence_is_refused():
+    """bool is a subclass of int, so True would read as a confidence of 1.0."""
+    assert parse_semantic_decision('{"operation":"none","hold":"none","confidence":true}') is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"operation": 3, "hold": "none", "confidence": 0.5},
+        {"operation": "none", "hold": ["none"], "confidence": 0.5},
+        {"operation": "none", "hold": "none", "confidence": "high"},
+        {"operation": "none", "hold": "none", "confidence": 0.5, "active_needs": "chat"},
+        {"operation": "none", "hold": "none", "confidence": 0.5, "must_address": {"a": 1}},
+        {"operation": "none", "hold": "none", "confidence": 0.5, "hold_detail": 7},
+    ],
+)
+def test_a_field_of_the_wrong_type_is_refused(payload):
+    assert parse_semantic_decision(json.dumps(payload)) is None
+
+
+def test_every_refusal_says_which_one_it_was():
+    """A comparison that cannot say WHICH candidate failed HOW is not much of
+    a comparison, and a bare None made every failure identical."""
+    from services.decision_owners import parse_semantic_decision_result
+
+    reasons = {
+        parse_semantic_decision_result("no json here").reason,
+        parse_semantic_decision_result('{"a": }').reason,
+        parse_semantic_decision_result("{}").reason,
+        parse_semantic_decision_result(_complete(operation="typo")).reason,
+        parse_semantic_decision_result(_complete(hold="typo")).reason,
+        parse_semantic_decision_result(_complete(confidence=5)).reason,
+        parse_semantic_decision_result(_complete(confidence="high")).reason,
+    }
+
+    assert len(reasons) == 7, reasons
+    assert all(reason for reason in reasons)
+
+    # "no json here" and "{oops" DO share a reason, and correctly: neither
+    # contains a JSON object, and inventing a distinction between them would
+    # be precision about nothing.
+    assert (
+        parse_semantic_decision_result("{oops").reason
+        == parse_semantic_decision_result("no json here").reason
+    )
+
+
+def test_the_owner_reports_the_reason_it_refused():
+    """The failure has to be visible, not just counted."""
+    import asyncio
+
+    from services.decision_owners import SemanticDecisionOwner
+
+    async def answers_badly(*_args, **_kwargs):
+        return SimpleNamespace(text='{"hold": "typo", "operation": "typo"}')
+
+    owner = SemanticDecisionOwner(answers_badly)
+    decision = asyncio.run(owner.decide(build_context_packet(history=[]), {}))
+
+    # The review's exact payload. What matters is that it is refused with a
+    # stated reason and zero confidence — not WHICH reason: it is missing
+    # `confidence` as well as carrying invented enums, and the missing-field
+    # check runs first because a response that does not say how far to trust
+    # it has not answered whatever else it got right.
+    assert decision.hold is HoldReason.INSUFFICIENT_EVIDENCE
+    assert decision.confidence == 0.0
+    assert "did not answer usably" in decision.hold_detail
+    assert "confidence" in decision.hold_detail
+
+    async def answers_with_a_bad_enum(*_args, **_kwargs):
+        return SimpleNamespace(
+            text='{"hold": "none", "operation": "typo", "confidence": 0.9}'
+        )
+
+    named = asyncio.run(
+        SemanticDecisionOwner(answers_with_a_bad_enum).decide(
+            build_context_packet(history=[]), {}
+        )
+    )
+
+    assert "typo" in named.hold_detail
+    assert named.confidence == 0.0
+
+
+def test_supporting_evidence_is_carried_when_the_answer_gives_it():
+    """The brief asks a decision to carry the evidence it rests on."""
+    decision = parse_semantic_decision(
+        _complete(supporting_messages=["fp-1", "fp-2"], must_address=["chicago"])
+    )
+
+    assert decision.supporting_messages == ("fp-1", "fp-2")
+    assert decision.must_address == ("chicago",)
