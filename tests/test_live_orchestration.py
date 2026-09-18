@@ -499,9 +499,7 @@ def test_simulator_entrypoint_selects_the_real_semantic_auto_path(monkeypatch):
         "resolve_ai_stack",
         lambda **_k: value(SimpleNamespace(profile_id="cleo_v3")),
     )
-    monkeypatch.setattr(
-        suggestions, "learn_from_fan_message", lambda **_k: value(None)
-    )
+    monkeypatch.setattr(suggestions, "learn_from_fan_message", lambda **_k: value(None))
 
     result = run(
         suggestions.run_simulated_inbound(
@@ -683,3 +681,671 @@ def test_real_fan_ignores_fan_override_and_invalid_environment_is_visible(monkey
                 platform_fan_id="real-fan",
             )
         )
+
+
+# Production regressions: rejected model proposals are evidence for repair,
+# never transaction permission and never an exception for the whole turn.
+
+
+def owner_world(monkeypatch, evidence, outputs):
+    calls = []
+    responses = iter(outputs)
+    evidence.stack.profile = SimpleNamespace(
+        stage=lambda *_: SimpleNamespace(
+            primary_target=lambda: None,
+            fallback_target=lambda: None,
+            prompt_version="v1",
+        )
+    )
+
+    async def complete(_target, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(text=next(responses))
+
+    monkeypatch.setattr(live_orchestration, "complete", complete)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        dict(
+            operation="check_payment_claim",
+            operation_subject="claimed payment",
+            operation_payment_reference="imaginary-payment",
+        ),
+        dict(
+            operation="present_offer",
+            operation_subject="the $30 set",
+            operation_offer_id="offer-1",
+            operation_set_id="set-1",
+        ),
+        dict(disposition="handoff", operation="none", hold="needs_human"),
+    ],
+)
+def test_rejected_owner_decisions_repair_using_same_snapshot(monkeypatch, bad):
+    evidence = loaded(pending_offer=offer(cents=3000), next_offer=offer(cents=3000))
+    before = evidence.snapshot.canonical_json()
+    state_before = evidence.commercial_state.model_dump()
+    calls = owner_world(monkeypatch, evidence, [live_payload(**bad), live_payload()])
+    decision = run(live_orchestration.decide_turn(evidence))
+    assert decision.proposed_operation.kind is OperationKind.NONE
+    assert len(calls) == 2
+    assert before in calls[0]["messages"][0]["content"]
+    assert before in calls[1]["messages"][0]["content"]
+    repair = calls[1]["messages"][0]["content"]
+    assert (
+        "validation_failures" in repair
+        and "Authoritative state outranks fan wording" in repair
+    )
+    assert "check_payment_claim" not in live_orchestration.legal_operations(evidence)
+    assert evidence.commercial_state.model_dump() == state_before
+    assert evidence.active_session is None
+
+
+def test_repeated_invalid_owner_decisions_handoff_without_execution(monkeypatch):
+    from models.conversation_decision import ResponseDisposition
+
+    evidence = loaded(pending_offer=offer())
+    calls = owner_world(
+        monkeypatch,
+        evidence,
+        [
+            live_payload(
+                operation="check_payment_claim",
+                operation_subject="claimed payment",
+                operation_payment_reference="fake",
+            )
+            for _ in range(3)
+        ],
+    )
+    monkeypatch.setattr(
+        live_orchestration, "load_evidence", lambda **_: value(evidence)
+    )
+    monkeypatch.setattr(live_orchestration, "_write_turn", _retired)
+    monkeypatch.setattr(live_orchestration, "send_locked_ppv", _retired)
+    frozen = []
+
+    async def freeze(fan_id, reason):
+        frozen.append((fan_id, reason))
+
+    monkeypatch.setattr(live_orchestration, "freeze_fan_for_review", freeze)
+    prepared = run(
+        live_orchestration.prepare_turn(
+            creator_id="creator-1",
+            fan_id="fan-1",
+            trigger_kind="fan_message",
+            trigger_identity="message-1",
+            latest_message="i dont see it",
+        )
+    )
+    assert prepared.decision.disposition is ResponseDisposition.HANDOFF
+    result = run(live_orchestration.execute_auto_turn(prepared))
+    assert len(calls) == 3
+    assert result["outcome"] == "human_review" and result["message_ids"] == []
+    assert "no pending payment" in frozen[0][1]
+    assert "repair_exhausted" in frozen[0][1]
+    assert evidence.commercial_state.accepted_offer_id is None
+
+
+@pytest.mark.parametrize(
+    "message", ["i dont see it", "cmon baby, send it to me", "I paid"]
+)
+def test_missing_delivery_never_manufactures_access_or_payment(monkeypatch, message):
+    from dataclasses import replace
+
+    evidence = loaded(pending_offer=offer(cents=3000))
+    evidence.snapshot = replace(
+        evidence.snapshot,
+        trigger=replace(evidence.snapshot.trigger, latest_message=message),
+    )
+    calls = owner_world(
+        monkeypatch,
+        evidence,
+        [
+            live_payload(
+                operation="repair_content_access",
+                operation_subject="missing content",
+                operation_purchase_id="fake",
+            ),
+            live_payload(
+                operation="check_payment_claim",
+                operation_subject="payment",
+                operation_payment_reference="fake",
+            ),
+            live_payload(),
+        ],
+    )
+    assert (
+        run(live_orchestration.decide_turn(evidence)).proposed_operation.kind
+        is OperationKind.NONE
+    )
+    assert len(calls) == 3
+    assert evidence.snapshot.confirmed_purchases == ()
+    assert evidence.pending_payment is None
+
+
+def test_delivered_unpaid_content_can_check_payment_but_not_repair_purchase():
+    evidence = loaded(pending_payment={"reference": "real-payment"})
+    payment = ConversationDecision(
+        proposed_operation=ProposedOperation(
+            kind=OperationKind.CHECK_PAYMENT_CLAIM,
+            subject="missing locked message",
+            payment_reference="real-payment",
+        )
+    )
+    assert live_orchestration.validate_decision(payment, evidence).approved
+    repair = ConversationDecision(
+        proposed_operation=ProposedOperation(
+            kind=OperationKind.REPAIR_CONTENT_ACCESS,
+            subject="missing content",
+            purchase_id="real-payment",
+        )
+    )
+    assert not live_orchestration.validate_decision(repair, evidence).approved
+    from dataclasses import replace
+
+    evidence.snapshot = replace(
+        evidence.snapshot, confirmed_purchases=({"reference": "real-payment"},)
+    )
+    assert live_orchestration.validate_decision(repair, evidence).approved
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "just sent it your way",
+        "check it",
+        "it's there",
+        "open it",
+        "should be there now",
+        "delivered it",
+    ],
+)
+def test_text_offer_cannot_claim_delivery(text):
+    execution = ApprovedExecution(
+        operation="present_offer", offer={"price_cents": 3000}
+    )
+    assert "false_delivery_claim" in live_orchestration.writer_contract_reasons(
+        [text], loaded(next_offer=offer(cents=3000)), execution, mode="auto"
+    )
+
+
+@pytest.mark.parametrize(
+    "fan_text, caption, rejected",
+    [
+        ("i do baby", "$30 to unlock", True),
+        ("i do baby", "30 dollars to unlock", True),
+        ("i do baby", "knew you would 😏", False),
+        ("i do baby", "you've got $300 reasons to smile", False),
+        ("how much?", "$30", False),
+        ("$30 is too much", "it's $30", False),
+    ],
+)
+def test_locked_caption_price_contract(fan_text, caption, rejected):
+    from dataclasses import replace
+
+    evidence = loaded()
+    evidence.snapshot = replace(
+        evidence.snapshot,
+        trigger=replace(evidence.snapshot.trigger, latest_message=fan_text),
+    )
+    execution = ApprovedExecution(
+        operation="send_locked_paid_message",
+        delivery={"media_ids": ["m1"], "price_cents": 3000},
+    )
+    reasons = live_orchestration.writer_contract_reasons(
+        [caption], evidence, execution, mode="auto"
+    )
+    assert ("redundant_locked_price" in reasons) is rejected
+
+
+def test_writer_voice_contract_and_current_life_grounding():
+    execution = ApprovedExecution()
+    evidence = loaded()
+    prompt = live_orchestration.build_writer_prompt(
+        evidence, ConversationDecision(), execution, mode="auto"
+    )[0]["content"]
+    for rule in [
+        "does not require a question",
+        "One natural thought",
+        "1–2 bubbles",
+        "catalogue",
+        "current-life facts",
+        "emotional moment",
+    ]:
+        assert rule in prompt
+    for legacy in [
+        "Conversation Director",
+        "Experience Director",
+        "strategic_move",
+        "session strategy",
+        "escalation ladder",
+    ]:
+        assert legacy not in prompt
+    assert (
+        live_orchestration.writer_contract_reasons(
+            ["you know I like that 😏"], evidence, execution, mode="auto"
+        )
+        == []
+    )
+    assert (
+        "unsupported_current_life_claim"
+        in live_orchestration.writer_contract_reasons(
+            ["I'm cooking dinner right now"], evidence, execution, mode="auto"
+        )
+    )
+
+
+def test_ready_offer_plans_exact_locked_delivery_without_pending_confirmation(
+    monkeypatch,
+):
+    evidence = loaded(next_offer=offer(cents=3000))
+    decision = ConversationDecision(
+        proposed_operation=ProposedOperation(
+            kind=OperationKind.SEND_LOCKED_PAID_MESSAGE,
+            subject="the bikini content",
+            offer_id="offer-1",
+            set_id="set-1",
+        )
+    )
+    planned = []
+
+    async def plan(*args, **kwargs):
+        planned.append(kwargs)
+        return {
+            "status": "ok",
+            "session": {
+                "plan": [
+                    {
+                        "set_id": "set-1",
+                        "media_ids": ["approved-1", "approved-2"],
+                        "price_cents": 3000,
+                    }
+                ]
+            },
+        }
+
+    monkeypatch.setattr(live_orchestration, "plan_session_for_fan", plan)
+    execution = run(
+        live_orchestration._prepare_execution(
+            decision, evidence, execute_operations=True
+        )
+    )
+    assert execution.operation == "send_locked_paid_message"
+    assert execution.delivery["media_ids"] == ["approved-1", "approved-2"]
+    assert execution.delivery["price_cents"] == 3000
+    assert planned[0] == {
+        "accepted_set_id": "set-1",
+        "accepted_price_cents": 3000,
+        "persist": False,
+    }
+    assert evidence.commercial_state.accepted_offer_id is None
+    evidence.within_daily_caps = False
+    assert not live_orchestration.validate_decision(decision, evidence).approved
+    evidence.within_daily_caps = True
+    evidence.pending_payment = {"reference": "already-pending"}
+    assert not live_orchestration.validate_decision(decision, evidence).approved
+
+
+def test_failed_ppv_delivery_returns_review_without_false_creator_message(monkeypatch):
+    evidence = loaded(pending_offer=offer())
+    execution = ApprovedExecution(
+        operation="send_locked_paid_message",
+        delivery={"media_ids": ["media-1"], "price_cents": 2500, "set_id": "set-1"},
+    )
+    prepared = live_orchestration.PreparedTurn(
+        evidence,
+        ConversationDecision(),
+        execution,
+        ["just sent it your way"],
+        ReplyProvenance("creator-1", "fan-1", PIPELINE_AUTO),
+        SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        live_orchestration, "_current_revision", lambda *_: value("revision-1")
+    )
+    monkeypatch.setattr(
+        live_orchestration, "_commit_locked_plan", lambda *_: value("revision-1")
+    )
+    monkeypatch.setattr(live_orchestration, "save_message", _retired)
+
+    async def refuse(**_):
+        raise live_orchestration.PPVDeliveryError("send refused")
+
+    monkeypatch.setattr(live_orchestration, "send_locked_ppv", refuse)
+    frozen = []
+
+    async def freeze(*args):
+        frozen.append(args)
+
+    monkeypatch.setattr(live_orchestration, "freeze_fan_for_review", freeze)
+    result = run(live_orchestration.execute_auto_turn(prepared))
+    assert result["outcome"] == "human_review" and result["message_ids"] == []
+    assert "send refused" in frozen[0][1]
+
+
+@pytest.mark.parametrize("initial_pending", [False, True])
+def test_bikini_trajectory_persists_real_ppv_receipt_and_payment_state(
+    monkeypatch, initial_pending
+):
+    """Real executor, adapter, receipt and reconciliation; models/DB are stubs."""
+    from dataclasses import replace
+    from services import ppv_delivery, ppv_persistence
+    from tests.test_full_auto_simulation import FakeDB
+
+    class DB(FakeDB):
+        def rpc(self, name, params):
+            assert name == "attach_pending_ppv"
+            self.tables["fans"][0]["pending_ppv_check"] = params["p_pending"]
+            return SimpleNamespace(execute=lambda: SimpleNamespace(data="attached"))
+
+    db = DB(
+        {
+            "messages": [],
+            "fans": [
+                {
+                    "id": "fan-1",
+                    "creator_id": "creator-1",
+                    "platform_fan_id": "test_fan_1",
+                    "pending_ppv_check": None,
+                }
+            ],
+            "creators": [{"id": "creator-1", "apifansly_account_id": "account-1"}],
+        }
+    )
+    evidence = loaded(
+        next_offer=offer(cents=3000),
+        pending_offer=offer(cents=3000) if initial_pending else None,
+    )
+    state = {"commercial": evidence.commercial_state, "session": None}
+    claims = []
+
+    async def save_state(_fan, _creator, commercial):
+        state["commercial"] = commercial
+
+    async def save_session(_fan, session):
+        state["session"] = session
+
+    async def noop(*_, **__):
+        return None
+
+    async def claim(**kwargs):
+        claims.append(kwargs)
+
+    for module in [live_orchestration, ppv_delivery, ppv_persistence]:
+        monkeypatch.setattr(module, "get_supabase", lambda: db)
+    monkeypatch.setattr("db.queries.get_supabase", lambda: db)
+    monkeypatch.setattr("services.message_diagnostics.record_diagnostics", noop)
+    for module in [live_orchestration, ppv_persistence]:
+        monkeypatch.setattr(
+            module, "get_fan_state", lambda *_: value(state["commercial"])
+        )
+        monkeypatch.setattr(module, "save_fan_state", save_state)
+        monkeypatch.setattr(module, "save_fan_session", save_session)
+    for module in [ppv_delivery, ppv_persistence]:
+        monkeypatch.setattr(
+            module, "get_fan_session", lambda *_: value(state["session"])
+        )
+        monkeypatch.setattr(
+            module, "get_creator_policy", lambda *_: value(CreatorPolicy())
+        )
+    monkeypatch.setattr(ppv_persistence, "schedule_action", noop)
+    monkeypatch.setattr(ppv_delivery, "claim_delivery", claim)
+    monkeypatch.setattr(ppv_delivery, "transition_delivery", noop)
+    monkeypatch.setattr(ppv_delivery, "send_apifansly_message", _retired)
+    monkeypatch.setattr(
+        live_orchestration, "_current_revision", lambda *_: value("revision-1")
+    )
+    monkeypatch.setattr(
+        live_orchestration, "load_evidence", lambda **_: value(evidence)
+    )
+    calls = owner_world(
+        monkeypatch,
+        evidence,
+        [
+            live_payload(),
+            live_payload(),
+            live_payload(
+                operation="send_locked_paid_message",
+                response_intent="deliver_accepted_offer",
+                operation_subject="the approved bikini content",
+                operation_offer_id="offer-1",
+                operation_set_id="set-1",
+            ),
+        ],
+    )
+    captions = iter(
+        [
+            "you like that bikini 😏",
+            "without it is even better 😏|wanna find out?",
+            "knew you would 😏",
+        ]
+    )
+
+    async def write(*_, **__):
+        return [next(captions)]
+
+    monkeypatch.setattr(live_orchestration, "generate_replies", write)
+    monkeypatch.setattr(
+        live_orchestration,
+        "plan_session_for_fan",
+        lambda *_a, **_k: value(
+            {
+                "status": "ok",
+                "session": {
+                    "status": "active",
+                    "current_index": 0,
+                    "plan": [
+                        {
+                            "set_id": "set-1",
+                            "media_ids": ["approved-1", "approved-2"],
+                            "price_cents": 3000,
+                            "sent": False,
+                            "purchased": False,
+                        }
+                    ],
+                },
+            }
+        ),
+    )
+    for message in [
+        "your ass looks soo good on that bikini photo, its so hot",
+        "yes it does baby, makes me really excited of what it is without that bikini on",
+        "i do baby",
+    ]:
+        evidence.snapshot = replace(
+            evidence.snapshot,
+            trigger=replace(evidence.snapshot.trigger, latest_message=message),
+        )
+        result = run(
+            live_orchestration.run_auto_turn(
+                creator_id="creator-1",
+                fan_id="fan-1",
+                latest_message=message,
+                trigger_identity=message,
+            )
+        )
+        assert result["outcome"] == "replied"
+    assert len(calls) == 3 and len(claims) == 1
+    row = db.tables["messages"][-1]
+    ppv = row["media_context"]["ppv"]
+    assert row["content"] == "knew you would 😏"
+    assert ppv["media_ids"] == ["approved-1", "approved-2"]
+    assert ppv["price_cents"] == 3000 and ppv["set_id"] == "set-1"
+    assert (
+        ppv["payment_reference"]
+        == db.tables["fans"][0]["pending_ppv_check"]["reference"]
+    )
+    assert state["commercial"].status is FanStatus.PAYMENT_PENDING
+    assert state["session"]["plan"][0]["purchased"] is False
+    assert all(
+        not r.get("media_context", {}).get("ppv") for r in db.tables["messages"][:-1]
+    )
+    assert all("sent it" not in r["content"] for r in db.tables["messages"])
+
+
+def test_writer_rejection_suppresses_entire_turn_before_delivery(monkeypatch):
+    evidence = loaded(next_offer=offer())
+    owner_world(
+        monkeypatch,
+        evidence,
+        [
+            live_payload(
+                operation="present_offer",
+                operation_subject="the approved content",
+                operation_offer_id="offer-1",
+                operation_set_id="set-1",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        live_orchestration, "load_evidence", lambda **_: value(evidence)
+    )
+    monkeypatch.setattr(
+        live_orchestration,
+        "generate_replies",
+        lambda *_a, **_k: value(["knew you would|just sent it your way|$25 to unlock"]),
+    )
+    monkeypatch.setattr(live_orchestration, "_deliver_plain_parts", _retired)
+    frozen = []
+
+    async def freeze(*args):
+        frozen.append(args)
+
+    monkeypatch.setattr(live_orchestration, "freeze_fan_for_review", freeze)
+    prepared = run(
+        live_orchestration.prepare_turn(
+            creator_id="creator-1",
+            fan_id="fan-1",
+            trigger_kind="fan_message",
+            trigger_identity="m1",
+            latest_message="yes",
+        )
+    )
+    assert prepared.replies == []
+    assert (
+        run(live_orchestration.execute_auto_turn(prepared))["outcome"] == "human_review"
+    )
+    assert frozen
+    assert evidence.commercial_state.pending_offer is None
+
+
+@pytest.mark.parametrize(
+    "cents, text", [(2500, "$25 to unlock"), (4250, "$42.50 to unlock")]
+)
+def test_price_guard_uses_approved_price_for_each_turn(cents, text):
+    execution = ApprovedExecution(
+        operation="send_locked_paid_message",
+        delivery={"media_ids": ["m1"], "price_cents": cents},
+    )
+    assert "redundant_locked_price" in live_orchestration.writer_contract_reasons(
+        [text], loaded(), execution, mode="auto"
+    )
+
+
+def test_planner_cannot_change_approved_price(monkeypatch):
+    evidence = loaded(next_offer=offer(cents=3000))
+    decision = ConversationDecision(
+        proposed_operation=ProposedOperation(
+            kind=OperationKind.SEND_LOCKED_PAID_MESSAGE,
+            subject="the content",
+            offer_id="offer-1",
+            set_id="set-1",
+        )
+    )
+    monkeypatch.setattr(
+        live_orchestration,
+        "plan_session_for_fan",
+        lambda *_a, **_k: value(
+            {
+                "status": "ok",
+                "session": {
+                    "plan": [
+                        {"set_id": "set-1", "media_ids": ["m1"], "price_cents": 2500}
+                    ]
+                },
+            }
+        ),
+    )
+    result = run(
+        live_orchestration._prepare_execution(
+            decision, evidence, execute_operations=True
+        )
+    )
+    assert not result.validation.approved and result.delivery is None
+    assert evidence.active_session is None
+
+
+def test_production_pending_offer_send_request_repairs_into_exact_locked_delivery(
+    monkeypatch,
+):
+    from dataclasses import replace
+
+    evidence = loaded(pending_offer=offer(cents=3000))
+    evidence.snapshot = replace(
+        evidence.snapshot,
+        trigger=replace(
+            evidence.snapshot.trigger,
+            latest_message="i dont see it, cmon baby send it to me",
+        ),
+    )
+    before = evidence.commercial_state.model_dump()
+    calls = owner_world(
+        monkeypatch,
+        evidence,
+        [
+            live_payload(
+                operation="check_payment_claim",
+                operation_subject="the $30 payment",
+                operation_payment_reference="imaginary",
+            ),
+            live_payload(
+                operation="send_locked_paid_message",
+                operation_subject="the exact pending content",
+                response_intent="deliver_accepted_offer",
+                operation_offer_id="offer-1",
+                operation_set_id="set-1",
+            ),
+        ],
+    )
+    decision = run(live_orchestration.decide_turn(evidence))
+    assert decision.proposed_operation.kind is OperationKind.SEND_LOCKED_PAID_MESSAGE
+    assert live_orchestration.validate_decision(decision, evidence).approved
+    assert "there is no pending payment to check" in calls[1]["messages"][0]["content"]
+    assert (
+        "semantic owner attempted to state a price"
+        in calls[1]["messages"][0]["content"]
+    )
+    assert evidence.commercial_state.model_dump() == before
+    assert evidence.pending_payment is None
+    evidence.active_session = {"status": "active", "plan": [{"sent": False}]}
+    assert not live_orchestration.validate_decision(decision, evidence).approved
+
+
+def test_writer_repairs_expression_without_changing_commercial_authority(monkeypatch):
+    evidence = loaded(next_offer=offer())
+    owner_world(monkeypatch, evidence, [])
+    state_before = evidence.commercial_state.model_dump()
+    replies = iter([["just sent it your way"], ["you've got me smiling 😏"]])
+    calls = []
+
+    async def generate(prompt, *_a, **_k):
+        calls.append(json.loads(json.dumps(prompt)))
+        return next(replies)
+
+    monkeypatch.setattr(live_orchestration, "generate_replies", generate)
+    execution = ApprovedExecution(
+        operation="present_offer", offer={"price_cents": 2500}
+    )
+    result, trace = run(
+        live_orchestration._write_turn(
+            evidence, ConversationDecision(), execution, mode="auto"
+        )
+    )
+    assert result == ["you've got me smiling 😏"] and len(calls) == 2
+    assert "false_delivery_claim" in calls[1][0]["content"]
+    assert calls[0][1] == calls[1][1]  # unchanged evidence and approved plan
+    assert trace.failure_reason == ""
+    assert evidence.commercial_state.model_dump() == state_before
+    assert execution.operation == "present_offer" and execution.delivery is None

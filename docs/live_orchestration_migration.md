@@ -101,3 +101,47 @@ do not establish conversational quality. Before unattended operation, compare
 multiple complete runs, inspect actual-provider/fallback provenance, latency,
 cost and intervention rates, and have a human review complete transcripts and
 candidate disagreements.
+
+## Semantic commercial expression and recoverable decisions
+
+`present_offer` remains a textual discussion, never a media delivery.
+`send_locked_paid_message` can present an exact approved offer immediately when
+readiness and the referent are clear. If an offer is pending, its exact record
+must be used; an expired offer, unresolved reference, pending payment, explicit
+spending ceiling, delivery cap, human hold or unresolved active-session delivery
+blocks sending. Another fan confirmation is needed only to resolve ambiguous
+readiness/references, not to turn a locked offer into a charge. Operator approval
+policies still apply. Selection/planning never confirms a purchase.
+
+Both paths retain deterministic inventory and price selection. Locked planning
+checks the exact set and price, then commits only after writing and revision
+checks. Only the shared PPV adapter sends and writes `media_context.ppv`, with
+media IDs, set, exact cents and payment reference. Its receipt and reconciliation
+establish the pending payment; authoritative purchase evidence remains required
+for access repair. The Simulator's existing terminal-turn refresh and PPV
+renderer consume this same durable receipt; no separate frontend PPV state is
+introduced.
+
+The writer receives conversation-specific expression rules without behavioral
+controllers. A deterministic output contract rejects unattached delivery claims,
+redundant approved-price narration in ordinary locked captions, media-count copy
+and unsupported explicit current-life claims. Price questions and negotiation
+may discuss the approved price. Rejected copy is suppressed before any send,
+approval request or commercial commit. Expression gets one bounded retry with
+the same approved plan and provider targets; repeated violations become an
+operator-visible review hold with the exact rejection reasons. Delivery failure likewise emits no plain-text
+success fallback.
+
+Semantic decisions get an initial attempt plus at most two repairs. Every repair
+uses the unchanged evidence snapshot, exact parser/validator failures and the
+validator-derived state-legal operation list. Every returned proposal passes the
+same deterministic validator. Repairs neither mutate commercial state nor
+coerce an invalid operation into an external action. Exhaustion produces a
+controlled `human_review` outcome and stores the reason in `fans.review_reason`.
+An unsupported "I paid"/"I don't see it" claim cannot create payment, delivery,
+purchase or access-repair authority. With a real pending locked receipt,
+payment checking or ordinary support/handoff is possible; free access repair
+still requires a confirmed purchase.
+
+This correctness change requires no additional DB migration or Railway/Vercel
+environment variable. It does not change core selection or model/provider routing.
