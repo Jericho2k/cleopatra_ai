@@ -203,6 +203,57 @@ async def _run_all(trajectories, creator_id: str, fan_id: str, *, use_clock: boo
     return reports
 
 
+async def _run_with_selected_core(
+    trajectories,
+    creator_id: str,
+    fan_id: str,
+    *,
+    use_clock: bool,
+    core_id: str,
+) -> list:
+    """Temporarily pin the evaluation fan and restore its prior selection."""
+    if not core_id:
+        return await _run_all(
+            trajectories,
+            creator_id,
+            fan_id,
+            use_clock=use_clock,
+        )
+    if any(
+        trajectory.fan_id and trajectory.fan_id != fan_id
+        for trajectory in trajectories
+    ):
+        raise FixtureRefused(
+            "--core requires every trajectory to use the --fan test fan"
+        )
+
+    from db.queries import get_fan_by_id
+    from services.conversation_core import (
+        set_simulation_fan_core_override,
+        simulation_fan_core_override,
+    )
+
+    fan = await get_fan_by_id(fan_id)
+    if fan is None or not str(fan.platform_fan_id or "").startswith("test_"):
+        raise FixtureRefused("--core may select only an owner simulation test fan")
+    previous = await simulation_fan_core_override(fan_id)
+    await set_simulation_fan_core_override(fan_id, core_id)
+    print(
+        f"[EVAL CORE] fan={fan_id} selected={core_id} "
+        f"rollback={previous or 'inherit'}",
+        file=sys.stderr,
+    )
+    try:
+        return await _run_all(
+            trajectories,
+            creator_id,
+            fan_id,
+            use_clock=use_clock,
+        )
+    finally:
+        await set_simulation_fan_core_override(fan_id, previous)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -242,6 +293,15 @@ def main() -> int:
             "exit non-zero if any trajectory did not cover what it claims. "
             "Separate from --fail-on-critical: an uncovered claim is not a "
             "system failure, it is a run that did not test what it says"
+        ),
+    )
+    parser.add_argument(
+        "--core",
+        choices=("legacy", "semantic_v1"),
+        default="",
+        help=(
+            "temporarily pin the test fan to this conversational runtime for "
+            "the complete run, then restore its previous override"
         ),
     )
     args = parser.parse_args()
@@ -289,9 +349,19 @@ def main() -> int:
         )
         return 2
 
-    reports = asyncio.run(
-        _run_all(trajectories, args.creator, args.fan, use_clock=args.simulate_time)
-    )
+    try:
+        reports = asyncio.run(
+            _run_with_selected_core(
+                trajectories,
+                args.creator,
+                args.fan,
+                use_clock=args.simulate_time,
+                core_id=args.core,
+            )
+        )
+    except FixtureRefused as refused:
+        print(f"evaluation refused: {refused}", file=sys.stderr)
+        return 2
 
     if args.json:
         print(

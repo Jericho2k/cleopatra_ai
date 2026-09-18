@@ -44,6 +44,7 @@ FANS = {
         "platform_fan_id": "test_abc",
         "display_name": "Test fan",
         "ai_stack_profile": None,
+        "conversation_core": None,
     },
     "fan-real": {
         "id": "fan-real",
@@ -51,10 +52,17 @@ FANS = {
         "platform_fan_id": "884422113355",
         "display_name": "Real fan",
         "ai_stack_profile": None,
+        "conversation_core": None,
     },
 }
 
-CREATORS = {"creator-1": {"id": "creator-1", "ai_stack_profile": None}}
+CREATORS = {
+    "creator-1": {
+        "id": "creator-1",
+        "ai_stack_profile": None,
+        "conversation_core": None,
+    }
+}
 
 
 class _Table:
@@ -118,10 +126,12 @@ def client(monkeypatch, store):
     monkeypatch.setenv("AUTO_SIMULATION_ALLOWED_USER_IDS", OWNER)
     monkeypatch.setenv("AI_STACK_PROFILE", "cleo_v2")
     monkeypatch.setenv("AI_STACK_CACHE_SECONDS", "0")
+    monkeypatch.setenv("CONVERSATION_CORE_CACHE_SECONDS", "0")
 
-    from services import ai_stack
+    from services import ai_stack, conversation_core
 
     ai_stack.clear_ai_stack_cache()
+    conversation_core.clear_conversation_core_cache()
 
     async def fake_user(authorization):
         token = str(authorization or "").split(" ")[-1]
@@ -136,7 +146,11 @@ def client(monkeypatch, store):
     monkeypatch.setattr(main, "get_supabase", lambda: store)
     monkeypatch.setattr(tenancy, "get_supabase", lambda: store)
     monkeypatch.setattr(ai_stack, "get_supabase", lambda: store)
-    return TestClient(app=main.app)
+    monkeypatch.setattr(conversation_core, "get_supabase", lambda: store)
+    client = TestClient(app=main.app)
+    yield client
+    ai_stack.clear_ai_stack_cache()
+    conversation_core.clear_conversation_core_cache()
 
 
 def headers(user: str) -> dict[str, str]:
@@ -184,6 +198,70 @@ def test_the_registry_never_returns_an_api_key(client):
 
     assert "API_KEY" not in body
     assert "sk-" not in body
+
+
+# --- selecting the conversational architecture ----------------------------
+
+
+def test_only_the_platform_owner_can_read_conversation_cores(client):
+    owner = client.get("/conversation-cores", headers=headers(OWNER))
+    agency = client.get("/conversation-cores", headers=headers(AGENCY))
+
+    assert owner.status_code == 200
+    assert {row["id"] for row in owner.json()["cores"]} == {
+        "legacy",
+        "semantic_v1",
+    }
+    assert agency.status_code == 403
+
+
+def test_owner_can_select_and_rollback_creator_conversation_core(client, store):
+    selected = client.put(
+        "/creator/creator-1/conversation-core",
+        headers=headers(OWNER),
+        json={"conversation_core": "semantic_v1"},
+    )
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["effective"]["conversation_core"] == "semantic_v1"
+    assert store.creators["creator-1"]["conversation_core"] == "semantic_v1"
+
+    rolled_back = client.put(
+        "/creator/creator-1/conversation-core",
+        headers=headers(OWNER),
+        json={"conversation_core": None},
+    )
+    assert rolled_back.status_code == 200, rolled_back.text
+    assert rolled_back.json()["effective"]["conversation_core"] == "legacy"
+
+
+def test_agency_cannot_change_conversation_architecture(client, store):
+    response = client.put(
+        "/creator/creator-1/conversation-core",
+        headers=headers(AGENCY),
+        json={"conversation_core": "semantic_v1"},
+    )
+
+    assert response.status_code == 403
+    assert store.creators["creator-1"]["conversation_core"] is None
+
+
+def test_owner_can_pin_only_a_test_fan_to_the_new_core(client, store):
+    selected = client.put(
+        "/creator/creator-1/fan/fan-test/conversation-core",
+        headers=headers(OWNER),
+        json={"conversation_core": "semantic_v1"},
+    )
+    refused = client.put(
+        "/creator/creator-1/fan/fan-real/conversation-core",
+        headers=headers(OWNER),
+        json={"conversation_core": "semantic_v1"},
+    )
+
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["effective"]["conversation_core"] == "semantic_v1"
+    assert store.fans["fan-test"]["conversation_core"] == "semantic_v1"
+    assert refused.status_code in {403, 404}
+    assert store.fans["fan-real"]["conversation_core"] is None
 
 
 # --- who may change a creator's brain --------------------------------------

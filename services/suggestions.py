@@ -27,6 +27,7 @@ from ai.situation_analyzer import ANALYZER_TRANSCRIPT_MESSAGES
 from services.context_packet import build_context_packet
 from ai.writer_router import select_writer_route
 from services.ppv_turn import plan_ppv_step_delivery, strip_ppv_tags
+from services.payment_claims import verify_ppv_purchase
 from services.content_access import REVIEW_REASON as CONTENT_ACCESS_REVIEW_REASON
 from services.episode_recording import close_finished_episode
 from services.conversation_continuity import (
@@ -88,6 +89,8 @@ def writer_retry_policy(prompt_version: str):
         if writer_persistent_primary_retries(prompt_version)
         else LEGACY_WRITER_RETRY_POLICY
     )
+
+
 from services.commercial_orchestrator import (
     consume_free_text_allowance,
     orchestrate,
@@ -234,6 +237,9 @@ AUTO_OUTCOME_PLAN_UNRECOVERABLE = "plan_unrecoverable"
 # them left nothing sendable. Never send the promise instead.
 AUTO_OUTCOME_INVENTORY_UNSAFE = "inventory_unsafe"
 AUTO_OUTCOME_HUMAN_REVIEW = "human_review"
+AUTO_OUTCOME_OWNER_FAILED = "owner_failed"
+AUTO_OUTCOME_STALE_GENERATION = "stale_generation"
+AUTO_OUTCOME_APPROVAL_REQUIRED = "approval_required"
 
 
 class HumanReviewHandoffError(RuntimeError):
@@ -332,7 +338,9 @@ async def _sleep_while_current(fan_id: str, seconds: float, *, phase: str) -> bo
         while True:
             current_task = _pending_auto_replies.get(fan_id)
             if current_task and current_task is not asyncio.current_task():
-                print(f"[AUTO TIMING] fan={fan_id} cancelled phase={phase} newer_task=true")
+                print(
+                    f"[AUTO TIMING] fan={fan_id} cancelled phase={phase} newer_task=true"
+                )
                 return False
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -356,14 +364,14 @@ async def _crisis_freezes_chat(creator_id: str, fan_id: str, situation: dict) ->
     human review and signal the auto path to stop. Returns True if the chat should be
     frozen (auto-reply must abort). 'continue' policy (default) returns False so the
     existing care-first crisis prompt handles it inline."""
-    signal = (situation.get("crisis_signal") or "none")
+    signal = situation.get("crisis_signal") or "none"
     if signal == "none":
         return False
     try:
         caps = await get_creator_caps(creator_id)
     except Exception:
         caps = {}
-    policy = (caps.get("crisis_policy") or "continue")
+    policy = caps.get("crisis_policy") or "continue"
     if policy == "freeze":
         await freeze_fan_for_review(fan_id, f"crisis:{signal}")
         print(f"[CRISIS] fan={fan_id} FROZEN for human review (signal={signal})")
@@ -371,7 +379,9 @@ async def _crisis_freezes_chat(creator_id: str, fan_id: str, situation: dict) ->
     return False
 
 
-async def _within_daily_caps(creator_id: str, sent_ppv: list[dict], fan_profile) -> tuple[bool, str]:
+async def _within_daily_caps(
+    creator_id: str, sent_ppv: list[dict], fan_profile
+) -> tuple[bool, str]:
     """Enforce the agency's per-fan daily autonomy caps before auto-selling.
     Returns (allowed, reason). No caps configured => always allowed.
     Counts today's sends/spend from sent_ppv (already loaded in the suggestion path)."""
@@ -384,13 +394,16 @@ async def _within_daily_caps(creator_id: str, sent_ppv: list[dict], fan_profile)
         return True, ""
 
     from datetime import datetime, timezone
+
     today = datetime.now(timezone.utc).date()
 
     def _is_today(sent_at: str) -> bool:
         if not sent_at:
             return False
         try:
-            return datetime.fromisoformat(sent_at.replace("Z", "+00:00")).date() == today
+            return (
+                datetime.fromisoformat(sent_at.replace("Z", "+00:00")).date() == today
+            )
         except Exception:
             return False
 
@@ -402,7 +415,9 @@ async def _within_daily_caps(creator_id: str, sent_ppv: list[dict], fan_profile)
 
     max_spend = caps.get("max_spend_per_fan_per_day")
     if max_spend is not None:
-        spent_today = sum(int(s.get("price", 0) or 0) for s in todays if s.get("purchased"))
+        spent_today = sum(
+            int(s.get("price", 0) or 0) for s in todays if s.get("purchased")
+        )
         if spent_today >= int(max_spend):
             return False, f"daily spend cap reached (${spent_today}/${max_spend})"
 
@@ -554,6 +569,35 @@ async def get_suggestions(
     creator_name: str = "a creator",
     save_fan_message: bool = True,
 ) -> SuggestionResponse:
+    # Resolve the application architecture before any behavioral model or
+    # controller runs.  Missing configuration stays on legacy; an invalid
+    # selected core raises visibly in services.conversation_core.
+    from services.conversation_core import (
+        log_effective_core,
+        resolve_conversation_core,
+    )
+
+    core = await resolve_conversation_core(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        db=get_supabase(),
+    )
+    log_effective_core(
+        core,
+        creator_id=creator_id,
+        fan_id=fan_id,
+        trigger="assisted_message",
+    )
+    if core.is_semantic:
+        from services.live_orchestration import get_assisted_suggestions
+
+        return await get_assisted_suggestions(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            fan_message=fan_message,
+            save_fan_message=save_fan_message,
+        )
+
     (
         conversation_history,
         fan_profile,
@@ -699,7 +743,11 @@ async def get_suggestions(
 
     # Auto-plan a session if the fan is asking for content and none is active,
     # and the creator's per-fan daily caps (if configured) aren't exceeded.
-    if not active_session and not _selling_locked(fan_profile) and _fan_wants_content(fan_message, situation):
+    if (
+        not active_session
+        and not _selling_locked(fan_profile)
+        and _fan_wants_content(fan_message, situation)
+    ):
         cap_ok, cap_reason = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
         if not cap_ok:
             print(f"[CAP] fan={fan_id} plan suppressed: {cap_reason}")
@@ -707,10 +755,16 @@ async def get_suggestions(
             try:
                 plan_data = await plan_session_for_fan(creator_id, fan_id)
                 if plan_data.get("status") == "ok":
-                    active_session = plan_data.get("session") or await get_fan_session(fan_id)
-                    print(f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
+                    active_session = plan_data.get("session") or await get_fan_session(
+                        fan_id
+                    )
+                    print(
+                        f"[SESSION] Auto-planned session for fan={fan_id} items={len((active_session or {}).get('plan', []))}"
+                    )
                 else:
-                    print(f"[SESSION] plan-session returned status={plan_data.get('status')} fan={fan_id}")
+                    print(
+                        f"[SESSION] plan-session returned status={plan_data.get('status')} fan={fan_id}"
+                    )
             except Exception as e:
                 print(f"[SESSION PLAN ERROR] {e}")
 
@@ -830,7 +884,9 @@ async def get_suggestions(
             "session_strategy_action": session_strategy.get("next_action"),
             "conversation_director_phase": conversation_director.get("phase"),
             "conversation_director_action": conversation_director.get("action"),
-            "conversation_director_reason": conversation_director.get("transition_reason"),
+            "conversation_director_reason": conversation_director.get(
+                "transition_reason"
+            ),
         },
         target_override=route.primary_target,
         fallback_target_override=route.fallback_target,
@@ -911,9 +967,7 @@ async def get_suggestions(
     print(assisted_trace.describe())
 
     if save_fan_message:
-        evidence_message_id = await save_message(
-            fan_id, creator_id, "fan", fan_message
-        )
+        evidence_message_id = await save_message(fan_id, creator_id, "fan", fan_message)
         extraction_history = [
             *conversation_history,
             Message(role="fan", content=fan_message),
@@ -931,7 +985,12 @@ async def get_suggestions(
         )
 
     if _should_update_memory(conversation_history):
-        spawn(_update_fan_memory(fan_id, creator_id, conversation_history, fan_profile.total_spent), name="update_fan_memory")
+        spawn(
+            _update_fan_memory(
+                fan_id, creator_id, conversation_history, fan_profile.total_spent
+            ),
+            name="update_fan_memory",
+        )
         spawn(
             _update_fan_ai_summary(
                 fan_id, conversation_history, profile_id=stack.profile_id
@@ -959,7 +1018,11 @@ def _render_legend(legend: dict) -> str:
         ("job", "Job"),
         ("background", "Background"),
     ]
-    lines = [f"{label}: {legend[key]}" for key, label in labels if (legend.get(key) or "").strip()]
+    lines = [
+        f"{label}: {legend[key]}"
+        for key, label in labels
+        if (legend.get(key) or "").strip()
+    ]
     other = legend.get("other") or []
     if isinstance(other, list) and other:
         lines.append("Other: " + "; ".join(other))
@@ -1148,6 +1211,7 @@ async def _update_fan_ai_summary(
     except Exception as e:
         print(f"[AI SUMMARY ERROR] fan={fan_id} error={e}")
         import traceback
+
         traceback.print_exc()
 
 
@@ -1390,7 +1454,9 @@ async def _debounced_auto_reply(
         # abort silently — the newer task will generate the reply
         current_task = _pending_auto_replies.get(fan_id)
         if current_task and current_task is not asyncio.current_task():
-            print(f"[AUTO REPLY] Newer task exists — aborting stale generation for fan={fan_id}")
+            print(
+                f"[AUTO REPLY] Newer task exists — aborting stale generation for fan={fan_id}"
+            )
             return
         (
             fan_profile,
@@ -1407,6 +1473,24 @@ async def _debounced_auto_reply(
         )
         if not fan_profile:
             return
+
+        from services.conversation_core import (
+            log_effective_core,
+            resolve_conversation_core,
+        )
+
+        core = await resolve_conversation_core(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            platform_fan_id=getattr(fan_profile, "platform_fan_id", None),
+            db=get_supabase(),
+        )
+        log_effective_core(
+            core,
+            creator_id=creator_id,
+            fan_id=fan_id,
+            trigger="auto_reply",
+        )
 
         # The local-test boundary is established HERE, not at delivery time.
         #
@@ -1425,29 +1509,65 @@ async def _debounced_auto_reply(
         if getattr(fan_profile, "needs_human_review", False):
             if outcome_sink is not None:
                 outcome_sink["outcome"] = AUTO_OUTCOME_HUMAN_REVIEW
-            print(f"[AUTO REPLY] fan={fan_id} is frozen for human review — skipping auto-reply")
+            print(
+                f"[AUTO REPLY] fan={fan_id} is frozen for human review — skipping auto-reply"
+            )
+            return
+
+        if core.is_semantic:
+            fan_messages = [
+                message for message in conversation_history if message.role == "fan"
+            ]
+            if not fan_messages:
+                return
+            latest = fan_messages[-1]
+            from services.live_orchestration import run_auto_turn
+
+            result = await run_auto_turn(
+                creator_id=creator_id,
+                fan_id=fan_id,
+                latest_message=latest.content,
+                trigger_identity=(
+                    expected_trigger_at
+                    or (
+                        latest.sent_at.isoformat()
+                        if latest.sent_at
+                        else fingerprint(latest.content)
+                    )
+                ),
+            )
+            if outcome_sink is not None:
+                outcome_sink["outcome"] = str(
+                    result.get("outcome") or AUTO_OUTCOME_NO_SEND
+                )
             return
         # Check for a pending tip and clear it atomically before building context
         pending_tip: dict | None = None
         try:
             tip_row = await asyncio.to_thread(
-                lambda: get_supabase()
-                .table("fans")
-                .select("pending_tip")
-                .eq("id", fan_id)
-                .single()
-                .execute()
+                lambda: (
+                    get_supabase()
+                    .table("fans")
+                    .select("pending_tip")
+                    .eq("id", fan_id)
+                    .single()
+                    .execute()
+                )
             )
             pending_tip = (tip_row.data or {}).get("pending_tip")
             if pending_tip:
                 await asyncio.to_thread(
-                    lambda: get_supabase()
-                    .table("fans")
-                    .update({"pending_tip": None})
-                    .eq("id", fan_id)
-                    .execute()
+                    lambda: (
+                        get_supabase()
+                        .table("fans")
+                        .update({"pending_tip": None})
+                        .eq("id", fan_id)
+                        .execute()
+                    )
                 )
-                print(f"[TIP ACK] Cleared pending_tip for fan={fan_id} amount=${pending_tip.get('amount')}")
+                print(
+                    f"[TIP ACK] Cleared pending_tip for fan={fan_id} amount=${pending_tip.get('amount')}"
+                )
         except Exception as e:
             print(f"[TIP ACK ERROR] {e}")
 
@@ -1636,7 +1756,9 @@ async def _debounced_auto_reply(
             )
             if outcome_sink is not None:
                 outcome_sink["outcome"] = AUTO_OUTCOME_HUMAN_REVIEW
-            print(f"[AUTO SUPPORT] fan={fan_id} reason=content_access_issue review_required=true")
+            print(
+                f"[AUTO SUPPORT] fan={fan_id} reason=content_access_issue review_required=true"
+            )
             return
 
         if fan_intelligence:
@@ -1655,7 +1777,9 @@ async def _debounced_auto_reply(
             trigger_type="auto_message_pre_policy",
         )
         situation["price_learning"] = price_learning
-        print(f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} crisis={situation.get('crisis_signal', 'none')}")
+        print(
+            f"[SITUATION] fan={fan_id} signal={situation.get('purchase_signal')} move={situation.get('strategic_move')} resend={situation.get('resend_requested')} crisis={situation.get('crisis_signal', 'none')}"
+        )
 
         # What this exchange leaves the conversation carrying.
         #
@@ -1682,7 +1806,11 @@ async def _debounced_auto_reply(
         # Commercial layer: deterministic policy decides what happens next
         # (sell / pause / tease / schedule). Flag-gated so it can be turned off
         # instantly in prod without a deploy.
-        commercial_enabled = os.environ.get("COMMERCIAL_LAYER_ENABLED", "").lower() in ("1", "true", "yes")
+        commercial_enabled = os.environ.get("COMMERCIAL_LAYER_ENABLED", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         decision = None
         if commercial_enabled:
             try:
@@ -1698,7 +1826,9 @@ async def _debounced_auto_reply(
                     situation=situation,
                     fan_has_bought_before=bool(getattr(fan_profile, "total_spent", 0)),
                     within_daily_caps=cap_ok,
-                    frozen_for_review=bool(getattr(fan_profile, "needs_human_review", False)),
+                    frozen_for_review=bool(
+                        getattr(fan_profile, "needs_human_review", False)
+                    ),
                     active_session=active_session,
                     scene=scene_before.to_context(),
                 )
@@ -1712,20 +1842,25 @@ async def _debounced_auto_reply(
         # OFFER_NEXT_UNLOCK, PAUSE_* and ordinary chat must never invoke the
         # content planner. When the flag is off, preserve old behavior.
         should_plan = (
-            decision is not None
-            and decision.action == ActionType.SEND_NEXT_PPV_STEP
-            and bool(decision.accepted_offer_set_id)
-        ) if commercial_enabled else (
-            not _selling_locked(fan_profile)
-            and _fan_wants_content(latest_message, situation)
+            (
+                decision is not None
+                and decision.action == ActionType.SEND_NEXT_PPV_STEP
+                and bool(decision.accepted_offer_set_id)
+            )
+            if commercial_enabled
+            else (
+                not _selling_locked(fan_profile)
+                and _fan_wants_content(latest_message, situation)
+            )
         )
 
         session_is_executable = bool(
-            active_session
-            and active_session.get("status") in {"active", "paused"}
+            active_session and active_session.get("status") in {"active", "paused"}
         )
         if not session_is_executable and should_plan:
-            cap_ok, cap_reason = await _within_daily_caps(creator_id, sent_ppv, fan_profile)
+            cap_ok, cap_reason = await _within_daily_caps(
+                creator_id, sent_ppv, fan_profile
+            )
             if not cap_ok:
                 print(f"[CAP] fan={fan_id} plan suppressed: {cap_reason}")
             else:
@@ -1733,33 +1868,45 @@ async def _debounced_auto_reply(
                     plan_data = await plan_session_for_fan(
                         creator_id,
                         fan_id,
-                        accepted_set_id=(decision.accepted_offer_set_id if decision else None),
-                        accepted_price_cents=(decision.session_budget_cents if decision else None),
+                        accepted_set_id=(
+                            decision.accepted_offer_set_id if decision else None
+                        ),
+                        accepted_price_cents=(
+                            decision.session_budget_cents if decision else None
+                        ),
                     )
                     plan_status = str(plan_data.get("status") or "")
                     if plan_status == "ok":
-                        active_session = plan_data.get("session") or await get_fan_session(fan_id)
-                        print(f"[SESSION] Planned for fan={fan_id} items={len((active_session or {}).get('plan', []))}")
+                        active_session = plan_data.get(
+                            "session"
+                        ) or await get_fan_session(fan_id)
+                        print(
+                            f"[SESSION] Planned for fan={fan_id} items={len((active_session or {}).get('plan', []))}"
+                        )
                     elif commercial_enabled:
                         # A plan that cannot be built is not a decision to say
                         # nothing. Classify it, repair what is repairable, and
                         # only then decide what this turn actually is.
-                        active_session, decision, recovery_outcome = (
-                            await _recover_or_downgrade_plan(
-                                creator_id=creator_id,
-                                fan_id=fan_id,
-                                status=plan_status,
-                                decision=decision,
-                                situation=situation,
-                                price_learning=price_learning,
-                            )
+                        (
+                            active_session,
+                            decision,
+                            recovery_outcome,
+                        ) = await _recover_or_downgrade_plan(
+                            creator_id=creator_id,
+                            fan_id=fan_id,
+                            status=plan_status,
+                            decision=decision,
+                            situation=situation,
+                            price_learning=price_learning,
                         )
                         if recovery_outcome is not None:
                             if outcome_sink is not None:
                                 outcome_sink["outcome"] = recovery_outcome
                             return
                     else:
-                        print(f"[SESSION] plan-session status={plan_status} fan={fan_id}")
+                        print(
+                            f"[SESSION] plan-session status={plan_status} fan={fan_id}"
+                        )
                 except Exception as e:
                     # An exception is an infrastructure failure, not a commercial
                     # outcome. Report it as one instead of as a no-send.
@@ -1780,13 +1927,20 @@ async def _debounced_auto_reply(
         if purchase_signal in ("bought", "declined"):
             db = get_supabase()
             fan_data = await asyncio.to_thread(
-                lambda: db.table("fans").select("pending_ppv_check")
-                .eq("id", fan_id).single().execute()
+                lambda: (
+                    db.table("fans")
+                    .select("pending_ppv_check")
+                    .eq("id", fan_id)
+                    .single()
+                    .execute()
+                )
             )
             pending = (fan_data.data or {}).get("pending_ppv_check")
             if pending and purchase_signal == "declined":
                 try:
-                    pending_price_cents = int(round(float(pending.get("price") or 0) * 100))
+                    pending_price_cents = int(
+                        round(float(pending.get("price") or 0) * 100)
+                    )
                     affordability = await refresh_affordability_from_situation(
                         creator_id=creator_id,
                         fan_id=fan_id,
@@ -1795,7 +1949,9 @@ async def _debounced_auto_reply(
                         offered_price_cents=pending_price_cents,
                     )
                 except Exception as exc:
-                    print(f"[AFFORDABILITY] decline price record failed fan={fan_id}: {exc}")
+                    print(
+                        f"[AFFORDABILITY] decline price record failed fan={fan_id}: {exc}"
+                    )
             if pending and purchase_signal == "bought":
                 print(f"[PPV SIGNAL] fan={fan_id} bought pending={pending}")
                 if local_test_delivery:
@@ -1805,7 +1961,9 @@ async def _debounced_auto_reply(
                     # simulate-purchase control), so eagerly spawning a remote
                     # verification here would be the one remote call a simulated
                     # turn could still make.
-                    print(f"[AUTO TEST DELIVERY] fan={fan_id} remote_verification=skipped")
+                    print(
+                        f"[AUTO TEST DELIVERY] fan={fan_id} remote_verification=skipped"
+                    )
                 else:
                     spawn(
                         _verify_ppv_purchase(fan_id, creator_id, pending),
@@ -1813,29 +1971,48 @@ async def _debounced_auto_reply(
                     )
 
         if commercial_enabled and decision is not None:
-            if decision.action in {ActionType.PAUSE_NO_BUDGET, ActionType.PAUSE_UNTIL_PAYDAY}:
+            if decision.action in {
+                ActionType.PAUSE_NO_BUDGET,
+                ActionType.PAUSE_UNTIL_PAYDAY,
+            }:
                 try:
                     declined_price = (pending or {}).get("price")
                     await set_fan_decline_lock(fan_id, declined_price)
-                    if active_session and active_session.get("awaiting_purchase_index") is not None:
+                    if (
+                        active_session
+                        and active_session.get("awaiting_purchase_index") is not None
+                    ):
                         active_session = mark_step_declined(
                             active_session,
                             reason=decision.action.value,
                             pause=True,
                         )
                         await save_fan_session(fan_id, active_session)
-                    print(f"[SESSION] fan={fan_id} affordability pause ({decision.action.value})")
+                    print(
+                        f"[SESSION] fan={fan_id} affordability pause ({decision.action.value})"
+                    )
                 except Exception as exc:
                     print(f"[DECLINE LOCK ERROR] fan={fan_id} error={exc}")
-            elif decision.action in {ActionType.SEND_NEXT_PPV_STEP, ActionType.RESUME_PREVIOUS_OFFER}:
+            elif decision.action in {
+                ActionType.SEND_NEXT_PPV_STEP,
+                ActionType.RESUME_PREVIOUS_OFFER,
+            }:
                 try:
                     await clear_fan_decline_lock(fan_id)
                 except Exception as exc:
                     print(f"[DECLINE UNLOCK ERROR] fan={fan_id} error={exc}")
-            elif decision.action == ActionType.CONTINUE_NORMAL_CHAT and purchase_signal == "declined":
+            elif (
+                decision.action == ActionType.CONTINUE_NORMAL_CHAT
+                and purchase_signal == "declined"
+            ):
                 # A normal 'no' is not proof of poverty. End only the pending offer.
-                if active_session and active_session.get("awaiting_purchase_index") is not None:
-                    active_session = mark_step_declined(active_session, reason="offer_declined", pause=False)
+                if (
+                    active_session
+                    and active_session.get("awaiting_purchase_index") is not None
+                ):
+                    active_session = mark_step_declined(
+                        active_session, reason="offer_declined", pause=False
+                    )
                     await save_fan_session(fan_id, None)
                     state = await get_fan_state(fan_id)
                     state.status = FanStatus.IDLE
@@ -1973,9 +2150,10 @@ async def _debounced_auto_reply(
             # The exact trigger the legacy prompt used, evaluated deterministically:
             # not paused for affordability, and either he just said yes or the
             # session has been open for three of his messages.
-            selling_paused = bool(
-                getattr(fan_profile, "sale_paused_at", None)
-            ) and purchase_signal != "money_available"
+            selling_paused = (
+                bool(getattr(fan_profile, "sale_paused_at", None))
+                and purchase_signal != "money_available"
+            )
             fan_msg_count = len([m for m in conversation_history if m.role == "fan"])
             msgs_since_session = fan_msg_count - int(
                 active_session.get("started_at_fan_msg_count", 0) or 0
@@ -2071,7 +2249,9 @@ async def _debounced_auto_reply(
             },
         )
         provenance.record_decision(
-            source="commercial_orchestrator" if commercial_enabled else "legacy_session",
+            source="commercial_orchestrator"
+            if commercial_enabled
+            else "legacy_session",
             action=getattr(decision, "action", None),
             reason=getattr(decision, "reason", None),
             purchase_signal=situation.get("purchase_signal"),
@@ -2123,14 +2303,16 @@ async def _debounced_auto_reply(
                     "fan_id": fan_id,
                     "feature": "auto_reply",
                     **route.telemetry_metadata(),
-                "buyer_lifecycle_stage": buyer_lifecycle.get("stage"),
-                "price_learning_mode": price_learning.get("mode"),
-                "price_learning_confidence": price_learning.get("confidence"),
-                "session_strategy_goal": session_strategy.get("goal"),
-                "session_strategy_action": session_strategy.get("next_action"),
-                "conversation_director_phase": conversation_director.get("phase"),
-                "conversation_director_action": conversation_director.get("action"),
-                "conversation_director_reason": conversation_director.get("transition_reason"),
+                    "buyer_lifecycle_stage": buyer_lifecycle.get("stage"),
+                    "price_learning_mode": price_learning.get("mode"),
+                    "price_learning_confidence": price_learning.get("confidence"),
+                    "session_strategy_goal": session_strategy.get("goal"),
+                    "session_strategy_action": session_strategy.get("next_action"),
+                    "conversation_director_phase": conversation_director.get("phase"),
+                    "conversation_director_action": conversation_director.get("action"),
+                    "conversation_director_reason": conversation_director.get(
+                        "transition_reason"
+                    ),
                 },
                 target_override=route.primary_target,
                 fallback_target_override=route.fallback_target,
@@ -2173,9 +2355,7 @@ async def _debounced_auto_reply(
             return
         provenance.record_transform(TRANSFORM_INVENTORY_REPAIR, inventory_repaired)
         if inventory_repaired:
-            print(
-                f"[INVENTORY GUARD] repaired unavailable-media promise fan={fan_id}"
-            )
+            print(f"[INVENTORY GUARD] repaired unavailable-media promise fan={fan_id}")
         reply = safe_reply
 
         # Platform semantics are an invariant, not a prompt preference: paid
@@ -2232,7 +2412,9 @@ async def _debounced_auto_reply(
         # Final check — abort if a new message arrived while we were generating
         current_task = _pending_auto_replies.get(fan_id)
         if current_task and current_task is not asyncio.current_task():
-            print(f"[AUTO REPLY] New message detected post-generation — aborting for fan={fan_id}")
+            print(
+                f"[AUTO REPLY] New message detected post-generation — aborting for fan={fan_id}"
+            )
             return
 
         # Also check DB directly — catches messages that came in during generation
@@ -2241,23 +2423,29 @@ async def _debounced_auto_reply(
         fresh_fan_msgs = [m for m in fresh_check if m.role == "fan"]
         current_fan_msgs = [m for m in conversation_history if m.role == "fan"]
         if len(fresh_fan_msgs) > len(current_fan_msgs):
-            print(f"[AUTO REPLY] New fan message in DB post-generation — aborting for fan={fan_id}")
+            print(
+                f"[AUTO REPLY] New fan message in DB post-generation — aborting for fan={fan_id}"
+            )
             return
 
         db = get_supabase()
         fan_row = await asyncio.to_thread(
-            lambda: db.table("fans")
-            .select("fansly_group_id, platform_fan_id")
-            .eq("id", fan_id)
-            .single()
-            .execute()
+            lambda: (
+                db.table("fans")
+                .select("fansly_group_id, platform_fan_id")
+                .eq("id", fan_id)
+                .single()
+                .execute()
+            )
         )
         creator_row = await asyncio.to_thread(
-            lambda: db.table("creators")
-            .select("fansly_account_id, apifansly_account_id")
-            .eq("id", creator_id)
-            .single()
-            .execute()
+            lambda: (
+                db.table("creators")
+                .select("fansly_account_id, apifansly_account_id")
+                .eq("id", creator_id)
+                .single()
+                .execute()
+            )
         )
 
         group_id = (fan_row.data or {}).get("fansly_group_id")
@@ -2277,7 +2465,9 @@ async def _debounced_auto_reply(
         ):
             from main import get_or_fetch_group_id
 
-            group_id = await get_or_fetch_group_id(apifansly_account_id, str(platform_fan_id), fan_id)
+            group_id = await get_or_fetch_group_id(
+                apifansly_account_id, str(platform_fan_id), fan_id
+            )
 
         # One name for "this turn does not wait". Availability and composition
         # were skipped by two separate flags, which is why the timing line could
@@ -2310,7 +2500,11 @@ async def _debounced_auto_reply(
         # schedule computed. In a fast simulated turn every one of them is zero,
         # and the mode says so rather than naming the live availability mode the
         # scheduler would have used.
-        awaited_away = 0.0 if (simulation_fast or skip_availability) else timing.availability_delay_seconds
+        awaited_away = (
+            0.0
+            if (simulation_fast or skip_availability)
+            else timing.availability_delay_seconds
+        )
         awaited_compose = 0.0 if simulation_fast else timing.composition_delay_seconds
         awaited_between = (
             [0.0 for _ in timing.inter_part_delays_seconds]
@@ -2364,9 +2558,7 @@ async def _debounced_auto_reply(
             except Exception:
                 pass
 
-        if not await _pause(
-            timing.composition_delay_seconds, phase="before_part_1"
-        ):
+        if not await _pause(timing.composition_delay_seconds, phase="before_part_1"):
             return
 
         last_plain_message_id: str | None = None
@@ -2388,9 +2580,10 @@ async def _debounced_auto_reply(
                 media_id = ppv_delivery.media_id
                 price = ppv_delivery.price
                 current_step = (
-                    ((active_session or {}).get("plan") or [None] * (ppv_delivery.step_index + 1))[
-                        ppv_delivery.step_index
-                    ]
+                    (
+                        (active_session or {}).get("plan")
+                        or [None] * (ppv_delivery.step_index + 1)
+                    )[ppv_delivery.step_index]
                     if active_session
                     else None
                 )
@@ -2430,9 +2623,7 @@ async def _debounced_auto_reply(
             # there is no route. The worker already postpones these actions, so
             # this is the backstop for any other caller.
             if (
-                not group_id
-                or not apifansly_account_id
-                or not apifansly_enabled()
+                not group_id or not apifansly_account_id or not apifansly_enabled()
             ) and not local_test_delivery:
                 print(f"[AUTO DELIVERY ERROR] fan={fan_id}: no live delivery route")
                 if is_ppv_part:
@@ -2461,15 +2652,23 @@ async def _debounced_auto_reply(
                         f"[AUTO DELIVERY ERROR] fan={fan_id}: refused "
                         f"simulation-only media on a live route media={media_ids}"
                     )
-                    await freeze_fan_for_review(fan_id, "simulation_media_on_live_route")
+                    await freeze_fan_for_review(
+                        fan_id, "simulation_media_on_live_route"
+                    )
                     return
                 elif is_ppv_part:
-                    ppv_content = text_out if text_out else random.choice([
-                        "here it is 😏",
-                        "just for you...",
-                        "this is what I've been saving 😈",
-                        "don't say I never spoil you 💋",
-                    ])
+                    ppv_content = (
+                        text_out
+                        if text_out
+                        else random.choice(
+                            [
+                                "here it is 😏",
+                                "just for you...",
+                                "this is what I've been saving 😈",
+                                "don't say I never spoil you 💋",
+                            ]
+                        )
+                    )
                     response_body = await send_apifansly_message(
                         str(apifansly_account_id),
                         str(group_id),
@@ -2495,7 +2694,9 @@ async def _debounced_auto_reply(
                     if not platform_message_id:
                         raise RuntimeError("platform rejected text delivery")
             except Exception as exc:
-                record_stage("fansly_send_ms", (time.perf_counter() - send_started) * 1000)
+                record_stage(
+                    "fansly_send_ms", (time.perf_counter() - send_started) * 1000
+                )
                 print(f"[AUTO DELIVERY ERROR] fan={fan_id}: {exc}")
                 if is_ppv_part:
                     await freeze_fan_for_review(fan_id, "ppv_send_failed")
@@ -2588,7 +2789,11 @@ async def _debounced_auto_reply(
                         "verification_attempts": 0,
                         "platform_message_id": platform_message_id,
                     }
-                    active_session, reconcile_at, attached = await persist_ppv_reconciliation(
+                    (
+                        active_session,
+                        reconcile_at,
+                        attached,
+                    ) = await persist_ppv_reconciliation(
                         creator_id=creator_id,
                         fan_id=fan_id,
                         pending=pending_check,
@@ -2607,11 +2812,13 @@ async def _debounced_auto_reply(
                         f"expires_at={expires_at.isoformat()}"
                     )
                 except Exception as exc:
-                    await freeze_fan_for_review(fan_id, "ppv_sent_but_reconciliation_not_persisted")
+                    await freeze_fan_for_review(
+                        fan_id, "ppv_sent_but_reconciliation_not_persisted"
+                    )
                     print(f"[PPV PERSIST ERROR] fan={fan_id}: {exc}")
                     return
 
-            print(f"[AUTO REPLY] Sent part {i+1}: {text_out[:50]}")
+            print(f"[AUTO REPLY] Sent part {i + 1}: {text_out[:50]}")
 
         # The reply is delivered and persisted. Only now may anything the
         # creator improvised about herself become canon: a turn that aborted at
@@ -2656,8 +2863,19 @@ async def _debounced_auto_reply(
         # to send nothing.
         raise
     except Exception as e:
+        # A selected semantic runtime is an architecture boundary.  Its owner,
+        # validation, writer or executor failure must reach the durable worker
+        # and simulator as a failure; it must never continue in or be mistaken
+        # for the legacy controller stack.
+        from services.live_orchestration import LiveOrchestrationError
+
+        if isinstance(e, LiveOrchestrationError):
+            if outcome_sink is not None:
+                outcome_sink["outcome"] = AUTO_OUTCOME_OWNER_FAILED
+            raise
         print(f"[DEBOUNCED AUTO REPLY ERROR] fan={fan_id} error={e}")
         import traceback
+
         traceback.print_exc()
     finally:
         # A cancelled older task may finish after schedule_auto_reply has already
@@ -2690,17 +2908,30 @@ async def record_ppv_purchase(
     The paid-session plan moves forward only here, after confirmation. The final
     step closes and clears the active session and resets session-specific state.
     """
+
     def _tier(total: int) -> str:
-        return "whale" if total >= 500 else "active" if total >= 100 else "casual" if total >= 20 else "cold"
+        return (
+            "whale"
+            if total >= 500
+            else "active"
+            if total >= 100
+            else "casual"
+            if total >= 20
+            else "cold"
+        )
 
     db = get_supabase()
     fan_response = await asyncio.to_thread(
-        lambda: db.table("fans")
-        .select(
-            "total_spent, sales_log, not_sold_log, creator_id, "
-            "needs_human_review, pending_ppv_check"
+        lambda: (
+            db.table("fans")
+            .select(
+                "total_spent, sales_log, not_sold_log, creator_id, "
+                "needs_human_review, pending_ppv_check"
+            )
+            .eq("id", fan_id)
+            .single()
+            .execute()
         )
-        .eq("id", fan_id).single().execute()
     )
     row = fan_response.data or {}
     creator_id = row.get("creator_id")
@@ -2730,7 +2961,11 @@ async def record_ppv_purchase(
             amount = plan[int(idx)].get("price")
     if amount is None:
         amount = next(
-            (entry.get("amount", 0) for entry in not_sold if str(media_id) in str(entry.get("item", ""))),
+            (
+                entry.get("amount", 0)
+                for entry in not_sold
+                if str(media_id) in str(entry.get("item", ""))
+            ),
             0,
         )
     amount_dollars = int(round(float(amount or 0)))
@@ -2757,16 +2992,19 @@ async def record_ppv_purchase(
     new_spent = old_spent
     if not already_recorded:
         from datetime import datetime
-        sales_log.append({
-            "date": datetime.utcnow().strftime("%d.%m.%Y"),
-            "item": f"PPV media {media_id}",
-            "media_id": str(media_id),
-            "media_ids": pending.get("media_ids") or [str(media_id)],
-            "payment_reference": reference or None,
-            "platform_order_id": platform_order_id or None,
-            "amount": amount_dollars,
-            "chatter": "Operator" if pending.get("source") == "operator" else "AI",
-        })
+
+        sales_log.append(
+            {
+                "date": datetime.utcnow().strftime("%d.%m.%Y"),
+                "item": f"PPV media {media_id}",
+                "media_id": str(media_id),
+                "media_ids": pending.get("media_ids") or [str(media_id)],
+                "payment_reference": reference or None,
+                "platform_order_id": platform_order_id or None,
+                "amount": amount_dollars,
+                "chatter": "Operator" if pending.get("source") == "operator" else "AI",
+            }
+        )
         not_sold = [
             entry
             for entry in not_sold
@@ -2786,11 +3024,10 @@ async def record_ppv_purchase(
             "purchased",
             amount_paid_cents=int(round(float(amount or 0) * 100)),
             metadata=(
-                {"platform_order_id": platform_order_id}
-                if platform_order_id
-                else None
+                {"platform_order_id": platform_order_id} if platform_order_id else None
             ),
         )
+
     def _merge_purchase(current: dict | None) -> dict | None:
         """Build the fan update from the row as it actually is.
 
@@ -2881,9 +3118,7 @@ async def record_ppv_purchase(
         raise
     await mark_ppv_purchased(fan_id, str(media_id))
     if creator_id and reference:
-        await cancel_action_by_dedupe_key(
-            f"ppv-reconcile:{fan_id}:{reference}"
-        )
+        await cancel_action_by_dedupe_key(f"ppv-reconcile:{fan_id}:{reference}")
     if creator_id and clears_current_pending:
         await cancel_actions_for_fan(fan_id, "ABANDONED_PPV_FOLLOWUP")
     if creator_id and not already_recorded:
@@ -2903,7 +3138,9 @@ async def record_ppv_purchase(
         # commercial session is cleared a few lines below, so by the time he
         # replies there is nothing left to infer a purchase from.
         try:
-            unlocked_set_id = (pending or {}).get("set_id") or (session or {}).get("set_id")
+            unlocked_set_id = (pending or {}).get("set_id") or (session or {}).get(
+                "set_id"
+            )
             await record_unlock(
                 creator_id=creator_id,
                 fan_id=fan_id,
@@ -2932,6 +3169,7 @@ async def record_ppv_purchase(
                 state.next_followup_dedupe_key = None
             if completed:
                 from datetime import datetime, timezone
+
                 completed_session = updated
                 await save_fan_session(fan_id, updated)
                 lifecycle_context = await refresh_fan_lifecycle(
@@ -3004,7 +3242,9 @@ async def record_ppv_purchase(
         from datetime import datetime, timedelta, timezone
 
         purchased_at = datetime.now(timezone.utc)
-        reaction_key = platform_order_id or reference or f"{media_id}:{purchased_at.isoformat()}"
+        reaction_key = (
+            platform_order_id or reference or f"{media_id}:{purchased_at.isoformat()}"
+        )
         await schedule_action(
             creator_id=creator_id,
             fan_id=fan_id,
@@ -3031,7 +3271,9 @@ async def record_ppv_purchase(
             threshold = int(caps.get("whale_handoff_threshold") or 0)
             if threshold and old_spent < threshold <= new_spent:
                 await freeze_fan_for_review(fan_id, f"whale:${new_spent}")
-                print(f"[WHALE HANDOFF] fan={fan_id} crossed ${threshold} (now ${new_spent})")
+                print(
+                    f"[WHALE HANDOFF] fan={fan_id} crossed ${threshold} (now ${new_spent})"
+                )
         except Exception as exc:
             print(f"[WHALE HANDOFF ERROR] fan={fan_id} error={exc}")
 
@@ -3055,36 +3297,8 @@ async def _verify_ppv_purchase(
     creator_id: str,
     pending: dict,
 ) -> None:
-    """Immediate verification hook; durable retries stay in scheduled_actions."""
-    try:
-        from services.followup_lifecycle import pending_reference
-        from services.ppv_reconciliation import (
-            PPVReconcileDisposition,
-            reconcile_pending_ppv,
-        )
-
-        reference = pending_reference(pending)
-        result = await reconcile_pending_ppv(
-            creator_id=creator_id,
-            fan_id=fan_id,
-            expected_reference=reference,
-        )
-        if result.disposition == PPVReconcileDisposition.PENDING and result.retry_at:
-            await schedule_action(
-                creator_id=creator_id,
-                fan_id=fan_id,
-                action_type="PPV_RECONCILE",
-                execute_at=result.retry_at,
-                payload={"payment_reference": reference},
-                dedupe_key=f"ppv-reconcile:{fan_id}:{reference}",
-            )
-        print(
-            f"[PPV VERIFY] fan={fan_id} disposition={result.disposition.value} "
-            f"reference={reference} reason={result.reason}"
-        )
-    except Exception as exc:
-        # The durable action remains pending and will retry with backoff.
-        print(f"[PPV VERIFY ERROR] fan={fan_id}: {exc}")
+    """Compatibility wrapper for the shared authoritative verifier."""
+    await verify_ppv_purchase(fan_id, creator_id, pending)
 
 
 async def sweep_stale_ppv_checks() -> None:
@@ -3114,15 +3328,17 @@ async def sweep_stale_ppv_checks() -> None:
         # until the next 15-minute pass.
         pending_rows = await retry_transient_db_operation(
             lambda: fetch_all_rows_async(
-                lambda start, end: db.table("fans")
-                .select(
-                    "id, creator_id, pending_ppv_check, needs_human_review, "
-                    "review_reason"
+                lambda start, end: (
+                    db.table("fans")
+                    .select(
+                        "id, creator_id, pending_ppv_check, needs_human_review, "
+                        "review_reason"
+                    )
+                    .not_.is_("pending_ppv_check", "null")
+                    .order("id")
+                    .range(start, end)
+                    .execute()
                 )
-                .not_.is_("pending_ppv_check", "null")
-                .order("id")
-                .range(start, end)
-                .execute()
             ),
             label="ppv_sweep.pending_rows",
         )
@@ -3193,7 +3409,9 @@ async def schedule_auto_reply(
     from services.followup_lifecycle import next_awake_time
 
     history = conversation_history or await get_conversation_history(fan_id)
-    latest_fan = next((message for message in reversed(history) if message.role == "fan"), None)
+    latest_fan = next(
+        (message for message in reversed(history) if message.role == "fan"), None
+    )
     trigger_at = (
         latest_fan.sent_at.astimezone(timezone.utc)
         if latest_fan and latest_fan.sent_at
@@ -3288,9 +3506,7 @@ async def deliver_scheduled_auto_reply(action: dict) -> bool:
         trigger_at = trigger_at.replace(tzinfo=timezone.utc)
     history = await get_conversation_history(fan_id, limit=10)
     return any(
-        message.role == "creator"
-        and message.sent_at
-        and message.sent_at > trigger_at
+        message.role == "creator" and message.sent_at and message.sent_at > trigger_at
         for message in history
     )
 
@@ -3435,7 +3651,8 @@ async def _recent_creator_message_rows(fan_id: str) -> list[dict]:
 
     def _load() -> list[dict]:
         result = (
-            get_supabase().table("messages")
+            get_supabase()
+            .table("messages")
             .select("id, role, content, sent_at, media_context")
             .eq("fan_id", fan_id)
             .eq("role", "creator")
@@ -3504,7 +3721,9 @@ async def run_simulated_inbound(
     mark_simulation_owned_message(fan_message_id)
 
     history_before = await get_conversation_history(fan_id)
-    creator_ids_before = {row["id"] for row in await _recent_creator_message_rows(fan_id)}
+    creator_ids_before = {
+        row["id"] for row in await _recent_creator_message_rows(fan_id)
+    }
 
     with simulation_scope(include_mirrored_catalog=include_mirrored_catalog):
         # Fan intelligence learning is part of the real inbound pipeline, so the

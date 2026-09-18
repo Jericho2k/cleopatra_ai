@@ -35,8 +35,15 @@ async def plan_session_for_fan(
     *,
     accepted_set_id: str | None = None,
     accepted_price_cents: int | None = None,
+    persist: bool = True,
 ) -> dict[str, Any]:
-    """Build the single locked step that delivers the accepted offer."""
+    """Build the single locked step that delivers the accepted offer.
+
+    ``persist=False`` is the semantic runtime's pre-generation validation
+    phase. It resolves the exact approved media and price without changing fan
+    state. The runtime persists that already-reviewed plan only after writing
+    succeeds and a final stale-state check passes.
+    """
     # The creator policy is deliberately not read here any more. The only
     # thing this function took from it was the purchase-gating flag, which
     # CreatorPolicy forces True and nothing downstream read — so the read was a
@@ -148,19 +155,21 @@ async def plan_session_for_fan(
         # CreatorPolicy's own validator and nothing ever read the copy, so it
         # was a field in persisted JSON that could only ever say one thing.
     }
-    await save_fan_session(fan_id, session)
+    if persist:
+        await save_fan_session(fan_id, session)
 
-    # A plan authorizes the locked PPV; it is not paid until the platform
-    # confirms the unlock.
-    state.status = FanStatus.OFFER_SELECTED
-    state.confirmed_budget_cents = cents
-    state.accepted_offer_set_id = step["set_id"]
-    from db.commercial_queries import save_fan_state
-    await save_fan_state(fan_id, creator_id, state)
+        # A plan authorizes the locked PPV; it is not paid until the platform
+        # confirms the unlock.
+        state.status = FanStatus.OFFER_SELECTED
+        state.confirmed_budget_cents = cents
+        state.accepted_offer_set_id = step["set_id"]
+        from db.commercial_queries import save_fan_state
+
+        await save_fan_state(fan_id, creator_id, state)
 
     print(
         f"[SESSION] planned fan={fan_id} unlock={step['set_id']} "
-        f"price=${cents / 100:.2f}"
+        f"price=${cents / 100:.2f} persisted={persist}"
     )
     return {"status": "ok", "session": session}
 

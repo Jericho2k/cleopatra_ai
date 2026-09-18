@@ -1639,7 +1639,7 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
     fan_row, creator_row = await asyncio.gather(
         asyncio.to_thread(
             lambda: db.table("fans")
-            .select("fansly_group_id")
+            .select("fansly_group_id, platform_fan_id")
             .eq("id", req.fan_id).single().execute()
         ),
         asyncio.to_thread(
@@ -1650,10 +1650,86 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
     )
 
     group_id = (fan_row.data or {}).get("fansly_group_id")
+    local_test_delivery = str(
+        (fan_row.data or {}).get("platform_fan_id") or ""
+    ).startswith("test_")
     apifansly_id = (creator_row.data or {}).get("apifansly_account_id")
 
+    if not local_test_delivery and (not group_id or not apifansly_id):
+        raise HTTPException(status_code=409, detail="No live delivery route for this fan")
+
+    # Redeem before delivery so a semantic Assisted token can be revalidated
+    # against the exact turn and operation snapshot before anything is visible
+    # to the customer. Legacy and missing tokens keep their attribution-only
+    # behavior and never become an authorization dependency.
+    from services.assisted_provenance import redeem as _redeem_provenance
+    from services.assisted_provenance import unavailable_metadata
+
+    provenance, unavailable = await _redeem_provenance(
+        req.suggestion_token, creator_id=req.creator_id, fan_id=req.fan_id
+    )
+    semantic_approval = None
+    if provenance is not None:
+        try:
+            from services.live_orchestration import (
+                LiveOrchestrationError,
+                prepare_assisted_approval,
+            )
+
+            semantic_approval = await prepare_assisted_approval(
+                provenance,
+                creator_id=req.creator_id,
+                fan_id=req.fan_id,
+            )
+        except LiveOrchestrationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if req.suggestion_index is not None:
+            if (provenance.decision or {}).get("conversation_core") == "semantic_v1":
+                provenance.decision["operator_chosen_index"] = str(
+                    req.suggestion_index
+                )
+                provenance.decision["operator_edited"] = str(
+                    bool(req.suggestion_edited)
+                )
+            else:
+                provenance.record_decision(
+                    source="assisted_operator",
+                    action="send_suggestion",
+                    extra={
+                        "chosen_index": req.suggestion_index,
+                        "operator_edited": req.suggestion_edited,
+                    },
+                )
+        provenance.record_transform(
+            TRANSFORM_OPERATOR_EDIT, bool(req.suggestion_edited)
+        )
+
+    if (
+        semantic_approval is not None
+        and semantic_approval.execution.operation == "send_locked_paid_message"
+    ):
+        try:
+            from services.live_orchestration import execute_assisted_locked_approval
+
+            delivery = await execute_assisted_locked_approval(
+                semantic_approval,
+                content=req.content,
+            )
+        except LiveOrchestrationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "status": "ok",
+            "message_id": delivery.get("message_id"),
+            "delivery": "locked_ppv",
+        }
+
+    # A test fan may exercise the locked adapter above, but plain Assisted
+    # messages have no local delivery boundary and must not manufacture a
+    # platform receipt.
     if not group_id or not apifansly_id:
         raise HTTPException(status_code=409, detail="No live delivery route for this fan")
+
     try:
         response_body = await send_apifansly_message(
             str(apifansly_id),
@@ -1674,12 +1750,6 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
     # expired token means no record at all — an operator's message must never
     # fail to send because its evidence trail could not be completed.
     media_context: dict | None = None
-    from services.assisted_provenance import redeem as _redeem_provenance
-    from services.assisted_provenance import unavailable_metadata
-
-    provenance, unavailable = await _redeem_provenance(
-        req.suggestion_token, creator_id=req.creator_id, fan_id=req.fan_id
-    )
     if provenance is None:
         # An admitted absence rather than no record at all. A message saved
         # with no provenance key is indistinguishable from one written by a
@@ -1693,18 +1763,6 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
             f"{unavailable}"
         )
     if provenance is not None:
-        if req.suggestion_index is not None:
-            provenance.record_decision(
-                source="assisted_operator",
-                action="send_suggestion",
-                extra={
-                    "chosen_index": req.suggestion_index,
-                    "operator_edited": req.suggestion_edited,
-                },
-            )
-        provenance.record_transform(
-            TRANSFORM_OPERATOR_EDIT, bool(req.suggestion_edited)
-        )
         media_context = provenance.as_metadata(
             delivery_kind=DELIVERY_TEXT,
             platform_message_id=platform_message_id,
@@ -1720,6 +1778,14 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
         fansly_message_id=platform_message_id,
         media_context=media_context,
     )
+
+    if semantic_approval is not None:
+        try:
+            from services.live_orchestration import finalize_assisted_plain_approval
+
+            await finalize_assisted_plain_approval(semantic_approval)
+        except LiveOrchestrationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     # An assisted reply becomes creator canon here and nowhere earlier: this is
     # the point at which a suggestion stops being a candidate and becomes
@@ -7781,18 +7847,26 @@ def _read_simulation_test_fans(db, creator_ids: list[str]):
             .execute()
         )
 
+    base = "id, display_name, creator_id, platform_fan_id"
+    optional = ["ai_stack_profile", "conversation_core"]
     try:
-        return _query("id, display_name, creator_id, platform_fan_id, ai_stack_profile")
+        return _query(f"{base}, {', '.join(optional)}")
     except Exception as exc:
         text = str(exc).lower()
-        if "ai_stack_profile" not in text:
+        missing = [name for name in optional if name in text]
+        if not missing:
             raise
+        kept = [name for name in optional if name not in missing]
         print(
-            "[SIMULATION] ai_stack_profile column missing — apply "
-            "db/ai_stack_profile_v1.sql. Listing test fans without per-fan "
-            "AI stack overrides."
+            f"[SIMULATION] optional columns missing ({','.join(missing)}); "
+            "listing test fans with available runtime overrides"
         )
-        return _query("id, display_name, creator_id, platform_fan_id")
+        try:
+            return _query(f"{base}, {', '.join(kept)}" if kept else base)
+        except Exception as second:
+            if not any(name in str(second).lower() for name in kept):
+                raise
+            return _query(base)
 
 
 @app.get("/simulation/creators")
@@ -7867,6 +7941,7 @@ async def simulation_creators(request: Request) -> dict:
                 "display_name": fan.get("display_name") or str(fan.get("id")),
                 "platform_fan_id": fan.get("platform_fan_id"),
                 "ai_stack_profile": fan.get("ai_stack_profile"),
+                "conversation_core": fan.get("conversation_core"),
             }
         )
     return {
@@ -8330,6 +8405,12 @@ class AIStackOverrideRequest(BaseModel):
     ai_stack_profile: str | None = None
 
 
+class ConversationCoreOverrideRequest(BaseModel):
+    """Select the live conversational architecture, or clear for rollback."""
+
+    conversation_core: str | None = None
+
+
 @app.post("/simulation/test-fans")
 async def create_simulation_test_fan(
     body: SimulationTestFanRequest,
@@ -8486,6 +8567,64 @@ async def update_simulation_fan_ai_stack(
         print(f"[AI STACK] simulation override write failed fan={fan_id}: {exc}")
         raise not_found() from exc
     return {"status": "ok", "fan_id": fan_id, "ai_stack_profile": stored}
+
+
+def _require_conversation_core_owner(request: Request) -> None:
+    """Runtime architecture selection is platform-owner authority."""
+    from core.simulation import request_is_platform_operator
+
+    if not request_is_platform_operator(request):
+        raise HTTPException(status_code=403, detail="This needs the platform operator.")
+
+
+@app.get("/conversation-cores")
+async def read_conversation_cores(request: Request) -> dict:
+    _require_conversation_core_owner(request)
+    from services.conversation_core import CORE_ENV_VAR, CORE_IDS, environment_core_id
+
+    labels = {"legacy": "Legacy controller stack", "semantic_v1": "Semantic owner v1"}
+    return {
+        "cores": [{"id": value, "name": labels[value]} for value in CORE_IDS],
+        "environment_core": environment_core_id(),
+        "environment_variable": CORE_ENV_VAR,
+    }
+
+
+@app.put("/creator/{creator_id}/fan/{fan_id}/conversation-core")
+async def update_simulation_fan_conversation_core(
+    creator_id: str,
+    fan_id: str,
+    body: ConversationCoreOverrideRequest,
+    request: Request,
+) -> dict:
+    """Pin one test fan to a core. Clearing the value is the rollback."""
+    _require_conversation_core_owner(request)
+    await _require_simulatable_fan(request, creator_id, fan_id)
+    from services.conversation_core import (
+        resolve_conversation_core,
+        set_simulation_fan_core_override,
+    )
+
+    try:
+        stored = await set_simulation_fan_core_override(
+            fan_id, body.conversation_core
+        )
+        effective = await resolve_conversation_core(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            platform_fan_id="test_selected",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"[CONVERSATION CORE] simulation write failed fan={fan_id}: {exc}")
+        raise HTTPException(status_code=503, detail="Could not save the conversation core.") from exc
+    return {
+        "status": "ok",
+        "fan_id": fan_id,
+        "conversation_core": stored,
+        "effective": effective.to_dict(),
+    }
 
 
 @app.get("/content-price-ranges")
@@ -8788,6 +8927,60 @@ async def update_creator_ai_stack(
         ) from exc
     effective = await resolve_ai_stack(creator_id=creator_id)
     print(f"[AI STACK] creator={creator_id} override set to {stored or 'none'}")
+    return {
+        "status": "ok",
+        "creator_id": creator_id,
+        "override": stored,
+        "effective": effective.to_dict(),
+    }
+
+
+@app.get("/creator/{creator_id}/conversation-core")
+async def read_creator_conversation_core(creator_id: str, request: Request) -> dict:
+    _require_conversation_core_owner(request)
+    await require_creator_access(request, creator_id)
+    from services.conversation_core import (
+        creator_core_override,
+        environment_core_id,
+        resolve_conversation_core,
+    )
+
+    override = await creator_core_override(creator_id)
+    effective = await resolve_conversation_core(creator_id=creator_id)
+    return {
+        "creator_id": creator_id,
+        "override": override,
+        "environment_core": environment_core_id(),
+        "effective": effective.to_dict(),
+    }
+
+
+@app.put("/creator/{creator_id}/conversation-core")
+async def update_creator_conversation_core(
+    creator_id: str,
+    body: ConversationCoreOverrideRequest,
+    request: Request,
+) -> dict:
+    """Owner-authorized creator rollout. NULL is the immediate rollback."""
+    _require_conversation_core_owner(request)
+    await require_creator_access(request, creator_id)
+    from services.conversation_core import (
+        resolve_conversation_core,
+        set_creator_core_override,
+    )
+
+    try:
+        stored = await set_creator_core_override(creator_id, body.conversation_core)
+        effective = await resolve_conversation_core(creator_id=creator_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        print(f"[CONVERSATION CORE] creator write failed creator={creator_id}: {exc}")
+        raise HTTPException(status_code=503, detail="Could not save the conversation core.") from exc
+    print(
+        f"[CONVERSATION CORE] creator={creator_id} override={stored or 'none'} "
+        f"effective={effective.core_id}"
+    )
     return {
         "status": "ok",
         "creator_id": creator_id,
