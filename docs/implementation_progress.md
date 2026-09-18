@@ -6,7 +6,7 @@ this page and continue, without re-running the investigation that produced
 has been built, what has been verified and how, and what the next sprint is.
 Keep it current in the same commit as the work it describes.
 
-Last updated: 2026-09-17.
+Last updated: 2026-09-18.
 
 ---
 
@@ -41,11 +41,24 @@ remains accurate and should not be removed until the file is actually provided.
 
 | Phase | Gate | Status |
 |---|---|---|
-| A — repair the concrete correctness gaps | reproductions fail before, pass after; CI evidence | **A1–A4 implemented.** Gate A partly met: reproductions and local suite are evidenced below, remote CI on this branch is not yet observed |
-| B — an evaluation harness that can disprove readiness | injected faults are actually detected | **Not started** |
-| C — durable ordinary-conversation memory and context | two deferred subjects survive 30+ turns and a return | **Not started** |
-| D — complete and compare conversational cores | baseline/candidate evidence with inspectable disagreement | **Not started** |
-| E — operator flows and controlled evaluation | reproducible bundle; the three claims kept separate | **Not started.** The owner trace inspector's backend half landed under A2 |
+| A — repair the concrete correctness gaps | reproductions fail before, pass after; CI evidence | **Implemented and locally tested.** The follow-up makes Assisted provenance consume atomic across replicas and adds live-path memory resolution/supersession. Remote CI and the real-Postgres concurrency test remain externally unverified |
+| B — an evaluation harness that can disprove readiness | injected faults are actually detected | **Implemented and locally tested in the existing longitudinal harness.** No new production-readiness claim is made; external evaluation evidence remains unverified |
+| C — durable ordinary-conversation memory and context | two deferred subjects survive 30+ turns and a return | **Implemented and locally tested.** Live Assisted/Auto extraction now closes or supersedes only exact in-scope thread IDs and refreshes the same-turn writer packet. The 30+ turn deployed gate remains externally unverified |
+| D — complete and compare conversational cores | baseline/candidate evidence with inspectable disagreement | **Implemented and locally tested.** A real-provider entry point compares reply-plus-intent against semantic-owner-plus-writer through one dry-run executor. No paid provider run or human selection has been performed |
+| E — operator flows and controlled evaluation | reproducible bundle; the three claims kept separate | **Partly implemented and locally tested.** Owner-only trace inspection, isolated-adapter browser flows and reproducible evaluation bundles are implemented. Deployed verification, provider runs, human review, and controlled pilots are blocked on external access/approval |
+
+### 2026-09-18 continuation follow-up
+
+| Deliverable | Readiness status | Evidence / remaining input |
+|---|---|---|
+| Atomic Assisted provenance consume | **Implemented and locally tested** | Unit concurrency tests pass. A real-Postgres two-connection test is included but skips without `TEST_DATABASE_URL`; target migration and multi-replica verification are externally unverified |
+| Live memory resolution and correction | **Implemented and locally tested** | Tests cover a question disappearing after its answer, a correction suppressing the superseded belief, ambiguous references doing nothing, and cross-tenant IDs being refused |
+| Owner reply-trace inspector | **Implemented and locally tested** | Backend owner/agency authorization, dashboard summary, and Playwright owner-flow tests pass. Deployed owner/agency verification still requires test accounts and a running target environment |
+| Operator browser flows | **Implemented and locally tested** | Playwright uses isolated adapters with the production repair, memory and trace components. It covers older-purchase selection, unknown-outcome repeat prevention, preservation of a newer hold, memory correction/closure, edited Assisted attribution, takeover and rollback |
+| Complete-core candidate comparison | **Implemented and locally tested** | `scripts/run_candidate_provider_eval.py` uses configured providers and the shared dry-run executor. A paid run needs provider credentials, budget, approved data, and human reviewers |
+| Reproducible evaluation bundle | **Implemented and locally tested** | Bundle pins source, flags, schema order, scenario digest, targets, full results, disagreements, latency, token use, and cost. No candidate is selected automatically |
+| Deployment and rollback procedure | **Implemented; externally unverified** | See `docs/continuation_deployment_rollback.md`. Deployment access and explicit approval are required |
+| Live deployment, live autonomy, message agency | **Blocked on external decision** | Deliberately not performed and not implied by any passing test |
 
 ### Phase A — what landed, and what each item was
 

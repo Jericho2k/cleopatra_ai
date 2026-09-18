@@ -148,6 +148,7 @@ def client(monkeypatch):
     monkeypatch.setattr("core.auth.authenticated_dashboard_user", fake_user)
     monkeypatch.setattr(tenancy, "_creator_ids_for_user", fake_creator_ids)
     monkeypatch.setattr(main, "get_supabase", _Fans)
+    monkeypatch.setattr("core.supabase.get_supabase", _Fans)
     # core.tenancy binds get_supabase at import time, so it needs its own patch.
     monkeypatch.setattr(tenancy, "get_supabase", _Fans)
     monkeypatch.setattr("services.suggestions.run_simulated_inbound", never_runs)
@@ -331,6 +332,33 @@ def test_an_agency_account_may_simulate_but_never_mirror(client):
         "simulation_mirror": False,
         "operator_diagnostics": False,
     }
+
+
+def test_reply_trace_is_owner_authorized_not_merely_hidden_in_the_ui(client):
+    agency = client.get(
+        "/creator/creator-1/fan/fan-real/reply-trace",
+        headers=_headers(AGENCY),
+    )
+    owner = client.get(
+        "/creator/creator-1/fan/fan-real/reply-trace",
+        headers=_headers(OWNER),
+    )
+
+    assert agency.status_code == 403
+    assert agency.json()["detail"] == "Platform owner only"
+    assert owner.status_code == 200
+    assert owner.json()["creator_id"] == "creator-1"
+
+
+def test_reply_trace_owner_identity_does_not_depend_on_simulator_switch(
+    client, monkeypatch
+):
+    monkeypatch.setenv("AUTO_SIMULATION_ENABLED", "false")
+
+    assert client.get(
+        "/creator/creator-1/fan/fan-real/reply-trace",
+        headers=_headers(OWNER),
+    ).status_code == 200
 
 
 def test_capability_response_leaks_nothing(client):
