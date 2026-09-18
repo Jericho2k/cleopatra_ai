@@ -16,6 +16,7 @@ one through the postgres service in .github/workflows/ci.yml.
 from __future__ import annotations
 
 import os
+import threading
 import uuid
 from pathlib import Path
 
@@ -174,6 +175,54 @@ def test_the_whole_pipeline_applies_to_a_fresh_database(pipeline):
         "reengagement_settings",
     ):
         assert required in tables, f"{required} is missing after the full pipeline"
+
+
+def test_assisted_provenance_consume_has_one_winner_across_connections(pipeline):
+    """The database, not a process cache, arbitrates concurrent replicas."""
+    connection, name = pipeline
+    token = f"token-{uuid.uuid4()}"
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f'insert into "{name}".creators (id, name) '
+            "values (gen_random_uuid(), 'Attribution creator') returning id"
+        )
+        creator_id = cursor.fetchone()[0]
+        cursor.execute(
+            f'insert into "{name}".fans (id, creator_id, display_name) '
+            "values (gen_random_uuid(), %s, 'Attribution fan') returning id",
+            (creator_id,),
+        )
+        fan_id = cursor.fetchone()[0]
+        cursor.execute(
+            f'insert into "{name}".assisted_provenance '
+            "(token, creator_id, fan_id, record) values (%s, %s, %s, %s::jsonb)",
+            (token, creator_id, fan_id, '{"turn_id":"one"}'),
+        )
+
+    barrier = threading.Barrier(3)
+    results: list[list[tuple]] = []
+
+    def consume():
+        replica = psycopg.connect(DATABASE_URL, autocommit=True)
+        try:
+            barrier.wait()
+            with replica.cursor() as cursor:
+                cursor.execute(
+                    f'select * from "{name}".consume_assisted_provenance(%s,%s,%s)',
+                    (token, str(creator_id), str(fan_id)),
+                )
+                results.append(cursor.fetchall())
+        finally:
+            replica.close()
+
+    workers = [threading.Thread(target=consume) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join()
+
+    assert sorted(len(rows) for rows in results) == [0, 1]
 
 
 def test_the_summaries_view_exists(pipeline):

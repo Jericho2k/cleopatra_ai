@@ -519,3 +519,58 @@ def test_a_row_written_by_a_newer_build_is_read_without_raising():
 def test_an_empty_thread_is_refused_rather_than_stored(db):
     assert run(continuity.record_open_thread(_thread(creator_id=""))) is None
     assert db.tables["conversation_open_threads"] == []
+
+
+def test_an_analyzer_reference_is_scoped_to_creator_and_fan(db):
+    stored = run(continuity.record_open_thread(_thread()))
+
+    assert not run(
+        continuity.resolve_referenced_thread(
+            stored.id,
+            creator_id="creator-2",
+            fan_id="fan-1",
+            status=ThreadStatus.FULFILLED,
+            resolved_by=ResolvedBy.FAN_MESSAGE,
+        )
+    )
+    assert not run(
+        continuity.resolve_referenced_thread(
+            stored.id,
+            creator_id="creator-1",
+            fan_id="fan-2",
+            status=ThreadStatus.FULFILLED,
+            resolved_by=ResolvedBy.FAN_MESSAGE,
+        )
+    )
+    assert len(run(continuity.open_threads_for("creator-1", "fan-1"))) == 1
+
+
+def test_a_cross_tenant_supersession_reference_records_and_closes_nothing(db):
+    stored = run(continuity.record_open_thread(_thread()))
+    replacement = _thread(
+        creator_id="creator-2",
+        summary="a correction belonging to another tenant",
+    )
+
+    result = run(
+        continuity.supersede_referenced_thread(
+            stored.id,
+            replacement,
+            creator_id="creator-2",
+            fan_id="fan-1",
+        )
+    )
+
+    assert result is None
+    assert len(db.tables["conversation_open_threads"]) == 1
+    assert db.tables["conversation_open_threads"][0]["status"] == "open"
+
+
+def test_analyzer_reference_lines_include_ids_but_writer_lines_do_not(db):
+    stored = run(continuity.record_open_thread(_thread()))
+
+    analyzer = continuity.summarize_thread_references([stored])
+    writer = continuity.summarize_threads([stored])
+
+    assert f"thread_id={stored.id}" in analyzer[0]
+    assert stored.id not in writer[0]

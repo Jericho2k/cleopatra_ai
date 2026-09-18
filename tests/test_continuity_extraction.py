@@ -114,11 +114,22 @@ def test_every_record_carries_provenance_back_to_its_turn():
 
 
 def test_a_resolution_is_proposed_rather_than_applied():
-    """Only the caller knows which stored thread a phrase refers to."""
+    """Only an opaque reference can identify a stored thread."""
+    result = _extract(
+        threads_resolved=[
+            {"thread_id": "thread-123", "evidence": "she answered about Chicago"}
+        ]
+    )
+
+    assert [proposal.thread_id for proposal in result.resolved] == ["thread-123"]
+    assert result.threads == []
+
+
+def test_a_free_text_resolution_is_refused_not_fuzzy_matched():
     result = _extract(threads_resolved=["the chicago question"])
 
-    assert result.resolved == ["the chicago question"]
-    assert result.threads == []
+    assert result.resolved == []
+    assert result.rejected == {"unscoped_resolution": 1}
 
 
 def test_an_empty_analysis_records_nothing():
@@ -156,10 +167,43 @@ def test_a_monetary_proposal_is_refused(proposal):
 
 def test_a_monetary_resolution_is_refused_too():
     """"He says he got it" is not delivery."""
-    result = _extract(threads_resolved=["he confirmed he was refunded"])
+    result = _extract(
+        threads_resolved=[
+            {"thread_id": "thread-123", "evidence": "he confirmed he was refunded"}
+        ]
+    )
 
     assert result.resolved == []
     assert result.rejected == {"monetary_resolution": 1}
+
+
+def test_a_correction_can_name_the_exact_record_it_supersedes():
+    result = _extract(
+        corrections_stated=[
+            {
+                "summary": "he prefers indoor shoots, not outdoor",
+                "supersedes_thread_id": "thread-old",
+                "evidence": "he explicitly corrected the preference",
+            }
+        ]
+    )
+
+    assert result.threads == []
+    assert len(result.supersessions) == 1
+    assert result.supersessions[0].replaces_thread_id == "thread-old"
+
+
+def test_a_correction_without_an_exact_reference_stays_visible_but_closes_nothing():
+    result = _extract(
+        corrections_stated=[
+            {"summary": "he prefers indoor shoots", "supersedes_thread_id": ""}
+        ]
+    )
+
+    assert [thread.summary for thread in result.threads] == [
+        "he prefers indoor shoots"
+    ]
+    assert result.supersessions == []
 
 
 def test_customer_text_cannot_talk_its_way_into_a_payment_record():

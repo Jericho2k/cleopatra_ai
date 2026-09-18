@@ -98,8 +98,8 @@ Return ONLY valid JSON with exactly these fields:
   "open_questions_raised": ["each question HE asked in the latest message that is still unanswered, as a short phrase"],
   "commitments_made": ["each thing the CREATOR promised to do, as a short phrase"],
   "topics_deferred": ["each topic either of them explicitly put off until later, as a short phrase"],
-  "corrections_stated": ["each thing HE corrected about himself or his preferences, as a short phrase"],
-  "threads_resolved": ["each earlier open item this exchange settles, as a short phrase"]
+  "corrections_stated": [{"summary": "what is true now", "supersedes_thread_id": "exact id from STILL OPEN, or empty", "evidence": "brief reason this exchange supports the change"}],
+  "threads_resolved": [{"thread_id": "exact id from STILL OPEN", "evidence": "brief reason this exchange settles it"}]
 }
 
 WHAT THE CONVERSATION IS STILL CARRYING:
@@ -114,8 +114,13 @@ WHAT THE CONVERSATION IS STILL CARRYING:
 - topics_deferred is a subject explicitly put off — "let's talk about that
   another time", "remind me later".
 - corrections_stated is him correcting the record about himself: a name, a
-  preference, a fact that was wrong. What he corrected TO belongs in the phrase.
-- threads_resolved is an earlier open item this exchange settles.
+  preference, a fact that was wrong. Put what he corrected TO in summary. Set
+  supersedes_thread_id only when one exact [thread_id=...] in STILL OPEN is the
+  obsolete record; otherwise leave it empty. Never guess from similar wording.
+- threads_resolved is an earlier open item this exchange settles. It MUST name
+  one exact [thread_id=...] supplied in STILL OPEN and say what in this exchange
+  is evidence. If no exact reference is certain, return no resolution. Never
+  copy, invent or alter an id.
 - NEVER put money in any of these. A payment, a purchase, a refund, an unlock,
   a price or whether he was charged is decided by the delivery ledger and never
   by reading a message. If he says he paid, that is not a record that he paid.
