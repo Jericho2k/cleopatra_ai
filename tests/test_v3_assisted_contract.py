@@ -33,6 +33,19 @@ def assisted_world(monkeypatch):
     calls: dict[str, list] = {"writer": [], "legend_writes": []}
     replies = ["first option", "second option", "third option"]
 
+    from services.conversation_core import (
+        CORE_LEGACY,
+        SOURCE_BUILTIN,
+        ConversationCoreResolution,
+    )
+
+    monkeypatch.setattr(
+        "services.conversation_core.resolve_conversation_core",
+        lambda **_kwargs: _value(
+            ConversationCoreResolution(CORE_LEGACY, SOURCE_BUILTIN)
+        ),
+    )
+
     async def fake_generate(prompt, persona, **kwargs):
         calls["writer"].append({"prompt": prompt, **kwargs})
         return list(replies)

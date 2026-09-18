@@ -233,10 +233,16 @@ class TurnOutcome(str, Enum):
     HANDED_OFF = "handed_off"
     #: The analyzer could not read the situation.
     ANALYSIS_FAILED = "analysis_failed"
+    #: The selected semantic owner failed or returned a malformed contract.
+    DECISION_FAILED = "decision_failed"
     #: The writer produced nothing usable, or its plan could not be recovered.
     WRITER_FAILED = "writer_failed"
     #: A commercial guard refused to send what was planned.
     INVENTORY_BLOCKED = "inventory_blocked"
+    #: State changed while the model was running; the old decision was dropped.
+    STALE = "stale"
+    #: The operation is bound and waiting for an operator, not delivered.
+    AWAITING_APPROVAL = "awaiting_approval"
     #: The turn raised. Infrastructure, not behaviour.
     INFRASTRUCTURE_ERROR = "infrastructure_error"
     #: Nothing recorded why. Missing evidence, reported as missing.
@@ -255,6 +261,9 @@ _OUTCOME_MEANING: dict[str, "TurnOutcome"] = {
     "writer_failed": TurnOutcome.WRITER_FAILED,
     "plan_unrecoverable": TurnOutcome.WRITER_FAILED,
     "inventory_unsafe": TurnOutcome.INVENTORY_BLOCKED,
+    "owner_failed": TurnOutcome.DECISION_FAILED,
+    "stale_generation": TurnOutcome.STALE,
+    "approval_required": TurnOutcome.AWAITING_APPROVAL,
 }
 
 #: Outcomes that are not the system working as intended. Counted separately,
@@ -263,6 +272,7 @@ _OUTCOME_MEANING: dict[str, "TurnOutcome"] = {
 FAILED_OUTCOMES: frozenset["TurnOutcome"] = frozenset(
     {
         TurnOutcome.ANALYSIS_FAILED,
+        TurnOutcome.DECISION_FAILED,
         TurnOutcome.WRITER_FAILED,
         TurnOutcome.INFRASTRUCTURE_ERROR,
         TurnOutcome.UNKNOWN,

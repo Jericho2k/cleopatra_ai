@@ -139,6 +139,7 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
     from db.experience_director_queries import get_scene
     from db.price_learning_queries import get_price_learning_profile
     from services.ai_stack import resolve_ai_stack
+    from services.conversation_core import resolve_conversation_core
 
     fan = await require_simulation_fan(fan_id, creator_id)
 
@@ -158,6 +159,7 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
         intelligence,
         actions,
         stack,
+        conversation_core,
         scene,
     ) = await asyncio.gather(
         _safe("commercial_state", get_fan_state(fan_id)),
@@ -168,6 +170,14 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
         _safe("fan_intelligence", get_fan_intelligence_context(fan_id)),
         _safe("scheduled_actions", pending_scheduled_actions(fan_id)),
         _safe("ai_stack", resolve_ai_stack(creator_id=creator_id, fan_id=fan_id)),
+        _safe(
+            "conversation_core",
+            resolve_conversation_core(
+                creator_id=creator_id,
+                fan_id=fan_id,
+                platform_fan_id=fan.get("platform_fan_id"),
+            ),
+        ),
         _safe("scene", get_scene(fan_id)),
     )
 
@@ -187,6 +197,9 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
             "sale_paused_at": fan.get("sale_paused_at"),
         },
         "ai_stack": (stack.to_dict() if stack is not None else None),
+        "conversation_core": (
+            conversation_core.to_dict() if conversation_core is not None else None
+        ),
         # Confirmed money only. This is simulated spend on a simulated fan and
         # is excluded from every production revenue view (see
         # core.simulation.exclude_simulation_fans).

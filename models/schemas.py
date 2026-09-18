@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class StageType(str, Enum):
@@ -19,6 +19,7 @@ class StageType(str, Enum):
 class Fan(BaseModel):
     id: str
     display_name: str
+    creator_id: str | None = None
     auto_mode: bool | None = None  # None = inherit creator setting
     platform_fan_id: str | None = None
     fansly_group_id: str | None = None
@@ -83,7 +84,11 @@ class Persona(BaseModel):
     @field_validator("voice_calibration_message_ids")
     @classmethod
     def normalize_voice_calibration_message_ids(cls, values: list[str]) -> list[str]:
-        return list(dict.fromkeys(str(value).strip() for value in (values or []) if str(value).strip()))[:30]
+        return list(
+            dict.fromkeys(
+                str(value).strip() for value in (values or []) if str(value).strip()
+            )
+        )[:30]
 
 
 class Message(BaseModel):
@@ -196,10 +201,18 @@ class SuggestionResponse(BaseModel):
     # attempt that actually produced it. Empty when provenance is unavailable;
     # the dashboard treats it as opaque and never displays it.
     suggestion_token: str = ""
+    # The semantic owner can explicitly choose silence or a human handoff.
+    # Assisted surfaces that decision without fabricating a sendable filler
+    # candidate merely to satisfy a historical 1..3 list shape.
+    reply_recommended: bool = True
+    disposition: str = "reply"
+    handoff_reason: str = ""
+    conversation_core: str = "legacy"
 
-    @field_validator("suggestions")
-    @classmethod
-    def between_one_and_three(cls, v: list[str]) -> list[str]:
-        if not 1 <= len(v) <= 3:
-            raise ValueError("suggestions must contain between 1 and 3 items")
-        return v
+    @model_validator(mode="after")
+    def between_zero_and_three(self) -> "SuggestionResponse":
+        if len(self.suggestions) > 3:
+            raise ValueError("suggestions must contain at most 3 items")
+        if not self.suggestions and self.reply_recommended:
+            raise ValueError("a recommended reply must contain at least one suggestion")
+        return self

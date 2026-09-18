@@ -79,6 +79,10 @@ conversation_continuity_v1.sql
 # it replaces, and (like v1) before tenant_isolation_v1.
 ai_stack_profile_v3.sql
 
+# Selectable conversational runtime. NULL everywhere preserves the current
+# legacy controller stack; semantic_v1 is owner-enabled per creator or test fan.
+conversation_core_v1.sql
+
 # One next unlock at a time instead of a two-package menu. Drops the quick/full
 # policy dials and the ordered offer snapshot, and backfills the single pending
 # offer from the first entry of that snapshot. Must run AFTER

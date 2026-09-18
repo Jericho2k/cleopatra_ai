@@ -28,10 +28,8 @@ from services.commercial_events import (
 )
 from services.commercial_policy import CommercialContext, decide_next_action
 from services.experience_director import scene_allows_new_offer
-from services.followup_lifecycle import (
-    complete_session_state,
-    pending_offer_expiry_obligation,
-)
+from services.followup_lifecycle import complete_session_state
+from services.offer_lifecycle import sync_pending_offer_expiry
 from services.payday import resolve_payday
 from services.session_lifecycle import (
     has_pending_purchase,
@@ -117,62 +115,6 @@ def _clear_followup_obligation(state) -> None:
     state.next_followup_dedupe_key = None
 
 
-async def _sync_pending_offer_expiry(
-    *,
-    creator_id: str,
-    fan_id: str,
-    state,
-    policy,
-    anchor: datetime,
-) -> None:
-    """Make fan state and the durable queue agree about one pending offer."""
-    if state.status != FanStatus.OFFER_PENDING or state.pending_offer is None:
-        try:
-            await cancel_actions_for_fan(fan_id, "OFFER_EXPIRY")
-        except Exception as exc:
-            print(f"[OFFER EXPIRY] cancellation failed fan={fan_id}: {exc}")
-        if state.next_followup_type == "OFFER_EXPIRY":
-            _clear_followup_obligation(state)
-        return
-
-    previous_type = state.next_followup_type
-    state.last_offer_at = anchor
-    obligation = pending_offer_expiry_obligation(
-        state,
-        policy=policy,
-        fan_id=fan_id,
-    )
-    if obligation is None:
-        return
-
-    if previous_type and previous_type != "OFFER_EXPIRY":
-        try:
-            await cancel_actions_for_fan(fan_id, previous_type)
-        except Exception as exc:
-            print(
-                f"[OFFER EXPIRY] superseded action cancellation failed "
-                f"fan={fan_id} type={previous_type}: {exc}"
-            )
-    try:
-        await cancel_actions_for_fan(fan_id, "OFFER_EXPIRY")
-        await schedule_action(
-            creator_id=creator_id,
-            fan_id=fan_id,
-            action_type=obligation.action_type,
-            execute_at=obligation.execute_at,
-            payload=obligation.payload,
-            dedupe_key=obligation.dedupe_key,
-        )
-    except Exception as exc:
-        # The state obligation is persisted by the caller and repaired by the
-        # worker, so a queue write failure cannot lose the expiry promise.
-        print(f"[OFFER EXPIRY] scheduling repair needed fan={fan_id}: {exc}")
-    state.next_followup_at = obligation.execute_at
-    state.next_followup_type = obligation.action_type
-    state.next_followup_payload = obligation.payload
-    state.next_followup_dedupe_key = obligation.dedupe_key
-
-
 async def acknowledge_fan_return(
     creator_id: str,
     fan_id: str,
@@ -198,12 +140,14 @@ async def acknowledge_fan_return(
 
     if state.status == FanStatus.OFFER_PENDING and state.pending_offer is not None:
         policy = await get_creator_policy(creator_id)
-        await _sync_pending_offer_expiry(
+        await sync_pending_offer_expiry(
             creator_id=creator_id,
             fan_id=fan_id,
             state=state,
             policy=policy,
             anchor=now or datetime.now(timezone.utc),
+            cancel_action=cancel_actions_for_fan,
+            schedule=schedule_action,
         )
         changed = True
 
@@ -498,12 +442,14 @@ async def orchestrate(
         except Exception as exc:
             print(f"[COMMERCIAL] cancel follow-up failed fan={fan_id}: {exc}")
 
-    await _sync_pending_offer_expiry(
+    await sync_pending_offer_expiry(
         creator_id=creator_id,
         fan_id=fan_id,
         state=state,
         policy=policy,
         anchor=now,
+        cancel_action=cancel_actions_for_fan,
+        schedule=schedule_action,
     )
 
     await save_fan_state(fan_id, creator_id, state)

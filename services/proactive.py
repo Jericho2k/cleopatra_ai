@@ -6,6 +6,7 @@ sessions and other lifecycle actions later).
 The caller supplies a GOAL — a decided commercial action — and this module only
 expresses it. The model does not get to decide whether to sell here.
 """
+
 import asyncio
 from datetime import datetime, timezone
 from typing import Any
@@ -89,23 +90,55 @@ async def send_proactive_message(
     if not fan:
         return False
 
+    # A due event is evidence, not permission to send.  On the selected
+    # semantic runtime it re-enters the same owner/validator/writer/executor as
+    # inbound Full Auto.  Resolve before building any legacy behavioral prompt.
+    from services.conversation_core import (
+        log_effective_core,
+        resolve_conversation_core,
+    )
+
+    core = await resolve_conversation_core(
+        creator_id=creator_id,
+        fan_id=fan_id,
+        platform_fan_id=getattr(fan, "platform_fan_id", None),
+        db=get_supabase(),
+    )
+    log_effective_core(
+        core,
+        creator_id=creator_id,
+        fan_id=fan_id,
+        trigger="scheduled_event",
+    )
+    if core.is_semantic:
+        from services.live_orchestration import run_proactive_turn
+
+        return await run_proactive_turn(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            goal=goal,
+            action_id=action_id,
+        )
+
     persona = await get_creator_persona(creator_id) or Persona()
     history = await get_conversation_history(fan_id, limit=20)
 
     try:
         from db.queries import get_creator_legend
+
         legend = await get_creator_legend(creator_id)
     except Exception:
         legend = {}
 
     ctx = ConversationContext(
-        fan_message="",          # proactive: he hasn't just said anything
+        fan_message="",  # proactive: he hasn't just said anything
         conversation_history=history,
         fan_profile=fan,
         creator_persona=persona,
         similar_exchanges=[],
         conversation_stage=StageType.RE_ENGAGEMENT
-        if hasattr(StageType, "RE_ENGAGEMENT") else StageType.WARMING_UP,
+        if hasattr(StageType, "RE_ENGAGEMENT")
+        else StageType.WARMING_UP,
         creator_name="",
         ppv_offers=[],
         sent_ppv=await get_sent_ppv(fan_id),
@@ -154,21 +187,26 @@ async def send_proactive_message(
     # control surface anywhere any more (services/ppv_turn.py), and a proactive
     # message never carries media, so this only keeps the string out of the chat.
     import re
+
     text = re.sub(r"\[PPV:[^\]]*\]", "", text).strip()
     if not text:
         return False
 
     group_id = getattr(fan, "fansly_group_id", None)
     creator_row = await asyncio.to_thread(
-        lambda: get_supabase().table("creators")
-        .select("apifansly_account_id, fansly_account_id")
-        .eq("id", creator_id)
-        .single()
-        .execute()
+        lambda: (
+            get_supabase()
+            .table("creators")
+            .select("apifansly_account_id, fansly_account_id")
+            .eq("id", creator_id)
+            .single()
+            .execute()
+        )
     )
     apifansly_account_id = (creator_row.data or {}).get("apifansly_account_id")
     creator_platform_id = str((creator_row.data or {}).get("fansly_account_id") or "")
-    local_test_delivery = str(getattr(fan, "platform_fan_id", "") or "").startswith("test_")
+    platform_fan_id = str(getattr(fan, "platform_fan_id", "") or "")
+    local_test_delivery = platform_fan_id.startswith("test_")
     if (not group_id or not apifansly_account_id) and not local_test_delivery:
         print(f"[PROACTIVE SEND ERROR] fan={fan_id}: no live delivery route")
         return False
@@ -184,15 +222,23 @@ async def send_proactive_message(
         except (TypeError, ValueError):
             started_at = None
 
-    if action_id and not local_test_delivery and not confirmed_message_id and started_at:
+    if (
+        action_id
+        and not local_test_delivery
+        and not confirmed_message_id
+        and started_at
+    ):
         try:
-            confirmed_message_id = await _reconcile_ambiguous_delivery(
-                account_id=str(apifansly_account_id),
-                group_id=str(group_id),
-                creator_platform_id=creator_platform_id,
-                text=text,
-                started_at=started_at,
-            ) or ""
+            confirmed_message_id = (
+                await _reconcile_ambiguous_delivery(
+                    account_id=str(apifansly_account_id),
+                    group_id=str(group_id),
+                    creator_platform_id=creator_platform_id,
+                    text=text,
+                    started_at=started_at,
+                )
+                or ""
+            )
             if confirmed_message_id:
                 print(
                     f"[PROACTIVE RECONCILED] fan={fan_id} "
@@ -205,11 +251,13 @@ async def send_proactive_message(
             return False
 
     if action_id and not confirmed_message_id:
-        delivery.update({
-            "text": text,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "attempts": int(delivery.get("attempts") or 0) + 1,
-        })
+        delivery.update(
+            {
+                "text": text,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "attempts": int(delivery.get("attempts") or 0) + 1,
+            }
+        )
         payload["_delivery"] = delivery
         await update_action_payload(action_id, payload)
 
@@ -233,11 +281,13 @@ async def send_proactive_message(
     journal_error: Exception | None = None
     if action_id:
         try:
-            delivery.update({
-                "text": text,
-                "platform_message_id": platform_message_id,
-                "confirmed_at": datetime.now(timezone.utc).isoformat(),
-            })
+            delivery.update(
+                {
+                    "text": text,
+                    "platform_message_id": platform_message_id,
+                    "confirmed_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
             payload["_delivery"] = delivery
             await update_action_payload(action_id, payload)
         except Exception as exc:

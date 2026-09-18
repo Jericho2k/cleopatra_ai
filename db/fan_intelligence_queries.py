@@ -107,7 +107,13 @@ async def update_fact(fact_id: str, patch: dict[str, Any]) -> None:
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     await asyncio.to_thread(
-        lambda: get_supabase().table("fan_facts").update(payload).eq("id", fact_id).execute()
+        lambda: (
+            get_supabase()
+            .table("fan_facts")
+            .update(payload)
+            .eq("id", fact_id)
+            .execute()
+        )
     )
 
 
@@ -135,19 +141,24 @@ async def get_fan_intelligence_context(fan_id: str) -> dict[str, Any]:
     """Return compact evidence-backed context for writers and commercial logic."""
 
     enabled = os.getenv("FAN_INTELLIGENCE_ENABLED", "false").strip().lower() in {
-        "1", "true", "yes", "on"
+        "1",
+        "true",
+        "yes",
+        "on",
     }
     if not enabled:
         return {}
 
     try:
+
         def _get() -> list[dict[str, Any]]:
             response = (
                 get_supabase()
                 .table("fan_facts")
                 .select(
                     "id, category, fact_key, value_json, confidence, status, "
-                    "source_type, is_active, confirmation_count, last_observed_at"
+                    "source_type, is_active, confirmation_count, last_observed_at, "
+                    "last_evidence_message_id"
                 )
                 .eq("fan_id", fan_id)
                 .order("updated_at", desc=True)
@@ -181,6 +192,7 @@ async def get_fan_intelligence_context(fan_id: str) -> dict[str, Any]:
                 "confidence": float(row.get("confidence") or 0),
                 "status": row.get("status"),
                 "source_type": row.get("source_type"),
+                "source_message_id": row.get("last_evidence_message_id"),
                 "confirmation_count": int(row.get("confirmation_count") or 1),
             }
         )

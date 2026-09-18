@@ -118,6 +118,7 @@ async def send_locked_ppv(
     was_ai_suggested: bool,
     set_id: str | None = None,
     step_index: int | None = None,
+    media_context_extra: dict | None = None,
 ) -> dict:
     """Send once, then durably attach reconciliation and payment state.
 
@@ -162,6 +163,7 @@ async def send_locked_ppv(
         )
     if source != "operator" and fan.get("pending_ppv_check"):
         raise PPVDeliveryError("this fan already has a locked PPV awaiting payment")
+    local_test_delivery = str(fan.get("platform_fan_id") or "").startswith("test_")
 
     creator_row = await asyncio.to_thread(
         lambda: db.table("creators")
@@ -172,7 +174,7 @@ async def send_locked_ppv(
     )
     account_id = (creator_row.data or {}).get("apifansly_account_id")
     group_id = fan.get("fansly_group_id")
-    if not group_id and account_id and fan.get("platform_fan_id"):
+    if not local_test_delivery and not group_id and account_id and fan.get("platform_fan_id"):
         from main import get_or_fetch_group_id
 
         group_id = await get_or_fetch_group_id(
@@ -180,7 +182,7 @@ async def send_locked_ppv(
             str(fan["platform_fan_id"]),
             fan_id,
         )
-    if not group_id or not account_id:
+    if not local_test_delivery and (not group_id or not account_id):
         await freeze_fan_for_review(fan_id, "ppv_delivery_route_missing")
         raise PPVDeliveryError("no live delivery route for this fan")
 
@@ -230,13 +232,31 @@ async def send_locked_ppv(
             f"media_ids={exact_media_ids} access_type=['ppv'] "
             f"price_dollars={price_dollars:.2f}"
         )
-        response_body = await send_apifansly_message(
-            str(account_id),
-            str(group_id),
-            content=content,
-            media_ids=exact_media_ids,
-            price_dollars=price_dollars,
-        )
+        if local_test_delivery:
+            response_body = {
+                "data": {
+                    "data": {
+                        "response": {
+                            "id": f"local-test:{reference}",
+                            "attachments": [
+                                {
+                                    "contentId": f"local-test-attachment:{reference}:{index}"
+                                }
+                                for index, _ in enumerate(exact_media_ids)
+                            ],
+                        }
+                    }
+                }
+            }
+            print(f"[PPV TEST DELIVERY] fan={fan_id} accepted=true reference={reference}")
+        else:
+            response_body = await send_apifansly_message(
+                str(account_id),
+                str(group_id),
+                content=content,
+                media_ids=exact_media_ids,
+                price_dollars=price_dollars,
+            )
     except ApiFanslyTransientError as exc:
         # The platform answered with a rate limit or an unavailability status,
         # which means it did not process the send. Nothing is in the fan's chat,
@@ -283,15 +303,23 @@ async def send_locked_ppv(
         )
 
     try:
-        lock_evidence = await verify_locked_ppv(
-            account_id=str(account_id),
-            group_id=str(group_id),
-            platform_message_id=platform_message_id,
-            media_ids=exact_media_ids,
-            price_cents=int(price_cents),
-            allow_provisional=source == "operator",
-            expected_attachment_ids=platform_attachment_ids,
-        )
+        if local_test_delivery:
+            lock_evidence = {
+                "verified": True,
+                "reason": "local_test_adapter",
+                "actual_media_ids": exact_media_ids,
+                "raw_prices": [int(price_cents)],
+            }
+        else:
+            lock_evidence = await verify_locked_ppv(
+                account_id=str(account_id),
+                group_id=str(group_id),
+                platform_message_id=platform_message_id,
+                media_ids=exact_media_ids,
+                price_cents=int(price_cents),
+                allow_provisional=source == "operator",
+                expected_attachment_ids=platform_attachment_ids,
+            )
         if lock_evidence.get("provisional"):
             print(
                 f"[PPV LOCK PROVISIONAL] fan={fan_id} "
@@ -383,6 +411,7 @@ async def send_locked_ppv(
             ),
         }
         media_context = {
+            **dict(media_context_extra or {}),
             "ppv": {
                 "media_ids": exact_media_ids,
                 "media_id": exact_media_ids[0],

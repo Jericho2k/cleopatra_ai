@@ -28,15 +28,11 @@ here for a phase, a tone ladder, a bubble count or a sentence template — and
 ``forbidden_fields`` exists so that a future owner adding one fails a test
 rather than quietly reintroducing what this replaces.
 
-**This does not add an authority.** The review warns that "another planner added
-on top would introduce another authority unless ownership is explicitly
-simplified", and that removal must be tested under replay rather than assumed.
-So the first thing built on this interface is a *projection* of the controllers
-that already exist (``services/decision_owners.current_stack_decision``), which
-changes no behaviour and makes today's decision inspectable. A single semantic
-owner is a second implementation of the same interface, compared against the
-first offline with the executor held fixed. Which one ships is a question for
-evidence, and this type is what makes the comparison possible.
+**This does not add an authority.** On the selected replacement path, the single
+semantic owner replaces the legacy behavioural controllers and its proposal is
+checked by a deterministic validator before execution. A projection of the old
+controllers (``services.decision_owners.current_stack_decision``) remains only
+as the frozen comparison baseline; it is not called by the selected path.
 
 **Neither owner may authorize anything.** ``ProposedOperation`` is a proposal in
 its name and in its semantics: §4 is explicit that "Neither model can authorize
@@ -75,10 +71,34 @@ class OperationKind(str, Enum):
     """
 
     NONE = "none"
+    PRESENT_OFFER = "present_offer"
+    SEND_LOCKED_PAID_MESSAGE = "send_locked_paid_message"
+    CHECK_PAYMENT_CLAIM = "check_payment_claim"
     OFFER_CONTENT = "offer_content"
     DELIVER_PAID_CONTENT = "deliver_paid_content"
     REPAIR_CONTENT_ACCESS = "repair_content_access"
     HAND_OFF_TO_HUMAN = "hand_off_to_human"
+
+
+class ResponseDisposition(str, Enum):
+    """Whether this turn writes, intentionally stays quiet, or hands off."""
+
+    REPLY = "reply"
+    SILENCE = "silence"
+    HANDOFF = "handoff"
+
+
+class ResponseIntent(str, Enum):
+    """Semantic purpose of the reply, without prescribing its wording."""
+
+    ORDINARY_CONVERSATION = "ordinary_conversation"
+    ANSWER_AND_CONTINUE = "answer_and_continue"
+    CLARIFY_REFERENCE = "clarify_reference"
+    PRESENT_OFFER = "present_offer"
+    DELIVER_ACCEPTED_OFFER = "deliver_accepted_offer"
+    ACKNOWLEDGE_PAYMENT_CHECK = "acknowledge_payment_check"
+    SUPPORT_HANDOFF = "support_handoff"
+    RESPECT_SILENCE = "respect_silence"
 
 
 class HoldReason(str, Enum):
@@ -109,6 +129,14 @@ class ProposedOperation:
     subject: str = ""
     #: Why this turn is proposing it.
     because: str = ""
+    # Exact opaque references copied from the evidence snapshot.  The semantic
+    # owner may choose among these values but may not create one.  Prices and
+    # media identifiers remain absent: the executor resolves both from the
+    # authoritative rows at execution time.
+    offer_id: str = ""
+    set_id: str = ""
+    payment_reference: str = ""
+    purchase_id: str = ""
 
     @property
     def is_external(self) -> bool:
@@ -146,6 +174,12 @@ class ConversationDecision:
     #: The one external thing being asked for, if any.
     proposed_operation: ProposedOperation = field(default_factory=ProposedOperation)
 
+    #: What the turn means to do and whether it should produce customer text.
+    #: Defaults preserve the offline comparison contract that predates the live
+    #: migration; the selected live core requires both fields explicitly.
+    response_intent: ResponseIntent = ResponseIntent.ORDINARY_CONVERSATION
+    disposition: ResponseDisposition = ResponseDisposition.REPLY
+
     #: Why this turn waits or hands over instead of answering.
     hold: HoldReason = HoldReason.NONE
     hold_detail: str = ""
@@ -174,6 +208,10 @@ class ConversationDecision:
                 f"operation: {self.proposed_operation.kind.value} vs "
                 f"{other.proposed_operation.kind.value}"
             )
+        if self.disposition != other.disposition:
+            differences.append(
+                f"disposition: {self.disposition.value} vs {other.disposition.value}"
+            )
         if self.hold != other.hold:
             differences.append(f"hold: {self.hold.value} vs {other.hold.value}")
         missed = set(other.must_address) - set(self.must_address)
@@ -199,9 +237,15 @@ class ConversationDecision:
             "supporting_messages": list(self.supporting_messages),
             "unresolved_references": list(self.unresolved_references),
             "must_address": list(self.must_address),
+            "response_intent": self.response_intent.value,
+            "disposition": self.disposition.value,
             "operation": self.proposed_operation.kind.value,
             "operation_subject": self.proposed_operation.subject,
             "operation_because": self.proposed_operation.because,
+            "operation_offer_id": self.proposed_operation.offer_id,
+            "operation_set_id": self.proposed_operation.set_id,
+            "operation_payment_reference": self.proposed_operation.payment_reference,
+            "operation_purchase_id": self.proposed_operation.purchase_id,
             "hold": self.hold.value,
             "hold_detail": self.hold_detail,
             "confidence": self.confidence,

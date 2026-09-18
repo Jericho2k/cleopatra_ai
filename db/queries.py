@@ -21,6 +21,7 @@ def _row_to_fan(row: dict) -> Fan:
     return Fan(
         id=str(row["id"]),
         display_name=row["display_name"],
+        creator_id=(str(row["creator_id"]) if row.get("creator_id") is not None else None),
         auto_mode=row.get("auto_mode"),
         platform_fan_id=str(row["platform_fan_id"]) if row.get("platform_fan_id") is not None else None,
         fansly_group_id=str(row["fansly_group_id"]) if row.get("fansly_group_id") is not None else None,

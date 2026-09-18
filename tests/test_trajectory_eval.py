@@ -474,6 +474,25 @@ def test_operator_rescues_are_counted_as_a_cost_not_a_failure():
     assert report.critical == []
 
 
+def test_semantic_runtime_outcomes_remain_distinct_in_evaluation():
+    report = TrajectoryReport(
+        trajectory="semantic outcomes",
+        turns=[
+            _turn(0, outcome="owner_failed"),
+            _turn(1, outcome="stale_generation"),
+            _turn(2, outcome="approval_required"),
+        ],
+    )
+
+    summary = report.summary()
+    assert summary["outcomes"] == {
+        "decision_failed": 1,
+        "stale": 1,
+        "awaiting_approval": 1,
+    }
+    assert summary["failed_turns"] == 1
+
+
 def test_the_tail_latency_is_reported_rather_than_averaged_away():
     """§5 asks for tail behaviour, which an average hides."""
     report = TrajectoryReport(
