@@ -116,47 +116,48 @@ async def redeem(
     if not key:
         return None, UNAVAILABLE_NO_TOKEN
 
-    cached = SUGGESTION_PROVENANCE.take(key, creator_id=creator_id, fan_id=fan_id)
-    if cached is not None:
-        # Still delete the durable row: the in-process hit means this replica
-        # served both requests, and leaving the row would let a replay on
-        # another replica redeem the same turn again.
-        await forget(key)
-        return cached, ""
-
-    def _read() -> list[dict[str, Any]]:
-        result = (
-            get_supabase().table(TABLE)
-            .select("token, creator_id, fan_id, record, created_at")
-            .eq("token", key)
-            .limit(1)
-            .execute()
-        )
+    def _consume() -> list[dict[str, Any]]:
+        # The DELETE ... RETURNING function is the authority.  The process
+        # cache can save deserialisation work after this succeeds, but it can
+        # never independently grant attribution: another replica may already
+        # have consumed the durable row.
+        result = get_supabase().rpc(
+            "consume_assisted_provenance",
+            {
+                "p_token": key,
+                "p_creator_id": str(creator_id or ""),
+                "p_fan_id": str(fan_id or ""),
+                "p_now": datetime.now(timezone.utc).isoformat(),
+            },
+        ).execute()
         return list(result.data or [])
 
     try:
-        rows = await asyncio.to_thread(_read)
+        rows = await asyncio.to_thread(_consume)
     except Exception as exc:
-        print(f"[PROVENANCE] could not read assisted record: {type(exc).__name__}")
+        # Diagnostics must never block an otherwise authorized operator send.
+        # Drop this replica's cache entry as well: after an uncertain database
+        # result it is not authoritative and must not become a later grant.
+        SUGGESTION_PROVENANCE.take(
+            key, creator_id=creator_id, fan_id=fan_id
+        )
+        print(f"[PROVENANCE] could not consume assisted record: {type(exc).__name__}")
         return None, UNAVAILABLE_MISSING
 
     if not rows:
+        SUGGESTION_PROVENANCE.take(
+            key, creator_id=creator_id, fan_id=fan_id
+        )
         return None, UNAVAILABLE_MISSING
     row = rows[0]
 
-    if creator_id and str(row.get("creator_id")) != str(creator_id):
-        # The wrong record is worse than no record, so this is a miss rather
-        # than a match. Same rule the in-process store applies.
-        return None, UNAVAILABLE_MISSING
-    if fan_id and str(row.get("fan_id")) != str(fan_id):
-        return None, UNAVAILABLE_MISSING
-
-    if _expired(row.get("created_at")):
-        await forget(key)
+    cached = SUGGESTION_PROVENANCE.take(
+        key, creator_id=creator_id, fan_id=fan_id
+    )
+    if bool(row.get("expired")) or _expired(row.get("created_at")):
         return None, UNAVAILABLE_EXPIRED
 
-    restored = ReplyProvenance.from_state(row.get("record"))
-    await forget(key)
+    restored = cached or ReplyProvenance.from_state(row.get("record"))
     if restored is None:
         return None, UNAVAILABLE_MISSING
     return restored, ""

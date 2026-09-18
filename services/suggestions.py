@@ -33,13 +33,18 @@ from services.conversation_continuity import (
     open_threads_for,
     recent_episodes_for,
     record_open_thread,
+    resolve_referenced_thread,
+    supersede_referenced_thread,
+    summarize_thread_references,
     summarize_threads,
 )
 from models.conversation_continuity import (
     EvidenceType,
     OpenThread,
+    ResolvedBy,
     ThreadKind,
     ThreadParty,
+    ThreadStatus,
 )
 from services.reply_provenance import (
     DELIVERY_PPV,
@@ -583,6 +588,7 @@ async def get_suggestions(
         recent_episodes_for(creator_id, fan_id),
     )
     open_thread_lines = summarize_threads(carried_threads)
+    analyzer_thread_lines = summarize_thread_references(carried_threads)
     episode_lines = [episode.render() for episode in past_episodes]
     if fan_profile is None:
         fan_profile = Fan(id=fan_id, display_name=fan_id)
@@ -608,9 +614,15 @@ async def get_suggestions(
     )
     stack_profile = stack.profile
 
+    # Created before analysis so automatic continuity changes and the eventual
+    # sent reply share one source turn id.
+    assisted_provenance = ReplyProvenance(
+        creator_id=str(creator_id), fan_id=str(fan_id), mode=PIPELINE_ASSISTED
+    )
+
     ctx_without_situation = ConversationContext(
         fan_message=fan_message,
-        open_threads=open_thread_lines,
+        open_threads=analyzer_thread_lines,
         conversation_episodes=episode_lines,
         conversation_history=conversation_history,
         fan_profile=fan_profile,
@@ -645,6 +657,18 @@ async def get_suggestions(
             f"[ASSISTED ANALYZER DEGRADED] fan={fan_id} creator={creator_id} "
             f"reason={assisted_degraded_reason or 'unknown'}"
         )
+    continuity_changed = False
+    if save_fan_message:
+        continuity_changed = await _record_conversation_threads(
+            situation,
+            creator_id=creator_id,
+            fan_id=fan_id,
+            latest_message=fan_message,
+            turn_id=assisted_provenance.turn_id,
+        )
+    if continuity_changed:
+        carried_threads = await open_threads_for(creator_id, fan_id)
+        open_thread_lines = summarize_threads(carried_threads)
     if fan_intelligence:
         situation["learned_fan_intelligence"] = fan_intelligence
 
@@ -833,9 +857,6 @@ async def get_suggestions(
     # is between generation and delivery, so the record waits for the send that
     # redeems its token (services/reply_provenance.py). Candidates the operator
     # does not pick never become a message and are never attributed.
-    assisted_provenance = ReplyProvenance(
-        creator_id=str(creator_id), fan_id=str(fan_id), mode=PIPELINE_ASSISTED
-    )
     assisted_provenance.record_trigger(
         kind="fan_message",
         text=fan_message,
@@ -1474,6 +1495,7 @@ async def _debounced_auto_reply(
             recent_episodes_for(creator_id, fan_id),
         )
         open_thread_lines = summarize_threads(carried_threads)
+        analyzer_thread_lines = summarize_thread_references(carried_threads)
         episode_lines = [episode.render() for episode in past_episodes]
 
         # If this turn is a return after a silence, the stretch before it is
@@ -1535,7 +1557,7 @@ async def _debounced_auto_reply(
             buyer_lifecycle=buyer_lifecycle,
             affordability=affordability,
             price_learning=price_learning,
-            open_threads=open_thread_lines,
+            open_threads=analyzer_thread_lines,
             conversation_episodes=episode_lines,
             ai_stack_profile=stack.profile_id,
             writer_prompt_version=writer_prompt_version,
@@ -1643,16 +1665,19 @@ async def _debounced_auto_reply(
         # at all — the tables existed and nothing wrote to them.
         #
         # Deliberately after the situation is complete and before anything
-        # decides or sends: this records what happened, and nothing reads it
-        # back to choose this turn's reply. A recorder that could change the
-        # reply is a recorder that can break one.
-        await _record_conversation_threads(
+        # decides or sends. A validated resolution is then removed from the
+        # writer's packet for this same turn; otherwise the writer would be
+        # told an answered question was still outstanding for one extra turn.
+        continuity_changed = await _record_conversation_threads(
             situation,
             creator_id=creator_id,
             fan_id=fan_id,
             latest_message=latest_message,
             turn_id=provenance.turn_id,
         )
+        if continuity_changed:
+            carried_threads = await open_threads_for(creator_id, fan_id)
+            open_thread_lines = summarize_threads(carried_threads)
 
         # Commercial layer: deterministic policy decides what happens next
         # (sell / pause / tease / schedule). Flag-gated so it can be turned off
@@ -3305,7 +3330,7 @@ async def _record_conversation_threads(
     fan_id: str,
     latest_message: str,
     turn_id: str,
-) -> None:
+) -> bool:
     """Persist the unfinished business this turn created or settled.
 
     Never raises and never blocks a reply. Continuity is memory: losing a
@@ -3330,9 +3355,52 @@ async def _record_conversation_threads(
         )
     except Exception as exc:  # pragma: no cover - extraction never blocks a turn
         print(f"[CONTINUITY] extraction failed fan={fan_id}: {type(exc).__name__}")
-        return
+        return False
 
     recorded = 0
+    resolved = 0
+    superseded = 0
+    evidence_fingerprint = fingerprint(latest_message)
+
+    for proposal in extracted.resolved:
+        try:
+            if await resolve_referenced_thread(
+                proposal.thread_id,
+                creator_id=str(creator_id),
+                fan_id=str(fan_id),
+                status=ThreadStatus.FULFILLED,
+                resolved_by=ResolvedBy.FAN_MESSAGE,
+                note=(
+                    f"automatic resolution turn={turn_id or 'unknown'} "
+                    f"evidence={evidence_fingerprint}"
+                ),
+            ):
+                resolved += 1
+        except Exception as exc:
+            print(
+                f"[CONTINUITY] could not resolve referenced thread "
+                f"fan={fan_id}: {type(exc).__name__}"
+            )
+
+    for proposal in extracted.supersessions:
+        try:
+            if await supersede_referenced_thread(
+                proposal.replaces_thread_id,
+                proposal.thread,
+                creator_id=str(creator_id),
+                fan_id=str(fan_id),
+                note=(
+                    f"automatic correction turn={turn_id or 'unknown'} "
+                    f"evidence={evidence_fingerprint}"
+                ),
+            ):
+                superseded += 1
+        except Exception as exc:
+            print(
+                f"[CONTINUITY] could not supersede referenced thread "
+                f"fan={fan_id}: {type(exc).__name__}"
+            )
+
     for thread in extracted.threads:
         try:
             if await record_open_thread(thread):
@@ -3343,15 +3411,17 @@ async def _record_conversation_threads(
                 f"fan={fan_id}: {type(exc).__name__}"
             )
 
-    if recorded or extracted.rejected:
+    if recorded or resolved or superseded or extracted.rejected:
         # The rejection counts are the interesting half. A rate that climbs is
         # how somebody notices the analyzer has started proposing things it
         # should not, which no amount of prompt wording would tell them.
         print(
             f"[CONTINUITY] fan={fan_id} recorded={recorded} "
+            f"resolved={resolved} superseded={superseded} "
             f"proposed={len(extracted.threads)} "
             f"rejected={extracted.rejected or 'none'}"
         )
+    return bool(recorded or resolved or superseded)
 
 
 async def _recent_creator_message_rows(fan_id: str) -> list[dict]:

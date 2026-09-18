@@ -264,6 +264,55 @@ async def resolve_thread(
         return False
 
 
+async def resolve_referenced_thread(
+    thread_id: str,
+    *,
+    creator_id: str,
+    fan_id: str,
+    status: ThreadStatus,
+    resolved_by: ResolvedBy,
+    note: str = "",
+) -> bool:
+    """Close an analyzer-referenced thread inside one conversation only.
+
+    An opaque id is necessary but not sufficient authority.  The creator, fan
+    and current OPEN status are predicates on the same update, so a stale,
+    cross-customer or cross-tenant reference changes no row.
+    """
+    if status == ThreadStatus.OPEN:
+        raise ValueError("resolve_referenced_thread cannot set a thread back to open")
+    if not (thread_id and creator_id and fan_id):
+        return False
+    now = _now().isoformat()
+
+    def _close() -> bool:
+        result = (
+            get_supabase()
+            .table(THREADS_TABLE)
+            .update(
+                {
+                    "status": status.value,
+                    "resolved_at": now,
+                    "resolved_by": resolved_by.value,
+                    "resolution_note": note[:400],
+                    "updated_at": now,
+                }
+            )
+            .eq("id", thread_id)
+            .eq("creator_id", creator_id)
+            .eq("fan_id", fan_id)
+            .eq("status", ThreadStatus.OPEN.value)
+            .execute()
+        )
+        return bool(result.data)
+
+    try:
+        return await asyncio.to_thread(_close)
+    except Exception as exc:
+        print(f"[CONTINUITY] could not resolve referenced thread {thread_id}: {exc}")
+        return False
+
+
 async def supersede_thread(old_thread_id: str, new_thread: OpenThread) -> OpenThread | None:
     """Record a correction: the new thread replaces the old one.
 
@@ -308,6 +357,86 @@ async def supersede_thread(old_thread_id: str, new_thread: OpenThread) -> OpenTh
             f"{old_thread_id}: {exc}"
         )
     return replacement
+
+
+async def supersede_referenced_thread(
+    old_thread_id: str,
+    new_thread: OpenThread,
+    *,
+    creator_id: str,
+    fan_id: str,
+    note: str = "",
+) -> OpenThread | None:
+    """Supersede a named OPEN row, guarded by its conversation scope.
+
+    The replacement is never allowed to inherit scope from model output.  It is
+    forced to the caller's creator/fan pair, and the old-row update repeats the
+    same predicates.  If the reference is stale or belongs elsewhere, nothing
+    is recorded and nothing is closed.
+    """
+    if not (old_thread_id and creator_id and fan_id):
+        return None
+
+    def _exists() -> bool:
+        result = (
+            get_supabase()
+            .table(THREADS_TABLE)
+            .select("id")
+            .eq("id", old_thread_id)
+            .eq("creator_id", creator_id)
+            .eq("fan_id", fan_id)
+            .eq("status", ThreadStatus.OPEN.value)
+            .limit(1)
+            .execute()
+        )
+        return bool(result.data)
+
+    try:
+        exists = await asyncio.to_thread(_exists)
+    except Exception as exc:
+        print(f"[CONTINUITY] could not validate thread {old_thread_id}: {exc}")
+        return None
+    if not exists:
+        return None
+
+    replacement = await record_open_thread(
+        new_thread.model_copy(
+            update={"creator_id": creator_id, "fan_id": fan_id, "id": ""}
+        )
+    )
+    if replacement is None or not replacement.id:
+        return None
+
+    now = _now().isoformat()
+
+    def _supersede() -> bool:
+        result = (
+            get_supabase()
+            .table(THREADS_TABLE)
+            .update(
+                {
+                    "status": ThreadStatus.SUPERSEDED.value,
+                    "resolved_at": now,
+                    "resolved_by": ResolvedBy.SUPERSESSION.value,
+                    "resolution_note": note[:400],
+                    "superseded_by": replacement.id,
+                    "updated_at": now,
+                }
+            )
+            .eq("id", old_thread_id)
+            .eq("creator_id", creator_id)
+            .eq("fan_id", fan_id)
+            .eq("status", ThreadStatus.OPEN.value)
+            .execute()
+        )
+        return bool(result.data)
+
+    try:
+        changed = await asyncio.to_thread(_supersede)
+    except Exception as exc:
+        print(f"[CONTINUITY] could not supersede referenced thread {old_thread_id}: {exc}")
+        return None
+    return replacement if changed else None
 
 
 async def expire_due_threads(
@@ -454,3 +583,18 @@ def rank_threads(threads: list[OpenThread]) -> list[OpenThread]:
 def summarize_threads(threads: list[OpenThread], *, limit: int = DEFAULT_THREAD_LIMIT) -> list[str]:
     """The lines a prompt gets: ranked, capped, and free of internal vocabulary."""
     return [thread.render() for thread in rank_threads(threads)[: max(0, int(limit))]]
+
+
+def summarize_thread_references(
+    threads: list[OpenThread], *, limit: int = DEFAULT_THREAD_LIMIT
+) -> list[str]:
+    """Analyzer-only lines with the opaque ids it may return.
+
+    Writers keep receiving ``summarize_threads`` without ids.  Identifiers are
+    control data for lifecycle proposals, not prose for a reply to imitate.
+    """
+    return [
+        f"[thread_id={thread.id}] {thread.render()}"
+        for thread in rank_threads(threads)[: max(0, int(limit))]
+        if thread.id
+    ]

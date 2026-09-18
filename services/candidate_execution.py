@@ -29,11 +29,11 @@ the other was not.
 
 NOTHING HERE SENDS ANYTHING
 ---------------------------
-"Executed" means the deterministic constraints permitted the operation, and is
-recorded as such. This is an offline comparison: no platform call, no database
-write, no money. A candidate that would have sent is compared against a
-candidate that would not have, which is the whole question, and neither of them
-sends.
+"Operation permitted in dry-run" means the deterministic constraints would
+have permitted the operation. It does NOT mean an external operation ran. This
+is an offline comparison: no platform call, no database write, no money. A
+candidate that would have sent is compared against a candidate that would not
+have, which is the whole question, and neither of them sends.
 """
 
 from __future__ import annotations
@@ -87,6 +87,10 @@ class ExecutedTurn:
             "said_nothing": self.said_nothing,
             "silent_because": self.silent_because,
             "operation": self.operation.value,
+            # The unambiguous public name. ``executed`` remains below for
+            # backwards-compatible readers of the original replay format; it
+            # has never represented a platform or database side effect.
+            "operation_permitted_in_dry_run": self.executed,
             "executed": self.executed,
             "suppressed_because": list(self.suppressed_because),
             "wrote_its_own_reply": self.wrote_its_own_reply,
@@ -256,6 +260,7 @@ class ExecutionReport:
             "turns": len(self.turns),
             "disagreed": self.disagreed,
             "operations_executed": executed,
+            "operations_permitted_in_dry_run": executed,
             "operations_suppressed": suppressed,
             "turns_silent": silent,
         }
@@ -265,7 +270,8 @@ class ExecutionReport:
         lines = [
             f"{' vs '.join(summary['candidates'])} over {summary['turns']} turns",
             f"  disagreed on: {summary['disagreed']}",
-            f"  operations executed:  {summary['operations_executed']}",
+            "  operations permitted in dry-run:  "
+            f"{summary['operations_permitted_in_dry_run']}",
             f"  operations suppressed: {summary['operations_suppressed']}",
             f"  turns with no reply:   {summary['turns_silent']}",
         ]

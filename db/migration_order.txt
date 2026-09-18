@@ -140,6 +140,10 @@ owner_only_diagnostics_v1.sql
 # tenant_isolation_v1 / browser_least_privilege_v1 pair that reads it.
 assisted_provenance_v1.sql
 
+# Replaces SELECT-then-DELETE redemption with one DELETE ... RETURNING claim.
+# Must run after assisted_provenance_v1.sql, which creates the table.
+assisted_provenance_atomic_consume_v1.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each

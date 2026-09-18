@@ -609,13 +609,20 @@ def _reply_headers() -> dict[str, str]:
 
 
 def test_an_operator_sent_reply_carries_the_turn_that_produced_it(monkeypatch):
-    from services.reply_provenance import SUGGESTION_PROVENANCE
-
     provenance = ReplyProvenance(
         creator_id="creator-1", fan_id="fan-1", mode=PIPELINE_ASSISTED
     )
     provenance.record_trigger(kind="fan_message", text="hey")
-    token = SUGGESTION_PROVENANCE.put(provenance)
+    token = "durably-consumed-token"
+
+    async def fake_atomic_redeem(value, *, creator_id, fan_id):
+        # This endpoint test owns the delivery/provenance join. The durable
+        # store's DELETE ... RETURNING concurrency contract is exercised in
+        # test_assisted_provenance.py and the real-Postgres schema suite.
+        assert (value, creator_id, fan_id) == (token, "creator-1", "fan-1")
+        return provenance, ""
+
+    monkeypatch.setattr("services.assisted_provenance.redeem", fake_atomic_redeem)
 
     sent: list[dict] = []
     response = _reply_client(monkeypatch, sent).post(

@@ -23,7 +23,9 @@ tried to attribute.
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,6 +36,63 @@ from services.reply_provenance import (
     ReplyProvenance,
 )
 from tests.fake_supabase import FakeSupabase
+
+
+class AtomicProvenanceSupabase(FakeSupabase):
+    """The database function's DELETE ... RETURNING semantics.
+
+    The lock is the important part: this fake can be shared by two event loops
+    in two threads and still grants the row to exactly one caller, just as the
+    PostgreSQL DELETE does across replicas.
+    """
+
+    def __init__(self):
+        super().__init__({"assisted_provenance": []})
+        self._consume_lock = threading.Lock()
+
+    def rpc(self, name, arguments):
+        if name != "consume_assisted_provenance":
+            raise AssertionError(f"unexpected RPC {name}")
+
+        def execute():
+            with self._consume_lock:
+                token = str(arguments.get("p_token") or "")
+                creator_id = str(arguments.get("p_creator_id") or "")
+                fan_id = str(arguments.get("p_fan_id") or "")
+                rows = self.tables["assisted_provenance"]
+                match = next(
+                    (
+                        row
+                        for row in rows
+                        if str(row.get("token")) == token
+                        and (not creator_id or str(row.get("creator_id")) == creator_id)
+                        and (not fan_id or str(row.get("fan_id")) == fan_id)
+                    ),
+                    None,
+                )
+                if match is None:
+                    return SimpleNamespace(data=[])
+                rows.remove(match)
+                created_at = match.get("created_at")
+                now = datetime.fromisoformat(
+                    str(arguments["p_now"]).replace("Z", "+00:00")
+                )
+                created = (
+                    datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+                    if created_at
+                    else now
+                )
+                return SimpleNamespace(
+                    data=[
+                        {
+                            "record": match.get("record"),
+                            "created_at": created_at,
+                            "expired": now - created > store.TTL,
+                        }
+                    ]
+                )
+
+        return SimpleNamespace(execute=execute)
 
 
 def run(coro):
@@ -49,7 +108,7 @@ def _clear_process_store():
 
 @pytest.fixture
 def db(monkeypatch):
-    fake = FakeSupabase({"assisted_provenance": []})
+    fake = AtomicProvenanceSupabase()
     monkeypatch.setattr(store, "get_supabase", lambda: fake)
     return fake
 
@@ -100,13 +159,12 @@ def test_the_in_process_store_is_still_the_fast_path(db):
     """The common case is the same replica seconds later, and it should not
     pay a round trip."""
     token = run(store.remember(_recorder()))
-    before = len(db.queries)
-
     restored, _ = run(store.redeem(token, creator_id="creator-1", fan_id="fan-1"))
 
     assert restored is not None
-    # A delete is a write, not a query; no SELECT was needed.
-    assert len(db.queries) == before
+    # The cache accelerates rebuilding only.  The durable consume still has to
+    # authorize this redemption, otherwise another replica could already own it.
+    assert db.tables["assisted_provenance"] == []
 
 
 def test_an_in_process_hit_still_clears_the_durable_row(db):
@@ -128,6 +186,53 @@ def test_a_record_is_redeemed_exactly_once(db):
     )
 
     assert second is None
+    assert unavailable == store.UNAVAILABLE_MISSING
+
+
+def test_two_replicas_racing_one_token_have_one_winner(db):
+    """The regression: both old SELECTs completed before either DELETE."""
+    token = run(store.remember(_recorder()))
+    SUGGESTION_PROVENANCE.clear()
+    barrier = threading.Barrier(3)
+    results = []
+
+    def redeem_on_replica():
+        barrier.wait()
+        results.append(
+            run(store.redeem(token, creator_id="creator-1", fan_id="fan-1"))
+        )
+
+    workers = [threading.Thread(target=redeem_on_replica) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join()
+
+    assert sum(record is not None for record, _reason in results) == 1
+    assert sum(reason == store.UNAVAILABLE_MISSING for _record, reason in results) == 1
+
+
+def test_a_cache_hit_cannot_bypass_a_database_consumer(db):
+    token = run(store.remember(_recorder()))
+
+    # Another replica consumes the durable authority while this process still
+    # has its cached copy.
+    db.rpc(
+        "consume_assisted_provenance",
+        {
+            "p_token": token,
+            "p_creator_id": "creator-1",
+            "p_fan_id": "fan-1",
+            "p_now": datetime.now(timezone.utc).isoformat(),
+        },
+    ).execute()
+
+    restored, unavailable = run(
+        store.redeem(token, creator_id="creator-1", fan_id="fan-1")
+    )
+
+    assert restored is None
     assert unavailable == store.UNAVAILABLE_MISSING
 
 
@@ -239,7 +344,7 @@ def test_it_uses_the_same_key_a_real_record_would():
 # ===========================================================================
 
 
-def test_a_database_that_refuses_the_write_still_returns_a_usable_token(monkeypatch):
+def test_a_database_that_refuses_the_write_cannot_turn_cache_into_authority(monkeypatch):
     class Exploding:
         def table(self, _name):
             raise RuntimeError("supabase down")
@@ -249,10 +354,14 @@ def test_a_database_that_refuses_the_write_still_returns_a_usable_token(monkeypa
     token = run(store.remember(_recorder()))
 
     assert token
-    # Still valid on this replica, which is strictly better than failing the
-    # suggestion — and the miss it may later cause is now admitted.
-    restored, _ = run(store.redeem(token, creator_id="creator-1", fan_id="fan-1"))
-    assert restored is not None
+    # The suggestion still succeeded and the operator send is not blocked, but
+    # attribution is explicitly unavailable.  A process cache cannot grant
+    # redemption when no durable claim was ever created.
+    restored, unavailable = run(
+        store.redeem(token, creator_id="creator-1", fan_id="fan-1")
+    )
+    assert restored is None
+    assert unavailable == store.UNAVAILABLE_MISSING
 
 
 def test_a_database_that_refuses_the_read_is_a_miss_not_an_error(monkeypatch):

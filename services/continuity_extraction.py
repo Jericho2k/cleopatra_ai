@@ -99,9 +99,14 @@ class ExtractionResult:
     """What one turn proposed, and what survived validation."""
 
     threads: list[OpenThread] = field(default_factory=list)
-    #: Summaries the analyzer offered as resolved. Applied by the caller, which
-    #: is the only place that knows which stored thread each one refers to.
-    resolved: list[str] = field(default_factory=list)
+    #: Opaque stored-thread references the analyzer offered as resolved.  Free
+    #: text is deliberately insufficient: a summary is not an identity and an
+    #: uncertain match must never close an unrelated obligation.
+    resolved: list["ResolutionProposal"] = field(default_factory=list)
+    #: Corrections that explicitly name the stored record they replace.  A
+    #: correction without a validated reference is still recorded as visible
+    #: new evidence, but it cannot suppress an old record automatically.
+    supersessions: list["SupersessionProposal"] = field(default_factory=list)
     #: Why proposals were refused, by reason. Reported rather than swallowed.
     rejected: dict[str, int] = field(default_factory=dict)
 
@@ -122,8 +127,22 @@ class ExtractionResult:
         return {
             "threads_recorded": len(self.threads),
             "threads_resolved_proposed": len(self.resolved),
+            "threads_superseded_proposed": len(self.supersessions),
             "rejected": dict(self.rejected),
         }
+
+
+@dataclass(frozen=True)
+class ResolutionProposal:
+    thread_id: str
+    evidence: str
+
+
+@dataclass(frozen=True)
+class SupersessionProposal:
+    thread: OpenThread
+    replaces_thread_id: str
+    evidence: str
 
 
 def mentions_money(text: object) -> bool:
@@ -156,6 +175,25 @@ def _proposals(situation: Any, key: str) -> list[str]:
     return [_clean(item) for item in raw if isinstance(item, (str, int, float))]
 
 
+_THREAD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _objects(situation: Any, key: str) -> list[dict[str, Any]]:
+    if not isinstance(situation, dict):
+        return []
+    raw = situation.get(key)
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _thread_id(value: object) -> str:
+    candidate = _clean(value)
+    return candidate if _THREAD_ID.fullmatch(candidate) else ""
+
+
 def extract_threads(
     situation: Any,
     *,
@@ -185,7 +223,19 @@ def extract_threads(
 
     for key, kind, raised_by in EXTRACTION_FIELDS:
         kept = 0
-        for summary in _proposals(situation, key):
+        proposals: list[tuple[str, str, str]] = [
+            (summary, "", "") for summary in _proposals(situation, key)
+        ]
+        if key == "corrections_stated":
+            proposals.extend(
+                (
+                    _clean(item.get("summary") or item.get("corrected_to")),
+                    _thread_id(item.get("supersedes_thread_id")),
+                    _clean(item.get("evidence")),
+                )
+                for item in _objects(situation, key)
+            )
+        for summary, replaces_thread_id, evidence in proposals:
             if not summary:
                 result._reject("empty")
                 continue
@@ -202,29 +252,52 @@ def extract_threads(
                 result._reject("over_limit")
                 continue
             kept += 1
-            result.threads.append(
-                OpenThread(
-                    creator_id=str(creator_id),
-                    fan_id=str(fan_id),
-                    kind=kind,
-                    raised_by=raised_by,
-                    summary=summary,
-                    evidence_type=evidence_type,
-                    confidence=max(0.0, min(1.0, float(confidence))),
-                    source_turn_id=str(source_turn_id or ""),
-                    source_message_fingerprint=str(source_message_fingerprint or ""),
-                )
+            thread = OpenThread(
+                creator_id=str(creator_id),
+                fan_id=str(fan_id),
+                kind=kind,
+                raised_by=raised_by,
+                summary=summary,
+                evidence_type=evidence_type,
+                confidence=max(0.0, min(1.0, float(confidence))),
+                source_turn_id=str(source_turn_id or ""),
+                source_message_fingerprint=str(source_message_fingerprint or ""),
             )
+            if replaces_thread_id and evidence:
+                result.supersessions.append(
+                    SupersessionProposal(
+                        thread=thread,
+                        replaces_thread_id=replaces_thread_id,
+                        evidence=evidence[:MAX_SUMMARY_CHARS],
+                    )
+                )
+            else:
+                # Missing or malformed references never suppress anything. The
+                # new correction remains visible so an operator can reconcile
+                # it instead of the system silently choosing between records.
+                result.threads.append(thread)
+                if replaces_thread_id and not evidence:
+                    result._reject("missing_supersession_evidence")
 
-    for summary in _proposals(situation, "threads_resolved"):
-        if not summary or len(summary) > MAX_SUMMARY_CHARS:
-            result._reject("empty" if not summary else "too_long")
+    for proposal in _objects(situation, "threads_resolved"):
+        thread_id = _thread_id(proposal.get("thread_id"))
+        evidence = _clean(proposal.get("evidence"))
+        if not thread_id:
+            result._reject("invalid_thread_reference")
             continue
-        if mentions_money(summary):
+        if not evidence or len(evidence) > MAX_SUMMARY_CHARS:
+            result._reject("empty" if not evidence else "too_long")
+            continue
+        if mentions_money(evidence):
             # Resolving a monetary obligation from prose is the same mistake in
             # the other direction: "he says he got it" is not delivery.
             result._reject("monetary_resolution")
             continue
-        result.resolved.append(summary)
+        result.resolved.append(ResolutionProposal(thread_id, evidence))
+
+    # Older/unstructured analyzer output is explicitly refused.  It can be
+    # logged and measured, but never fuzzy-matched against stored summaries.
+    for _summary in _proposals(situation, "threads_resolved"):
+        result._reject("unscoped_resolution")
 
     return result
