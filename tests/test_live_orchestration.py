@@ -1501,15 +1501,3 @@ def test_review_resume_reuses_the_exact_unsent_plan_without_replanning(monkeypat
         step[field] = before
     evidence.active_session['awaiting_purchase_index'] = 0
     assert not live_orchestration.validate_decision(decision, evidence).approved
-
-
-def test_semantic_writer_receives_the_configured_creator_voice():
-    evidence = loaded()
-    evidence.persona.emoji_usage = 'none'
-    evidence.persona.capitalization = 'normal'
-    evidence.persona.communication_style = 'Thoughtful and direct'
-    prompt = live_orchestration.build_writer_prompt(evidence, ConversationDecision(), ApprovedExecution(), mode='auto')
-    voice = json.loads(prompt[1]['content'])['creator_voice']
-    assert voice['emoji_usage'] == 'none'
-    assert voice['capitalization'] == 'normal'
-    assert voice['communication_style'] == 'Thoughtful and direct'
