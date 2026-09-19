@@ -25,7 +25,8 @@ from core.supabase import get_supabase
 
 CORE_LEGACY = "legacy"
 CORE_SEMANTIC_V1 = "semantic_v1"
-CORE_IDS = (CORE_LEGACY, CORE_SEMANTIC_V1)
+CORE_SEMANTIC_V2 = "semantic_v2"
+CORE_IDS = (CORE_LEGACY, CORE_SEMANTIC_V1, CORE_SEMANTIC_V2)
 CORE_ENV_VAR = "CONVERSATION_CORE"
 
 SOURCE_SIMULATION_FAN = "simulation_fan"

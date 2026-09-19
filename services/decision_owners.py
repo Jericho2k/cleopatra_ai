@@ -316,7 +316,7 @@ class DecisionParse:
     shape" line, and a comparison could not say WHICH candidate failed how.
     """
 
-    decision: "ConversationDecision | None" = None
+    decision: ConversationDecision | None = None
     reason: str = ""
 
     @property
@@ -695,7 +695,7 @@ class CandidateAnswer:
     replay "does not compare two complete new conversational cores".
     """
 
-    decision: "ConversationDecision"
+    decision: ConversationDecision
     reply: str = ""
     #: True when the candidate wrote the reply itself in the same call that
     #: produced the decision, rather than a separate writer being asked to.
@@ -705,8 +705,8 @@ class CandidateAnswer:
 
 
 def parse_reply_plus_intent(
-    text: str, *, source: str
-) -> "tuple[CandidateAnswer | None, str]":
+    text: str, *, source: str, strict_live: bool = False
+) -> tuple[CandidateAnswer | None, str]:
     """Read a one-call answer strictly, or say why it was refused.
 
     The decision half goes through exactly the same validator as the two-call
@@ -715,7 +715,9 @@ def parse_reply_plus_intent(
     would win comparisons by being marked wrong less often, which would make
     the comparison measure the parsers rather than the architectures.
     """
-    parsed = parse_semantic_decision_result(text, source=source)
+    parsed = parse_semantic_decision_result(
+        text, source=source, strict_live=strict_live
+    )
     if not parsed.ok:
         return None, parsed.reason
 
@@ -806,7 +808,7 @@ class ReplyPlusIntentOwner:
 
     async def decide(
         self, packet: ContextPacket, state: dict[str, Any]
-    ) -> "ConversationDecision":
+    ) -> ConversationDecision:
         """The decision half alone, so this satisfies DecisionOwner too."""
         return (await self.answer(packet, state)).decision
 
@@ -837,5 +839,5 @@ class DecideThenWrite:
 
     async def decide(
         self, packet: ContextPacket, state: dict[str, Any]
-    ) -> "ConversationDecision":
+    ) -> ConversationDecision:
         return await self._owner.decide(packet, state)

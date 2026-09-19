@@ -54,6 +54,42 @@
   ],
   "trajectories": [
     {
+      "name": "human chatter rhythm, specific reaction before commercial turn",
+      "covers": "Derived from agency evidence: react to the exact detail, vary message length, co-author the scene, and delay selling until the fan bids for more. Catches paraphrase-question loops and catalogue-style offers.",
+      "turns": [
+        {
+          "message": "the trainers in that last post are wrecked in the best way",
+          "tests": "specific detail; a reaction can stand without a question"
+        },
+        {
+          "message": "i keep thinking about how theyd look on my floor though",
+          "tests": "immersive continuation"
+        },
+        {
+          "message": "ok youve got me. what would you send me from that set",
+          "tests": "fan bids; commercial turn now has conversational justification"
+        }
+      ]
+    },
+    {
+      "name": "human chatter continuity after a delayed return",
+      "covers": "Derived from agency evidence: resume the shared scene after absence without inventing current life or restarting the introduction. Catches fabricated activity and generic openers.",
+      "turns": [
+        {
+          "message": "that shower thing you described yesterday has been stuck in my head",
+          "tests": "references an earlier shared scene"
+        },
+        {
+          "message": "had the longest shift. give me two minutes",
+          "tests": "fan leaves briefly"
+        },
+        {
+          "message": "back. you still there",
+          "tests": "same-day return; continuity should not reset"
+        }
+      ]
+    },
+    {
       "name": "ordinary conversation with no purchase goal",
       "covers": "Regression seed: several topic changes and no purchase request, in a short scripted conversation. Catches a forced commercial pivot in the small. The 40-80 turn row it used to claim is covered by 'ordinary conversation, adaptive' below.",
       "turns": [

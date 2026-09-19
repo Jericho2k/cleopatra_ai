@@ -14,6 +14,8 @@ from models.conversation_decision import (
     ConversationDecision,
     OperationKind,
     ProposedOperation,
+    ResponseDisposition,
+    ResponseIntent,
 )
 from models.live_orchestration import (
     ApprovedExecution,
@@ -25,7 +27,10 @@ from models.live_orchestration import (
 from models.schemas import Fan, Message, Persona, SuggestionResponse
 from services import conversation_core, live_orchestration, proactive, suggestions
 from services.context_packet import ContextPacket
-from services.decision_owners import build_semantic_prompt, parse_semantic_decision_result
+from services.decision_owners import (
+    build_semantic_prompt,
+    parse_semantic_decision_result,
+)
 from services.reply_provenance import PIPELINE_AUTO, ReplyProvenance
 
 
@@ -115,6 +120,7 @@ def live_payload(**overrides):
         "hold": "none",
         "hold_detail": "",
         "confidence": 0.91,
+        "reply": "you always pick the dangerous details",
     }
     payload.update(overrides)
     return json.dumps(payload)
@@ -757,7 +763,12 @@ def owner_world(monkeypatch, evidence, outputs):
 
     async def complete(_target, **kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(text=next(responses))
+        return SimpleNamespace(
+            text=next(responses),
+            target=SimpleNamespace(provider="test", model="kimi"),
+            latency_ms=1,
+            upstream_provider="digitalocean",
+        )
 
     monkeypatch.setattr(live_orchestration, "complete", complete)
     return calls
@@ -1091,6 +1102,7 @@ def test_bikini_trajectory_persists_real_ppv_receipt_and_payment_state(
 ):
     """Real executor, adapter, receipt and reconciliation; models/DB are stubs."""
     from dataclasses import replace
+
     from services import ppv_delivery, ppv_persistence
     from tests.test_full_auto_simulation import FakeDB
 
@@ -1169,9 +1181,10 @@ def test_bikini_trajectory_persists_real_ppv_receipt_and_payment_state(
         monkeypatch,
         evidence,
         [
-            live_payload(),
-            live_payload(),
+            live_payload(reply="you like that bikini 😏"),
+            live_payload(reply="without it is even better 😏|wanna find out?"),
             live_payload(
+                reply="knew you would 😏",
                 operation="send_locked_paid_message",
                 response_intent="deliver_accepted_offer",
                 operation_subject="the approved bikini content",
@@ -1180,18 +1193,6 @@ def test_bikini_trajectory_persists_real_ppv_receipt_and_payment_state(
             ),
         ],
     )
-    captions = iter(
-        [
-            "you like that bikini 😏",
-            "without it is even better 😏|wanna find out?",
-            "knew you would 😏",
-        ]
-    )
-
-    async def write(*_, **__):
-        return [next(captions)]
-
-    monkeypatch.setattr(live_orchestration, "generate_replies", write)
     monkeypatch.setattr(
         live_orchestration,
         "plan_session_for_fan",
@@ -1257,6 +1258,7 @@ def test_writer_rejection_suppresses_entire_turn_before_delivery(monkeypatch):
         evidence,
         [
             live_payload(
+                reply="knew you would|just sent it your way|$25 to unlock",
                 operation="present_offer",
                 operation_subject="the approved content",
                 operation_offer_id="offer-1",
@@ -1266,11 +1268,6 @@ def test_writer_rejection_suppresses_entire_turn_before_delivery(monkeypatch):
     )
     monkeypatch.setattr(
         live_orchestration, "load_evidence", lambda **_: value(evidence)
-    )
-    monkeypatch.setattr(
-        live_orchestration,
-        "generate_replies",
-        lambda *_a, **_k: value(["knew you would|just sent it your way|$25 to unlock"]),
     )
     monkeypatch.setattr(live_orchestration, "_deliver_plain_parts", _retired)
     frozen = []
@@ -1554,3 +1551,60 @@ def test_review_resume_reuses_the_exact_unsent_plan_without_replanning(monkeypat
         step[field] = before
     evidence.active_session['awaiting_purchase_index'] = 0
     assert not live_orchestration.validate_decision(decision, evidence).approved
+
+
+def test_semantic_v2_uses_one_call_and_bypasses_the_separate_writer(monkeypatch):
+    calls = []
+
+    async def owner(*args, **kwargs):
+        calls.append(kwargs)
+        return (
+            ConversationDecision(
+                proposed_operation=ProposedOperation(kind=OperationKind.NONE),
+                response_intent=ResponseIntent.ORDINARY_CONVERSATION,
+                disposition=ResponseDisposition.REPLY,
+                source="reply_plus_intent",
+                confidence=0.9,
+            ),
+            ["that bit about the trainers is dangerously specific — good taste"],
+        )
+
+    async def retired_writer(*args, **kwargs):
+        raise AssertionError("semantic_v2 must not call the separate writer")
+
+    monkeypatch.setattr(live_orchestration, "_conversational_answer", owner)
+    monkeypatch.setattr(live_orchestration, "_write_turn", retired_writer)
+    monkeypatch.setattr(
+        live_orchestration,
+        "load_evidence",
+        lambda **_kwargs: value(loaded()),
+    )
+    prepared = run(live_orchestration.prepare_turn(
+        creator_id="creator-1",
+        fan_id="fan-1",
+        trigger_kind="inbound_message",
+        trigger_identity="message-1",
+        latest_message="those trainers look wrecked in the best way",
+    ))
+    assert prepared.replies == [
+        "that bit about the trainers is dangerously specific — good taste"
+    ]
+    assert len(calls) == 1
+    assert prepared.provenance.context["writer_prompt_version"] == "semantic_v2_one_call"
+
+
+def test_semantic_v2_rejects_the_single_call_reply_deterministically(monkeypatch):
+    decision, execution, replies = live_orchestration._validate_single_call_reply(
+        ConversationDecision(
+            proposed_operation=ProposedOperation(kind=OperationKind.NONE),
+            disposition=ResponseDisposition.REPLY,
+            source="reply_plus_intent",
+        ),
+        ["I'll send you the link"],
+        ApprovedExecution(operation="none"),
+        loaded(),
+        mode="auto",
+    )
+    assert replies == []
+    assert execution.operation == "hand_off_to_human"
+    assert decision.hold_detail.startswith("semantic_reply_contract_rejected")
