@@ -485,8 +485,14 @@ def test_full_auto_entrypoint_bypasses_legacy_and_reports_semantic_outcome(monke
     assert sink == {"outcome": "no_send"}
 
 
-def test_simulator_entrypoint_selects_the_real_semantic_auto_path(monkeypatch):
-    configure_auto_route(monkeypatch, outcome={"outcome": "no_send", "message_ids": []})
+@pytest.mark.parametrize(
+    "outcome,reason",
+    [("no_send", None), ("human_review", "semantic_writer_contract_rejected: false_delivery_claim")],
+)
+def test_simulator_entrypoint_selects_the_real_semantic_auto_path(monkeypatch, outcome, reason):
+    configure_auto_route(
+        monkeypatch, outcome={"outcome": outcome, "message_ids": [], "reason": reason}
+    )
     monkeypatch.setattr(
         suggestions, "save_message", lambda *_a, **_k: value("fan-message-1")
     )
@@ -511,7 +517,8 @@ def test_simulator_entrypoint_selects_the_real_semantic_auto_path(monkeypatch):
     )
 
     assert result["simulation"] is True
-    assert result["outcome"] == "no_send"
+    assert result["outcome"] == outcome
+    assert result["reason"] == reason
     assert result["fan_message_id"] == "fan-message-1"
 
 
@@ -785,6 +792,7 @@ def test_repeated_invalid_owner_decisions_handoff_without_execution(monkeypatch)
     assert result["outcome"] == "human_review" and result["message_ids"] == []
     assert "no pending payment" in frozen[0][1]
     assert "repair_exhausted" in frozen[0][1]
+    assert result["reason"] == frozen[0][1]
     assert evidence.commercial_state.accepted_offer_id is None
 
 
@@ -1241,6 +1249,101 @@ def test_price_guard_uses_approved_price_for_each_turn(cents, text):
     )
     assert "redundant_locked_price" in live_orchestration.writer_contract_reasons(
         [text], loaded(), execution, mode="auto"
+    )
+
+
+def test_validated_price_repetition_cannot_freeze_a_locked_delivery(monkeypatch):
+    evidence = loaded(next_offer=offer(cents=3000))
+    owner_world(monkeypatch, evidence, [])
+    execution = ApprovedExecution(
+        operation="send_locked_paid_message",
+        delivery={"media_ids": ["approved-1"], "price_cents": 3000},
+    )
+    attempts = []
+
+    async def writer(*args, **kwargs):
+        attempts.append(kwargs["trace"])
+        return ["The approved item is $30."]
+
+    monkeypatch.setattr(live_orchestration, "generate_replies", writer)
+    replies, trace = run(live_orchestration._write_turn(
+        evidence, ConversationDecision(), execution, mode="auto"
+    ))
+    assert len(attempts) == 2
+    assert replies == ["The approved item is $30."]
+    assert trace is attempts[-1]
+    assert not trace.failure_reason
+
+
+@pytest.mark.parametrize("second", [[], ["dm me for the link"], ["$300 to unlock"]])
+def test_expression_retry_keeps_prior_safe_caption_and_its_attribution(monkeypatch, second):
+    evidence = loaded(next_offer=offer(cents=3000))
+    owner_world(monkeypatch, evidence, [])
+    attempts = []
+
+    async def writer(*args, **kwargs):
+        attempts.append(kwargs["trace"])
+        return ["$30 to unlock"] if len(attempts) == 1 else second
+
+    monkeypatch.setattr(live_orchestration, "generate_replies", writer)
+    replies, trace = run(live_orchestration._write_turn(
+        evidence, ConversationDecision(), ApprovedExecution(
+            operation="send_locked_paid_message",
+            delivery={"media_ids": ["approved-1"], "price_cents": 3000},
+        ), mode="auto"
+    ))
+    assert replies == ["$30 to unlock"]
+    assert trace is attempts[0]
+
+
+@pytest.mark.parametrize("caption", ["$300 to unlock", "$30 plus $99", "Only 90 dollars"])
+def test_wrong_price_is_a_hard_failure_even_with_correct_price_present(caption):
+    reasons = live_orchestration.writer_contract_reasons(
+        [caption], loaded(), ApprovedExecution(
+            operation="send_locked_paid_message",
+            delivery={"media_ids": ["approved-1"], "price_cents": 3000},
+        ), mode="auto"
+    )
+    assert "unapproved_price_claim" in reasons
+
+
+def test_price_counteroffer_can_be_discussed_without_repricing():
+    from dataclasses import replace
+
+    evidence = loaded()
+    evidence.snapshot = replace(evidence.snapshot, trigger=replace(
+        evidence.snapshot.trigger, latest_message="Can you do $20 instead?"
+    ))
+    execution = ApprovedExecution(
+        operation="present_offer", offer={"price_cents": 3000}
+    )
+    assert live_orchestration.writer_contract_reasons(
+        ["You asked for $20; this item is $30."], evidence, execution, mode="auto"
+    ) == []
+    assert execution.offer["price_cents"] == 3000
+
+
+@pytest.mark.parametrize("operation", ["none", "present_offer", "send_locked_paid_message"])
+def test_direct_message_redirect_is_invalid_in_every_semantic_operation(operation):
+    assert "unsupported_delivery_route" in live_orchestration.writer_contract_reasons(
+        ["dm me for the link"], loaded(), ApprovedExecution(operation=operation), mode="auto"
+    )
+
+
+def test_semantic_writer_platform_and_visual_boundaries():
+    prompt = live_orchestration.build_writer_prompt(
+        loaded(), ConversationDecision(), ApprovedExecution(), mode="auto"
+    )[0]["content"]
+    assert "there is no delivery link" in prompt
+    assert "You cannot see the fan" in prompt
+    assert live_orchestration.writer_contract_reasons(
+        ["The link you shared was interesting."], loaded(), ApprovedExecution(), mode="auto"
+    ) == []
+    assert live_orchestration.writer_contract_reasons(
+        ["Message me for advice any time."], loaded(), ApprovedExecution(), mode="auto"
+    ) == []
+    assert "unsupported_delivery_route" in live_orchestration.writer_contract_reasons(
+        ["I'll send you the link"], loaded(), ApprovedExecution(operation="present_offer"), mode="auto"
     )
 
 

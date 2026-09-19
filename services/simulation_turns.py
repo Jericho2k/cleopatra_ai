@@ -619,6 +619,9 @@ async def execute_turn(
             str(row.get("id")) for row in creator_messages if row.get("id")
         ],
         "outcome": settled.get("outcome"),
+        # Completed review holds are not exceptions, but their cause must
+        # survive polling/reload too. `error` is owner-only in public_view.
+        "error": str(settled["reason"])[:2000] if settled.get("reason") else None,
         "analysis_degraded": bool(settled.get("analysis_degraded")),
         "finished_at": _now(),
     }
