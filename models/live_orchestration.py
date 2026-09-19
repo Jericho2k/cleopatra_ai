@@ -43,6 +43,7 @@ class EvidenceSnapshot:
     creator_voice: dict[str, Any] = field(default_factory=dict)
     recent_turns: tuple[dict[str, Any], ...] = ()
     historical_facts: tuple[EvidenceFact, ...] = ()
+    conversation_episodes: tuple[EvidenceFact, ...] = ()
     unresolved_obligations: tuple[dict[str, Any], ...] = ()
     corrections: tuple[dict[str, Any], ...] = ()
     approved_inventory: tuple[dict[str, Any], ...] = ()

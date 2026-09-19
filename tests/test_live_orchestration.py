@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from models.commercial import CreatorPolicy, FanCommercialState, FanStatus, Offer
+from models.conversation_continuity import ConversationEpisode
 from models.conversation_decision import (
     ConversationDecision,
     OperationKind,
@@ -15,6 +17,7 @@ from models.conversation_decision import (
 )
 from models.live_orchestration import (
     ApprovedExecution,
+    EvidenceFact,
     EvidenceSnapshot,
     TurnTrigger,
     ValidationResult,
@@ -22,7 +25,7 @@ from models.live_orchestration import (
 from models.schemas import Fan, Message, Persona, SuggestionResponse
 from services import conversation_core, live_orchestration, proactive, suggestions
 from services.context_packet import ContextPacket
-from services.decision_owners import parse_semantic_decision_result
+from services.decision_owners import build_semantic_prompt, parse_semantic_decision_result
 from services.reply_provenance import PIPELINE_AUTO, ReplyProvenance
 
 
@@ -259,7 +262,8 @@ def test_state_revision_detects_a_repeated_identical_fan_message():
     assert live_orchestration._revision(first) != live_orchestration._revision(repeated)
 
 
-def test_context_ceiling_keeps_latest_trigger_and_transaction_evidence(monkeypatch):
+@pytest.mark.parametrize("episode_count", [0, 6])
+def test_context_ceiling_keeps_latest_trigger_and_transaction_evidence(monkeypatch, episode_count):
     history = [
         Message(
             role="fan" if index % 2 == 0 else "creator",
@@ -336,8 +340,17 @@ def test_context_ceiling_keeps_latest_trigger_and_transaction_evidence(monkeypat
         live_orchestration, "get_creator_policy", lambda *_a: value(CreatorPolicy())
     )
     monkeypatch.setattr(live_orchestration, "open_threads_for", lambda *_a: value([]))
+    episodes = [
+        ConversationEpisode(
+            id=f"episode-{index}", creator_id="creator-1", fan_id="fan-1",
+            summary=f"Discussed the interview at company-{index}; waiting for the result.",
+            first_message_at=datetime(2026, 9, 10 - index, tzinfo=timezone.utc),
+            last_message_at=datetime(2026, 9, 10 - index, tzinfo=timezone.utc),
+        )
+        for index in range(episode_count)
+    ]
     monkeypatch.setattr(
-        live_orchestration, "recent_episodes_for", lambda *_a: value([])
+        live_orchestration, "recent_episodes_for", lambda *_a: value(episodes)
     )
     monkeypatch.setattr(
         live_orchestration, "_fan_pending_payment", lambda *_a: value(None)
@@ -375,6 +388,43 @@ def test_context_ceiling_keeps_latest_trigger_and_transaction_evidence(monkeypat
     assert snapshot.memory_status["historical_backfill_complete"] is False
     assert snapshot.truncation
     assert len(snapshot.canonical_json()) <= live_orchestration.MAX_EVIDENCE_CHARS
+
+    # Exercise the actual production prompt paths: a populated ContextPacket
+    # alone did not put any episode into either model's input before this fix.
+    _, owner_input = build_semantic_prompt(result.packet, {"evidence_snapshot": snapshot})
+    owner_evidence = json.loads(owner_input.split("\n", 1)[1])
+    writer_messages = live_orchestration.build_writer_prompt(
+        result, ConversationDecision(), ApprovedExecution(), mode=live_orchestration.MODE_AUTO
+    )
+    writer_evidence = json.loads(writer_messages[1]["content"])["evidence"]
+    assert writer_evidence == owner_evidence
+    assert len(writer_evidence["conversation_episodes"]) == min(episode_count, 4)
+    if episode_count:
+        first_episode = writer_evidence["conversation_episodes"][0]
+        assert first_episode["source_ref"] == "conversation_episodes:episode-0"
+        assert first_episode["certainty"] == "inferred"
+        assert "2026-09-10" in first_episode["value"]
+        assert "company-0" in first_episode["value"]
+        assert snapshot.truncation["conversation_episodes"] == 2
+
+
+def test_episode_budget_drops_oldest_before_current_exchange(monkeypatch):
+    original = loaded().snapshot
+    current = ({"speaker": "fan", "bubbles": ["I changed jobs since then."]},)
+    correction = ({"kind": "correction", "summary": "Now works at the library."},)
+    newer = EvidenceFact("Recent interview " + "a" * 400, "conversation_episodes:new", "inferred")
+    older = EvidenceFact("Old job " + "b" * 400, "conversation_episodes:old", "inferred")
+    expected = replace(original, recent_turns=current, corrections=correction,
+                       conversation_episodes=(newer,), truncation={"conversation_episodes": 3})
+    monkeypatch.setattr(live_orchestration, "MAX_EVIDENCE_CHARS", len(expected.canonical_json()))
+    snapshot = replace(expected, conversation_episodes=(newer, older),
+                       truncation={"conversation_episodes": 2})
+
+    result = live_orchestration._trim_snapshot(snapshot)
+
+    assert result == expected
+    assert result.trigger == original.trigger
+    assert len(result.canonical_json()) <= live_orchestration.MAX_EVIDENCE_CHARS
 
 
 def _semantic_resolution():
