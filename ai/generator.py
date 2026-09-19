@@ -225,11 +225,9 @@ def _is_valid_reply(reply: str, creator_persona: Persona) -> bool:
     if _is_standalone_filler(lowered):
         return False
 
-    if (
-        creator_persona.avg_message_length == "short"
-        and len(reply.split()) > 25
-    ):
-        return False
+    # Average length is a voice preference, not a validity limit. Rejecting
+    # every >25-word reply silently discarded substantive answers and retried
+    # the model even when the response matched the requested JSON contract.
 
     return True
 
@@ -315,7 +313,7 @@ def parse_auto_messages_outcome(
 
     reply = " | ".join(bubbles)
     # Bot-speak is judged per bubble; "is this whole reply filler" and the
-    # persona length rule are judged on the reply, because that is what gets
+    # filler check are judged on the reply, because that is what gets
     # sent. One rejected bubble rejects the reply: there is no alternative to
     # fall back to, and sending the rest would send a reply nobody wrote.
     if any(
