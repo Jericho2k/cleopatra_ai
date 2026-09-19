@@ -45,3 +45,18 @@ def test_the_default_cardinality_is_unchanged():
     payload = json.dumps(["one", "two", "three", "four"])
     replies = parse_reply_candidates(payload, Persona())
     assert len(replies) == 3
+
+
+def test_short_average_is_not_a_hard_word_limit_for_a_substantive_answer():
+    from ai.generator import parse_auto_messages_outcome
+
+    reply = ('You mentioned two different problems with the download. First, tell me '
+             'whether the attachment opens at all. Then we can check the missing sound '
+             'without asking you to buy the same item again.')
+    assert len(reply.split()) > 25
+    persona = Persona(avg_message_length='short')
+    assert parse_reply_candidates(json.dumps([reply]), persona) == [reply]
+    assert parse_auto_messages_outcome(json.dumps({'messages': [reply]}), persona).replies == [reply]
+    # Several bubbles form one reply, and may legitimately exceed 25 words too.
+    result = parse_auto_messages_outcome(json.dumps({'messages': [reply, 'Which one happened first?']}), persona)
+    assert result.replies == [reply + ' | Which one happened first?']

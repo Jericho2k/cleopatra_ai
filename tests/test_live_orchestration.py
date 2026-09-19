@@ -917,7 +917,8 @@ def test_writer_voice_contract_and_current_life_grounding():
     for rule in [
         "does not require a question",
         "One natural thought",
-        "1–2 bubbles",
+        "Choose length",
+        "Do not repeat a two-message template",
         "catalogue",
         "current-life facts",
         "emotional moment",
@@ -1034,13 +1035,19 @@ def test_failed_ppv_delivery_returns_review_without_false_creator_message(monkey
 
 
 @pytest.mark.parametrize("initial_pending", [False, True])
+@pytest.mark.parametrize("mirrored", [False, True])
 def test_bikini_trajectory_persists_real_ppv_receipt_and_payment_state(
-    monkeypatch, initial_pending
+    monkeypatch, initial_pending, mirrored
 ):
     """Real executor, adapter, receipt and reconciliation; models/DB are stubs."""
     from dataclasses import replace
     from services import ppv_delivery, ppv_persistence
     from tests.test_full_auto_simulation import FakeDB
+
+    media_ids = ["approved-1", "approved-2"]
+    if mirrored:
+        from core.simulation_catalog import simulation_media_id
+        media_ids = [simulation_media_id("source-creator", mid) for mid in media_ids]
 
     class DB(FakeDB):
         def rpc(self, name, params):
@@ -1147,7 +1154,7 @@ def test_bikini_trajectory_persists_real_ppv_receipt_and_payment_state(
                     "plan": [
                         {
                             "set_id": "set-1",
-                            "media_ids": ["approved-1", "approved-2"],
+                            "media_ids": media_ids,
                             "price_cents": 3000,
                             "sent": False,
                             "purchased": False,
@@ -1179,7 +1186,7 @@ def test_bikini_trajectory_persists_real_ppv_receipt_and_payment_state(
     row = db.tables["messages"][-1]
     ppv = row["media_context"]["ppv"]
     assert row["content"] == "knew you would 😏"
-    assert ppv["media_ids"] == ["approved-1", "approved-2"]
+    assert ppv["media_ids"] == media_ids
     assert ppv["price_cents"] == 3000 and ppv["set_id"] == "set-1"
     assert (
         ppv["payment_reference"]
@@ -1452,3 +1459,48 @@ def test_writer_repairs_expression_without_changing_commercial_authority(monkeyp
     assert trace.failure_reason == ""
     assert evidence.commercial_state.model_dump() == state_before
     assert execution.operation == "present_offer" and execution.delivery is None
+
+
+@pytest.mark.parametrize('text', ["its 30 if ur down", "it's 30", '30 to unlock'])
+def test_bare_commercial_price_gets_a_style_rewrite(text):
+    execution = ApprovedExecution(operation='present_offer', offer={'price_cents': 3000})
+    assert 'unsolicited_offer_price' in live_orchestration.writer_contract_reasons(
+        [text], loaded(), execution, mode='auto'
+    )
+    execution.offer['price_cents'] = 4000
+    assert 'unapproved_price_claim' in live_orchestration.writer_contract_reasons(
+        [text], loaded(), execution, mode='auto'
+    )
+
+
+def test_bare_price_detection_does_not_turn_ordinary_numbers_into_prices():
+    assert live_orchestration._mentioned_prices('It is 30 degrees outside; I have 2 questions.') == set()
+
+
+def test_review_resume_reuses_the_exact_unsent_plan_without_replanning(monkeypatch):
+    evidence = loaded(pending_offer=offer(cents=3000))
+    evidence.commercial_state.accepted_offer_id = 'offer-1'
+    evidence.active_session = {
+        'status': 'active', 'commercial_offer_id': 'offer-1', 'current_index': 0,
+        'plan': [{'set_id': 'set-1', 'price_cents': 3000,
+                  'media_ids': ['sim:source:one'], 'sent': False, 'purchased': False}],
+    }
+    decision = ConversationDecision(proposed_operation=ProposedOperation(
+        kind=OperationKind.SEND_LOCKED_PAID_MESSAGE, offer_id='offer-1', set_id='set-1', subject='the approved item'
+    ))
+    monkeypatch.setattr(live_orchestration, 'plan_session_for_fan', _retired)
+    execution = run(live_orchestration._prepare_execution(decision, evidence, execute_operations=True))
+    assert execution.validation.approved
+    assert execution.delivery['media_ids'] == ['sim:source:one']
+    assert execution.delivery['price_cents'] == 3000
+    evidence.fan.platform_fan_id = 'real-fan'
+    assert not live_orchestration._resumable_locked_session(evidence, evidence.commercial_state.pending_offer)
+    evidence.fan.platform_fan_id = 'test_fan_1'
+    for field, bad in [('sent', True), ('purchased', True), ('set_id', 'another'), ('price_cents', 9000)]:
+        step = evidence.active_session['plan'][0]
+        before = step[field]
+        step[field] = bad
+        assert not live_orchestration._resumable_locked_session(evidence, evidence.commercial_state.pending_offer)
+        step[field] = before
+    evidence.active_session['awaiting_purchase_index'] = 0
+    assert not live_orchestration.validate_decision(decision, evidence).approved

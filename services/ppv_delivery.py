@@ -131,17 +131,6 @@ async def send_locked_ppv(
         raise PPVDeliveryError("at least one media item is required")
     if int(price_cents) <= 0:
         raise PPVDeliveryError("price must be greater than zero")
-    # The last barrier for the owner-only simulation catalog. Mirrored test
-    # media carries a rewritten ``sim:`` id that is not a platform media id, so
-    # a delivery built from one is refused here rather than being handed to the
-    # platform. Planning already excludes these rows; this is what makes "never
-    # eligible for real delivery" a property of the delivery path itself and not
-    # a promise made by every caller.
-    if contains_simulation_media(exact_media_ids):
-        raise PPVDeliveryError(
-            "simulation-only test media can never be delivered to a real fan"
-        )
-
     db = get_supabase()
     fan_row = await asyncio.to_thread(
         lambda: db.table("fans")
@@ -164,6 +153,13 @@ async def send_locked_ppv(
     if source != "operator" and fan.get("pending_ppv_check"):
         raise PPVDeliveryError("this fan already has a locked PPV awaiting payment")
     local_test_delivery = str(fan.get("platform_fan_id") or "").startswith("test_")
+    # Resolve the persisted recipient before applying the live-only barrier.
+    # Mirrored ids are valid in the local simulator adapter, never on Fansly.
+    # Caller flags or a simulation scope cannot turn a real fan into a test fan.
+    if contains_simulation_media(exact_media_ids) and not local_test_delivery:
+        raise PPVDeliveryError(
+            "simulation-only test media can never be delivered to a real fan"
+        )
 
     creator_row = await asyncio.to_thread(
         lambda: db.table("creators")

@@ -272,6 +272,10 @@ def test_the_delivery_path_refuses_simulation_media(monkeypatch):
     """The second barrier, independent of the flag and of planning."""
     from services.ppv_delivery import PPVDeliveryError, send_locked_ppv
 
+    db = FakeSupabase({"fans": [{"id": "fan-1", "creator_id": TARGET,
+                                "platform_fan_id": "real-fan-1"}]})
+    monkeypatch.setattr("services.ppv_delivery.get_supabase", lambda: db)
+
     with pytest.raises(PPVDeliveryError, match="simulation-only"):
         run(
             send_locked_ppv(
