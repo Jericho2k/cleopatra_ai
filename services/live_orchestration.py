@@ -742,15 +742,17 @@ async def load_evidence(
 
 
 def _resumable_locked_session(loaded: LoadedEvidence, offer: Offer | None) -> bool:
-    """An armed first step may be retried after review, with the exact offer.
+    """A test fan's armed first step may resume with the exact offer.
 
-    The delivery journal still arbitrates an outstanding/accepted send; this
-    only prevents the saved pre-send plan from permanently blocking recovery.
+    Live delivery uncertainty still requires the existing receipt recovery.
+    The journal also arbitrates outstanding local claims; this only prevents
+    the saved pre-send simulation plan from permanently blocking recovery.
     """
     session = loaded.active_session or {}
     plan = session.get("plan") or []
     if (
-        offer is None or loaded.pending_payment or not plan
+        not str(loaded.fan.platform_fan_id or "").startswith("test_")
+        or offer is None or loaded.pending_payment or not plan
         or session.get("status") != "active"
         or int(session.get("current_index") or 0) != 0
         or session.get("awaiting_purchase_index") is not None

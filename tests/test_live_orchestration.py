@@ -1493,6 +1493,9 @@ def test_review_resume_reuses_the_exact_unsent_plan_without_replanning(monkeypat
     assert execution.validation.approved
     assert execution.delivery['media_ids'] == ['sim:source:one']
     assert execution.delivery['price_cents'] == 3000
+    evidence.fan.platform_fan_id = 'real-fan'
+    assert not live_orchestration._resumable_locked_session(evidence, evidence.commercial_state.pending_offer)
+    evidence.fan.platform_fan_id = 'test_fan_1'
     for field, bad in [('sent', True), ('purchased', True), ('set_id', 'another'), ('price_cents', 9000)]:
         step = evidence.active_session['plan'][0]
         before = step[field]
