@@ -1540,6 +1540,8 @@ async def _debounced_auto_reply(
                 outcome_sink["outcome"] = str(
                     result.get("outcome") or AUTO_OUTCOME_NO_SEND
                 )
+                if result.get("reason"):
+                    outcome_sink["reason"] = str(result["reason"])[:2000]
             return
         # Check for a pending tip and clear it atomically before building context
         pending_tip: dict | None = None
@@ -3804,4 +3806,7 @@ async def run_simulated_inbound(
         "creator_messages": creator_messages,
         "analysis_degraded": analyzer_degraded,
         "outcome": outcome,
+        # Internal runner result; persisted behind the owner's diagnostics
+        # boundary by simulation_turns, never public message metadata.
+        "reason": auto_outcome.get("reason"),
     }

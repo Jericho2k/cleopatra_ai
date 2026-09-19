@@ -202,6 +202,25 @@ def _modes(writer_state) -> list[str]:
     return [mode for _model, mode in writer_state["calls"]]
 
 
+def test_completed_review_reason_survives_reload_and_stays_owner_only():
+    reason = "semantic_execution_refused: selected_set_unavailable"
+
+    async def runner(**kwargs):
+        return {
+            "fan_message_id": "fan-message-1", "creator_messages": [],
+            "outcome": "human_review", "reason": reason,
+        }
+
+    turn, _ = asyncio.run(start_turn(
+        creator_id=CREATOR, fan_id=FAN, message="yes", fast=True,
+        include_mirrored_catalog=True, idempotency_key="review-reason", runner=runner,
+    ))
+    persisted = asyncio.run(get_turn(CREATOR, FAN, turn.id))
+    assert persisted.status == STATUS_COMPLETED
+    assert persisted.public_view(diagnostics=True)["error"] == reason
+    assert "error" not in persisted.public_view(diagnostics=False)
+
+
 # --- THE INCIDENT, end to end ----------------------------------------------
 
 

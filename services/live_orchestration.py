@@ -87,6 +87,7 @@ from services.decision_owners import SemanticDecisionOwner
 from services.fan_lifecycle import get_fan_lifecycle_context
 from services.offer_lifecycle import sync_pending_offer_expiry
 from services.payment_claims import verify_ppv_purchase
+from services.ppv_language import contains_delivery_link_language
 from services.ppv_delivery import (
     PPVDeliveryError,
     create_ppv_approval_request,
@@ -119,6 +120,15 @@ OUTCOME_WRITER_FAILED = "writer_failed"
 OUTCOME_HUMAN_REVIEW = "human_review"
 OUTCOME_STALE = "stale_generation"
 OUTCOME_APPROVAL_REQUIRED = "approval_required"
+
+# These are presentation preferences, not transaction failures. Try to improve
+# them once, but never freeze a valid delivery solely for repeating its price.
+_WRITER_STYLE_REASONS = frozenset({"redundant_locked_price"})
+_PRICE_MENTION = re.compile(
+    r"\$\s*([+-]?\d+(?:\.\d{1,2})?)(?!\d|\.\d)|"
+    r"\b(\d+(?:\.\d{1,2})?)\s*(?:dollars?|bucks?|USD)\b",
+    re.IGNORECASE,
+)
 
 
 class LiveOrchestrationError(RuntimeError):
@@ -1053,6 +1063,12 @@ emotional moment without immediately selling again or asking a generic question.
 Do not fabricate current-life facts: physical activity, location, schedule,
 clothing or surroundings. Inventory descriptions are content, not evidence of
 what the creator is doing or wearing right now.
+This is already the private platform chat. Approved paid media is attached to
+the message and unlocked here; there is no delivery link. Never tell the fan
+to DM you, go to another chat, or request/click a link to receive this content.
+You cannot see the fan. Their messages about your appearance are not evidence
+of theirs. Do not describe or compliment their looks, body, clothing or visible
+reactions without a sourced observation; respond to what they actually wrote.
 The lock card presents the price. Omit prices in ordinary locked captions;
 discuss the exact approved price only when the fan asks or negotiates about it.
 Prices may be copied only from approved_execution.offer.price_cents. Never
@@ -1095,6 +1111,7 @@ async def _write_turn(
     spec = loaded.stack.profile.stage(stage_name)
     trace = GenerationTrace()
     prompt = build_writer_prompt(loaded, decision, execution, mode=mode)
+    safe_fallback: tuple[list[str], GenerationTrace] | None = None
     for output_attempt in range(2):
         replies = await generate_replies(
             prompt,
@@ -1127,7 +1144,11 @@ async def _write_turn(
         )
         violations = writer_contract_reasons(replies, loaded, execution, mode=mode)
         if not violations:
-            return replies, trace
+            return (replies, trace) if replies or safe_fallback is None else safe_fallback
+        if replies and set(violations) <= _WRITER_STYLE_REASONS:
+            # Keep the successful attempt's attribution, even if a rewrite
+            # later fails. This never changes the approved operation or price.
+            safe_fallback = (replies, trace)
         print(
             f"[SEMANTIC WRITER REJECTED] attempt={output_attempt} reason={','.join(violations)} operation={execution.operation} delivery_attached={bool(execution.delivery) and not execution.approval_required}"
         )
@@ -1138,9 +1159,12 @@ async def _write_turn(
                 "\nYour previous expression was rejected by the output contract: "
                 + ", ".join(violations)
                 + ". Rewrite naturally using only the same approved facts. "
-                "Do not claim unattached delivery or unconfirmed payment; omit redundant price and inventory counts; do not invent current-life activity."
+                "Do not claim unattached delivery or unconfirmed payment; omit redundant price and inventory counts; do not invent current-life activity or visual knowledge of the fan. Paid media stays attached in this chat; never redirect to a DM or delivery link."
             )
             trace = GenerationTrace()
+    if safe_fallback is not None:
+        print("[SEMANTIC WRITER] style_retry_exhausted using_validated_caption=true")
+        return safe_fallback
     trace.failure_reason = "semantic_writer_contract_rejected: " + ",".join(violations)
     replies = []
     return replies, trace
@@ -1166,6 +1190,21 @@ def writer_contract_reasons(
 ) -> list[str]:
     text = " ".join(replies).replace("|", " ")
     reasons = []
+    # The retired prompt's platform contract was missing from semantic_v1.
+    # Do not repair this into a claim of delivery: regenerate against the same
+    # approved operation. Explicit DM redirects are invalid even for op=none.
+    redirect = re.search(
+        r"\b(?:dm|message|text)\s+me\s+(?:for|to (?:get|see|receive|unlock))\s+"
+        r"(?:(?:the|a|your|that|this|those|these|my)\s+)?"
+        r"(?:links?|photos?|pics?|videos?|content|media|set|access)\b",
+        text, re.IGNORECASE,
+    )
+    delivery_turn = execution.operation in {
+        OperationKind.PRESENT_OFFER.value,
+        OperationKind.SEND_LOCKED_PAID_MESSAGE.value,
+    }
+    if redirect or (delivery_turn and contains_delivery_link_language(text)):
+        reasons.append("unsupported_delivery_route")
     # Completion/access language is only legal inside the same atomic locked
     # delivery; a planned plain-text offer cannot make a delivery true.
     completion = re.search(
@@ -1207,16 +1246,22 @@ def writer_contract_reasons(
         if claim.group(0).lower().strip() not in facts:
             reasons.append("unsupported_current_life_claim")
             break
-    if execution.delivery and not price_discussion_required(loaded):
-        cents = int(execution.delivery.get("price_cents") or 0)
-        for match in re.finditer(
-            r"\$\s*(\d+(?:\.\d{1,2})?)(?![\d.])|\b(\d+(?:\.\d{1,2})?)\s*(?:dollars?|bucks?|USD)\b",
-            text,
-            re.IGNORECASE,
-        ):
-            if int(Decimal(match.group(1) or match.group(2)) * 100) == cents:
-                reasons.append("redundant_locked_price")
-                break
+    price_record = execution.delivery or execution.offer or {}
+    if delivery_turn and price_record.get("price_cents") is not None:
+        approved = Decimal(str(price_record["price_cents"])) / 100
+        mentioned = {Decimal(m.group(1) or m.group(2)) for m in _PRICE_MENTION.finditer(text)}
+        allowed = {approved}
+        discussing_price = price_discussion_required(loaded)
+        if discussing_price:
+            # A counteroffer can be discussed without accepting/repricing it.
+            allowed.update(
+                Decimal(m.group(1) or m.group(2))
+                for m in _PRICE_MENTION.finditer(loaded.snapshot.trigger.latest_message)
+            )
+        if mentioned - allowed:
+            reasons.append("unapproved_price_claim")
+        if execution.delivery and not discussing_price and approved in mentioned:
+            reasons.append("redundant_locked_price")
     return reasons
 
 
@@ -1557,7 +1602,7 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
     creator_id = prepared.loaded.snapshot.creator_id
 
     if prepared.loaded.fan.needs_human_review or prepared.loaded.fan.auto_mode is False:
-        return {"outcome": OUTCOME_HUMAN_REVIEW, "message_ids": []}
+        return {"outcome": OUTCOME_HUMAN_REVIEW, "message_ids": [], "reason": "existing_review_hold_or_auto_disabled"}
 
     if decision.disposition is ResponseDisposition.SILENCE:
         return {"outcome": OUTCOME_NO_SEND, "message_ids": []}
@@ -1571,7 +1616,8 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
             else decision.hold_detail or "semantic_owner_handoff"
         )
         await freeze_fan_for_review(fan_id, reason)
-        return {"outcome": OUTCOME_HUMAN_REVIEW, "message_ids": []}
+        print(f"[SEMANTIC REVIEW] fan={fan_id} reason={reason}")
+        return {"outcome": OUTCOME_HUMAN_REVIEW, "message_ids": [], "reason": reason}
     if not prepared.replies:
         return {"outcome": OUTCOME_WRITER_FAILED, "message_ids": []}
 
