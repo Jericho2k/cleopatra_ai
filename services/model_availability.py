@@ -23,6 +23,7 @@ import httpx
 from ai import openrouter_routing
 from ai.model_migrations import resolve_supported_model
 from ai.stack_profiles import (
+    STAGE_CONVERSATIONAL_OWNER,
     STAGE_WRITER_COMMERCIAL,
     STAGE_WRITER_DEFAULT,
     STAGE_WRITER_SAFETY,
@@ -70,6 +71,7 @@ def configured_writer_models() -> list[dict[str, str]]:
     seen: set[tuple[str, str]] = set()
     configured: list[dict[str, str]] = []
     for stage_name, role in (
+        (STAGE_CONVERSATIONAL_OWNER, "conversational_owner"),
         (STAGE_WRITER_DEFAULT, "ordinary_writer"),
         (STAGE_WRITER_COMMERCIAL, "commercial_writer"),
         (STAGE_WRITER_SAFETY, "safety_writer"),
@@ -249,7 +251,7 @@ async def refresh_model_availability(
             detail = " ".join(sorted(errors.values()))
         elif not missing:
             status = "healthy"
-            detail = "Configured writer models are available."
+            detail = "Configured reply models are available."
         elif len(missing) == len(checkable):
             status = "unavailable"
             detail = "No configured writer model is currently available: " + ", ".join(
