@@ -60,6 +60,7 @@
       "metadata": {
         "role": "conversational owner",
         "reasoning_enabled": true,
+        "reasoning_effort": "low",
         "openrouter_providers": [],
         "openrouter_ignore_global_provider_override": true,
         "note": "Live conversational owner for semantic_v2 and conversational_v1. Routed through OpenRouter's eligible GLM provider pool and deliberately ignores the Kimi-specific OPENROUTER_PROVIDERS pin. Pricing is a snapshot and should be reverified before large-scale rollout."
