@@ -329,6 +329,32 @@ def test_openrouter_request_carries_pin_and_session_affinity(monkeypatch):
     assert body["user"] == "fan-abc"
 
 
+
+def test_openrouter_request_carries_structured_output_and_reasoning_effort(monkeypatch):
+    client = _install_client(monkeypatch, _response(content='{"ok":true}'))
+    target = _openrouter_target(
+        model="z-ai/glm-5.3-flash",
+        metadata={"reasoning_enabled": True, "reasoning_effort": "low"},
+    )
+
+    asyncio.run(
+        complete(
+            target,
+            system="prefix",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=4096,
+            response_format={"type": "json_object"},
+        )
+    )
+
+    call = client.chat.completions.calls[0]
+    assert call["response_format"] == {"type": "json_object"}
+    assert call["extra_body"]["reasoning"] == {
+        "enabled": True,
+        "effort": "low",
+    }
+
+
 def test_together_requests_carry_no_openrouter_fields(monkeypatch):
     client = _install_client(monkeypatch, _response())
 
