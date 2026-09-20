@@ -1685,7 +1685,10 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         if req.suggestion_index is not None:
-            if (provenance.decision or {}).get("conversation_core") == "semantic_v1":
+            if (provenance.decision or {}).get("conversation_core") in {
+                "semantic_v1",
+                "semantic_v2",
+            }:
                 provenance.decision["operator_chosen_index"] = str(
                     req.suggestion_index
                 )

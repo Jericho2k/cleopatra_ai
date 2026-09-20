@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ai.generation_trace import GenerationTrace
 from models.commercial import CreatorPolicy, FanCommercialState, FanStatus, Offer
 from models.conversation_continuity import ConversationEpisode
 from models.conversation_decision import (
@@ -440,25 +441,42 @@ def _semantic_resolution():
     )
 
 
+def _semantic_v2_resolution():
+    return conversation_core.ConversationCoreResolution(
+        conversation_core.CORE_SEMANTIC_V2,
+        conversation_core.SOURCE_CREATOR,
+    )
+
+
 def _retired(*_args, **_kwargs):
     raise AssertionError("retired behavioral controller was called")
 
 
-def test_assisted_entrypoint_bypasses_every_legacy_behavioral_controller(monkeypatch):
+@pytest.mark.parametrize("core_id", ["semantic_v1", "semantic_v2"])
+def test_assisted_entrypoint_bypasses_every_legacy_behavioral_controller(
+    monkeypatch, core_id
+):
+    resolution = conversation_core.ConversationCoreResolution(
+        core_id, conversation_core.SOURCE_CREATOR
+    )
     monkeypatch.setattr(
         conversation_core,
         "resolve_conversation_core",
-        lambda **_k: value(_semantic_resolution()),
+        lambda **_k: value(resolution),
     )
+    forwarded = []
+
+    async def semantic_suggestions(**kwargs):
+        forwarded.append(kwargs)
+        return SuggestionResponse(
+            suggestions=["ordinary reply"],
+            conversation_core=kwargs["conversation_core"],
+        )
+
     monkeypatch.setattr(
         live_orchestration,
         "get_assisted_suggestions",
-        lambda **_k: value(
-            SuggestionResponse(
-                suggestions=["ordinary reply"],
-                conversation_core="semantic_v1",
-            )
-        ),
+        semantic_suggestions,
     )
     for name in (
         "analyze_situation",
@@ -476,12 +494,29 @@ def test_assisted_entrypoint_bypasses_every_legacy_behavioral_controller(monkeyp
             save_fan_message=False,
         )
     )
-    assert result.conversation_core == "semantic_v1"
+    assert result.conversation_core == core_id
     assert result.suggestions == ["ordinary reply"]
+    assert forwarded[0]["conversation_core"] == core_id
+
+
+def test_core_resolution_classifies_both_semantic_versions():
+    assert _semantic_resolution().is_semantic
+    assert _semantic_resolution().is_semantic_v1
+    assert _semantic_v2_resolution().is_semantic
+    assert _semantic_v2_resolution().is_semantic_v2
+    legacy = conversation_core.ConversationCoreResolution(
+        conversation_core.CORE_LEGACY, conversation_core.SOURCE_BUILTIN
+    )
+    assert not legacy.is_semantic
 
 
 def configure_auto_route(
-    monkeypatch, *, outcome=None, failure: Exception | None = None
+    monkeypatch,
+    *,
+    outcome=None,
+    failure: Exception | None = None,
+    core_id: str = "semantic_v1",
+    forwarded: list | None = None,
 ):
     fan = Fan(
         id="fan-1",
@@ -506,10 +541,16 @@ def configure_auto_route(
     monkeypatch.setattr(
         conversation_core,
         "resolve_conversation_core",
-        lambda **_k: value(_semantic_resolution()),
+        lambda **_k: value(
+            conversation_core.ConversationCoreResolution(
+                core_id, conversation_core.SOURCE_CREATOR
+            )
+        ),
     )
 
     async def semantic_turn(**_kwargs):
+        if forwarded is not None:
+            forwarded.append(_kwargs)
         if failure:
             raise failure
         return outcome or {"outcome": "replied", "message_ids": ["message-1"]}
@@ -525,8 +566,17 @@ def configure_auto_route(
     suggestions._pending_auto_replies.clear()
 
 
-def test_full_auto_entrypoint_bypasses_legacy_and_reports_semantic_outcome(monkeypatch):
-    configure_auto_route(monkeypatch, outcome={"outcome": "no_send", "message_ids": []})
+@pytest.mark.parametrize("core_id", ["semantic_v1", "semantic_v2"])
+def test_full_auto_entrypoint_bypasses_legacy_and_reports_semantic_outcome(
+    monkeypatch, core_id
+):
+    forwarded = []
+    configure_auto_route(
+        monkeypatch,
+        outcome={"outcome": "no_send", "message_ids": []},
+        core_id=core_id,
+        forwarded=forwarded,
+    )
     sink = {}
     run(
         suggestions._debounced_auto_reply(
@@ -539,6 +589,7 @@ def test_full_auto_entrypoint_bypasses_legacy_and_reports_semantic_outcome(monke
         )
     )
     assert sink == {"outcome": "no_send"}
+    assert forwarded[0]["conversation_core"] == core_id
 
 
 @pytest.mark.parametrize(
@@ -598,7 +649,10 @@ def test_semantic_provider_failure_never_falls_through_to_legacy(monkeypatch):
     assert sink == {"outcome": "owner_failed"}
 
 
-def test_scheduled_entrypoint_uses_shared_core_and_not_legacy_writer(monkeypatch):
+@pytest.mark.parametrize("core_id", ["semantic_v1", "semantic_v2"])
+def test_scheduled_entrypoint_uses_shared_core_and_not_legacy_writer(
+    monkeypatch, core_id
+):
     fan = Fan(
         id="fan-1",
         display_name="Test Fan",
@@ -609,10 +663,20 @@ def test_scheduled_entrypoint_uses_shared_core_and_not_legacy_writer(monkeypatch
     monkeypatch.setattr(
         conversation_core,
         "resolve_conversation_core",
-        lambda **_k: value(_semantic_resolution()),
+        lambda **_k: value(
+            conversation_core.ConversationCoreResolution(
+                core_id, conversation_core.SOURCE_CREATOR
+            )
+        ),
     )
+    forwarded = []
+
+    async def proactive_turn(**kwargs):
+        forwarded.append(kwargs)
+        return True
+
     monkeypatch.setattr(
-        live_orchestration, "run_proactive_turn", lambda **_k: value(True)
+        live_orchestration, "run_proactive_turn", proactive_turn
     )
     monkeypatch.setattr(proactive, "generate_replies", _retired)
 
@@ -624,6 +688,7 @@ def test_scheduled_entrypoint_uses_shared_core_and_not_legacy_writer(monkeypatch
             action_id="action-1",
         )
     )
+    assert forwarded[0]["conversation_core"] == core_id
 
 
 def test_locked_auto_execution_uses_controlled_delivery_adapter(monkeypatch):
@@ -1230,6 +1295,7 @@ def test_bikini_trajectory_persists_real_ppv_receipt_and_payment_state(
                 fan_id="fan-1",
                 latest_message=message,
                 trigger_identity=message,
+                conversation_core="semantic_v2",
             )
         )
         assert result["outcome"] == "replied"
@@ -1283,6 +1349,7 @@ def test_writer_rejection_suppresses_entire_turn_before_delivery(monkeypatch):
             trigger_kind="fan_message",
             trigger_identity="m1",
             latest_message="yes",
+            conversation_core="semantic_v2",
         )
     )
     assert prepared.replies == []
@@ -1558,6 +1625,25 @@ def test_semantic_v2_uses_one_call_and_bypasses_the_separate_writer(monkeypatch)
 
     async def owner(*args, **kwargs):
         calls.append(kwargs)
+        trace = GenerationTrace()
+        trace.record_request(
+            primary_target=SimpleNamespace(provider="test", model="kimi"),
+            fallback_target=None,
+            profile="cleo_v3",
+            policy="single_conversational_call",
+            deadline_seconds=0,
+        )
+        trace.record_success(
+            target=SimpleNamespace(provider="test", model="kimi"),
+            role="semantic_v2_owner_writer",
+            attempt_index=0,
+            upstream_provider="digitalocean",
+            outcome="semantic_v2_first_try_success",
+            attempts=1,
+            pinned_attempts=1,
+            alternate_attempts=0,
+            elapsed_ms=17,
+        )
         return (
             ConversationDecision(
                 proposed_operation=ProposedOperation(kind=OperationKind.NONE),
@@ -1567,6 +1653,7 @@ def test_semantic_v2_uses_one_call_and_bypasses_the_separate_writer(monkeypatch)
                 confidence=0.9,
             ),
             ["that bit about the trainers is dangerously specific — good taste"],
+            trace,
         )
 
     async def retired_writer(*args, **kwargs):
@@ -1585,12 +1672,91 @@ def test_semantic_v2_uses_one_call_and_bypasses_the_separate_writer(monkeypatch)
         trigger_kind="inbound_message",
         trigger_identity="message-1",
         latest_message="those trainers look wrecked in the best way",
+        conversation_core="semantic_v2",
     ))
     assert prepared.replies == [
         "that bit about the trainers is dangerously specific — good taste"
     ]
     assert len(calls) == 1
-    assert prepared.provenance.context["writer_prompt_version"] == "semantic_v2_one_call"
+    assert prepared.provenance.context["writer_prompt_version"] == "semantic_v2_one_call_v1"
+    assert prepared.provenance.decision["conversation_core"] == "semantic_v2"
+    assert prepared.writer_trace.model == "kimi"
+    assert prepared.writer_trace.upstream_provider == "digitalocean"
+    assert prepared.writer_trace.elapsed_ms == 17
+    assert prepared.provenance.writer["actual"]["model"] == "kimi"
+
+
+def test_semantic_v1_uses_decision_owner_then_separate_writer(monkeypatch):
+    calls = []
+
+    async def decide(_loaded):
+        calls.append("decision_owner")
+        return ConversationDecision(
+            proposed_operation=ProposedOperation(kind=OperationKind.NONE),
+            disposition=ResponseDisposition.REPLY,
+            source="semantic_owner",
+        )
+
+    async def write(*_args, **_kwargs):
+        calls.append("writer")
+        return ["specific reply"], GenerationTrace()
+
+    monkeypatch.setattr(live_orchestration, "decide_turn", decide)
+    monkeypatch.setattr(live_orchestration, "_write_turn", write)
+    monkeypatch.setattr(live_orchestration, "decide_with_reply", _retired)
+    monkeypatch.setattr(
+        live_orchestration, "load_evidence", lambda **_kwargs: value(loaded())
+    )
+    prepared = run(
+        live_orchestration.prepare_turn(
+            creator_id="creator-1",
+            fan_id="fan-1",
+            trigger_kind="fan_message",
+            trigger_identity="message-1",
+            latest_message="hello",
+            conversation_core="semantic_v1",
+        )
+    )
+    assert calls == ["decision_owner", "writer"]
+    assert prepared.replies == ["specific reply"]
+    assert prepared.provenance.decision["conversation_core"] == "semantic_v1"
+    assert prepared.provenance.context["writer_prompt_version"] == "semantic_writer_v1"
+
+
+@pytest.mark.parametrize("core_id", ["semantic_v1", "semantic_v2"])
+def test_assisted_approval_accepts_both_semantic_cores(monkeypatch, core_id):
+    evidence = loaded()
+    provenance = ReplyProvenance("creator-1", "fan-1", "assisted")
+    provenance.decision = {
+        "conversation_core": core_id,
+        "semantic_operation": "none",
+        "semantic_state_revision": evidence.snapshot.state_revision,
+    }
+    monkeypatch.setattr(
+        live_orchestration, "get_conversation_history", lambda *_a: value([])
+    )
+    monkeypatch.setattr(
+        live_orchestration, "load_evidence", lambda **_kwargs: value(evidence)
+    )
+    prepared = run(
+        live_orchestration.prepare_assisted_approval(
+            provenance, creator_id="creator-1", fan_id="fan-1"
+        )
+    )
+    assert prepared is not None
+    assert prepared.decision.source == (
+        "reply_plus_intent" if core_id == "semantic_v2" else "semantic_owner"
+    )
+
+
+def test_legacy_assisted_token_never_enters_semantic_approval():
+    provenance = ReplyProvenance("creator-1", "fan-1", "assisted")
+    provenance.decision = {"conversation_core": "legacy"}
+    assert run(
+        live_orchestration.prepare_assisted_approval(
+            provenance, creator_id="creator-1", fan_id="fan-1"
+        )
+    ) is None
 
 
 def test_semantic_v2_rejects_the_single_call_reply_deterministically(monkeypatch):
@@ -1608,3 +1774,50 @@ def test_semantic_v2_rejects_the_single_call_reply_deterministically(monkeypatch
     assert replies == []
     assert execution.operation == "hand_off_to_human"
     assert decision.hold_detail.startswith("semantic_reply_contract_rejected")
+
+
+def test_semantic_v2_trace_counts_validation_repair_calls(monkeypatch):
+    evidence = loaded()
+    calls = []
+
+    async def answer(_loaded, *, repair=None):
+        calls.append(repair)
+        trace = GenerationTrace()
+        trace.record_success(
+            target=SimpleNamespace(provider="test", model="kimi"),
+            role="semantic_v2_owner_writer",
+            attempt_index=0,
+            upstream_provider="digitalocean",
+            outcome="semantic_v2_first_try_success",
+            attempts=1,
+            pinned_attempts=1,
+            alternate_attempts=0,
+            elapsed_ms=10,
+        )
+        operation = (
+            ProposedOperation(
+                kind=OperationKind.CHECK_PAYMENT_CLAIM,
+                subject="fake payment",
+                payment_reference="missing",
+            )
+            if repair is None
+            else ProposedOperation(kind=OperationKind.NONE)
+        )
+        return (
+            ConversationDecision(
+                proposed_operation=operation,
+                disposition=ResponseDisposition.REPLY,
+                source="reply_plus_intent",
+            ),
+            ["specific reply"],
+            trace,
+        )
+
+    monkeypatch.setattr(live_orchestration, "_conversational_answer", answer)
+    _decision, _replies, trace = run(live_orchestration.decide_with_reply(evidence))
+    assert len(calls) == 2
+    assert trace.attempts == 2
+    assert trace.pinned_attempts == 2
+    assert trace.elapsed_ms == 20
+    assert trace.attempt_index == 1
+    assert trace.outcome == "semantic_v2_repair_success"

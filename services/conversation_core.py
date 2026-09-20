@@ -48,7 +48,15 @@ class ConversationCoreResolution:
 
     @property
     def is_semantic(self) -> bool:
+        return self.core_id in {CORE_SEMANTIC_V1, CORE_SEMANTIC_V2}
+
+    @property
+    def is_semantic_v1(self) -> bool:
         return self.core_id == CORE_SEMANTIC_V1
+
+    @property
+    def is_semantic_v2(self) -> bool:
+        return self.core_id == CORE_SEMANTIC_V2
 
     def to_dict(self) -> dict[str, str]:
         return {
