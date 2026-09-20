@@ -596,6 +596,7 @@ async def get_suggestions(
             fan_id=fan_id,
             fan_message=fan_message,
             save_fan_message=save_fan_message,
+            conversation_core=core.core_id,
         )
 
     (
@@ -1527,6 +1528,7 @@ async def _debounced_auto_reply(
                 creator_id=creator_id,
                 fan_id=fan_id,
                 latest_message=latest.content,
+                conversation_core=core.core_id,
                 trigger_identity=(
                     expected_trigger_at
                     or (

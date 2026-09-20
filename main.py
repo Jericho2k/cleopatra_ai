@@ -1685,7 +1685,10 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
         if req.suggestion_index is not None:
-            if (provenance.decision or {}).get("conversation_core") == "semantic_v1":
+            if (provenance.decision or {}).get("conversation_core") in {
+                "semantic_v1",
+                "semantic_v2",
+            }:
                 provenance.decision["operator_chosen_index"] = str(
                     req.suggestion_index
                 )
@@ -8582,7 +8585,11 @@ async def read_conversation_cores(request: Request) -> dict:
     _require_conversation_core_owner(request)
     from services.conversation_core import CORE_ENV_VAR, CORE_IDS, environment_core_id
 
-    labels = {"legacy": "Legacy controller stack", "semantic_v1": "Semantic owner v1"}
+    labels = {
+        "legacy": "Legacy controller stack",
+        "semantic_v1": "Semantic owner v1",
+        "semantic_v2": "One-call conversational owner",
+    }
     return {
         "cores": [{"id": value, "name": labels[value]} for value in CORE_IDS],
         "environment_core": environment_core_id(),

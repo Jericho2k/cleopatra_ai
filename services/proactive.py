@@ -118,6 +118,7 @@ async def send_proactive_message(
             fan_id=fan_id,
             goal=goal,
             action_id=action_id,
+            conversation_core=core.core_id,
         )
 
     persona = await get_creator_persona(creator_id) or Persona()
