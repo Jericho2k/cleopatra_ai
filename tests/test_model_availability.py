@@ -156,17 +156,22 @@ def test_missing_together_key_is_visible_without_network_call(monkeypatch):
     assert [url for url, _ in client.calls] == [OPENROUTER_URL]
 
 
-def test_together_only_configuration_still_works(monkeypatch):
+def test_together_writer_configuration_still_works_with_openrouter_owner(monkeypatch):
     monkeypatch.setenv("WRITER_DEFAULT_PROVIDER", "together")
     monkeypatch.setenv("WRITER_DEFAULT_MODEL", "moonshotai/Kimi-K3")
     client = Client(
-        {TOGETHER_URL: ["moonshotai/Kimi-K3", "Qwen/Qwen3.7-Plus"]}
+        {
+            OPENROUTER_URL: ["z-ai/glm-5.3-flash"],
+            TOGETHER_URL: ["moonshotai/Kimi-K3", "Qwen/Qwen3.7-Plus"],
+        }
     )
 
     result = asyncio.run(refresh_model_availability(client=client, now=NOW))
 
     assert result["status"] == "healthy"
-    assert [url for url, _ in client.calls] == [TOGETHER_URL]
+    assert sorted(url for url, _ in client.calls) == sorted(
+        [OPENROUTER_URL, TOGETHER_URL]
+    )
 
 
 def test_unknown_provider_is_reported_as_unknown_not_missing(monkeypatch):
@@ -175,7 +180,11 @@ def test_unknown_provider_is_reported_as_unknown_not_missing(monkeypatch):
 
     result = asyncio.run(refresh_model_availability(client=_default_client(), now=NOW))
 
-    assert result["models"][0]["available"] is None
+    ordinary = next(
+        model for model in result["models"] if model["role"] == "ordinary_writer"
+    )
+    assert ordinary["provider"] == "anthropic"
+    assert ordinary["available"] is None
     assert result["status"] == "healthy"
 
 
