@@ -140,6 +140,7 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
     from db.price_learning_queries import get_price_learning_profile
     from services.ai_stack import resolve_ai_stack
     from services.conversation_core import resolve_conversation_core
+    from services.conversational_core import load_working_state
 
     fan = await require_simulation_fan(fan_id, creator_id)
 
@@ -160,6 +161,7 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
         actions,
         stack,
         conversation_core,
+        conversational_working_state,
         scene,
     ) = await asyncio.gather(
         _safe("commercial_state", get_fan_state(fan_id)),
@@ -177,6 +179,10 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
                 fan_id=fan_id,
                 platform_fan_id=fan.get("platform_fan_id"),
             ),
+        ),
+        _safe(
+            "conversational_working_state",
+            load_working_state(creator_id, fan_id),
         ),
         _safe("scene", get_scene(fan_id)),
     )
@@ -199,6 +205,11 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
         "ai_stack": (stack.to_dict() if stack is not None else None),
         "conversation_core": (
             conversation_core.to_dict() if conversation_core is not None else None
+        ),
+        "conversational_working_state": (
+            conversational_working_state.as_dict()
+            if conversational_working_state is not None
+            else None
         ),
         # Confirmed money only. This is simulated spend on a simulated fan and
         # is excluded from every production revenue view (see

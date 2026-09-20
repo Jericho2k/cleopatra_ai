@@ -452,7 +452,9 @@ def _retired(*_args, **_kwargs):
     raise AssertionError("retired behavioral controller was called")
 
 
-@pytest.mark.parametrize("core_id", ["semantic_v1", "semantic_v2"])
+@pytest.mark.parametrize(
+    "core_id", ["semantic_v1", "semantic_v2", "conversational_v1"]
+)
 def test_assisted_entrypoint_bypasses_every_legacy_behavioral_controller(
     monkeypatch, core_id
 ):
@@ -499,11 +501,17 @@ def test_assisted_entrypoint_bypasses_every_legacy_behavioral_controller(
     assert forwarded[0]["conversation_core"] == core_id
 
 
-def test_core_resolution_classifies_both_semantic_versions():
+def test_core_resolution_classifies_owner_runtime_versions():
     assert _semantic_resolution().is_semantic
     assert _semantic_resolution().is_semantic_v1
     assert _semantic_v2_resolution().is_semantic
     assert _semantic_v2_resolution().is_semantic_v2
+    conversational = conversation_core.ConversationCoreResolution(
+        conversation_core.CORE_CONVERSATIONAL_V1,
+        conversation_core.SOURCE_CREATOR,
+    )
+    assert conversational.is_semantic
+    assert conversational.is_conversational_v1
     legacy = conversation_core.ConversationCoreResolution(
         conversation_core.CORE_LEGACY, conversation_core.SOURCE_BUILTIN
     )
@@ -566,7 +574,9 @@ def configure_auto_route(
     suggestions._pending_auto_replies.clear()
 
 
-@pytest.mark.parametrize("core_id", ["semantic_v1", "semantic_v2"])
+@pytest.mark.parametrize(
+    "core_id", ["semantic_v1", "semantic_v2", "conversational_v1"]
+)
 def test_full_auto_entrypoint_bypasses_legacy_and_reports_semantic_outcome(
     monkeypatch, core_id
 ):
@@ -649,7 +659,9 @@ def test_semantic_provider_failure_never_falls_through_to_legacy(monkeypatch):
     assert sink == {"outcome": "owner_failed"}
 
 
-@pytest.mark.parametrize("core_id", ["semantic_v1", "semantic_v2"])
+@pytest.mark.parametrize(
+    "core_id", ["semantic_v1", "semantic_v2", "conversational_v1"]
+)
 def test_scheduled_entrypoint_uses_shared_core_and_not_legacy_writer(
     monkeypatch, core_id
 ):

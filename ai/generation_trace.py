@@ -43,7 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from models.model_runtime import ModelTarget
+from models.model_runtime import ModelTarget, resolve_cost_usd
 
 
 @dataclass
@@ -82,6 +82,11 @@ class GenerationTrace:
     pinned_attempts: int = 0
     alternate_attempts: int = 0
     elapsed_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    cost_usd: float | None = None
     deadline_seconds: float = 0.0
     deadline_exceeded: bool = False
 
@@ -144,6 +149,8 @@ class GenerationTrace:
         pinned_attempts: int,
         alternate_attempts: int,
         elapsed_ms: int,
+        usage: Any = None,
+        reported_cost_usd: float | None = None,
     ) -> None:
         """Note the attempt whose text is the one being returned."""
         self.recorded = True
@@ -157,6 +164,16 @@ class GenerationTrace:
         self.pinned_attempts = int(pinned_attempts)
         self.alternate_attempts = int(alternate_attempts)
         self.elapsed_ms = int(elapsed_ms)
+        if usage is not None:
+            self.input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+            self.output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+            self.cache_read_tokens = int(getattr(usage, "cache_read_tokens", 0) or 0)
+            self.cache_write_tokens = int(getattr(usage, "cache_write_tokens", 0) or 0)
+            self.cost_usd = resolve_cost_usd(
+                target,
+                usage,
+                reported_cost_usd=reported_cost_usd,
+            )
         self.failure_reason = ""
 
     def record_failure(
@@ -220,6 +237,22 @@ class GenerationTrace:
             record["served_by_requested_model"] = self.served_by_requested_model
         if self.outcome:
             record["outcome"] = self.outcome
+        if any(
+            (
+                self.input_tokens,
+                self.output_tokens,
+                self.cache_read_tokens,
+                self.cache_write_tokens,
+            )
+        ):
+            record["usage"] = {
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "cache_read_tokens": self.cache_read_tokens,
+                "cache_write_tokens": self.cache_write_tokens,
+            }
+        if self.cost_usd is not None:
+            record["cost_usd"] = self.cost_usd
         if self.failure_reason:
             record["failure_reason"] = self.failure_reason
         if self.deadline_exceeded:

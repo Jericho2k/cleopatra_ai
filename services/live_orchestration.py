@@ -64,12 +64,17 @@ from db.queries import (
     save_message,
 )
 from models.commercial import FanStatus, Offer
+from models.conversational_core import (
+    ConversationalWorkingState,
+    StateDeltaValidation,
+)
 from models.conversation_decision import (
     ConversationDecision,
     HoldReason,
     OperationKind,
     ProposedOperation,
     ResponseDisposition,
+    ResponseIntent,
 )
 from models.live_orchestration import (
     ApprovedExecution,
@@ -84,7 +89,19 @@ from services.ai_stack import resolve_ai_stack
 from services.assisted_provenance import remember as remember_assisted_provenance
 from services.context_packet import ContextPacket, build_context_packet
 from services.conversation_continuity import open_threads_for, recent_episodes_for
-from services.conversation_core import CORE_SEMANTIC_V1, CORE_SEMANTIC_V2
+from services.conversation_core import (
+    CORE_CONVERSATIONAL_V1,
+    CORE_SEMANTIC_V1,
+    CORE_SEMANTIC_V2,
+)
+from services.conversational_core import (
+    CoreStateConflictError,
+    evidence_catalog_view,
+    load_working_state,
+    save_working_state,
+    state_fingerprint,
+    validate_and_apply_delta,
+)
 from services.decision_owners import SemanticDecisionOwner, parse_reply_plus_intent
 from services.fan_lifecycle import get_fan_lifecycle_context
 from services.offer_lifecycle import sync_pending_offer_expiry
@@ -140,6 +157,7 @@ _BARE_PRICE_MENTION = re.compile(
 )
 
 SEMANTIC_V2_PROMPT_VERSION = "semantic_v2_one_call_v1"
+CONVERSATIONAL_V1_PROMPT_VERSION = "conversational_owner_v1"
 SEMANTIC_V2_ONE_CALL_SYSTEM = """You are the conversational owner for one creator's private customer conversation on a paid-content platform. In one call, understand the evidence, write the customer-facing reply in the creator's voice, and state the reply's typed intent and proposed operation.
 
 Return one JSON object and nothing else, with exactly this contract:
@@ -182,6 +200,45 @@ Authority and safety:
 - If evidence is insufficient or safety requires review, use the appropriate hold/handoff instead of fabricating. If silence is correct, leave reply empty and explain it in hold_detail.
 """
 
+CONVERSATIONAL_V1_SYSTEM = """You are the single conversational owner for one creator's private customer conversation. Interpret the moment, contribute naturally in the creator's voice, choose any proposed operation, and update the compact working state in the same response. Do not reveal private reasoning.
+
+Return one JSON object and nothing else. It must contain the same reply/intent fields below plus state_delta:
+{
+  "reply": "customer-facing message; | only for a genuinely separate bubble",
+  "active_needs": [], "supporting_messages": [], "unresolved_references": [], "must_address": [],
+  "response_intent": "ordinary_conversation" | "answer_and_continue" | "clarify_reference" | "present_offer" | "deliver_accepted_offer" | "acknowledge_payment_check" | "support_handoff" | "respect_silence",
+  "disposition": "reply" | "silence" | "handoff",
+  "operation": "none" | "present_offer" | "send_locked_paid_message" | "check_payment_claim" | "repair_content_access" | "hand_off_to_human",
+  "operation_subject": "", "operation_because": "", "operation_offer_id": "", "operation_set_id": "", "operation_payment_reference": "", "operation_purchase_id": "",
+  "hold": "none" | "waiting_on_customer" | "waiting_on_payment" | "needs_human" | "respect_silence" | "insufficient_evidence",
+  "hold_detail": "", "confidence": 0.0,
+  "state_delta": {
+    "scene_summary": null, "current_action_focus": null, "current_direction": null,
+    "pacing": null, "has_shared_imagined_scene": null,
+    "initiative_holder": null, "current_focus": null, "participation_gist": null,
+    "add_unresolved_possibilities": [], "resolve_unresolved_possibilities": [],
+    "active_thread_ids": null,
+    "add_established_elements": [{"element_id":"stable-new-id", "claim":"", "source_type":"explicit_fan_statement|creator_config|model_inference|scene_assumption|shared_imagined|transaction_fact", "source_refs":[], "world_scope":"conversation|imagined_scene|present_world|transaction"}],
+    "corrections": [{"replaces_element_id":"old-id", "replacement":{"element_id":"stable-new-id", "claim":"", "source_type":"explicit_fan_statement", "source_refs":[], "world_scope":"conversation"}}]
+  }
+}
+
+Conversation judgment:
+- Contribute a thought, feeling, callback, implication, scene development, playful move, or useful direction. Do not merely paraphrase, validate, then ask a generic question.
+- Initiative may be fan, creator, or shared. A short response can be acceptance, hesitation, acknowledgement, cooling, continuation, or an invitation for you to lead. Do not use a stage ladder or automatically escalate.
+- Preserve a shared imagined scene vividly while keeping it imagined. Creator configuration and inventory descriptions are not evidence of what the creator is physically doing, wearing, or seeing right now.
+- Pacing may build, hold, continue, cool, redirect, pause, or resume. After rejection, purchase, delivery, correction, or a major scene turn, stay in the moment instead of resetting or immediately selling again.
+- Commercial behavior must fit the conversation. Never use catalogue voice, media counts, package/set/inventory language, or unsolicited price announcements.
+
+State and authority:
+- Raw messages/events remain history. The working-state summary is interpretation, never proof and never a valid source_ref.
+- Cite only exact refs from EVIDENCE CATALOG. Repeated inference stays model_inference forever. scene_assumption and shared_imagined never become present-world fact.
+- A correction may supersede an existing element only when the current fan message explicitly corrects it. Never delete history.
+- Transaction facts require authoritative transaction refs. A pending payment record proves only that a check is pending. Never claim payment, purchase, attachment, send, delivery, exact price, or operation completion from fan wording or from proposed state.
+- The operation is only a proposal. Deterministic code owns recipient, inventory, exact prices, payment, purchase, delivery, permissions, idempotency, and receipts.
+- If no state field needs changing, return an empty state_delta. Never add private reasoning or pseudo-history.
+"""
+
 
 class LiveOrchestrationError(RuntimeError):
     """A selected new-core turn failed and must never enter the legacy stack."""
@@ -212,6 +269,10 @@ class PreparedTurn:
     replies: list[str]
     provenance: ReplyProvenance
     writer_trace: GenerationTrace
+    conversation_core: str = CORE_SEMANTIC_V1
+    working_state_before: ConversationalWorkingState | None = None
+    state_delta_validation: StateDeltaValidation | None = None
+    state_persisted: bool = False
 
 
 def _plain(value: Any, *, limit: int = 1_000) -> str:
@@ -1205,6 +1266,125 @@ async def decide_with_reply(
     )
 
 
+def _json_object(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.lower().startswith("json"):
+            raw = raw[4:]
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        value = json.loads(raw[start : end + 1])
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+async def decide_conversational_v1(
+    loaded: LoadedEvidence,
+    working_state: ConversationalWorkingState,
+) -> tuple[ConversationDecision, list[str], GenerationTrace, Any]:
+    """One owner call returning reply, intent/operation, and state delta."""
+    spec = loaded.stack.profile.stage(STAGE_SITUATION_ANALYZER)
+    target = spec.primary_target()
+    payload = {
+        "evidence_snapshot": loaded.snapshot.as_dict(),
+        "evidence_catalog": evidence_catalog_view(loaded.snapshot),
+        "working_state": working_state.as_dict(),
+        "working_state_fingerprint": state_fingerprint(working_state),
+        "legal_operations": legal_operations(loaded),
+    }
+    trace = GenerationTrace()
+    if target is not None:
+        trace.record_request(
+            primary_target=target,
+            fallback_target=spec.fallback_target(),
+            profile=loaded.stack.profile_id,
+            policy="single_conversational_owner_with_state",
+            deadline_seconds=0.0,
+        )
+    try:
+        result = await complete(
+            target,
+            system=CONVERSATIONAL_V1_SYSTEM,
+            messages=[
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False, default=str),
+                }
+            ],
+            max_tokens=1400,
+        )
+    except Exception as exc:
+        trace.record_failure(
+            outcome="conversational_v1_owner_unreachable",
+            reason=f"the conversational owner could not be reached: {exc}",
+            attempts=1,
+            pinned_attempts=1,
+            alternate_attempts=0,
+            elapsed_ms=0,
+            deadline_exceeded=False,
+        )
+        return (
+            ConversationDecision(
+                disposition=ResponseDisposition.SILENCE,
+                hold=HoldReason.INSUFFICIENT_EVIDENCE,
+                hold_detail="conversational_v1_owner_unreachable",
+                source="conversational_owner_v1",
+                confidence=0.0,
+            ),
+            [],
+            trace,
+            {},
+        )
+
+    answer, refusal = parse_reply_plus_intent(
+        result.text,
+        source="conversational_owner_v1",
+        strict_live=True,
+    )
+    payload_result = _json_object(result.text)
+    if answer is None or payload_result is None:
+        trace.record_failure(
+            outcome="conversational_v1_owner_invalid",
+            reason=f"the conversational owner did not answer usably: {refusal}",
+            attempts=1,
+            pinned_attempts=1,
+            alternate_attempts=0,
+            elapsed_ms=result.latency_ms,
+            deadline_exceeded=False,
+        )
+        return (
+            ConversationDecision(
+                disposition=ResponseDisposition.SILENCE,
+                hold=HoldReason.INSUFFICIENT_EVIDENCE,
+                hold_detail="conversational_v1_owner_invalid",
+                source="conversational_owner_v1",
+                confidence=0.0,
+            ),
+            [],
+            trace,
+            {},
+        )
+    trace.record_success(
+        target=result.target,
+        role="conversational_v1_owner",
+        attempt_index=0,
+        upstream_provider=result.upstream_provider,
+        outcome="conversational_v1_first_try_success",
+        attempts=1,
+        pinned_attempts=1,
+        alternate_attempts=0,
+        elapsed_ms=result.latency_ms,
+        usage=getattr(result, "usage", None),
+        reported_cost_usd=getattr(result, "reported_cost_usd", None),
+    )
+    raw_delta: Any = payload_result.get("state_delta", "missing")
+    return answer.decision, [answer.reply], trace, raw_delta
+
+
 def _validate_single_call_reply(
     decision: ConversationDecision,
     replies: list[str],
@@ -1238,6 +1418,127 @@ def _validate_single_call_reply(
         validation=validate_decision(rejected, loaded),
     )
     return rejected, rejected_execution, []
+
+
+_LOCAL_UNSAFE_COPY = re.compile(
+    r"\b(?:you (?:paid|purchased|unlocked)|payment (?:confirmed|received)|"
+    r"got your payment|sent|delivered|attached|uploaded|in your inbox|"
+    r"\d+\s+(?:photos?|pics?|pictures?|videos?)|here(?: is|['’]s) a set of|"
+    r"dm|delivery link|click (?:the|a) link|i(?:['’]m| am)\s+(?:currently\s+|"
+    r"right now\s+|just\s+)?(?:wearing|sitting|lying|cooking|driving|working|"
+    r"shopping|showering|heading|at home|at work|in bed))\b",
+    re.IGNORECASE,
+)
+_PRIVATE_METADATA_WORDS = re.compile(
+    r"\b(?:offer_id|set_id|payment_reference|purchase_id|media_id|"
+    r"explicit_fan_statement|creator_config|model_inference|scene_assumption|"
+    r"shared_imagined|transaction_fact|conversational_core_v1|"
+    r"send_locked_paid_message|check_payment_claim|repair_content_access)\b",
+    re.IGNORECASE,
+)
+
+
+def _redact_private_metadata(
+    replies: list[str], loaded: LoadedEvidence
+) -> tuple[list[str], bool]:
+    private_values = {
+        row["source_ref"]
+        for row in evidence_catalog_view(loaded.snapshot)
+        if len(str(row.get("source_ref") or "")) >= 4
+    }
+    for record in (
+        loaded.snapshot.pending_offer,
+        *loaded.snapshot.approved_inventory,
+        loaded.snapshot.pending_payment,
+    ):
+        if not isinstance(record, dict):
+            continue
+        for key, value in record.items():
+            if (key.endswith("_id") or key.endswith("_reference")) and len(
+                str(value or "")
+            ) >= 4:
+                private_values.add(str(value))
+    changed = False
+    redacted: list[str] = []
+    for reply in replies:
+        text = str(reply or "")
+        cleaned = _PRIVATE_METADATA_WORDS.sub("", text)
+        for value in sorted(private_values, key=len, reverse=True):
+            cleaned = cleaned.replace(value, "")
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,;:-")
+        changed = changed or cleaned != text
+        if cleaned:
+            redacted.append(cleaned)
+    return redacted, changed
+
+
+def _repair_fan_visible_copy(replies: list[str]) -> list[str]:
+    """Strip unsafe clauses locally; never turn presentation into a freeze."""
+    repaired: list[str] = []
+    for reply in replies:
+        bubbles: list[str] = []
+        for bubble in str(reply or "").split("|"):
+            sentences = re.split(r"(?<=[.!?])\s+", bubble.strip())
+            safe = [sentence for sentence in sentences if sentence and not _LOCAL_UNSAFE_COPY.search(sentence)]
+            text = " ".join(safe).strip()
+            # An exact amount is removable private/commercial metadata unless
+            # the validator has already established that this turn may say it.
+            text = _PRICE_MENTION.sub("", text)
+            text = _BARE_PRICE_MENTION.sub("", text)
+            text = re.sub(r"\s{2,}", " ", text).strip(" ,;:-")
+            if text:
+                bubbles.append(text)
+        if bubbles:
+            repaired.append(" | ".join(bubbles))
+    return repaired
+
+
+def _validate_conversational_v1_reply(
+    decision: ConversationDecision,
+    replies: list[str],
+    execution: ApprovedExecution,
+    loaded: LoadedEvidence,
+    *,
+    mode: str,
+) -> tuple[ConversationDecision, ApprovedExecution, list[str], bool]:
+    if decision.disposition is not ResponseDisposition.REPLY:
+        return decision, execution, replies, False
+    replies, metadata_redacted = _redact_private_metadata(replies, loaded)
+    violations = writer_contract_reasons(replies, loaded, execution, mode=mode)
+    if not violations:
+        return decision, execution, replies, metadata_redacted
+    repaired = _repair_fan_visible_copy(replies)
+    remaining = writer_contract_reasons(repaired, loaded, execution, mode=mode)
+    print(
+        "[CONVERSATIONAL V1 LOCAL REPAIR] rejected="
+        + ",".join(violations)
+        + " remaining="
+        + (",".join(remaining) or "none")
+    )
+    if repaired and not remaining:
+        return decision, execution, repaired, True
+    quiet = ConversationDecision(
+        active_needs=decision.active_needs,
+        supporting_messages=decision.supporting_messages,
+        unresolved_references=decision.unresolved_references,
+        must_address=decision.must_address,
+        proposed_operation=ProposedOperation(),
+        response_intent=ResponseIntent.RESPECT_SILENCE,
+        disposition=ResponseDisposition.SILENCE,
+        hold=HoldReason.INSUFFICIENT_EVIDENCE,
+        hold_detail="conversational_v1_local_output_rejected",
+        source=decision.source,
+        confidence=decision.confidence,
+    )
+    return (
+        quiet,
+        ApprovedExecution(
+            operation="none",
+            validation=validate_decision(quiet, loaded),
+        ),
+        [],
+        True,
+    )
 
 
 async def _prepare_execution(
@@ -1612,8 +1913,11 @@ def _provenance(
     *,
     mode: str,
     conversation_core: str,
+    working_state_before: ConversationalWorkingState | None = None,
+    state_delta_validation: StateDeltaValidation | None = None,
 ) -> ReplyProvenance:
     is_v2 = conversation_core == CORE_SEMANTIC_V2
+    is_conversational_v1 = conversation_core == CORE_CONVERSATIONAL_V1
     provenance = ReplyProvenance(
         creator_id=loaded.snapshot.creator_id,
         fan_id=loaded.snapshot.fan_id,
@@ -1624,26 +1928,58 @@ def _provenance(
         text=loaded.snapshot.trigger.latest_message,
         history_position=len(loaded.history) - 1 if loaded.history else None,
     )
+    packet_record: dict[str, Any] = {
+        "version": loaded.snapshot.version,
+        "fingerprint": loaded.snapshot.fingerprint(),
+        "state_revision": loaded.snapshot.state_revision,
+        "truncation": loaded.snapshot.truncation,
+    }
+    if working_state_before is not None and state_delta_validation is not None:
+        packet_record.update(
+            {
+                "working_state_before": working_state_before.as_dict(),
+                "working_state_before_fingerprint": state_fingerprint(
+                    working_state_before
+                ),
+                "proposed_state_delta": state_delta_validation.proposed,
+                "accepted_state_fields": list(
+                    state_delta_validation.accepted_fields
+                ),
+                "rejected_state_fields": dict(
+                    state_delta_validation.rejected_fields
+                ),
+                "working_state_after": state_delta_validation.state_after.as_dict(),
+                "working_state_after_fingerprint": state_fingerprint(
+                    state_delta_validation.state_after
+                ),
+            }
+        )
     provenance.record_context(
         history_messages=len(loaded.history),
-        packet={
-            "version": loaded.snapshot.version,
-            "fingerprint": loaded.snapshot.fingerprint(),
-            "state_revision": loaded.snapshot.state_revision,
-            "truncation": loaded.snapshot.truncation,
-        },
+        packet=packet_record,
         stack_profile=loaded.stack.profile_id,
         writer_prompt_version=(
-            SEMANTIC_V2_PROMPT_VERSION if is_v2 else "semantic_writer_v1"
+            CONVERSATIONAL_V1_PROMPT_VERSION
+            if is_conversational_v1
+            else (SEMANTIC_V2_PROMPT_VERSION if is_v2 else "semantic_writer_v1")
         ),
         live_state={
-            ("semantic_owner_writer" if is_v2 else "semantic_owner"): True,
+            (
+                "conversational_owner_v1"
+                if is_conversational_v1
+                else ("semantic_owner_writer" if is_v2 else "semantic_owner")
+            ): True,
             "deterministic_validator": True,
+            "working_state_validator": state_delta_validation is not None,
             "approved_operation": execution.operation != "none",
         },
     )
     provenance.record_decision(
-        source="reply_plus_intent" if is_v2 else "semantic_owner",
+        source=(
+            "conversational_owner_v1"
+            if is_conversational_v1
+            else ("reply_plus_intent" if is_v2 else "semantic_owner")
+        ),
         action=decision.proposed_operation.kind,
         reason=decision.proposed_operation.because or decision.hold_detail,
         extra={
@@ -1659,6 +1995,16 @@ def _provenance(
             "semantic_purchase_id": decision.proposed_operation.purchase_id,
             "semantic_state_revision": loaded.snapshot.state_revision,
             "semantic_approval_required": execution.approval_required,
+            "state_validator_accepted": len(
+                state_delta_validation.accepted_fields
+            )
+            if state_delta_validation is not None
+            else 0,
+            "state_validator_rejected": len(
+                state_delta_validation.rejected_fields
+            )
+            if state_delta_validation is not None
+            else 0,
         },
     )
     provenance.record_writer(trace)
@@ -1677,7 +2023,11 @@ async def prepare_turn(
     execute_operations: bool = True,
     conversation_core: str = CORE_SEMANTIC_V1,
 ) -> PreparedTurn:
-    if conversation_core not in {CORE_SEMANTIC_V1, CORE_SEMANTIC_V2}:
+    if conversation_core not in {
+        CORE_SEMANTIC_V1,
+        CORE_SEMANTIC_V2,
+        CORE_CONVERSATIONAL_V1,
+    }:
         raise LiveOrchestrationError(
             f"live orchestration cannot execute conversation core {conversation_core!r}"
         )
@@ -1691,7 +2041,27 @@ async def prepare_turn(
     )
     replies: list[str] = []
     trace = GenerationTrace()
-    if conversation_core == CORE_SEMANTIC_V2:
+    locally_repaired = False
+    working_state_before: ConversationalWorkingState | None = None
+    state_delta_validation: StateDeltaValidation | None = None
+    if conversation_core == CORE_CONVERSATIONAL_V1:
+        working_state_before = await load_working_state(creator_id, fan_id)
+        decision, replies, trace, raw_delta = await decide_conversational_v1(
+            loaded,
+            working_state_before,
+        )
+        known_thread_ids = {
+            str(thread.get("id"))
+            for thread in loaded.snapshot.unresolved_obligations
+            if thread.get("id")
+        }
+        state_delta_validation = validate_and_apply_delta(
+            working_state_before,
+            raw_delta,
+            snapshot=loaded.snapshot,
+            known_thread_ids=known_thread_ids,
+        )
+    elif conversation_core == CORE_SEMANTIC_V2:
         decision, replies, trace = await decide_with_reply(loaded)
     else:
         decision = await decide_turn(loaded)
@@ -1704,22 +2074,48 @@ async def prepare_turn(
         decision.proposed_operation.kind is not OperationKind.NONE
         and not execution.validation.approved
     ):
-        # Planning can also refuse a validated operation (inventory changed).
-        # It must not fall through into a textual pretend-delivery.
-        decision = ConversationDecision(
-            disposition=ResponseDisposition.HANDOFF,
-            hold=HoldReason.NEEDS_HUMAN,
-            hold_detail="semantic_execution_refused: "
-            + "; ".join(execution.validation.reasons),
-            proposed_operation=ProposedOperation(
-                kind=OperationKind.HAND_OFF_TO_HUMAN,
-                subject="execution requires review",
-            ),
-        )
-        execution = ApprovedExecution(
-            operation="hand_off_to_human",
-            validation=validate_decision(decision, loaded),
-        )
+        if conversation_core == CORE_CONVERSATIONAL_V1:
+            # Hard authority remains deterministic: block the proposal and its
+            # dependent copy, but do not freeze the customer. Keep the rejected
+            # proposal on the decision so provenance shows exactly what failed.
+            print(
+                "[CONVERSATIONAL V1 OPERATION REJECTED] operation="
+                + decision.proposed_operation.kind.value
+                + " reasons="
+                + "; ".join(execution.validation.reasons)
+            )
+            decision = ConversationDecision(
+                active_needs=decision.active_needs,
+                supporting_messages=decision.supporting_messages,
+                unresolved_references=decision.unresolved_references,
+                must_address=decision.must_address,
+                proposed_operation=decision.proposed_operation,
+                response_intent=ResponseIntent.RESPECT_SILENCE,
+                disposition=ResponseDisposition.SILENCE,
+                hold=HoldReason.INSUFFICIENT_EVIDENCE,
+                hold_detail="conversational_v1_operation_rejected: "
+                + "; ".join(execution.validation.reasons),
+                source=decision.source,
+                confidence=decision.confidence,
+            )
+            replies = []
+        else:
+            # Planning can also refuse a validated operation (inventory changed).
+            # It must not fall through into a textual pretend-delivery.
+            decision = ConversationDecision(
+                disposition=ResponseDisposition.HANDOFF,
+                hold=HoldReason.NEEDS_HUMAN,
+                hold_detail="semantic_execution_refused: "
+                + "; ".join(execution.validation.reasons),
+                proposed_operation=ProposedOperation(
+                    kind=OperationKind.HAND_OFF_TO_HUMAN,
+                    subject="execution requires review",
+                ),
+            )
+            execution = ApprovedExecution(
+                operation="hand_off_to_human",
+                validation=validate_decision(decision, loaded),
+            )
     if conversation_core == CORE_SEMANTIC_V2:
         decision, execution, replies = _validate_single_call_reply(
             decision,
@@ -1727,6 +2123,16 @@ async def prepare_turn(
             execution,
             loaded,
             mode=mode,
+        )
+    elif conversation_core == CORE_CONVERSATIONAL_V1:
+        decision, execution, replies, locally_repaired = (
+            _validate_conversational_v1_reply(
+                decision,
+                replies,
+                execution,
+                loaded,
+                mode=mode,
+            )
         )
     elif decision.disposition is ResponseDisposition.REPLY:
         replies, trace = await _write_turn(
@@ -1759,7 +2165,11 @@ async def prepare_turn(
         trace,
         mode=(PIPELINE_ASSISTED if mode == MODE_ASSISTED else PIPELINE_AUTO),
         conversation_core=conversation_core,
+        working_state_before=working_state_before,
+        state_delta_validation=state_delta_validation,
     )
+    if conversation_core == CORE_CONVERSATIONAL_V1 and locally_repaired:
+        provenance.record_transform("conversational_v1_local_repair")
     return PreparedTurn(
         loaded=loaded,
         decision=decision,
@@ -1767,6 +2177,9 @@ async def prepare_turn(
         replies=replies,
         provenance=provenance,
         writer_trace=trace,
+        conversation_core=conversation_core,
+        working_state_before=working_state_before,
+        state_delta_validation=state_delta_validation,
     )
 
 
@@ -1803,6 +2216,28 @@ async def _current_revision(prepared: PreparedTurn) -> str:
 
 async def _expected_execution_revision(prepared: PreparedTurn) -> str:
     return prepared.loaded.snapshot.state_revision
+
+
+async def _persist_core_state(prepared: PreparedTurn) -> None:
+    if (
+        prepared.conversation_core != CORE_CONVERSATIONAL_V1
+        or prepared.state_persisted
+        or prepared.working_state_before is None
+        or prepared.state_delta_validation is None
+    ):
+        return
+    validation = prepared.state_delta_validation
+    if validation.accepted_fields:
+        await save_working_state(
+            prepared.loaded.snapshot.creator_id,
+            prepared.loaded.fan.id,
+            expected_revision=prepared.working_state_before.revision,
+            state=validation.state_after,
+        )
+    prepared.state_persisted = True
+    packet = prepared.provenance.context.get("packet")
+    if isinstance(packet, dict):
+        packet["working_state_persisted"] = True
 
 
 async def _commit_locked_plan(prepared: PreparedTurn) -> str:
@@ -1967,6 +2402,26 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
     if prepared.loaded.fan.needs_human_review or prepared.loaded.fan.auto_mode is False:
         return {"outcome": OUTCOME_HUMAN_REVIEW, "message_ids": [], "reason": "existing_review_hold_or_auto_disabled"}
 
+    if (
+        prepared.conversation_core == CORE_CONVERSATIONAL_V1
+        and prepared.writer_trace.failure_reason
+        and not prepared.replies
+    ):
+        return {
+            "outcome": OUTCOME_OWNER_FAILED,
+            "message_ids": [],
+            "reason": prepared.writer_trace.failure_reason,
+        }
+
+    if prepared.conversation_core == CORE_CONVERSATIONAL_V1:
+        expected = await _expected_execution_revision(prepared)
+        if await _current_revision(prepared) != expected:
+            return {"outcome": OUTCOME_STALE, "message_ids": []}
+        try:
+            await _persist_core_state(prepared)
+        except CoreStateConflictError:
+            return {"outcome": OUTCOME_STALE, "message_ids": []}
+
     if decision.disposition is ResponseDisposition.SILENCE:
         return {"outcome": OUTCOME_NO_SEND, "message_ids": []}
     if decision.disposition is ResponseDisposition.HANDOFF or execution.operation in {
@@ -2129,7 +2584,11 @@ async def prepare_assisted_approval(
     """
     recorded = provenance.decision or {}
     recorded_core = str(recorded.get("conversation_core") or "")
-    if recorded_core not in {CORE_SEMANTIC_V1, CORE_SEMANTIC_V2}:
+    if recorded_core not in {
+        CORE_SEMANTIC_V1,
+        CORE_SEMANTIC_V2,
+        CORE_CONVERSATIONAL_V1,
+    }:
         return None
     if provenance.creator_id != str(creator_id) or provenance.fan_id != str(fan_id):
         raise LiveOrchestrationError("the Assisted approval token is out of scope")
@@ -2151,6 +2610,33 @@ async def prepare_assisted_approval(
         raise LiveOrchestrationError(
             "the conversation changed after this Assisted draft was generated"
         )
+    working_state_before: ConversationalWorkingState | None = None
+    state_delta_validation: StateDeltaValidation | None = None
+    if recorded_core == CORE_CONVERSATIONAL_V1:
+        packet = (provenance.context or {}).get("packet") or {}
+        try:
+            recorded_before = ConversationalWorkingState.model_validate(
+                packet.get("working_state_before")
+            )
+            recorded_after = ConversationalWorkingState.model_validate(
+                packet.get("working_state_after")
+            )
+            current_state = await load_working_state(creator_id, fan_id)
+        except Exception as exc:
+            raise LiveOrchestrationError(
+                "the Assisted Core v1 draft has invalid working-state provenance"
+            ) from exc
+        if state_fingerprint(current_state) != state_fingerprint(recorded_before):
+            raise LiveOrchestrationError(
+                "the Core v1 working state changed after this Assisted draft was generated"
+            )
+        working_state_before = current_state
+        state_delta_validation = StateDeltaValidation(
+            proposed=dict(packet.get("proposed_state_delta") or {}),
+            accepted_fields=list(packet.get("accepted_state_fields") or []),
+            rejected_fields=dict(packet.get("rejected_state_fields") or {}),
+            state_after=recorded_after,
+        )
     try:
         operation = OperationKind(str(recorded.get("semantic_operation") or "none"))
     except ValueError as exc:
@@ -2170,9 +2656,13 @@ async def prepare_assisted_approval(
         ),
         disposition=ResponseDisposition.REPLY,
         source=(
-            "reply_plus_intent"
-            if recorded_core == CORE_SEMANTIC_V2
-            else "semantic_owner"
+            "conversational_owner_v1"
+            if recorded_core == CORE_CONVERSATIONAL_V1
+            else (
+                "reply_plus_intent"
+                if recorded_core == CORE_SEMANTIC_V2
+                else "semantic_owner"
+            )
         ),
     )
     execution = await _prepare_execution(decision, loaded, execute_operations=True)
@@ -2188,6 +2678,9 @@ async def prepare_assisted_approval(
         replies=[],
         provenance=provenance,
         writer_trace=GenerationTrace(),
+        conversation_core=recorded_core,
+        working_state_before=working_state_before,
+        state_delta_validation=state_delta_validation,
     )
 
 
@@ -2202,6 +2695,7 @@ async def execute_assisted_locked_approval(
     expected_revision = await _expected_execution_revision(prepared)
     if await _current_revision(prepared) != expected_revision:
         raise LiveOrchestrationError("the Assisted locked delivery became stale")
+    await _persist_core_state(prepared)
     committed_revision = await _commit_locked_plan(prepared)
     if await _current_revision(prepared) != committed_revision:
         raise LiveOrchestrationError("the Assisted locked delivery became stale")
@@ -2230,6 +2724,7 @@ async def finalize_assisted_plain_approval(prepared: PreparedTurn | None) -> Non
     """Commit only the operation whose corresponding text was actually sent."""
     if prepared is None:
         return
+    await _persist_core_state(prepared)
     operation = prepared.execution.operation
     if operation == OperationKind.PRESENT_OFFER.value:
         await _commit_presented_offer(prepared)

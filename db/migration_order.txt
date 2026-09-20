@@ -148,6 +148,11 @@ assisted_provenance_v1.sql
 # Must run after assisted_provenance_v1.sql, which creates the table.
 assisted_provenance_atomic_consume_v1.sql
 
+# Conversational Core v1: durable evidence-grounded working state and the DB
+# constraint widening for semantic_v2 + conversational_v1. Creates a
+# creator-owned table, so it must precede tenant isolation / least privilege.
+conversational_working_state_v1.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each

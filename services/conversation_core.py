@@ -26,7 +26,13 @@ from core.supabase import get_supabase
 CORE_LEGACY = "legacy"
 CORE_SEMANTIC_V1 = "semantic_v1"
 CORE_SEMANTIC_V2 = "semantic_v2"
-CORE_IDS = (CORE_LEGACY, CORE_SEMANTIC_V1, CORE_SEMANTIC_V2)
+CORE_CONVERSATIONAL_V1 = "conversational_v1"
+CORE_IDS = (
+    CORE_LEGACY,
+    CORE_SEMANTIC_V1,
+    CORE_SEMANTIC_V2,
+    CORE_CONVERSATIONAL_V1,
+)
 CORE_ENV_VAR = "CONVERSATION_CORE"
 
 SOURCE_SIMULATION_FAN = "simulation_fan"
@@ -48,7 +54,13 @@ class ConversationCoreResolution:
 
     @property
     def is_semantic(self) -> bool:
-        return self.core_id in {CORE_SEMANTIC_V1, CORE_SEMANTIC_V2}
+        # Kept as the compatibility name used by the routing call sites. It
+        # means "owned by live_orchestration rather than legacy choreography".
+        return self.core_id in {
+            CORE_SEMANTIC_V1,
+            CORE_SEMANTIC_V2,
+            CORE_CONVERSATIONAL_V1,
+        }
 
     @property
     def is_semantic_v1(self) -> bool:
@@ -57,6 +69,10 @@ class ConversationCoreResolution:
     @property
     def is_semantic_v2(self) -> bool:
         return self.core_id == CORE_SEMANTIC_V2
+
+    @property
+    def is_conversational_v1(self) -> bool:
+        return self.core_id == CORE_CONVERSATIONAL_V1
 
     def to_dict(self) -> dict[str, str]:
         return {

@@ -212,6 +212,7 @@ def test_only_the_platform_owner_can_read_conversation_cores(client):
         "legacy",
         "semantic_v1",
         "semantic_v2",
+        "conversational_v1",
     }
     assert agency.status_code == 403
 
@@ -263,6 +264,18 @@ def test_owner_can_pin_only_a_test_fan_to_the_new_core(client, store):
     assert store.fans["fan-test"]["conversation_core"] == "semantic_v1"
     assert refused.status_code in {403, 404}
     assert store.fans["fan-real"]["conversation_core"] is None
+
+
+def test_owner_can_select_conversational_v1_for_a_test_fan(client, store):
+    selected = client.put(
+        "/creator/creator-1/fan/fan-test/conversation-core",
+        headers=headers(OWNER),
+        json={"conversation_core": "conversational_v1"},
+    )
+
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["effective"]["conversation_core"] == "conversational_v1"
+    assert store.fans["fan-test"]["conversation_core"] == "conversational_v1"
 
 
 # --- who may change a creator's brain --------------------------------------
