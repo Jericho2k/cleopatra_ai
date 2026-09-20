@@ -8582,7 +8582,11 @@ async def read_conversation_cores(request: Request) -> dict:
     _require_conversation_core_owner(request)
     from services.conversation_core import CORE_ENV_VAR, CORE_IDS, environment_core_id
 
-    labels = {"legacy": "Legacy controller stack", "semantic_v1": "Semantic owner v1"}
+    labels = {
+        "legacy": "Legacy controller stack",
+        "semantic_v1": "Semantic owner v1",
+        "semantic_v2": "One-call conversational owner",
+    }
     return {
         "cores": [{"id": value, "name": labels[value]} for value in CORE_IDS],
         "environment_core": environment_core_id(),

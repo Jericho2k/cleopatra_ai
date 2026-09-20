@@ -211,6 +211,7 @@ def test_only_the_platform_owner_can_read_conversation_cores(client):
     assert {row["id"] for row in owner.json()["cores"]} == {
         "legacy",
         "semantic_v1",
+        "semantic_v2",
     }
     assert agency.status_code == 403
 
