@@ -288,8 +288,8 @@ _LEGACY_ANALYZER = StageSpec(
 # actual fan-facing conversational brain.
 _CONVERSATIONAL_OWNER = StageSpec(
     stage=STAGE_CONVERSATIONAL_OWNER,
-    provider="together",
-    model="zai-org/GLM-5.3-Flash",
+    provider="openrouter",
+    model="z-ai/glm-5.3-flash",
     prompt_version="conversational_owner_v1",
     reasoning=False,
     output_mode=OUTPUT_JSON_OBJECT,
@@ -297,7 +297,8 @@ _CONVERSATIONAL_OWNER = StageSpec(
     temperature=None,
     notes=(
         "Dedicated conversational owner for semantic_v2 and conversational_v1. "
-        "GLM-5.3-Flash is intentionally separate from the Anthropic analyzer."
+        "GLM-5.3-Flash is routed through OpenRouter and intentionally separate "
+        "from the Anthropic analyzer."
     ),
 )
 

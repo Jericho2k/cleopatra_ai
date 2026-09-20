@@ -2408,6 +2408,10 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
         and prepared.writer_trace.failure_reason
         and not prepared.replies
     ):
+        print(
+            "[CONVERSATIONAL V1 OWNER FAILED] "
+            f"fan={fan_id} reason={prepared.writer_trace.failure_reason}"
+        )
         return {
             "outcome": OUTCOME_OWNER_FAILED,
             "message_ids": [],

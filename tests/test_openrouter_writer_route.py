@@ -179,6 +179,17 @@ def test_catalog_metadata_supplies_the_default_pin():
     assert openrouter_routing.pinned_providers(target.metadata) == ["Inceptron"]
 
 
+def test_glm_owner_uses_openrouter_pool_and_ignores_kimi_global_pin(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_PROVIDERS", "Inceptron")
+    target = model_providers.find_catalog_target("openrouter", "z-ai/glm-5.3-flash")
+
+    assert target is not None
+    assert openrouter_routing.pinned_providers(target.metadata) == []
+    preferences = openrouter_routing.provider_preferences(target.metadata)
+    assert "only" not in preferences
+    assert preferences["data_collection"] == "deny"
+
+
 # --- 5 & 6: conversation-stable session affinity ------------------------------
 
 
