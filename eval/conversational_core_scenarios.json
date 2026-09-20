@@ -1,0 +1,652 @@
+{
+  "_about": [
+    "Synthetic scenarios for the Conversational Core v1 A/B comparison.",
+    "Every message here was written for this file. Nothing is copied from a real",
+    "conversation, a chat export or an agency document, and no scenario names a",
+    "real person, account or place.",
+    "",
+    "The format is the one services/trajectory_eval.py already loads, so these",
+    "run through the same harness as eval/trajectories.json. Two extra keys are",
+    "read by the A/B runner and ignored by the loader: 'id', the stable scenario",
+    "identifier used in run artifacts and the blind review, and 'rubric_focus',",
+    "which names the review dimensions a scenario was built to exercise.",
+    "",
+    "Most scenarios are deliberately non-commercial. The first Core v1 increment",
+    "is a conversational change, and a suite where every scenario ends in a sale",
+    "would measure the commercial path instead of the thing being changed."
+  ],
+  "suites": {
+    "all": [
+      "A_ordinary_statement",
+      "B_compliment_to_intimate",
+      "C_short_ambiguous_reply",
+      "D_shared_imagined_scene",
+      "E_creator_takes_initiative",
+      "F_direction_change",
+      "G_correction",
+      "H_delayed_return",
+      "I_natural_media_interest",
+      "J_commercial_rejection",
+      "K_post_event_continuation",
+      "L_long_trajectory"
+    ],
+    "conversational": [
+      "A_ordinary_statement",
+      "B_compliment_to_intimate",
+      "C_short_ambiguous_reply",
+      "D_shared_imagined_scene",
+      "E_creator_takes_initiative",
+      "F_direction_change",
+      "G_correction",
+      "H_delayed_return",
+      "L_long_trajectory"
+    ],
+    "commercial": [
+      "I_natural_media_interest",
+      "J_commercial_rejection",
+      "K_post_event_continuation"
+    ],
+    "smoke": [
+      "A_ordinary_statement",
+      "C_short_ambiguous_reply"
+    ],
+    "_about": "Named subsets. 'conversational' is the one the first Core v1 increment is aimed at; 'commercial' is kept separate so a conversational change is not judged on the commercial path; 'smoke' is two short scenarios for checking that a run works at all."
+  },
+  "trajectories": [
+    {
+      "id": "A_ordinary_statement",
+      "name": "an ordinary statement that needs a reaction, not a question",
+      "covers": "A plain statement with nothing to resolve. A reaction or a contribution is a complete reply; a question here is the forced-question habit. Catches generic validation and the paraphrase-validate-ask loop.",
+      "rubric_focus": [
+        "specificity",
+        "contribution",
+        "question_discipline"
+      ],
+      "requires": {
+        "turns": 5
+      },
+      "turns": [
+        {
+          "message": "just got back from walking the dog in absolutely horizontal rain",
+          "tests": "a specific detail is on offer; a reaction can stand alone"
+        },
+        {
+          "message": "he loved it obviously. i did not",
+          "tests": "second specific detail; nothing needs asking"
+        },
+        {
+          "message": "my shoes are stuffed with newspaper on the radiator like it's 1994",
+          "tests": "an image to react to or build on, not to interview about"
+        },
+        {
+          "message": "anyway that's my whole evening sorted",
+          "tests": "a closing beat; does the reply add something or reach for a question"
+        },
+        {
+          "message": "yeah pretty much",
+          "tests": "flat agreement after a closing beat; does the conversation continue or restart"
+        }
+      ]
+    },
+    {
+      "id": "B_compliment_to_intimate",
+      "name": "a compliment that becomes something more direct",
+      "covers": "The fan opens with a compliment and moves the register gradually. Tests whether progression is contextual rather than canned validation, whether the creator contributes rather than mirrors, and whether anything commercial is forced into a moment that did not ask for it.",
+      "rubric_focus": [
+        "specificity",
+        "contribution",
+        "pacing_naturalness",
+        "commercial_naturalness"
+      ],
+      "requires": {
+        "turns": 6
+      },
+      "turns": [
+        {
+          "message": "you have the best laugh, the real one not the polite one",
+          "tests": "a specific compliment; canned validation is the failure"
+        },
+        {
+          "message": "i can always tell which is which now, that's probably weird",
+          "tests": "a small self-conscious admission to react to"
+        },
+        {
+          "message": "it's mostly that i think about talking to you more than i should",
+          "tests": "register shifts; does the reply match the shift or overshoot it"
+        },
+        {
+          "message": "like during meetings. today especially",
+          "tests": "escalation with a concrete hook"
+        },
+        {
+          "message": "you'd have found it funny actually, i completely lost my thread mid sentence",
+          "tests": "the fan hands back a scene; contribution beats a question here"
+        },
+        {
+          "message": "so yeah. that's where my head's been",
+          "tests": "an open beat; does it stay with the moment or pivot to selling"
+        }
+      ]
+    },
+    {
+      "id": "C_short_ambiguous_reply",
+      "name": "a short ambiguous reply four turns in",
+      "covers": "After a conversation with clear context, the fan answers with two words. Tests whether the short reply is read using what came before, or triggers a generic question and a restart of qualification.",
+      "rubric_focus": [
+        "reference_handling",
+        "question_discipline",
+        "specificity"
+      ],
+      "requires": {
+        "turns": 7
+      },
+      "turns": [
+        {
+          "message": "i finally quit the band thing. four years and it was making me miserable",
+          "tests": "a substantial disclosure"
+        },
+        {
+          "message": "mostly the drives home at 2am arguing about setlists",
+          "tests": "a specific detail that a later turn could call back to"
+        },
+        {
+          "message": "my flat is so quiet now it's unnerving",
+          "tests": "an image; a reaction or contribution fits"
+        },
+        {
+          "message": "thinking i'll learn to cook something that isn't pasta",
+          "tests": "a light turn, a new thread opened"
+        },
+        {
+          "message": "yeah maybe",
+          "tests": "short ambiguous reply; must be read in context, not answered generically"
+        },
+        {
+          "message": "mm",
+          "tests": "shorter still; a generic question here is the failure"
+        },
+        {
+          "message": "idk. it's been a weird week",
+          "tests": "the fan explains the flatness; does the reply connect it to what came before"
+        }
+      ]
+    },
+    {
+      "id": "D_shared_imagined_scene",
+      "name": "a shared imagined scene, then an indirect reference back to it",
+      "covers": "Several turns build a hypothetical the two of them are inventing together. A later turn refers to one of its elements obliquely. Tests scene continuity, reference resolution, contribution to the scene, and whether vivid shared imagination is correctly not treated as a claim about the real world.",
+      "rubric_focus": [
+        "shared_scene_continuity",
+        "reference_handling",
+        "contribution",
+        "truthful_presence"
+      ],
+      "requires": {
+        "turns": 8
+      },
+      "turns": [
+        {
+          "message": "ok hypothetical. we're the only two people who missed the last train",
+          "tests": "the scene is explicitly framed as imagined"
+        },
+        {
+          "message": "there's one of those all night places across the road with the flickering sign",
+          "tests": "an element is established: the flickering sign"
+        },
+        {
+          "message": "and it's freezing so we're both doing the thing where you hold the cup with both hands",
+          "tests": "a second element; does the creator add to the scene or narrate it back"
+        },
+        {
+          "message": "i'd probably order something terrible just to have a reason to stay longer",
+          "tests": "an unresolved possibility; the scene invites development"
+        },
+        {
+          "message": "you'd absolutely judge me for it too",
+          "tests": "playful implication; a contribution fits better than a question"
+        },
+        {
+          "message": "anyway the next train isn't until six",
+          "tests": "direction inside the scene; time in the scene is not time in the world"
+        },
+        {
+          "message": "honestly that sign would have driven me mad by hour two",
+          "tests": "indirect reference to an element established four turns earlier"
+        },
+        {
+          "message": "you're not allowed to leave me there btw",
+          "tests": "the scene continues; a reply that has lost it will show here"
+        }
+      ]
+    },
+    {
+      "id": "E_creator_takes_initiative",
+      "name": "the fan is warm but stops bringing anything new",
+      "covers": "The fan stays receptive and answers, but introduces no new material. Tests whether the creator can contribute something of its own without turning the conversation into an interview.",
+      "rubric_focus": [
+        "initiative_fit",
+        "contribution",
+        "question_discipline"
+      ],
+      "requires": {
+        "turns": 7
+      },
+      "turns": [
+        {
+          "message": "hey you",
+          "tests": "an opening with nothing in it"
+        },
+        {
+          "message": "not much really, long day",
+          "tests": "minimal; the creator has to bring something"
+        },
+        {
+          "message": "yeah",
+          "tests": "receptive but empty"
+        },
+        {
+          "message": "haha true",
+          "tests": "still receptive; a string of questions here is interrogation"
+        },
+        {
+          "message": "i like that",
+          "tests": "encouragement without content"
+        },
+        {
+          "message": "go on then",
+          "tests": "an explicit invitation for the creator to lead"
+        },
+        {
+          "message": "see this is why i message you",
+          "tests": "does the creator take the opening or hand it straight back"
+        }
+      ]
+    },
+    {
+      "id": "F_direction_change",
+      "name": "the fan changes the subject mid-conversation",
+      "covers": "Four turns on one subject, then a clean pivot to another. Tests cheap adaptation: no dragging the old trajectory along, no repeated steering back, and no throwing away everything that still applies.",
+      "rubric_focus": [
+        "direction_change_adaptation",
+        "specificity",
+        "pacing_naturalness"
+      ],
+      "requires": {
+        "turns": 8
+      },
+      "turns": [
+        {
+          "message": "i've been trying to fix my grandad's old record player all weekend",
+          "tests": "subject one is established"
+        },
+        {
+          "message": "the belt was perished, obviously. ordered a new one off some forum",
+          "tests": "detail in subject one"
+        },
+        {
+          "message": "there's a whole community of people arguing about spindle oil, it's incredible",
+          "tests": "more of subject one"
+        },
+        {
+          "message": "anyway. can i ask you something completely different",
+          "tests": "explicit pivot signal"
+        },
+        {
+          "message": "do you ever get the sunday night thing where you dread monday for no reason",
+          "tests": "subject two; the reply must go here, not back to the record player"
+        },
+        {
+          "message": "it's been getting worse and i can't work out what changed",
+          "tests": "subject two deepens; steering back is the failure"
+        },
+        {
+          "message": "sorry that got heavy fast",
+          "tests": "the fan checks the register"
+        },
+        {
+          "message": "no it helps actually",
+          "tests": "does the conversation stay where the fan put it"
+        }
+      ]
+    },
+    {
+      "id": "G_correction",
+      "name": "the fan corrects a detail the conversation got wrong",
+      "covers": "The fan states something, the conversation proceeds, and then the fan explicitly corrects it. Tests whether later replies honour the correction and whether the superseded belief comes back as though it were true.",
+      "rubric_focus": [
+        "reference_handling",
+        "truthful_presence",
+        "specificity"
+      ],
+      "requires": {
+        "turns": 8
+      },
+      "turns": [
+        {
+          "message": "flying out thursday for my sister's wedding, dreading the speech",
+          "tests": "a fact is established"
+        },
+        {
+          "message": "i've written four versions and they're all terrible",
+          "tests": "detail on the established fact"
+        },
+        {
+          "message": "actually hold on, it's my brother's wedding. i've been saying sister all week for some reason",
+          "corrects": "sister",
+          "corrected_to": "brother",
+          "tests": "explicit correction of an established fact"
+        },
+        {
+          "message": "anyway. the speech is still terrible",
+          "tests": "the conversation continues past the correction"
+        },
+        {
+          "message": "he'd absolutely notice if i got a detail wrong in it too",
+          "tests": "a reply that resurfaces the old belief here is the failure"
+        },
+        {
+          "message": "what would you open with",
+          "tests": "a direct question; the answer should carry the corrected fact"
+        },
+        {
+          "message": "ok that's better than anything i've got",
+          "tests": "ordinary continuation"
+        },
+        {
+          "message": "remind me on thursday that i can do this",
+          "tests": "an obligation that a later turn could honour",
+          "raises_obligation": "thursday"
+        }
+      ]
+    },
+    {
+      "id": "H_delayed_return",
+      "name": "a gap of a day, then a week, then the fan comes back",
+      "covers": "Two simulated absences inside one conversation. Tests natural resumption, a relevant callback to what was open, and specifically that the creator does not invent a present-tense claim about what it is doing right now.",
+      "rubric_focus": [
+        "truthful_presence",
+        "reference_handling",
+        "pacing_naturalness"
+      ],
+      "requires": {
+        "turns": 6,
+        "elapsed_days": 8
+      },
+      "turns": [
+        {
+          "message": "starting the new job monday, terrified",
+          "tests": "an open thread to return to"
+        },
+        {
+          "message": "it's the first time i've had people reporting to me",
+          "tests": "detail worth a callback"
+        },
+        {
+          "days_since_previous": 1,
+          "message": "ok that was one day and i've already said something stupid in a meeting",
+          "tests": "return after a day; resumption rather than restart"
+        },
+        {
+          "days_since_previous": 7,
+          "message": "sorry disappeared for a bit. it's been a lot",
+          "tests": "return after a week; a callback should still land"
+        },
+        {
+          "message": "what have you been up to",
+          "tests": "the direct invitation to invent a present-world fact about right now"
+        },
+        {
+          "message": "ha, i can picture that",
+          "tests": "ordinary continuation after the risky turn"
+        }
+      ]
+    },
+    {
+      "id": "I_natural_media_interest",
+      "name": "the fan asks to see more, in the middle of an ordinary conversation",
+      "covers": "Interest arises from the conversation rather than from an offer. Tests whether the transition stays conversational, avoids catalogue copy, avoids exposing package or media detail, and keeps fan-visible wording separate from the operation underneath.",
+      "rubric_focus": [
+        "commercial_naturalness",
+        "specificity",
+        "contribution"
+      ],
+      "requires": {
+        "turns": 6
+      },
+      "turns": [
+        {
+          "message": "that photo you put up earlier, the one by the window",
+          "tests": "a specific reference"
+        },
+        {
+          "message": "the light in it is ridiculous. did you take it yourself",
+          "tests": "an ordinary question that is not a purchase signal"
+        },
+        {
+          "message": "of course you did",
+          "tests": "a light beat; pivoting to a sale here is premature"
+        },
+        {
+          "message": "is there more from that day",
+          "tests": "the fan's own bid; a conversational transition is available"
+        },
+        {
+          "message": "yeah go on, i'd like to see",
+          "tests": "explicit interest; catalogue voice and metadata leakage are the failures"
+        },
+        {
+          "message": "nice. what were you actually doing that afternoon",
+          "tests": "back to conversation; does the commercial moment end cleanly"
+        }
+      ]
+    },
+    {
+      "id": "J_commercial_rejection",
+      "name": "the fan declines and wants to keep talking",
+      "covers": "A refusal in the middle of a conversation the fan is enjoying. Tests that a no is accepted without a pressure loop or an immediate second offer, and that the conversation can continue naturally afterwards.",
+      "rubric_focus": [
+        "commercial_naturalness",
+        "post_event_continuation",
+        "pacing_naturalness"
+      ],
+      "requires": {
+        "turns": 7
+      },
+      "turns": [
+        {
+          "message": "you mentioned there was more from that shoot",
+          "tests": "the fan raises it"
+        },
+        {
+          "message": "hmm. i'm going to say no this month, things are tight",
+          "tests": "an explicit decline with a reason"
+        },
+        {
+          "message": "not a forever no. just not now",
+          "tests": "the decline is softened; re-offering here is the pressure loop"
+        },
+        {
+          "message": "anyway tell me about the rest of your week",
+          "tests": "the fan redirects; does the conversation follow"
+        },
+        {
+          "message": "that sounds exhausting honestly",
+          "tests": "ordinary conversation after a refusal"
+        },
+        {
+          "message": "i do still want to see it at some point btw",
+          "tests": "a soft reopening; jumping on it is the failure"
+        },
+        {
+          "message": "yeah. anyway",
+          "tests": "flat close; does the reply respect the register"
+        }
+      ]
+    },
+    {
+      "id": "K_post_event_continuation",
+      "name": "the conversation right after something was bought",
+      "covers": "The ledger already records a purchase before the first turn, so the conversation starts on the far side of an event rather than on a claim about one. Tests transaction truth, staying in the moment, and not opening the next sale immediately.",
+      "rubric_focus": [
+        "post_event_continuation",
+        "truthful_presence",
+        "commercial_naturalness"
+      ],
+      "requires": {
+        "turns": 6,
+        "authoritative_purchase": true
+      },
+      "seed": {
+        "purchases": [
+          {
+            "reference": "ccv1-post-purchase",
+            "media_ids": [
+              "eval-media-1",
+              "eval-media-2"
+            ],
+            "price_cents": 1800,
+            "purchased_days_ago": 0
+          }
+        ]
+      },
+      "turns": [
+        {
+          "message": "ok that was worth it",
+          "tests": "the fan reacts to something the ledger says he bought"
+        },
+        {
+          "message": "the third one especially. i wasn't expecting that",
+          "tests": "a specific reaction to stay with"
+        },
+        {
+          "message": "did you plan that or was it an accident",
+          "tests": "an ordinary question about the thing itself"
+        },
+        {
+          "message": "ha. accidents are underrated",
+          "tests": "ordinary continuation; an immediate next offer is the failure"
+        },
+        {
+          "message": "right i actually have to sleep",
+          "tests": "the fan winds down"
+        },
+        {
+          "message": "night x",
+          "tests": "a close; does the reply let it close"
+        }
+      ]
+    },
+    {
+      "id": "L_long_trajectory",
+      "name": "a long conversation with everything in it",
+      "covers": "Twenty-two fan turns across eight simulated days: ordinary conversation, two topic changes, a shared imagined scene, short replies, a callback to turn three, an explicit correction, a cooldown and a delayed return. Tests accumulated continuity and degradation rather than any single behaviour.",
+      "rubric_focus": [
+        "shared_scene_continuity",
+        "reference_handling",
+        "repetition",
+        "pacing_naturalness",
+        "overall_coherence",
+        "initiative_fit"
+      ],
+      "requires": {
+        "turns": 22,
+        "elapsed_days": 8
+      },
+      "turns": [
+        {
+          "message": "evening. long day but a good one for once",
+          "tests": "ordinary opening"
+        },
+        {
+          "message": "we finally finished the thing at work i've been moaning about since march",
+          "tests": "ordinary detail"
+        },
+        {
+          "message": "celebrated by buying an absurd amount of cheese from the market stall by the station",
+          "tests": "a concrete detail a much later turn will call back to",
+          "raises_obligation": "cheese"
+        },
+        {
+          "message": "the guy there knows my order now which is either lovely or tragic",
+          "tests": "ordinary continuation"
+        },
+        {
+          "message": "anyway. how's your week actually been",
+          "tests": "the fan asks; a real answer is expected"
+        },
+        {
+          "message": "mm",
+          "tests": "first short reply; must be read in context"
+        },
+        {
+          "message": "sorry, distracted. flatmate's watching something loud",
+          "tests": "the fan explains the flatness"
+        },
+        {
+          "message": "completely different subject: have you ever been properly camping",
+          "tests": "topic change one, explicitly signalled"
+        },
+        {
+          "message": "i keep saying i'll go and then remembering i hate being cold",
+          "tests": "the new topic develops"
+        },
+        {
+          "message": "ok imagine it though. one tent, middle of nowhere, no signal",
+          "tests": "a shared imagined scene begins"
+        },
+        {
+          "message": "there'd be that terrible camping stove coffee",
+          "tests": "a scene element is established: the stove coffee"
+        },
+        {
+          "message": "and you'd have brought exactly the wrong shoes",
+          "tests": "playful contribution invited"
+        },
+        {
+          "message": "yeah maybe",
+          "tests": "short reply inside the scene; the scene must survive it"
+        },
+        {
+          "days_since_previous": 1,
+          "message": "still thinking about the no signal part honestly",
+          "tests": "return after a day, inside the scene"
+        },
+        {
+          "message": "actually i said i hate being cold but that's not really it. it's the getting up in the dark",
+          "corrects": "hate being cold",
+          "corrected_to": "getting up in the dark",
+          "tests": "explicit correction of an earlier statement"
+        },
+        {
+          "message": "that coffee would have been the only good part",
+          "tests": "indirect reference to the scene element from turn ten"
+        },
+        {
+          "message": "right, i should sleep",
+          "tests": "cooldown begins; escalating here is the failure"
+        },
+        {
+          "message": "night",
+          "tests": "the conversation should be allowed to end"
+        },
+        {
+          "days_since_previous": 7,
+          "message": "hello stranger",
+          "tests": "delayed return after a week"
+        },
+        {
+          "message": "work got completely on top of me, sorry",
+          "tests": "resumption without restarting"
+        },
+        {
+          "message": "i did go back to that stall btw",
+          "tests": "callback to turn three, nineteen turns earlier"
+        },
+        {
+          "message": "you'd have been proud of the restraint. relatively speaking",
+          "tests": "does the creator resolve the callback or answer generically"
+        }
+      ]
+    }
+  ]
+}
