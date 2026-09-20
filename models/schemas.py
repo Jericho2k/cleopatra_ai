@@ -92,6 +92,7 @@ class Persona(BaseModel):
 
 
 class Message(BaseModel):
+    id: str = ""
     role: str  # "fan" | "creator"
     content: str
     sent_at: datetime | None = None

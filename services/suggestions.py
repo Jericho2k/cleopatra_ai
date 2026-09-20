@@ -1530,11 +1530,15 @@ async def _debounced_auto_reply(
                 latest_message=latest.content,
                 conversation_core=core.core_id,
                 trigger_identity=(
-                    expected_trigger_at
-                    or (
-                        latest.sent_at.isoformat()
-                        if latest.sent_at
-                        else fingerprint(latest.content)
+                    latest.id
+                    if core.is_conversational_v1 and latest.id
+                    else (
+                        expected_trigger_at
+                        or (
+                            latest.sent_at.isoformat()
+                            if latest.sent_at
+                            else fingerprint(latest.content)
+                        )
                     )
                 ),
             )

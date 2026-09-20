@@ -44,6 +44,7 @@ def _row_to_message(row: dict) -> Message:
     if sent_at is not None and isinstance(sent_at, str):
         sent_at = datetime.fromisoformat(sent_at.replace("Z", "+00:00"))
     return Message(
+        id=str(row.get("id") or ""),
         role=row["role"],
         content=row["content"],
         sent_at=sent_at,
@@ -225,7 +226,7 @@ async def get_conversation_history(fan_id: str, limit: int = 40) -> list[Message
     def _get():
         r = (
             get_supabase().table("messages")
-            .select("role, content, sent_at, media_context")
+            .select("id, role, content, sent_at, media_context")
             .eq("fan_id", fan_id)
             .order("sent_at", desc=True)
             .limit(limit)
