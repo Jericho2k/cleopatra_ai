@@ -397,4 +397,4 @@ def test_v3_uses_the_same_models_as_v2(auto_world, spy_transport):
         v3 = CLEO_V3.stage(stage)
         assert v3.resolved_primary() == v2.resolved_primary(), stage
         assert v3.resolved_fallback() == v2.resolved_fallback(), stage
-        assert v3.reasoning is False, stage
+        assert v3.reasoning == v2.reasoning, stage
