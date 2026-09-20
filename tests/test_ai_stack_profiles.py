@@ -20,6 +20,7 @@ from ai.stack_profiles import (
     CLEO_V3,
     DEFAULT_PROFILE_ID,
     PROFILE_IDS,
+    STAGE_CONVERSATIONAL_OWNER,
     STAGE_FAN_INTELLIGENCE,
     STAGE_FAN_SUMMARY,
     STAGE_ORDER,
@@ -94,6 +95,21 @@ def test_legacy_still_honours_the_environment_escape_hatches(monkeypatch):
 
 
 # --- V2 ---------------------------------------------------------------------
+
+
+def test_conversational_owner_is_glm_and_not_the_analyzer():
+    """One-call runtimes must never borrow the Anthropic analyzer slot."""
+    for profile in (CLEO_LEGACY_V1, CLEO_V2, CLEO_V3):
+        analyzer = profile.stage(STAGE_SITUATION_ANALYZER)
+        owner = profile.stage(STAGE_CONVERSATIONAL_OWNER)
+        assert analyzer.resolved_primary() == (
+            "anthropic",
+            "claude-haiku-4-5-20251001",
+        )
+        assert owner.resolved_primary() == ("together", "zai-org/GLM-5.3-Flash")
+        assert owner.resolved_primary() != analyzer.resolved_primary()
+        assert owner.reasoning is False
+        assert owner.output_mode == stack_profiles.OUTPUT_JSON_OBJECT
 
 
 def test_v2_puts_one_writer_in_front_of_conversation_and_commerce():
