@@ -173,8 +173,52 @@ def test_the_whole_pipeline_applies_to_a_fresh_database(pipeline):
         "blocked_words",
         "reengagement_log",
         "reengagement_settings",
+        "conversational_core_states",
     ):
         assert required in tables, f"{required} is missing after the full pipeline"
+
+
+def test_conversational_core_v1_schema_and_runtime_ids(pipeline):
+    connection, name = pipeline
+    columns = _columns(connection, name, "conversational_core_states")
+    assert {
+        "creator_id",
+        "fan_id",
+        "schema_version",
+        "revision",
+        "state",
+    } <= columns
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f'insert into "{name}".creators (id, name, conversation_core) '
+            "values (gen_random_uuid(), 'Core v1 creator', 'conversational_v1') "
+            "returning id"
+        )
+        creator_id = cursor.fetchone()[0]
+        cursor.execute(
+            f'update "{name}".creators set conversation_core = %s where id = %s',
+            ("semantic_v2", creator_id),
+        )
+        cursor.execute(
+            f'update "{name}".creators set conversation_core = %s where id = %s',
+            ("conversational_v1", creator_id),
+        )
+        cursor.execute(
+            f'insert into "{name}".fans '
+            "(id, creator_id, display_name, conversation_core) "
+            "values (gen_random_uuid(), %s, 'Core v1 fan', 'conversational_v1') "
+            "returning id",
+            (creator_id,),
+        )
+        fan_id = cursor.fetchone()[0]
+        cursor.execute(
+            f'insert into "{name}".conversational_core_states '
+            "(creator_id, fan_id, schema_version, revision, state) "
+            "values (%s, %s, 'conversational_core_v1', 1, "
+            '\'{"schema_version":"conversational_core_v1","revision":1}\'::jsonb)',
+            (creator_id, fan_id),
+        )
 
 
 def test_assisted_provenance_consume_has_one_winner_across_connections(pipeline):

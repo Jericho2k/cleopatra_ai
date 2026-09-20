@@ -1688,6 +1688,7 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
             if (provenance.decision or {}).get("conversation_core") in {
                 "semantic_v1",
                 "semantic_v2",
+                "conversational_v1",
             }:
                 provenance.decision["operator_chosen_index"] = str(
                     req.suggestion_index
@@ -8589,6 +8590,7 @@ async def read_conversation_cores(request: Request) -> dict:
         "legacy": "Legacy controller stack",
         "semantic_v1": "Semantic owner v1",
         "semantic_v2": "One-call conversational owner",
+        "conversational_v1": "Conversational Core v1",
     }
     return {
         "cores": [{"id": value, "name": labels[value]} for value in CORE_IDS],
