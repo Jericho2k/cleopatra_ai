@@ -65,3 +65,31 @@ python scripts/run_candidate_provider_eval.py \
 
 Neither command creates an automatic quality score. Human review of complete
 conversations remains a separate requirement.
+
+## Compare two conversational runtimes (Conversational Core v1)
+
+The A/B harness runs one scripted fan trajectory through two runtimes, each
+against its own `test_` fan, and writes both runs, the objective metrics and a
+blind review into `eval/results/<run-id>/`. It works with one arm, so it is
+usable before a candidate runtime exists:
+
+```bash
+python scripts/run_ab_trajectory_eval.py \
+  --baseline semantic_v2 --creator <creator-id> \
+  --provision-fans --suite conversational --simulate-time
+```
+
+Add `--candidate <core-id>` for the comparison, then:
+
+```bash
+python scripts/build_conversation_blind_review.py eval/results/<run-id>
+```
+
+The reviewer document names no runtime and says nothing about which one is
+expected to win; the key is a separate file. Scenarios live in
+`eval/conversational_core_scenarios.json` and are entirely synthetic. The full
+experiment, the fairness and isolation rules, and the artifact shape are in
+`docs/conversational_core_v1_evaluation.md`.
+
+As everywhere else here, no automatic quality score is produced, and human
+review of the complete conversations remains a separate requirement.

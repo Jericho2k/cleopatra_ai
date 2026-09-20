@@ -297,11 +297,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--core",
-        choices=("legacy", "semantic_v1"),
         default="",
         help=(
             "temporarily pin the test fan to this conversational runtime for "
-            "the complete run, then restore its previous override"
+            "the complete run, then restore its previous override. Validated "
+            "against the runtimes this build registers rather than against a "
+            "list here, so a runtime added on another branch works without "
+            "editing this script"
         ),
     )
     args = parser.parse_args()
@@ -348,6 +350,20 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.core:
+        # Checked before anything runs, and named rather than left to fail
+        # deeper as a ValueError from the write. The set is read at call time,
+        # so a runtime registered by another branch needs no change here.
+        from services.conversation_core import CORE_IDS
+
+        if args.core not in CORE_IDS:
+            print(
+                f"unknown conversation core {args.core!r}; this build registers "
+                f"{', '.join(CORE_IDS)}",
+                file=sys.stderr,
+            )
+            return 2
 
     try:
         reports = asyncio.run(

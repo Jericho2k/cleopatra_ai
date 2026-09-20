@@ -62,6 +62,13 @@ from core.build_info import build_snapshot
 #: The key this record occupies inside ``messages.media_context``.
 PROVENANCE_KEY = "reply_provenance"
 
+#: An OPTIONAL block inside the record, for a conversational runtime that keeps
+#: working state across a turn. Written by whichever runtime has such a state
+#: and read by the A/B evaluator (``services/ab_trajectory_eval.py``); every
+#: field is optional and a runtime that keeps no state writes nothing. Defined
+#: here so the producer and the reader agree on one key rather than two.
+CORE_STATE_KEY = "core_state"
+
 #: Which pipeline produced the reply. Recorded because Assisted and Full Auto
 #: assemble context differently (finding A was exactly that divergence), and a
 #: quality comparison that mixes them is comparing two systems.
@@ -138,6 +145,10 @@ class ReplyProvenance:
     writer: dict[str, Any] = field(default_factory=dict)
     # What was done to the writer's text before anyone saw it.
     transforms: list[str] = field(default_factory=list)
+    # A runtime's own working state for this turn, when it has one. Optional
+    # in every sense: absent for runtimes without the concept, and never read
+    # by anything that decides what to send.
+    core_state: dict[str, Any] = field(default_factory=dict)
 
     def as_state(self) -> dict[str, Any]:
         """The recorder's fields, for storing between two HTTP requests.
@@ -157,6 +168,7 @@ class ReplyProvenance:
             "decision": dict(self.decision),
             "writer": dict(self.writer),
             "transforms": list(self.transforms),
+            "core_state": dict(self.core_state),
         }
 
     @classmethod
@@ -189,6 +201,9 @@ class ReplyProvenance:
         transforms = state.get("transforms")
         if isinstance(transforms, list):
             restored.transforms = [str(item) for item in transforms if str(item)]
+        core_state = state.get("core_state")
+        if isinstance(core_state, dict):
+            restored.core_state = dict(core_state)
         return restored
 
     def record_trigger(
@@ -324,6 +339,23 @@ class ReplyProvenance:
         if cleaned and cleaned not in self.transforms:
             self.transforms.append(cleaned)
 
+    def record_core_state(self, state: Any) -> None:
+        """Record a runtime's working state for this turn. Optional, total.
+
+        The integration point for a conversational runtime that maintains state
+        across a turn — typically ``state_before``, ``proposed_delta``,
+        ``accepted_fields``, ``rejected_fields`` and ``state_after``, though
+        nothing here requires any particular field. The A/B evaluator reads
+        whatever is present and treats the whole block as absent when it is not.
+
+        Deliberately shape-agnostic and deliberately never raising, following
+        the rule the rest of this module follows: a recorder that failed must
+        never be able to stop a reply. Anything that is not a mapping is
+        ignored.
+        """
+        if isinstance(state, dict) and state:
+            self.core_state = dict(state)
+
     def as_metadata(
         self,
         *,
@@ -362,6 +394,10 @@ class ReplyProvenance:
             record["writer"] = dict(self.writer)
         if self.transforms:
             record["transforms"] = list(self.transforms)
+        if self.core_state:
+            # Absent rather than empty, so "this runtime keeps no state" and
+            # "this runtime kept an empty state" cannot read the same.
+            record[CORE_STATE_KEY] = dict(self.core_state)
 
         delivery: dict[str, Any] = {"kind": _clean(delivery_kind)}
         receipt = _clean(platform_message_id)
