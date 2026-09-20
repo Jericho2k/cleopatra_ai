@@ -65,7 +65,7 @@ def test_running_without_a_creator_refuses_rather_than_guessing():
 
 
 def test_an_unregistered_candidate_runtime_is_refused_by_name():
-    """The error an operator sees on the day before the runtime branch lands."""
+    """An actually unknown runtime is rejected before any backend access."""
     result = subprocess.run(
         [
             sys.executable,
@@ -73,7 +73,7 @@ def test_an_unregistered_candidate_runtime_is_refused_by_name():
             "--baseline",
             "semantic_v2",
             "--candidate",
-            "conversational_v1",
+            "conversational_v99",
             "--creator",
             "creator-1",
             "--baseline-fan",

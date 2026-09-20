@@ -28,7 +28,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-from ai.stack_profiles import PROFILE_IDS
+from ai.stack_profiles import PROFILE_IDS, STAGE_ORDER
 from core import tenancy
 
 
@@ -524,7 +524,7 @@ def test_the_owner_still_gets_the_full_diagnostics(client):
     assert writer["fallback_model"] == "Qwen/Qwen3.7-Plus"
     assert writer["prompt_version"] == "writer_v3"
     # Every stage, not just the writer: the owner's view is the whole stack.
-    assert len(v3["stages"]) == 7
+    assert len(v3["stages"]) == len(STAGE_ORDER)
 
 
 def test_an_agency_account_can_still_select_cleo_v3(client, store):
