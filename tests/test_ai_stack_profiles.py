@@ -108,7 +108,7 @@ def test_conversational_owner_is_glm_and_not_the_analyzer():
         )
         assert owner.resolved_primary() == ("openrouter", "z-ai/glm-5.3-flash")
         assert owner.resolved_primary() != analyzer.resolved_primary()
-        assert owner.reasoning is False
+        assert owner.reasoning is True
         assert owner.output_mode == stack_profiles.OUTPUT_JSON_OBJECT
 
 
@@ -169,7 +169,7 @@ def test_v3_changes_the_writer_prompt_and_nothing_about_the_routing():
         v3 = CLEO_V3.stage(stage_name)
         assert v3.resolved_primary() == v2.resolved_primary(), stage_name
         assert v3.resolved_fallback() == v2.resolved_fallback(), stage_name
-        assert v3.reasoning == v2.reasoning is False, stage_name
+        assert v3.reasoning == v2.reasoning, stage_name
         assert v3.output_mode == v2.output_mode, stage_name
         assert v3.resolved_max_tokens() == v2.resolved_max_tokens(), stage_name
         assert v3.temperature == v2.temperature, stage_name
