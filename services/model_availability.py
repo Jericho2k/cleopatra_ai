@@ -22,6 +22,7 @@ import httpx
 
 from ai import openrouter_routing
 from ai.model_migrations import resolve_supported_model
+from ai.model_providers import find_catalog_target
 from ai.stack_profiles import (
     STAGE_CONVERSATIONAL_OWNER,
     STAGE_WRITER_COMMERCIAL,
@@ -172,10 +173,15 @@ class ApiKeyMissing(RuntimeError):
 
 
 def _annotate(row: dict[str, str]) -> dict[str, Any]:
-    """Attach the pinned upstream providers to an OpenRouter row."""
+    """Attach target-specific OpenRouter routing diagnostics."""
     if row["provider"] != "openrouter":
         return dict(row)
-    return {**row, "pinned_providers": openrouter_routing.pinned_providers()}
+    target = find_catalog_target(row["provider"], row["model"])
+    metadata = target.metadata if target is not None else None
+    return {
+        **row,
+        "pinned_providers": openrouter_routing.pinned_providers(metadata),
+    }
 
 
 async def refresh_model_availability(
