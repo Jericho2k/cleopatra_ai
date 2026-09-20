@@ -45,7 +45,7 @@
       }
     },
     {
-      "name": "OpenRouter GLM 5.3 Flash (DeepInfra pinned)",
+      "name": "OpenRouter GLM 5.3 Flash",
       "provider": "openrouter",
       "model": "z-ai/glm-5.3-flash",
       "base_url": "https://openrouter.ai/api/v1",
@@ -60,10 +60,9 @@
       "metadata": {
         "role": "conversational owner",
         "reasoning_enabled": false,
-        "openrouter_providers": [
-          "DeepInfra"
-        ],
-        "note": "Live conversational owner for semantic_v2 and conversational_v1. Routed through OpenRouter, pinned to a GLM-capable upstream so it never inherits Kimi's Inceptron pin. Pricing is a snapshot and should be reverified before large-scale rollout."
+        "openrouter_providers": [],
+        "openrouter_ignore_global_provider_override": true,
+        "note": "Live conversational owner for semantic_v2 and conversational_v1. Routed through OpenRouter's eligible GLM provider pool and deliberately ignores the Kimi-specific OPENROUTER_PROVIDERS pin. Pricing is a snapshot and should be reverified before large-scale rollout."
       }
     },
     {
