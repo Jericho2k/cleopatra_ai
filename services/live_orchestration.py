@@ -1060,6 +1060,26 @@ def legal_operations(loaded: LoadedEvidence) -> list[str]:
     return choices
 
 
+def _owner_max_tokens(spec: Any, default: int = 4096) -> int:
+    """Resolve the owner's output budget without assuming a concrete StageSpec.
+
+    Production passes a StageSpec, while orchestration tests intentionally use
+    small SimpleNamespace stand-ins. Keeping this boundary structural prevents
+    a transport-only change from breaking every test fixture that does not
+    implement the full profile API.
+    """
+    resolver = getattr(spec, "resolved_max_tokens", None)
+    if callable(resolver):
+        try:
+            return max(int(resolver()), 1)
+        except (TypeError, ValueError):
+            pass
+    try:
+        return max(int(getattr(spec, "max_tokens", default) or default), 1)
+    except (TypeError, ValueError):
+        return default
+
+
 async def _conversational_answer(
     loaded: LoadedEvidence,
     *,
@@ -1093,7 +1113,7 @@ async def _conversational_answer(
             target,
             system=SEMANTIC_V2_ONE_CALL_SYSTEM,
             messages=[{"role": "user", "content": user}],
-            max_tokens=spec.resolved_max_tokens(),
+            max_tokens=_owner_max_tokens(spec),
             response_format={"type": "json_object"},
         )
     except Exception as exc:
@@ -1317,7 +1337,7 @@ async def decide_conversational_v1(
                     "content": json.dumps(payload, ensure_ascii=False, default=str),
                 }
             ],
-            max_tokens=spec.resolved_max_tokens(),
+            max_tokens=_owner_max_tokens(spec),
             response_format={"type": "json_object"},
         )
     except Exception as exc:
