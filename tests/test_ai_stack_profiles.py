@@ -106,7 +106,7 @@ def test_conversational_owner_is_glm_and_not_the_analyzer():
             "anthropic",
             "claude-haiku-4-5-20251001",
         )
-        assert owner.resolved_primary() == ("together", "zai-org/GLM-5.3-Flash")
+        assert owner.resolved_primary() == ("openrouter", "z-ai/glm-5.3-flash")
         assert owner.resolved_primary() != analyzer.resolved_primary()
         assert owner.reasoning is False
         assert owner.output_mode == stack_profiles.OUTPUT_JSON_OBJECT
