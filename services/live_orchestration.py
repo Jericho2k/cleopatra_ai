@@ -1093,7 +1093,8 @@ async def _conversational_answer(
             target,
             system=SEMANTIC_V2_ONE_CALL_SYSTEM,
             messages=[{"role": "user", "content": user}],
-            max_tokens=900,
+            max_tokens=spec.resolved_max_tokens(),
+            response_format={"type": "json_object"},
         )
     except Exception as exc:
         trace.record_failure(
@@ -1316,7 +1317,8 @@ async def decide_conversational_v1(
                     "content": json.dumps(payload, ensure_ascii=False, default=str),
                 }
             ],
-            max_tokens=1400,
+            max_tokens=spec.resolved_max_tokens(),
+            response_format={"type": "json_object"},
         )
     except Exception as exc:
         trace.record_failure(
