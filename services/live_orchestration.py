@@ -32,6 +32,7 @@ from ai.generator import (
 )
 from ai.model_providers import complete
 from ai.stack_profiles import (
+    STAGE_CONVERSATIONAL_OWNER,
     STAGE_SITUATION_ANALYZER,
     STAGE_WRITER_COMMERCIAL,
     STAGE_WRITER_DEFAULT,
@@ -1064,7 +1065,7 @@ async def _conversational_answer(
     *,
     repair: dict[str, Any] | None = None,
 ) -> tuple[ConversationDecision, list[str], GenerationTrace]:
-    spec = loaded.stack.profile.stage(STAGE_SITUATION_ANALYZER)
+    spec = loaded.stack.profile.stage(STAGE_CONVERSATIONAL_OWNER)
     target = spec.primary_target()
     state = {
         "evidence_snapshot": loaded.snapshot,
@@ -1287,7 +1288,7 @@ async def decide_conversational_v1(
     working_state: ConversationalWorkingState,
 ) -> tuple[ConversationDecision, list[str], GenerationTrace, Any]:
     """One owner call returning reply, intent/operation, and state delta."""
-    spec = loaded.stack.profile.stage(STAGE_SITUATION_ANALYZER)
+    spec = loaded.stack.profile.stage(STAGE_CONVERSATIONAL_OWNER)
     target = spec.primary_target()
     payload = {
         "evidence_snapshot": loaded.snapshot.as_dict(),
