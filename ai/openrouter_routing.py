@@ -116,6 +116,8 @@ def pinned_providers(target_metadata: dict[str, Any] | None = None) -> list[str]
         )
     else:
         catalog_default = DEFAULT_PINNED_PROVIDERS
+    if metadata.get("openrouter_ignore_global_provider_override"):
+        return list(catalog_default)
     return _csv("OPENROUTER_PROVIDERS", catalog_default)
 
 
