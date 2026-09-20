@@ -59,6 +59,7 @@ from models.model_runtime import ModelTarget
 # here only because a real ``complete()``-equivalent call is made for it.
 
 STAGE_SITUATION_ANALYZER = "situation_analyzer"
+STAGE_CONVERSATIONAL_OWNER = "conversational_owner"
 STAGE_WRITER_DEFAULT = "writer_default"
 STAGE_WRITER_COMMERCIAL = "writer_commercial"
 STAGE_WRITER_SAFETY = "writer_safety"
@@ -68,6 +69,7 @@ STAGE_HISTORY_EXTRACTION = "history_extraction"
 
 STAGE_ORDER: tuple[str, ...] = (
     STAGE_SITUATION_ANALYZER,
+    STAGE_CONVERSATIONAL_OWNER,
     STAGE_WRITER_DEFAULT,
     STAGE_WRITER_COMMERCIAL,
     STAGE_WRITER_SAFETY,
@@ -78,6 +80,7 @@ STAGE_ORDER: tuple[str, ...] = (
 
 STAGE_LABELS: dict[str, str] = {
     STAGE_SITUATION_ANALYZER: "Situation analyzer",
+    STAGE_CONVERSATIONAL_OWNER: "Conversational owner",
     STAGE_WRITER_DEFAULT: "Writer — ordinary conversation",
     STAGE_WRITER_COMMERCIAL: "Writer — commercial expression",
     STAGE_WRITER_SAFETY: "Writer — safety-sensitive",
@@ -279,6 +282,25 @@ _LEGACY_ANALYZER = StageSpec(
     notes="Observation only. Never decides a commercial action.",
 )
 
+# Dedicated owner for the one-call conversational runtimes.  This must not
+# borrow the situation-analyzer slot: the analyzer remains an observation-only
+# legacy stage, while semantic_v2 and conversational_v1 use this model as the
+# actual fan-facing conversational brain.
+_CONVERSATIONAL_OWNER = StageSpec(
+    stage=STAGE_CONVERSATIONAL_OWNER,
+    provider="together",
+    model="zai-org/GLM-5.3-Flash",
+    prompt_version="conversational_owner_v1",
+    reasoning=False,
+    output_mode=OUTPUT_JSON_OBJECT,
+    max_tokens=1400,
+    temperature=None,
+    notes=(
+        "Dedicated conversational owner for semantic_v2 and conversational_v1. "
+        "GLM-5.3-Flash is intentionally separate from the Anthropic analyzer."
+    ),
+)
+
 _LEGACY_WRITER_DEFAULT = StageSpec(
     stage=STAGE_WRITER_DEFAULT,
     provider="openrouter",
@@ -393,6 +415,7 @@ CLEO_LEGACY_V1 = AIStackProfile(
     ),
     stages={
         STAGE_SITUATION_ANALYZER: _LEGACY_ANALYZER,
+        STAGE_CONVERSATIONAL_OWNER: _CONVERSATIONAL_OWNER,
         STAGE_WRITER_DEFAULT: _LEGACY_WRITER_DEFAULT,
         STAGE_WRITER_COMMERCIAL: _LEGACY_WRITER_COMMERCIAL,
         STAGE_WRITER_SAFETY: _LEGACY_WRITER_SAFETY,
@@ -470,6 +493,7 @@ CLEO_V2 = AIStackProfile(
         STAGE_SITUATION_ANALYZER: replace(
             _LEGACY_ANALYZER, provider_env=None, model_env=None
         ),
+        STAGE_CONVERSATIONAL_OWNER: _CONVERSATIONAL_OWNER,
         STAGE_WRITER_DEFAULT: _V2_WRITER_DEFAULT,
         STAGE_WRITER_COMMERCIAL: _V2_WRITER_COMMERCIAL,
         STAGE_WRITER_SAFETY: _V2_WRITER_SAFETY,
@@ -535,6 +559,7 @@ CLEO_V3 = AIStackProfile(
     ),
     stages={
         STAGE_SITUATION_ANALYZER: CLEO_V2.stage(STAGE_SITUATION_ANALYZER),
+        STAGE_CONVERSATIONAL_OWNER: CLEO_V2.stage(STAGE_CONVERSATIONAL_OWNER),
         STAGE_WRITER_DEFAULT: _V3_WRITER_DEFAULT,
         STAGE_WRITER_COMMERCIAL: _V3_WRITER_COMMERCIAL,
         STAGE_WRITER_SAFETY: _V3_WRITER_SAFETY,
