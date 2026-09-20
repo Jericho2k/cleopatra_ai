@@ -293,7 +293,7 @@ _CONVERSATIONAL_OWNER = StageSpec(
     prompt_version="conversational_owner_v1",
     reasoning=True,
     output_mode=OUTPUT_JSON_OBJECT,
-    max_tokens=1400,
+    max_tokens=4096,
     temperature=None,
     notes=(
         "Dedicated conversational owner for semantic_v2 and conversational_v1. "
