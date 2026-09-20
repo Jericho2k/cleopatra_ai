@@ -152,6 +152,7 @@ async def complete(
     temperature: float | None = None,
     session_id: str | None = None,
     end_user_id: str | None = None,
+    response_format: dict[str, Any] | None = None,
 ) -> ModelResult:
     """Call a configured model endpoint and normalize text, usage, and latency.
 
@@ -198,6 +199,7 @@ async def complete(
                 temperature=temperature,
                 session_id=session_id,
                 end_user_id=end_user_id,
+                response_format=response_format,
             )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
 
@@ -294,6 +296,7 @@ async def _complete_openai_compatible(
     temperature: float | None,
     session_id: str | None = None,
     end_user_id: str | None = None,
+    response_format: dict[str, Any] | None = None,
 ) -> ModelResult:
     if not target.base_url:
         raise RuntimeError(f"No base URL configured for {target.name}")
@@ -317,14 +320,20 @@ async def _complete_openai_compatible(
 
     if temperature is not None:
         kwargs["temperature"] = temperature
+    if response_format is not None:
+        kwargs["response_format"] = response_format
 
     extra_body: dict[str, Any] = {}
 
     reasoning_enabled = target.metadata.get("reasoning_enabled")
     if reasoning_enabled is not None:
-        extra_body["reasoning"] = {
+        reasoning: dict[str, Any] = {
             "enabled": bool(reasoning_enabled),
         }
+        reasoning_effort = target.metadata.get("reasoning_effort")
+        if reasoning_effort:
+            reasoning["effort"] = str(reasoning_effort)
+        extra_body["reasoning"] = reasoning
 
     if target.provider == "openrouter":
         # Provider pinning, privacy controls, and the sticky-routing key that
