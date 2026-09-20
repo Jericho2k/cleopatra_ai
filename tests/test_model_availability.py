@@ -57,7 +57,7 @@ class Client:
 
 def _default_client(**overrides):
     catalogs = {
-        OPENROUTER_URL: ["moonshotai/kimi-k2.6"],
+        OPENROUTER_URL: ["z-ai/glm-5.3-flash", "moonshotai/kimi-k2.6"],
         TOGETHER_URL: ["Qwen/Qwen3.7-Plus"],
     }
     catalogs.update(overrides)
@@ -86,9 +86,8 @@ def test_openrouter_writer_is_not_judged_against_the_together_catalog():
     client = _default_client()
 
     result = asyncio.run(refresh_model_availability(client=client, now=NOW))
-    ordinary = result["models"][0]
+    ordinary = next(model for model in result["models"] if model["role"] == "ordinary_writer")
 
-    assert ordinary["role"] == "ordinary_writer"
     assert ordinary["provider"] == "openrouter"
     assert ordinary["model"] == "moonshotai/kimi-k2.6"
     assert ordinary["available"] is True
@@ -108,8 +107,12 @@ def test_each_provider_is_queried_with_its_own_credential():
 def test_pinned_upstream_providers_are_reported_for_openrouter():
     result = asyncio.run(refresh_model_availability(client=_default_client(), now=NOW))
 
-    assert result["models"][0]["pinned_providers"] == ["Inceptron"]
-    assert "pinned_providers" not in result["models"][1]
+    owner = next(model for model in result["models"] if model["role"] == "conversational_owner")
+    ordinary = next(model for model in result["models"] if model["role"] == "ordinary_writer")
+    together = next(model for model in result["models"] if model["provider"] == "together")
+    assert owner["pinned_providers"] == []
+    assert ordinary["pinned_providers"] == ["Inceptron"]
+    assert "pinned_providers" not in together
 
 
 def test_missing_primary_model_surfaces_degraded_fallback():
@@ -118,9 +121,10 @@ def test_missing_primary_model_surfaces_degraded_fallback():
     result = asyncio.run(refresh_model_availability(client=client, now=NOW))
 
     assert result["status"] == "degraded"
-    assert result["models"][0]["role"] == "ordinary_writer"
-    assert result["models"][0]["available"] is False
-    assert result["models"][1]["available"] is True
+    ordinary = next(model for model in result["models"] if model["role"] == "ordinary_writer")
+    together = next(model for model in result["models"] if model["provider"] == "together")
+    assert ordinary["available"] is False
+    assert together["available"] is True
     assert "openrouter:moonshotai/kimi-k2.6" in result["detail"]
 
 
@@ -132,7 +136,11 @@ def test_missing_openrouter_key_is_visible_without_network_call(monkeypatch):
 
     assert result["status"] == "misconfigured"
     assert "OPENROUTER_API_KEY" in result["detail"]
-    assert result["models"][0]["available"] is False
+    assert all(
+        model["available"] is False
+        for model in result["models"]
+        if model["provider"] == "openrouter"
+    )
     # Together is still reachable and must still be checked.
     assert [url for url, _ in client.calls] == [TOGETHER_URL]
 
@@ -182,8 +190,10 @@ def test_repeated_live_primary_failures_surface_even_when_catalog_is_healthy():
 
     assert result["status"] == "degraded"
     assert "moonshotai/kimi-k2.6" in result["detail"]
-    assert result["models"][0]["runtime"]["consecutive_failures"] == 2
-    assert result["models"][1]["runtime"]["consecutive_failures"] == 0
+    ordinary = next(model for model in result["models"] if model["model"] == "moonshotai/kimi-k2.6")
+    together = next(model for model in result["models"] if model["model"] == "Qwen/Qwen3.7-Plus")
+    assert ordinary["runtime"]["consecutive_failures"] == 2
+    assert together["runtime"]["consecutive_failures"] == 0
 
 
 def test_availability_redirects_deprecated_kimi_environment_setting(monkeypatch):
@@ -192,7 +202,7 @@ def test_availability_redirects_deprecated_kimi_environment_setting(monkeypatch)
 
     configured = model_availability.configured_writer_models()
 
-    assert configured[0]["model"] == "moonshotai/Kimi-K3"
+    assert next(row for row in configured if row["role"] == "ordinary_writer")["model"] == "moonshotai/Kimi-K3"
 
 
 def test_availability_keeps_kimi_k26_on_openrouter(monkeypatch):
@@ -201,5 +211,6 @@ def test_availability_keeps_kimi_k26_on_openrouter(monkeypatch):
 
     configured = model_availability.configured_writer_models()
 
-    assert configured[0]["provider"] == "openrouter"
-    assert configured[0]["model"] == "moonshotai/kimi-k2.6"
+    ordinary = next(row for row in configured if row["role"] == "ordinary_writer")
+    assert ordinary["provider"] == "openrouter"
+    assert ordinary["model"] == "moonshotai/kimi-k2.6"
