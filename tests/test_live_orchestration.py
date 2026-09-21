@@ -13,6 +13,7 @@ from models.commercial import CreatorPolicy, FanCommercialState, FanStatus, Offe
 from models.conversation_continuity import ConversationEpisode
 from models.conversation_decision import (
     ConversationDecision,
+    HoldReason,
     OperationKind,
     ProposedOperation,
     ResponseDisposition,
