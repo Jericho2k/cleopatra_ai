@@ -5,6 +5,11 @@ Verified against the OpenRouter request schema published in the official
 
 ``provider``
     ``only``            list of provider slugs the request may use.
+    ``require_parameters``
+                        true restricts routing to upstreams that support every
+                        parameter in the request. Without it, a request that
+                        sends ``response_format`` and ``reasoning`` may be
+                        served by an upstream that ignores them.
     ``allow_fallbacks`` false means "use only the pinned provider and return
                         the upstream error if it is unavailable".
     ``data_collection`` ``"deny"`` restricts routing to providers that do not
@@ -177,6 +182,20 @@ def provider_preferences(
         # pricing, and a cold cache — on the very first attempt, which is
         # precisely what the recovery ladder exists to make deliberate.
         preferences["allow_fallbacks"] = _flag("OPENROUTER_ALLOW_FALLBACKS", False)
+
+    # Structured output and reasoning are not universally supported. With this
+    # off, OpenRouter is free to serve a request that carries
+    # ``response_format`` and ``reasoning`` from an upstream that silently
+    # ignores both — which is how one model produced usable JSON on some turns
+    # and prose on others with nothing in the request to explain the
+    # difference. ``require_parameters`` restricts routing to upstreams that
+    # actually honour every parameter sent. It is opt-in per target, because a
+    # route with no such upstream should fail loudly rather than everywhere.
+    if _flag(
+        "OPENROUTER_REQUIRE_PARAMETERS",
+        bool(metadata.get("openrouter_require_parameters")),
+    ):
+        preferences["require_parameters"] = True
 
     # Privacy and eligibility are identical in both modes. Recovery is never a
     # reason to widen them.

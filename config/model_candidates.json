@@ -56,14 +56,16 @@
       "adult_policy": "unverified",
       "enabled": true,
       "stream": false,
-      "timeout_seconds": 90,
+      "timeout_seconds": 60,
       "metadata": {
         "role": "conversational owner",
         "reasoning_enabled": true,
         "reasoning_effort": "low",
         "openrouter_providers": [],
         "openrouter_ignore_global_provider_override": true,
-        "note": "Live conversational owner for semantic_v2 and conversational_v1. Routed through OpenRouter's eligible GLM provider pool and deliberately ignores the Kimi-specific OPENROUTER_PROVIDERS pin. Pricing is a snapshot and should be reverified before large-scale rollout."
+        "note": "Live conversational owner for semantic_v2 and conversational_v1. Reasoning is REQUIRED by this model, and on every OpenAI-compatible reasoning route the request's max_tokens is ONE budget shared by the reasoning trace and the visible answer. Unbounded, the owner spent the whole allowance thinking and returned message.content=null with finish_reason=length after ~98s, which the runtime could only report as 'no JSON object'. reasoning_max_tokens caps the trace so the answer always has budget left. openrouter_require_parameters restricts routing to upstreams that actually honour response_format and reasoning: the GLM pool is open (no provider pin), and upstreams that silently ignore response_format are why identical requests returned JSON on some turns and prose on others. Set OPENROUTER_REQUIRE_PARAMETERS=false to widen the pool if no eligible upstream remains. Pricing is a snapshot and should be reverified before large-scale rollout.",
+        "reasoning_max_tokens": 1024,
+        "openrouter_require_parameters": true
       }
     },
     {

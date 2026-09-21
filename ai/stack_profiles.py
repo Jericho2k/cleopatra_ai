@@ -293,12 +293,19 @@ _CONVERSATIONAL_OWNER = StageSpec(
     prompt_version="conversational_owner_v1",
     reasoning=True,
     output_mode=OUTPUT_JSON_OBJECT,
-    max_tokens=4096,
+    max_tokens=8192,
     temperature=None,
+    max_tokens_env="CONVERSATIONAL_OWNER_MAX_TOKENS",
     notes=(
         "Dedicated conversational owner for semantic_v2 and conversational_v1. "
         "GLM-5.3-Flash is routed through OpenRouter and intentionally separate "
-        "from the Anthropic analyzer."
+        "from the Anthropic analyzer. Reasoning is mandatory for this model and "
+        "shares ONE token budget with the visible answer, so the budget is "
+        "sized for reply plus state delta AFTER a bounded reasoning trace: at "
+        "4096 the model spent the whole allowance thinking and returned "
+        "message.content=null with finish_reason=length. The catalog caps "
+        "reasoning separately; CONVERSATIONAL_OWNER_MAX_TOKENS re-sizes the "
+        "total without a deploy."
     ),
 )
 

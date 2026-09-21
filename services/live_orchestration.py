@@ -18,6 +18,7 @@ import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from dataclasses import replace as dataclasses_replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -30,7 +31,7 @@ from ai.generator import (
     PERSISTENT_PRIMARY_RETRY_POLICY,
     generate_replies,
 )
-from ai.model_providers import complete
+from ai.model_providers import classify_transport_error, complete
 from ai.stack_profiles import (
     STAGE_CONVERSATIONAL_OWNER,
     STAGE_SITUATION_ANALYZER,
@@ -84,6 +85,11 @@ from models.live_orchestration import (
     TurnTrigger,
     ValidationResult,
 )
+from models.model_runtime import (
+    FAILURE_EMPTY_UNEXPLAINED,
+    FAILURE_TIMEOUT,
+    ModelResponseDiagnostics,
+)
 from models.schemas import Fan, Persona, SuggestionResponse
 from services.affordability import get_affordability_context
 from services.ai_stack import resolve_ai_stack
@@ -104,6 +110,11 @@ from services.conversational_core import (
     validate_and_apply_delta,
 )
 from services.decision_owners import SemanticDecisionOwner, parse_reply_plus_intent
+from services.owner_contract import (
+    MINIMUM_OWNER_CONTRACT,
+    OwnerResult,
+    extract_owner_result,
+)
 from services.fan_lifecycle import get_fan_lifecycle_context
 from services.offer_lifecycle import sync_pending_offer_expiry
 from services.payment_claims import verify_ppv_purchase
@@ -124,6 +135,11 @@ from services.reply_provenance import (
     fingerprint,
 )
 from services.session_planner import plan_session_for_fan
+
+#: Two owner calls is the whole budget for one turn: the answer, and at most
+#: one bounded format repair. A third would trade a dead turn for a slow one.
+OWNER_REPAIR_REASONING_TOKENS = 512
+OWNER_REPAIR_TIMEOUT_SECONDS = 45.0
 
 MAX_CREATOR_FACTS = 20
 MAX_HISTORICAL_FACTS = 24
@@ -203,16 +219,21 @@ Authority and safety:
 
 CONVERSATIONAL_V1_SYSTEM = """You are the single conversational owner for one creator's private customer conversation. Interpret the moment, contribute naturally in the creator's voice, choose any proposed operation, and update the compact working state in the same response. Do not reveal private reasoning.
 
-Return one JSON object and nothing else. It must contain the same reply/intent fields below plus state_delta:
+Return ONE JSON object and nothing else. No markdown fence, no commentary, no reasoning inside the content.
+
+REQUIRED — a response without this is not an answer:
+  "reply": "customer-facing message; | only for a genuinely separate bubble"
+
+Everything below is optional. Omit any field you have nothing to say about; an omitted field is read as "unchanged" or "none", and a field you are unsure of is better left out than guessed. Write "reply" FIRST so it survives even if the response is cut short.
 {
-  "reply": "customer-facing message; | only for a genuinely separate bubble",
-  "active_needs": [], "supporting_messages": [], "unresolved_references": [], "must_address": [],
+  "reply": "...",
   "response_intent": "ordinary_conversation" | "answer_and_continue" | "clarify_reference" | "present_offer" | "deliver_accepted_offer" | "acknowledge_payment_check" | "support_handoff" | "respect_silence",
   "disposition": "reply" | "silence" | "handoff",
   "operation": "none" | "present_offer" | "send_locked_paid_message" | "check_payment_claim" | "repair_content_access" | "hand_off_to_human",
   "operation_subject": "", "operation_because": "", "operation_offer_id": "", "operation_set_id": "", "operation_payment_reference": "", "operation_purchase_id": "",
   "hold": "none" | "waiting_on_customer" | "waiting_on_payment" | "needs_human" | "respect_silence" | "insufficient_evidence",
   "hold_detail": "", "confidence": 0.0,
+  "active_needs": [], "supporting_messages": [], "unresolved_references": [], "must_address": [],
   "state_delta": {
     "scene_summary": null, "current_action_focus": null, "current_direction": null,
     "pacing": null, "has_shared_imagined_scene": null,
@@ -224,8 +245,12 @@ Return one JSON object and nothing else. It must contain the same reply/intent f
   }
 }
 
+Budget: the reply matters more than the bookkeeping. Omit state_delta entirely when nothing meaningful changed, and never spend the response on restating state that already holds. If you are running long, finish the reply and stop.
+
 Conversation judgment:
 - Contribute a thought, feeling, callback, implication, scene development, playful move, or useful direction. Do not merely paraphrase, validate, then ask a generic question.
+- The shape "acknowledge what they said -> compliment or tease -> emoji -> open question" is the one thing to avoid. A question is optional; one specific thought, opinion, memory, or small move of your own is usually better than asking them for more. You may lead, disagree, change the subject, or finish a thought they started.
+- Stock phrasing is worse than saying less. Do not reach for "good taste", "flattery will get you everywhere", "what's your favorite part", "tell me more", or any line that would fit equally well in a conversation you have not had.
 - Initiative may be fan, creator, or shared. A short response can be acceptance, hesitation, acknowledgement, cooling, continuation, or an invitation for you to lead. Do not use a stage ladder or automatically escalate.
 - Preserve a shared imagined scene vividly while keeping it imagined. Creator configuration and inventory descriptions are not evidence of what the creator is physically doing, wearing, or seeing right now.
 - Pacing may build, hold, continue, cool, redirect, pause, or resume. After rejection, purchase, delivery, correction, or a major scene turn, stay in the moment instead of resetting or immediately selling again.
@@ -237,7 +262,29 @@ State and authority:
 - A correction may supersede an existing element only when the current fan message explicitly corrects it. Never delete history.
 - Transaction facts require authoritative transaction refs. A pending payment record proves only that a check is pending. Never claim payment, purchase, attachment, send, delivery, exact price, or operation completion from fan wording or from proposed state.
 - The operation is only a proposal. Deterministic code owns recipient, inventory, exact prices, payment, purchase, delivery, permissions, idempotency, and receipts.
-- If no state field needs changing, return an empty state_delta. Never add private reasoning or pseudo-history.
+- Never put a price, an amount, or a currency symbol in operation_subject or operation_because.
+- If no state field needs changing, omit state_delta. Never add private reasoning or pseudo-history.
+"""
+
+#: The one bounded repair. It asks for the MINIMUM object and nothing else,
+#: from the same evidence, so a model that lost the format has the smallest
+#: possible thing to get right. It deliberately cannot carry a state delta:
+#: re-deriving working state under a format failure is exactly the kind of
+#: second chance at authority this runtime does not grant.
+CONVERSATIONAL_V1_REPAIR_SYSTEM = """Your previous response could not be read as the required JSON object.
+
+Return ONE JSON object and nothing else. No markdown fence, no commentary, no reasoning inside the content. Keep it short.
+
+Required minimum:
+""" + MINIMUM_OWNER_CONTRACT + """
+
+Rules for this repair:
+- Use ONLY the evidence you were already given. Do not add, change, or infer any new fact.
+- Do not invent or alter an offer id, set id, payment reference, or purchase reference. Unless you are repeating one that appears exactly in the evidence catalog, set "operation" to "none".
+- Never state a price or an amount, and never claim payment, purchase, sending, attachment, or delivery.
+- Omit state_delta entirely.
+- Write the reply in the creator's voice, reacting to the actual moment. Do not fall back on generic validation, a stock compliment, or a filler question.
+- If nothing should be said at all, return {"reply": "", "disposition": "silence", "hold": "respect_silence"}.
 """
 
 
@@ -1288,29 +1335,243 @@ async def decide_with_reply(
     )
 
 
-def _json_object(text: str) -> dict[str, Any] | None:
-    raw = str(text or "").strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.lower().startswith("json"):
-            raw = raw[4:]
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end <= start:
+def _evidenced_reference_set(loaded: LoadedEvidence) -> frozenset[str]:
+    """Every exact reference the owner was actually shown this turn.
+
+    A repair attempt re-emits a structured object from the SAME evidence. It
+    must not be able to introduce an identifier that was never in front of it,
+    so anything outside this set disqualifies the operation before deterministic
+    validation ever sees it.
+    """
+    refs: set[str] = {
+        str(row.get("source_ref") or "")
+        for row in evidence_catalog_view(loaded.snapshot)
+    }
+    records: list[Any] = [
+        loaded.snapshot.pending_offer,
+        loaded.snapshot.pending_payment,
+        *loaded.snapshot.approved_inventory,
+        *loaded.snapshot.confirmed_purchases,
+        *loaded.snapshot.confirmed_deliveries,
+    ]
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        for key, value in record.items():
+            if key.endswith("_id") or key.endswith("_reference") or key == "reference":
+                refs.add(str(value or ""))
+    offer = loaded.commercial_state.pending_offer or loaded.next_offer
+    if offer is not None:
+        refs.update({str(offer.offer_id or ""), str(offer.set_id or "")})
+    refs.discard("")
+    return frozenset(refs)
+
+
+@dataclass(frozen=True)
+class OwnerAttempt:
+    """One conversational-owner call, whatever came back."""
+
+    label: str
+    result: OwnerResult
+    diagnostics: ModelResponseDiagnostics
+    latency_ms: int = 0
+    usage: Any = None
+    reported_cost_usd: float | None = None
+    target: Any = None
+    upstream_provider: str = ""
+
+    @property
+    def failure_category(self) -> str:
+        """Why this attempt produced nothing usable, as specifically as known.
+
+        The transport's explanation wins over the parser's. "The response
+        contained no JSON object" is true of an empty completion and says
+        nothing; "the completion budget was spent on reasoning" is actionable.
+        """
+        if self.result.usable:
+            return ""
+        transport = self.diagnostics.empty_content_category()
+        return transport or self.result.failure_category or FAILURE_EMPTY_UNEXPLAINED
+
+    @property
+    def failure_detail(self) -> str:
+        """Say WHY, in the vocabulary of whichever layer actually knows.
+
+        When the provider returned nothing, the parser's "contained no JSON
+        object" is a true statement about an empty string and tells an operator
+        nothing. The transport's account of the empty completion replaces it.
+        """
+        if self.result.usable:
+            return ""
+        if self.diagnostics.provider_error:
+            return self.diagnostics.provider_error
+        if self.diagnostics.empty_content_category():
+            return (
+                "the provider returned no content ("
+                f"finish_reason={self.diagnostics.finish_reason or 'none'}, "
+                f"content_null={str(self.diagnostics.content_is_null).lower()}, "
+                f"reasoning_tokens={self.diagnostics.reasoning_tokens}, "
+                f"completion_tokens={self.diagnostics.completion_tokens}, "
+                f"max_tokens={self.diagnostics.max_tokens_requested})"
+            )
+        return self.result.failure_detail or "the owner returned no usable answer"
+
+
+def _repair_target(target: Any) -> Any:
+    """The same model, asked to spend its budget on the answer.
+
+    Reasoning stays enabled — this model requires it — but is bounded hard, and
+    the deadline is shortened. A format repair that thinks for another ninety
+    seconds is a second dead turn, not a recovery.
+    """
+    if target is None:
         return None
+    metadata = dict(getattr(target, "metadata", None) or {})
+    if metadata.get("reasoning_enabled"):
+        metadata["reasoning_effort"] = "low"
+        metadata["reasoning_max_tokens"] = min(
+            int(metadata.get("reasoning_max_tokens") or OWNER_REPAIR_REASONING_TOKENS),
+            OWNER_REPAIR_REASONING_TOKENS,
+        )
     try:
-        value = json.loads(raw[start : end + 1])
-    except (TypeError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
+        return dataclasses_replace(
+            target,
+            metadata=metadata,
+            timeout_seconds=min(
+                float(getattr(target, "timeout_seconds", 45.0) or 45.0),
+                OWNER_REPAIR_TIMEOUT_SECONDS,
+            ),
+        )
+    except TypeError:
+        # Orchestration tests use light stand-ins for a target; a repair must
+        # still be attempted against them rather than failing structurally.
+        return target
+
+
+async def _call_conversational_owner(
+    loaded: LoadedEvidence,
+    *,
+    target: Any,
+    max_tokens: int,
+    user_content: str,
+    system: str,
+    label: str,
+    evidenced_refs: frozenset[str] | None,
+    owner_complete: Any = None,
+) -> OwnerAttempt:
+    """One owner call, reduced to components and structural diagnostics.
+
+    Never raises. A transport failure is a diagnostic category like any other,
+    because the caller has to decide between repairing, degrading and failing
+    for every one of them, not only for the ones that returned a body.
+    """
+    try:
+        result = await (owner_complete or complete)(
+            target,
+            system=system,
+            messages=[{"role": "user", "content": user_content}],
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:  # noqa: BLE001 - every failure is classified below
+        category = classify_transport_error(exc)
+        return OwnerAttempt(
+            label=label,
+            result=OwnerResult(
+                failure_category=category,
+                failure_detail=f"{type(exc).__name__}: {exc}"[:300],
+            ),
+            diagnostics=ModelResponseDiagnostics(
+                provider=str(getattr(target, "provider", "") or ""),
+                model=str(getattr(target, "model", "") or ""),
+                max_tokens_requested=int(max_tokens),
+                response_format_requested="json_object",
+                error_category=category,
+                provider_error=f"{type(exc).__name__}: {exc}"[:200],
+            ),
+            target=target,
+        )
+
+    diagnostics = getattr(result, "diagnostics", None) or ModelResponseDiagnostics(
+        provider=str(getattr(target, "provider", "") or ""),
+        model=str(getattr(target, "model", "") or ""),
+        content_chars=len(result.text or ""),
+        latency_ms=int(getattr(result, "latency_ms", 0) or 0),
+    )
+    extracted = extract_owner_result(
+        result.text,
+        source="conversational_owner_v1",
+        evidenced_refs=evidenced_refs,
+    )
+    return OwnerAttempt(
+        label=label,
+        result=extracted,
+        diagnostics=diagnostics,
+        latency_ms=int(getattr(result, "latency_ms", 0) or 0),
+        usage=getattr(result, "usage", None),
+        reported_cost_usd=getattr(result, "reported_cost_usd", None),
+        target=getattr(result, "target", target),
+        upstream_provider=str(getattr(result, "upstream_provider", "") or ""),
+    )
+
+
+def _record_owner_attempt(trace: GenerationTrace, attempt: OwnerAttempt) -> None:
+    extra: dict[str, Any] = {
+        "json_status": attempt.result.json_status,
+        "reply_chars": len(attempt.result.reply),
+        "usable": attempt.result.usable,
+    }
+    if attempt.result.degradations:
+        extra["degraded_fields"] = dict(attempt.result.degradations)
+    if attempt.result.operation_discarded:
+        extra["operation_discarded"] = attempt.result.operation_discarded
+    if not attempt.result.usable:
+        extra["failure_category"] = attempt.failure_category
+        extra["failure_detail"] = attempt.failure_detail
+    trace.record_attempt(
+        label=attempt.label,
+        diagnostics=attempt.diagnostics,
+        extra=extra,
+    )
+    print(
+        f"[CONVERSATIONAL V1 OWNER CALL] attempt={attempt.label} "
+        f"{attempt.diagnostics.describe()} {attempt.result.describe()} "
+        f"resolved_failure={attempt.failure_category or 'none'}"
+    )
 
 
 async def decide_conversational_v1(
     loaded: LoadedEvidence,
     working_state: ConversationalWorkingState,
+    *,
+    owner_complete: Any = None,
 ) -> tuple[ConversationDecision, list[str], GenerationTrace, Any]:
-    """One owner call returning reply, intent/operation, and state delta."""
+    """Get one usable owner result, repairing the FORMAT at most once.
+
+    THE FAILURE MODEL
+    -----------------
+    The reply, the proposed operation and the working-state delta are read
+    independently by ``services.owner_contract``. A rejected operation or an
+    unreadable delta degrades that component alone and the conversation
+    continues. Only an answer with no reply and no stated reason for silence is
+    a failure of the turn.
+
+    When that happens, exactly ONE repair call is made, against the SAME
+    immutable evidence, asking for the minimum object. It cannot introduce an
+    operation reference the evidence never contained
+    (``_evidenced_reference_set``), and it is never retried again: two owner
+    calls is the whole budget, so a provider having a bad minute costs a
+    bounded amount of time rather than an unbounded loop.
+
+    ``owner_complete`` replaces the transport, the same way
+    ``SemanticDecisionOwner`` already takes one. It exists so
+    ``services.owner_stability_eval`` can run thousands of turns through this
+    exact function — an eval that measured a reimplementation of the failure
+    model would not be measuring the failure model.
+    """
     spec = loaded.stack.profile.stage(STAGE_CONVERSATIONAL_OWNER)
     target = spec.primary_target()
+    max_tokens = _owner_max_tokens(spec)
     payload = {
         "evidence_snapshot": loaded.snapshot.as_dict(),
         "evidence_catalog": evidence_catalog_view(loaded.snapshot),
@@ -1318,6 +1579,7 @@ async def decide_conversational_v1(
         "working_state_fingerprint": state_fingerprint(working_state),
         "legal_operations": legal_operations(loaded),
     }
+    user_content = json.dumps(payload, ensure_ascii=False, default=str)
     trace = GenerationTrace()
     if target is not None:
         trace.record_request(
@@ -1327,85 +1589,101 @@ async def decide_conversational_v1(
             policy="single_conversational_owner_with_state",
             deadline_seconds=0.0,
         )
-    try:
-        result = await complete(
-            target,
-            system=CONVERSATIONAL_V1_SYSTEM,
-            messages=[
-                {
-                    "role": "user",
-                    "content": json.dumps(payload, ensure_ascii=False, default=str),
-                }
-            ],
-            max_tokens=_owner_max_tokens(spec),
-            response_format={"type": "json_object"},
-        )
-    except Exception as exc:
-        trace.record_failure(
-            outcome="conversational_v1_owner_unreachable",
-            reason=f"the conversational owner could not be reached: {exc}",
-            attempts=1,
-            pinned_attempts=1,
-            alternate_attempts=0,
-            elapsed_ms=0,
-            deadline_exceeded=False,
-        )
-        return (
-            ConversationDecision(
-                disposition=ResponseDisposition.SILENCE,
-                hold=HoldReason.INSUFFICIENT_EVIDENCE,
-                hold_detail="conversational_v1_owner_unreachable",
-                source="conversational_owner_v1",
-                confidence=0.0,
-            ),
-            [],
-            trace,
-            {},
-        )
 
-    answer, refusal = parse_reply_plus_intent(
-        result.text,
-        source="conversational_owner_v1",
-        strict_live=True,
+    attempt = await _call_conversational_owner(
+        loaded,
+        target=target,
+        max_tokens=max_tokens,
+        user_content=user_content,
+        system=CONVERSATIONAL_V1_SYSTEM,
+        label="initial",
+        evidenced_refs=None,
+        owner_complete=owner_complete,
     )
-    payload_result = _json_object(result.text)
-    if answer is None or payload_result is None:
-        trace.record_failure(
-            outcome="conversational_v1_owner_invalid",
-            reason=f"the conversational owner did not answer usably: {refusal}",
-            attempts=1,
-            pinned_attempts=1,
-            alternate_attempts=0,
-            elapsed_ms=result.latency_ms,
-            deadline_exceeded=False,
-        )
-        return (
-            ConversationDecision(
-                disposition=ResponseDisposition.SILENCE,
-                hold=HoldReason.INSUFFICIENT_EVIDENCE,
-                hold_detail="conversational_v1_owner_invalid",
-                source="conversational_owner_v1",
-                confidence=0.0,
+    _record_owner_attempt(trace, attempt)
+    total_latency_ms = attempt.latency_ms
+    attempts = 1
+
+    if not attempt.result.usable:
+        first_failure = f"{attempt.failure_category}: {attempt.failure_detail}"
+        repair = await _call_conversational_owner(
+            loaded,
+            target=_repair_target(target),
+            max_tokens=max_tokens,
+            user_content=(
+                user_content
+                + "\\nFORMAT REPAIR CONTEXT:\\n"
+                + json.dumps(
+                    {
+                        "previous_attempt_failed_because": attempt.failure_category,
+                        "required_minimum_object": MINIMUM_OWNER_CONTRACT,
+                    },
+                    ensure_ascii=False,
+                )
             ),
-            [],
-            trace,
-            {},
+            system=CONVERSATIONAL_V1_REPAIR_SYSTEM,
+            label="repair",
+            evidenced_refs=_evidenced_reference_set(loaded),
+            owner_complete=owner_complete,
         )
+        _record_owner_attempt(trace, repair)
+        total_latency_ms += repair.latency_ms
+        attempts = 2
+        if repair.result.usable:
+            trace.repaired = True
+            attempt = repair
+        else:
+            trace.record_failure(
+                outcome="conversational_v1_owner_invalid",
+                reason=(
+                    "the conversational owner did not answer usably after one "
+                    f"repair: first={first_failure}; "
+                    f"repair={repair.failure_category}: {repair.failure_detail}"
+                ),
+                attempts=attempts,
+                pinned_attempts=attempts,
+                alternate_attempts=0,
+                elapsed_ms=total_latency_ms,
+                deadline_exceeded=repair.failure_category == FAILURE_TIMEOUT,
+            )
+            return (
+                ConversationDecision(
+                    disposition=ResponseDisposition.SILENCE,
+                    hold=HoldReason.INSUFFICIENT_EVIDENCE,
+                    hold_detail="conversational_v1_owner_invalid",
+                    source="conversational_owner_v1",
+                    confidence=0.0,
+                ),
+                [],
+                trace,
+                {},
+            )
+
     trace.record_success(
-        target=result.target,
+        target=attempt.target if attempt.target is not None else target,
         role="conversational_v1_owner",
-        attempt_index=0,
-        upstream_provider=result.upstream_provider,
-        outcome="conversational_v1_first_try_success",
-        attempts=1,
-        pinned_attempts=1,
+        attempt_index=attempts - 1,
+        upstream_provider=attempt.upstream_provider,
+        outcome=(
+            "conversational_v1_repair_success"
+            if trace.repaired
+            else "conversational_v1_first_try_success"
+        ),
+        attempts=attempts,
+        pinned_attempts=attempts,
         alternate_attempts=0,
-        elapsed_ms=result.latency_ms,
-        usage=getattr(result, "usage", None),
-        reported_cost_usd=getattr(result, "reported_cost_usd", None),
+        elapsed_ms=total_latency_ms,
+        usage=attempt.usage,
+        reported_cost_usd=attempt.reported_cost_usd,
     )
-    raw_delta: Any = payload_result.get("state_delta", "missing")
-    return answer.decision, [answer.reply], trace, raw_delta
+    if attempt.result.operation_discarded:
+        print(
+            "[CONVERSATIONAL V1 OPERATION DISCARDED] reason="
+            + attempt.result.operation_discarded
+        )
+    raw_delta = attempt.result.state_delta
+    replies = [attempt.result.reply] if attempt.result.reply else []
+    return attempt.result.decision, replies, trace, raw_delta
 
 
 def _validate_single_call_reply(
@@ -2087,6 +2365,129 @@ def _repair_rejected_core_v1_operation(
     return repaired, repaired.proposed_operation != op
 
 
+@dataclass(frozen=True)
+class ConversationalV1Settlement:
+    """What deterministic authority made of one owner answer.
+
+    The owner proposed; this is what the system will actually do. It is a value
+    rather than four return positions because the stability harness settles the
+    same way a live turn does — measuring a reimplementation of this pipeline
+    would measure the reimplementation.
+    """
+
+    decision: ConversationDecision
+    execution: ApprovedExecution
+    replies: list[str]
+    locally_repaired: bool = False
+    #: The operation the owner asked for, before authority ruled on it.
+    proposed_operation: str = "none"
+    #: Why authority refused it, when it did.
+    operation_rejection_reasons: tuple[str, ...] = ()
+
+    @property
+    def operation_rejected(self) -> bool:
+        return bool(self.operation_rejection_reasons)
+
+
+async def settle_conversational_v1_turn(
+    loaded: LoadedEvidence,
+    *,
+    decision: ConversationDecision,
+    replies: list[str],
+    mode: str,
+    execute_operations: bool,
+) -> ConversationalV1Settlement:
+    """Apply deterministic authority to an owner answer without losing the reply.
+
+    Three things are decided here, in this order, and each one can fail on its
+    own:
+
+    1. The proposed operation goes to ``validate_decision``. A refusal first has
+       non-authoritative prose repaired (a price the owner wrote into
+       ``operation_subject`` is descriptive text, not authority), and if it is
+       still refused the operation is dropped to ``none``. The conversation
+       continues either way.
+    2. The fan-visible copy goes through the writer contract. Unsafe clauses are
+       stripped locally rather than escalated.
+    3. Only if nothing safe remains to send does the turn become silent — and
+       that is a copy failure with a reason, never an owner failure.
+
+    A rejected operation never erases the reply, and a dropped reply never
+    re-enables a rejected operation.
+    """
+    execution = await _prepare_execution(
+        decision,
+        loaded,
+        execute_operations=execute_operations,
+    )
+    locally_repaired = False
+    proposed_operation = decision.proposed_operation.kind.value
+    rejection_reasons: tuple[str, ...] = ()
+
+    if (
+        decision.proposed_operation.kind is not OperationKind.NONE
+        and not execution.validation.approved
+    ):
+        rejection_reasons = tuple(execution.validation.reasons)
+        print(
+            "[CONVERSATIONAL V1 OPERATION REJECTED] operation="
+            + proposed_operation
+            + " reasons="
+            + "; ".join(rejection_reasons)
+        )
+        decision, operation_repaired = _repair_rejected_core_v1_operation(decision)
+        execution = await _prepare_execution(
+            decision,
+            loaded,
+            execute_operations=execute_operations,
+        )
+        if not execution.validation.approved:
+            decision = ConversationDecision(
+                active_needs=decision.active_needs,
+                supporting_messages=decision.supporting_messages,
+                unresolved_references=decision.unresolved_references,
+                must_address=decision.must_address,
+                proposed_operation=ProposedOperation(),
+                response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
+                disposition=ResponseDisposition.REPLY,
+                hold=HoldReason.NONE,
+                hold_detail="",
+                source=decision.source,
+                confidence=decision.confidence,
+            )
+            execution = await _prepare_execution(
+                decision,
+                loaded,
+                execute_operations=execute_operations,
+            )
+            operation_repaired = True
+        locally_repaired = locally_repaired or operation_repaired
+        print(
+            "[CONVERSATIONAL V1 OPERATION RECOVERY] original="
+            + proposed_operation
+            + " recovered="
+            + execution.operation
+            + " approved="
+            + str(execution.validation.approved).lower()
+        )
+
+    decision, execution, replies, reply_repaired = _validate_conversational_v1_reply(
+        decision,
+        replies,
+        execution,
+        loaded,
+        mode=mode,
+    )
+    return ConversationalV1Settlement(
+        decision=decision,
+        execution=execution,
+        replies=replies,
+        locally_repaired=locally_repaired or reply_repaired,
+        proposed_operation=proposed_operation,
+        operation_rejection_reasons=rejection_reasons,
+    )
+
+
 async def prepare_turn(
     *,
     creator_id: str,
@@ -2117,7 +2518,6 @@ async def prepare_turn(
     )
     replies: list[str] = []
     trace = GenerationTrace()
-    locally_repaired = False
     working_state_before: ConversationalWorkingState | None = None
     state_delta_validation: StateDeltaValidation | None = None
     if conversation_core == CORE_CONVERSATIONAL_V1:
@@ -2131,16 +2531,68 @@ async def prepare_turn(
             for thread in loaded.snapshot.unresolved_obligations
             if thread.get("id")
         }
-        state_delta_validation = validate_and_apply_delta(
-            working_state_before,
-            raw_delta,
-            snapshot=loaded.snapshot,
-            known_thread_ids=known_thread_ids,
-        )
+        try:
+            state_delta_validation = validate_and_apply_delta(
+                working_state_before,
+                raw_delta,
+                snapshot=loaded.snapshot,
+                known_thread_ids=known_thread_ids,
+            )
+        except Exception as exc:  # noqa: BLE001 - a delta may never kill a reply
+            # The delta validator refuses fields individually and is not
+            # expected to raise. If a shape it has never seen makes it, the
+            # working state simply does not advance this turn: state is
+            # interpretation, and losing a turn of it costs nothing a fan sees.
+            print(
+                "[CONVERSATIONAL V1 STATE DELTA UNREADABLE] "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            state_delta_validation = StateDeltaValidation(
+                proposed=raw_delta if isinstance(raw_delta, dict) else {},
+                rejected_fields={
+                    "state_delta": f"state delta could not be read: {type(exc).__name__}"
+                },
+                state_after=working_state_before.model_copy(deep=True),
+            )
     elif conversation_core == CORE_SEMANTIC_V2:
         decision, replies, trace = await decide_with_reply(loaded)
     else:
         decision = await decide_turn(loaded)
+    if conversation_core == CORE_CONVERSATIONAL_V1:
+        settlement = await settle_conversational_v1_turn(
+            loaded,
+            decision=decision,
+            replies=replies,
+            mode=mode,
+            execute_operations=execute_operations,
+        )
+        decision = settlement.decision
+        execution = settlement.execution
+        replies = settlement.replies
+        locally_repaired = settlement.locally_repaired
+        provenance = _provenance(
+            loaded,
+            decision,
+            execution,
+            trace,
+            mode=(PIPELINE_ASSISTED if mode == MODE_ASSISTED else PIPELINE_AUTO),
+            conversation_core=conversation_core,
+            working_state_before=working_state_before,
+            state_delta_validation=state_delta_validation,
+        )
+        if locally_repaired:
+            provenance.record_transform("conversational_v1_local_repair")
+        return PreparedTurn(
+            loaded=loaded,
+            decision=decision,
+            execution=execution,
+            replies=replies,
+            provenance=provenance,
+            writer_trace=trace,
+            conversation_core=conversation_core,
+            working_state_before=working_state_before,
+            state_delta_validation=state_delta_validation,
+        )
     execution = await _prepare_execution(
         decision,
         loaded,
@@ -2150,75 +2602,22 @@ async def prepare_turn(
         decision.proposed_operation.kind is not OperationKind.NONE
         and not execution.validation.approved
     ):
-        if conversation_core == CORE_CONVERSATIONAL_V1:
-            # Hard authority remains deterministic, but a rejected proposal is
-            # not a reason to erase an otherwise valid conversation turn.
-            # Repair non-authoritative operation prose first; if authority still
-            # rejects the action, drop the action and let the local fan-visible
-            # copy validator remove any operation-dependent wording.
-            rejected_operation = decision.proposed_operation.kind.value
-            rejected_reasons = tuple(execution.validation.reasons)
-            print(
-                "[CONVERSATIONAL V1 OPERATION REJECTED] operation="
-                + rejected_operation
-                + " reasons="
-                + "; ".join(rejected_reasons)
-            )
-            decision, operation_repaired = _repair_rejected_core_v1_operation(
-                decision
-            )
-            execution = await _prepare_execution(
-                decision,
-                loaded,
-                execute_operations=execute_operations,
-            )
-            if not execution.validation.approved:
-                decision = ConversationDecision(
-                    active_needs=decision.active_needs,
-                    supporting_messages=decision.supporting_messages,
-                    unresolved_references=decision.unresolved_references,
-                    must_address=decision.must_address,
-                    proposed_operation=ProposedOperation(),
-                    response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
-                    disposition=ResponseDisposition.REPLY,
-                    hold=HoldReason.NONE,
-                    hold_detail="",
-                    source=decision.source,
-                    confidence=decision.confidence,
-                )
-                execution = await _prepare_execution(
-                    decision,
-                    loaded,
-                    execute_operations=execute_operations,
-                )
-                operation_repaired = True
-            if operation_repaired:
-                locally_repaired = True
-            print(
-                "[CONVERSATIONAL V1 OPERATION RECOVERY] original="
-                + rejected_operation
-                + " recovered="
-                + execution.operation
-                + " approved="
-                + str(execution.validation.approved).lower()
-            )
-        else:
-            # Planning can also refuse a validated operation (inventory changed).
-            # It must not fall through into a textual pretend-delivery.
-            decision = ConversationDecision(
-                disposition=ResponseDisposition.HANDOFF,
-                hold=HoldReason.NEEDS_HUMAN,
-                hold_detail="semantic_execution_refused: "
-                + "; ".join(execution.validation.reasons),
-                proposed_operation=ProposedOperation(
-                    kind=OperationKind.HAND_OFF_TO_HUMAN,
-                    subject="execution requires review",
-                ),
-            )
-            execution = ApprovedExecution(
-                operation="hand_off_to_human",
-                validation=validate_decision(decision, loaded),
-            )
+        # Planning can also refuse a validated operation (inventory changed).
+        # It must not fall through into a textual pretend-delivery.
+        decision = ConversationDecision(
+            disposition=ResponseDisposition.HANDOFF,
+            hold=HoldReason.NEEDS_HUMAN,
+            hold_detail="semantic_execution_refused: "
+            + "; ".join(execution.validation.reasons),
+            proposed_operation=ProposedOperation(
+                kind=OperationKind.HAND_OFF_TO_HUMAN,
+                subject="execution requires review",
+            ),
+        )
+        execution = ApprovedExecution(
+            operation="hand_off_to_human",
+            validation=validate_decision(decision, loaded),
+        )
     if conversation_core == CORE_SEMANTIC_V2:
         decision, execution, replies = _validate_single_call_reply(
             decision,
@@ -2227,17 +2626,6 @@ async def prepare_turn(
             loaded,
             mode=mode,
         )
-    elif conversation_core == CORE_CONVERSATIONAL_V1:
-        decision, execution, replies, reply_repaired = (
-            _validate_conversational_v1_reply(
-                decision,
-                replies,
-                execution,
-                loaded,
-                mode=mode,
-            )
-        )
-        locally_repaired = locally_repaired or reply_repaired
     elif decision.disposition is ResponseDisposition.REPLY:
         replies, trace = await _write_turn(
             loaded,
@@ -2272,8 +2660,6 @@ async def prepare_turn(
         working_state_before=working_state_before,
         state_delta_validation=state_delta_validation,
     )
-    if conversation_core == CORE_CONVERSATIONAL_V1 and locally_repaired:
-        provenance.record_transform("conversational_v1_local_repair")
     return PreparedTurn(
         loaded=loaded,
         decision=decision,
@@ -2511,14 +2897,29 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
         and prepared.writer_trace.failure_reason
         and not prepared.replies
     ):
+        attempts = prepared.writer_trace.owner_attempts
+        categories = [
+            str(row.get("failure_category") or "")
+            for row in attempts
+            if row.get("failure_category")
+        ]
         print(
             "[CONVERSATIONAL V1 OWNER FAILED] "
-            f"fan={fan_id} reason={prepared.writer_trace.failure_reason}"
+            f"fan={fan_id} reason={prepared.writer_trace.failure_reason} "
+            f"attempts={len(attempts)} "
+            f"repair_attempted={str(prepared.writer_trace.repair_attempted).lower()} "
+            f"categories={','.join(categories) or 'unknown'}"
         )
+        for row in attempts:
+            # The structural record of each call, so an operator can see WHY the
+            # content was empty rather than only that no JSON was found.
+            print("[CONVERSATIONAL V1 OWNER ATTEMPT] " + json.dumps(row, default=str))
         return {
             "outcome": OUTCOME_OWNER_FAILED,
             "message_ids": [],
             "reason": prepared.writer_trace.failure_reason,
+            "owner_failure_categories": categories,
+            "owner_attempts": [dict(row) for row in attempts],
         }
 
     if prepared.conversation_core == CORE_CONVERSATIONAL_V1:
