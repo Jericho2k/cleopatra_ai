@@ -37,6 +37,20 @@ FORBIDDEN_PROSE_FIELDS = frozenset(
     }
 )
 
+# These fields recreate the linear/scored machinery Core v1 is replacing.
+# Intimacy is represented by independent working-state dimensions instead.
+FORBIDDEN_FUNNEL_FIELDS = frozenset(
+    {
+        "engagement_score",
+        "fan_engagement",
+        "intimacy_stage",
+        "sexual_stage",
+        "escalation_stage",
+        "spending_power",
+        "conversion_likelihood",
+    }
+)
+
 EVIDENCE_CATEGORIES = frozenset(
     {"inventory", "memory", "continuity", "transactions", "creator_voice"}
 )
@@ -107,6 +121,12 @@ def parse_semantic_decision(
         return SemanticDecisionResult(
             failure="decision model emitted fan-facing prose fields: "
             + ", ".join(forbidden)
+        )
+    funnel_fields = sorted(FORBIDDEN_FUNNEL_FIELDS.intersection(payload))
+    if funnel_fields:
+        return SemanticDecisionResult(
+            failure="decision model emitted forbidden funnel fields: "
+            + ", ".join(funnel_fields)
         )
 
     degradations: dict[str, str] = {}
