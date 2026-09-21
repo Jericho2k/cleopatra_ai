@@ -13,6 +13,7 @@ from models.commercial import CreatorPolicy, FanCommercialState, FanStatus, Offe
 from models.conversation_continuity import ConversationEpisode
 from models.conversation_decision import (
     ConversationDecision,
+    HoldReason,
     OperationKind,
     ProposedOperation,
     ResponseDisposition,
@@ -1557,6 +1558,85 @@ def test_production_pending_offer_send_request_repairs_into_exact_locked_deliver
     assert evidence.pending_payment is None
     evidence.active_session = {"status": "active", "plan": [{"sent": False}]}
     assert not live_orchestration.validate_decision(decision, evidence).approved
+
+
+def test_core_v1_repairs_price_in_operation_metadata_instead_of_silencing():
+    evidence = loaded(next_offer=offer(cents=3000))
+    decision = ConversationDecision(
+        proposed_operation=ProposedOperation(
+            kind=OperationKind.PRESENT_OFFER,
+            subject="the $30 bikini set",
+            because="he wants it for $30",
+            offer_id="offer-1",
+            set_id="set-1",
+        ),
+        response_intent=ResponseIntent.PRESENT_OFFER,
+        disposition=ResponseDisposition.REPLY,
+        source="conversational_owner_v1",
+    )
+
+    rejected = live_orchestration.validate_decision(decision, evidence)
+    assert not rejected.approved
+    assert "semantic owner attempted to state a price" in rejected.reasons
+
+    repaired, changed = live_orchestration._repair_rejected_core_v1_operation(
+        decision
+    )
+    assert changed is True
+    assert "$30" not in repaired.proposed_operation.subject
+    assert "$30" not in repaired.proposed_operation.because
+    assert repaired.proposed_operation.offer_id == "offer-1"
+    assert repaired.proposed_operation.set_id == "set-1"
+    assert repaired.disposition is ResponseDisposition.REPLY
+    assert live_orchestration.validate_decision(repaired, evidence).approved
+
+
+def test_core_v1_rejected_operation_can_fall_back_to_safe_conversation():
+    evidence = loaded(next_offer=offer(cents=3000))
+    decision = ConversationDecision(
+        proposed_operation=ProposedOperation(
+            kind=OperationKind.PRESENT_OFFER,
+            subject="the bikini content",
+            offer_id="wrong-offer",
+            set_id="wrong-set",
+        ),
+        response_intent=ResponseIntent.PRESENT_OFFER,
+        disposition=ResponseDisposition.REPLY,
+        source="conversational_owner_v1",
+    )
+
+    repaired, _ = live_orchestration._repair_rejected_core_v1_operation(decision)
+    assert not live_orchestration.validate_decision(repaired, evidence).approved
+
+    downgraded = ConversationDecision(
+        active_needs=repaired.active_needs,
+        supporting_messages=repaired.supporting_messages,
+        unresolved_references=repaired.unresolved_references,
+        must_address=repaired.must_address,
+        proposed_operation=ProposedOperation(),
+        response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
+        disposition=ResponseDisposition.REPLY,
+        hold=HoldReason.NONE,
+        source=repaired.source,
+        confidence=repaired.confidence,
+    )
+    execution = ApprovedExecution(
+        operation="none",
+        validation=live_orchestration.validate_decision(downgraded, evidence),
+    )
+    final_decision, final_execution, replies, changed = (
+        live_orchestration._validate_conversational_v1_reply(
+            downgraded,
+            ["you've got me curious too 😏"],
+            execution,
+            evidence,
+            mode="auto",
+        )
+    )
+    assert final_decision.disposition is ResponseDisposition.REPLY
+    assert final_execution.operation == "none"
+    assert replies == ["you've got me curious too 😏"]
+    assert changed is False
 
 
 def test_writer_repairs_expression_without_changing_commercial_authority(monkeypatch):

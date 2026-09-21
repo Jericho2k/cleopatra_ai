@@ -2034,6 +2034,59 @@ def _provenance(
     return provenance
 
 
+def _strip_price_from_operation_text(text: str) -> str:
+    """Remove model-authored price text from non-authoritative operation prose."""
+    cleaned = _PRICE_MENTION.sub("", str(text or ""))
+    cleaned = _BARE_PRICE_MENTION.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,;:-")
+    return cleaned
+
+
+def _repair_rejected_core_v1_operation(
+    decision: ConversationDecision,
+) -> tuple[ConversationDecision, bool]:
+    """Strip non-authoritative price text from an operation proposal.
+
+    Operation subject/because are descriptive prose, never authority. Opaque
+    refs are preserved exactly; the normal deterministic executor will
+    revalidate and prepare the action after this repair.
+    """
+    op = decision.proposed_operation
+    sanitized = ProposedOperation(
+        kind=op.kind,
+        subject=_strip_price_from_operation_text(op.subject),
+        because=_strip_price_from_operation_text(op.because),
+        offer_id=op.offer_id,
+        set_id=op.set_id,
+        payment_reference=op.payment_reference,
+        purchase_id=op.purchase_id,
+    )
+    if sanitized.kind is not OperationKind.NONE and not sanitized.subject:
+        sanitized = ProposedOperation(
+            kind=sanitized.kind,
+            subject="the evidenced request",
+            because=sanitized.because,
+            offer_id=sanitized.offer_id,
+            set_id=sanitized.set_id,
+            payment_reference=sanitized.payment_reference,
+            purchase_id=sanitized.purchase_id,
+        )
+    repaired = ConversationDecision(
+        active_needs=decision.active_needs,
+        supporting_messages=decision.supporting_messages,
+        unresolved_references=decision.unresolved_references,
+        must_address=decision.must_address,
+        proposed_operation=sanitized,
+        response_intent=decision.response_intent,
+        disposition=decision.disposition,
+        hold=decision.hold,
+        hold_detail=decision.hold_detail,
+        source=decision.source,
+        confidence=decision.confidence,
+    )
+    return repaired, repaired.proposed_operation != op
+
+
 async def prepare_turn(
     *,
     creator_id: str,
@@ -2098,30 +2151,57 @@ async def prepare_turn(
         and not execution.validation.approved
     ):
         if conversation_core == CORE_CONVERSATIONAL_V1:
-            # Hard authority remains deterministic: block the proposal and its
-            # dependent copy, but do not freeze the customer. Keep the rejected
-            # proposal on the decision so provenance shows exactly what failed.
+            # Hard authority remains deterministic, but a rejected proposal is
+            # not a reason to erase an otherwise valid conversation turn.
+            # Repair non-authoritative operation prose first; if authority still
+            # rejects the action, drop the action and let the local fan-visible
+            # copy validator remove any operation-dependent wording.
+            rejected_operation = decision.proposed_operation.kind.value
+            rejected_reasons = tuple(execution.validation.reasons)
             print(
                 "[CONVERSATIONAL V1 OPERATION REJECTED] operation="
-                + decision.proposed_operation.kind.value
+                + rejected_operation
                 + " reasons="
-                + "; ".join(execution.validation.reasons)
+                + "; ".join(rejected_reasons)
             )
-            decision = ConversationDecision(
-                active_needs=decision.active_needs,
-                supporting_messages=decision.supporting_messages,
-                unresolved_references=decision.unresolved_references,
-                must_address=decision.must_address,
-                proposed_operation=decision.proposed_operation,
-                response_intent=ResponseIntent.RESPECT_SILENCE,
-                disposition=ResponseDisposition.SILENCE,
-                hold=HoldReason.INSUFFICIENT_EVIDENCE,
-                hold_detail="conversational_v1_operation_rejected: "
-                + "; ".join(execution.validation.reasons),
-                source=decision.source,
-                confidence=decision.confidence,
+            decision, operation_repaired = _repair_rejected_core_v1_operation(
+                decision
             )
-            replies = []
+            execution = await _prepare_execution(
+                decision,
+                loaded,
+                execute_operations=execute_operations,
+            )
+            if not execution.validation.approved:
+                decision = ConversationDecision(
+                    active_needs=decision.active_needs,
+                    supporting_messages=decision.supporting_messages,
+                    unresolved_references=decision.unresolved_references,
+                    must_address=decision.must_address,
+                    proposed_operation=ProposedOperation(),
+                    response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
+                    disposition=ResponseDisposition.REPLY,
+                    hold=HoldReason.NONE,
+                    hold_detail="",
+                    source=decision.source,
+                    confidence=decision.confidence,
+                )
+                execution = await _prepare_execution(
+                    decision,
+                    loaded,
+                    execute_operations=execute_operations,
+                )
+                operation_repaired = True
+            if operation_repaired:
+                locally_repaired = True
+            print(
+                "[CONVERSATIONAL V1 OPERATION RECOVERY] original="
+                + rejected_operation
+                + " recovered="
+                + execution.operation
+                + " approved="
+                + str(execution.validation.approved).lower()
+            )
         else:
             # Planning can also refuse a validated operation (inventory changed).
             # It must not fall through into a textual pretend-delivery.
@@ -2148,7 +2228,7 @@ async def prepare_turn(
             mode=mode,
         )
     elif conversation_core == CORE_CONVERSATIONAL_V1:
-        decision, execution, replies, locally_repaired = (
+        decision, execution, replies, reply_repaired = (
             _validate_conversational_v1_reply(
                 decision,
                 replies,
@@ -2157,6 +2237,7 @@ async def prepare_turn(
                 mode=mode,
             )
         )
+        locally_repaired = locally_repaired or reply_repaired
     elif decision.disposition is ResponseDisposition.REPLY:
         replies, trace = await _write_turn(
             loaded,
