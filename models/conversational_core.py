@@ -54,6 +54,40 @@ class Pacing(str, Enum):
     RESUME = "resume"
 
 
+class IntimacyRegister(str, Enum):
+    """Descriptive content register, never a progression ladder."""
+
+    NONE = "none"
+    FLIRTY = "flirty"
+    SUGGESTIVE = "suggestive"
+    EXPLICIT = "explicit"
+
+
+class IntimacySceneMode(str, Enum):
+    """How intimate content is situated in the conversation."""
+
+    NONE = "none"
+    CONVERSATIONAL = "conversational"
+    SHARED_IMAGINED = "shared_imagined"
+
+
+class IntimacyContext(BaseModel):
+    """Independent intimate-continuity dimensions.
+
+    These fields describe the current interaction so a later turn can preserve
+    or cool it.  They never authorize escalation, media, price, or a sale.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    active: bool = False
+    content_register: IntimacyRegister = IntimacyRegister.NONE
+    scene_mode: IntimacySceneMode = IntimacySceneMode.NONE
+    direction: Pacing = Pacing.CONTINUE
+    last_beat: str = Field(default="", max_length=400)
+    boundaries: list[str] = Field(default_factory=list, max_length=8)
+
+
 class EstablishedElement(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -120,6 +154,7 @@ class ConversationalWorkingState(BaseModel):
     revision: int = Field(default=0, ge=0)
     active_scene: ActiveScene = Field(default_factory=ActiveScene)
     flow: ConversationFlow = Field(default_factory=ConversationFlow)
+    intimacy: IntimacyContext = Field(default_factory=IntimacyContext)
 
     @field_validator("schema_version")
     @classmethod
@@ -167,6 +202,17 @@ class WorkingStateDelta(BaseModel):
         default_factory=list, max_length=12
     )
     active_thread_ids: list[str] | None = Field(default=None, max_length=12)
+
+    # Adult/intimate continuity is deliberately multidimensional.  These
+    # descriptors may move in any direction on any turn; they are not stages
+    # and must never be interpreted as "advance to the next level".
+    intimacy_active: bool | None = None
+    intimacy_content_register: IntimacyRegister | None = None
+    intimacy_scene_mode: IntimacySceneMode | None = None
+    intimacy_direction: Pacing | None = None
+    intimacy_last_beat: str | None = Field(default=None, max_length=400)
+    intimacy_boundaries: list[str] | None = Field(default=None, max_length=8)
+
     add_established_elements: list[ProposedElement] = Field(
         default_factory=list, max_length=12
     )
