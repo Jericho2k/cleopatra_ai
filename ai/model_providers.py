@@ -222,6 +222,7 @@ async def complete(
         raw_response_id=result.raw_response_id,
         upstream_provider=result.upstream_provider,
         reported_cost_usd=result.reported_cost_usd,
+        served_model=result.served_model,
         gate_wait_ms=int(gate_wait_ms),
         # Only ``complete`` knows the real provider time, so it is the one that
         # can stamp it onto the structural record.
@@ -275,11 +276,13 @@ async def _complete_anthropic(
         ),
         latency_ms=0,
         raw_response_id=getattr(response, "id", None),
+        served_model=str(getattr(response, "model", "") or "") or None,
         # Anthropic names things differently, but an empty completion has to be
         # explainable on every route, not only on the one that broke first.
         diagnostics=ModelResponseDiagnostics(
             provider=target.provider,
             model=target.model,
+            served_model=str(getattr(response, "model", "") or ""),
             response_id=str(getattr(response, "id", "") or ""),
             max_tokens_requested=int(max_tokens),
             choice_count=1,
@@ -544,6 +547,7 @@ async def _complete_openai_compatible(
     raw_response_id: str | None = None
     usage = None
     upstream_provider: str | None = None
+    served_model: str | None = None
     reported_cost_usd: float | None = None
     finish_reason = ""
     native_finish_reason = ""
@@ -569,6 +573,8 @@ async def _complete_openai_compatible(
         async for chunk in stream:
             if raw_response_id is None:
                 raw_response_id = getattr(chunk, "id", None)
+            if served_model is None:
+                served_model = str(getattr(chunk, "model", "") or "") or None
 
             if upstream_provider is None:
                 upstream_provider = openrouter_routing.upstream_provider(chunk)
@@ -616,6 +622,7 @@ async def _complete_openai_compatible(
 
     else:
         response = await client.chat.completions.create(**kwargs)
+        served_model = str(getattr(response, "model", "") or "") or None
 
         choices = list(getattr(response, "choices", None) or [])
         choice_count = len(choices)
@@ -692,6 +699,7 @@ async def _complete_openai_compatible(
     diagnostics = ModelResponseDiagnostics(
         provider=target.provider,
         model=target.model,
+        served_model=str(served_model or ""),
         upstream_provider=str(upstream_provider or ""),
         response_id=str(raw_response_id or ""),
         streamed=bool(target.stream),
@@ -731,5 +739,6 @@ async def _complete_openai_compatible(
         raw_response_id=raw_response_id,
         upstream_provider=upstream_provider,
         reported_cost_usd=reported_cost_usd,
+        served_model=served_model,
         diagnostics=diagnostics,
     )

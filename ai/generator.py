@@ -990,6 +990,7 @@ async def generate_replies(
                             0, primary_attempts_made - pinned_attempts_made
                         ),
                         elapsed_ms=int(_elapsed() * 1000),
+                        served_model=getattr(result, "served_model", None),
                     )
                     print(trace.describe())
                 await _report(

@@ -73,6 +73,7 @@ class GenerationTrace:
     #: The attempt that actually answered. Empty when none did.
     provider: str = ""
     model: str = ""
+    served_model: str = ""
     upstream_provider: str = ""
     role: str = ""
     attempt_index: int = 0
@@ -161,11 +162,13 @@ class GenerationTrace:
         elapsed_ms: int,
         usage: Any = None,
         reported_cost_usd: float | None = None,
+        served_model: str | None = None,
     ) -> None:
         """Note the attempt whose text is the one being returned."""
         self.recorded = True
         self.provider = str(target.provider)
         self.model = str(target.model)
+        self.served_model = str(served_model or "")
         self.upstream_provider = str(upstream_provider or "")
         self.role = str(role)
         self.attempt_index = int(attempt_index)
@@ -229,6 +232,7 @@ class GenerationTrace:
         self.deadline_exceeded = bool(deadline_exceeded)
         self.provider = ""
         self.model = ""
+        self.served_model = ""
         self.upstream_provider = ""
         self.role = ""
         self.attempt_index = 0
@@ -260,6 +264,7 @@ class GenerationTrace:
             record["actual"] = {
                 "provider": self.provider,
                 "model": self.model,
+                "served_model": self.served_model or "unknown",
                 "role": self.role,
                 "attempt": self.attempt_index,
             }

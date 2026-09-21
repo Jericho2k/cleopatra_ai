@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -306,7 +307,20 @@ def main() -> int:
             "editing this script"
         ),
     )
+    parser.add_argument(
+        "--hermes-retrieval",
+        choices=("default", "on", "off"),
+        default="default",
+        help=(
+            "A/B override for approved Hermes examples. 'default' uses "
+            "HERMES_RETRIEVAL_ENABLED; on/off changes only retrieval."
+        ),
+    )
     args = parser.parse_args()
+    if args.hermes_retrieval != "default":
+        os.environ["HERMES_RETRIEVAL_ENABLED"] = (
+            "true" if args.hermes_retrieval == "on" else "false"
+        )
 
     trajectories = load_trajectories(_load(args.trajectories))
     if not trajectories:

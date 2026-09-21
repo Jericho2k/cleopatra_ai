@@ -4,9 +4,10 @@ This module is intentionally self-contained at the behavioural boundary.  A
 turn selected into a semantic core never calls the situation analyzer,
 commercial orchestrator, Conversation Director, Experience Director, session
 strategy, or the legacy prompt builder.  It reuses their useful data sources
-and the existing durable delivery ledger. ``semantic_v1`` uses a decision owner
-and separate writer; ``semantic_v2`` uses one owner that writes the reply and
-states its intent in the same model call.
+and the existing durable delivery ledger. ``semantic_v1`` uses its historical
+decision owner and writer, ``semantic_v2`` retains the one-call comparison
+runtime, and ``conversational_v1`` uses GLM for semantic decisions followed by
+Kimi as the sole fan-facing writer.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import json
 import re
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dataclasses import replace as dataclasses_replace
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -34,6 +35,7 @@ from ai.generator import (
 from ai.model_providers import classify_transport_error, complete
 from ai.stack_profiles import (
     STAGE_CONVERSATIONAL_OWNER,
+    STAGE_CONVERSATIONAL_WRITER,
     STAGE_SITUATION_ANALYZER,
     STAGE_WRITER_COMMERCIAL,
     STAGE_WRITER_DEFAULT,
@@ -109,13 +111,13 @@ from services.conversational_core import (
     state_fingerprint,
     validate_and_apply_delta,
 )
-from services.decision_owners import SemanticDecisionOwner, parse_reply_plus_intent
-from services.owner_contract import (
-    MINIMUM_OWNER_CONTRACT,
-    OwnerResult,
-    extract_owner_result,
+from services.conversational_decision_contract import (
+    SemanticDecisionResult,
+    parse_semantic_decision,
 )
+from services.decision_owners import SemanticDecisionOwner, parse_reply_plus_intent
 from services.fan_lifecycle import get_fan_lifecycle_context
+from services.hermes_retrieval import retrieve_examples, retrieval_enabled
 from services.offer_lifecycle import sync_pending_offer_expiry
 from services.payment_claims import verify_ppv_purchase
 from services.ppv_delivery import (
@@ -174,7 +176,6 @@ _BARE_PRICE_MENTION = re.compile(
 )
 
 SEMANTIC_V2_PROMPT_VERSION = "semantic_v2_one_call_v1"
-CONVERSATIONAL_V1_PROMPT_VERSION = "conversational_owner_v1"
 SEMANTIC_V2_ONE_CALL_SYSTEM = """You are the conversational owner for one creator's private customer conversation on a paid-content platform. In one call, understand the evidence, write the customer-facing reply in the creator's voice, and state the reply's typed intent and proposed operation.
 
 Return one JSON object and nothing else, with exactly this contract:
@@ -217,53 +218,35 @@ Authority and safety:
 - If evidence is insufficient or safety requires review, use the appropriate hold/handoff instead of fabricating. If silence is correct, leave reply empty and explain it in hold_detail.
 """
 
-CONVERSATIONAL_V1_SYSTEM = """You are the single conversational owner for one creator's private customer conversation. Interpret the moment, contribute naturally in the creator's voice, choose any proposed operation, and update the compact working state in the same response. Do not reveal private reasoning.
+CONVERSATIONAL_V1_SYSTEM = """You are GLM, the semantic decision role for one private creator/fan conversation. You interpret the situation; you NEVER write words for the fan.
 
-Return ONE JSON object and nothing else. No markdown fence, no commentary, no reasoning inside the content.
+Return ONE JSON object only. Never include reply, message, caption, copy, rewrite, phrasing, candidate sentences, or "say something like" prose. Do not expose hidden reasoning.
 
-REQUIRED — a response without this is not an answer:
-  "reply": "customer-facing message; | only for a genuinely separate bubble"
-
-Everything below is optional. Omit any field you have nothing to say about; an omitted field is read as "unchanged" or "none", and a field you are unsure of is better left out than guessed. Write "reply" FIRST so it survives even if the response is cut short.
+Contract:
 {
-  "reply": "...",
-  "response_intent": "ordinary_conversation" | "answer_and_continue" | "clarify_reference" | "present_offer" | "deliver_accepted_offer" | "acknowledge_payment_check" | "support_handoff" | "respect_silence",
-  "disposition": "reply" | "silence" | "handoff",
-  "operation": "none" | "present_offer" | "send_locked_paid_message" | "check_payment_claim" | "repair_content_access" | "hand_off_to_human",
-  "operation_subject": "", "operation_because": "", "operation_offer_id": "", "operation_set_id": "", "operation_payment_reference": "", "operation_purchase_id": "",
-  "hold": "none" | "waiting_on_customer" | "waiting_on_payment" | "needs_human" | "respect_silence" | "insufficient_evidence",
-  "hold_detail": "", "confidence": 0.0,
-  "active_needs": [], "supporting_messages": [], "unresolved_references": [], "must_address": [],
-  "state_delta": {
-    "scene_summary": null, "current_action_focus": null, "current_direction": null,
-    "pacing": null, "has_shared_imagined_scene": null,
-    "initiative_holder": null, "current_focus": null, "participation_gist": null,
-    "add_unresolved_possibilities": [], "resolve_unresolved_possibilities": [],
-    "active_thread_ids": null,
-    "add_established_elements": [{"element_id":"stable-new-id", "claim":"", "source_type":"explicit_fan_statement|creator_config|model_inference|scene_assumption|shared_imagined|transaction_fact", "source_refs":[], "world_scope":"conversation|imagined_scene|present_world|transaction"}],
-    "corrections": [{"replaces_element_id":"old-id", "replacement":{"element_id":"stable-new-id", "claim":"", "source_type":"explicit_fan_statement", "source_refs":[], "world_scope":"conversation"}}]
-  }
+  "turn_id": "copy the supplied turn id",
+  "conversation_revision": "copy the supplied revision",
+  "disposition": "reply|silence|handoff",
+  "response_goal": "the semantic outcome Kimi should achieve, without wording it",
+  "must_address": [{"need":"semantic need", "source_ids":["message/event id"]}],
+  "active_needs": [],
+  "unresolved_references": [],
+  "contribution_goal": "optional kind of new conversational value to add, not a sentence",
+  "relevant_thread_ids": [],
+  "initiative": "fan|creator|shared",
+  "pacing": "build|hold|continue|cool|redirect|pause|resume",
+  "evidence_requests": [{"category":"inventory|memory|continuity|transactions|creator_voice"}],
+  "operation_proposal": {"kind":"none|present_offer|send_locked_paid_message|check_payment_claim|repair_content_access|hand_off_to_human", "subject":"", "because":"", "candidate_handle":"", "payment_reference":"", "purchase_id":""},
+  "hold": "none|waiting_on_customer|waiting_on_payment|needs_human|respect_silence|insufficient_evidence",
+  "hold_detail": "",
+  "confidence": 0.0,
+  "state_delta": {},
+  "memory_candidates": []
 }
 
-Budget: the reply matters more than the bookkeeping. Omit state_delta entirely when nothing meaningful changed, and never spend the response on restating state that already holds. If you are running long, finish the reply and stop.
+Interpret short replies from the immediate raw exchange, not from length. Track initiative and non-linear pacing without a funnel. Direction changes and corrections override an old trajectory. Preserve shared imagined premises as imagined. Purchases, rejection, delivery, and failed operations remain events inside the same conversation rather than reset points.
 
-Conversation judgment:
-- Contribute a thought, feeling, callback, implication, scene development, playful move, or useful direction. Do not merely paraphrase, validate, then ask a generic question.
-- The shape "acknowledge what they said -> compliment or tease -> emoji -> open question" is the one thing to avoid. A question is optional; one specific thought, opinion, memory, or small move of your own is usually better than asking them for more. You may lead, disagree, change the subject, or finish a thought they started.
-- Stock phrasing is worse than saying less. Do not reach for "good taste", "flattery will get you everywhere", "what's your favorite part", "tell me more", or any line that would fit equally well in a conversation you have not had.
-- Initiative may be fan, creator, or shared. A short response can be acceptance, hesitation, acknowledgement, cooling, continuation, or an invitation for you to lead. Do not use a stage ladder or automatically escalate.
-- Preserve a shared imagined scene vividly while keeping it imagined. Creator configuration and inventory descriptions are not evidence of what the creator is physically doing, wearing, or seeing right now.
-- Pacing may build, hold, continue, cool, redirect, pause, or resume. After rejection, purchase, delivery, correction, or a major scene turn, stay in the moment instead of resetting or immediately selling again.
-- Commercial behavior must fit the conversation. Never use catalogue voice, media counts, package/set/inventory language, or unsolicited price announcements.
-
-State and authority:
-- Raw messages/events remain history. The working-state summary is interpretation, never proof and never a valid source_ref.
-- Cite only exact refs from EVIDENCE CATALOG. Repeated inference stays model_inference forever. scene_assumption and shared_imagined never become present-world fact.
-- A correction may supersede an existing element only when the current fan message explicitly corrects it. Never delete history.
-- Transaction facts require authoritative transaction refs. A pending payment record proves only that a check is pending. Never claim payment, purchase, attachment, send, delivery, exact price, or operation completion from fan wording or from proposed state.
-- The operation is only a proposal. Deterministic code owns recipient, inventory, exact prices, payment, purchase, delivery, permissions, idempotency, and receipts.
-- Never put a price, an amount, or a currency symbol in operation_subject or operation_because.
-- If no state field needs changing, omit state_delta. Never add private reasoning or pseudo-history.
+The application alone owns inventory identity, price, recipient, payment, purchase, delivery, permissions, idempotency, persistence, and operation results. Choose at most one supplied opaque candidate_handle. Request missing essential evidence; do not invent it. Omit optional fields when nothing changes.
 """
 
 #: The one bounded repair. It asks for the MINIMUM object and nothing else,
@@ -271,20 +254,19 @@ State and authority:
 #: possible thing to get right. It deliberately cannot carry a state delta:
 #: re-deriving working state under a format failure is exactly the kind of
 #: second chance at authority this runtime does not grant.
-CONVERSATIONAL_V1_REPAIR_SYSTEM = """Your previous response could not be read as the required JSON object.
+CONVERSATIONAL_V1_REPAIR_SYSTEM = """Your previous semantic decision could not be read.
 
 Return ONE JSON object and nothing else. No markdown fence, no commentary, no reasoning inside the content. Keep it short.
 
 Required minimum:
-""" + MINIMUM_OWNER_CONTRACT + """
+{"disposition":"reply", "response_goal":"a concise semantic goal", "operation_proposal":{"kind":"none"}}
 
 Rules for this repair:
 - Use ONLY the evidence you were already given. Do not add, change, or infer any new fact.
-- Do not invent or alter an offer id, set id, payment reference, or purchase reference. Unless you are repeating one that appears exactly in the evidence catalog, set "operation" to "none".
-- Never state a price or an amount, and never claim payment, purchase, sending, attachment, or delivery.
+- Never include a reply, message, caption, copy, rewrite, phrasing, candidate sentence, or proposed wording.
+- Do not invent a candidate handle, payment reference, or purchase reference. Unless one appears exactly in evidence, use operation kind "none".
 - Omit state_delta entirely.
-- Write the reply in the creator's voice, reacting to the actual moment. Do not fall back on generic validation, a stock compliment, or a filler question.
-- If nothing should be said at all, return {"reply": "", "disposition": "silence", "hold": "respect_silence"}.
+- If nothing should be said, return {"disposition":"silence", "response_goal":"", "hold":"respect_silence", "operation_proposal":{"kind":"none"}}.
 """
 
 
@@ -307,6 +289,9 @@ class LoadedEvidence:
     sent_ppv: list[dict[str, Any]]
     within_daily_caps: bool
     stack: Any
+    candidate_handles: dict[str, Offer] = field(default_factory=dict)
+    hermes_examples: list[dict[str, Any]] = field(default_factory=list)
+    hermes_retrieval_active: bool = False
 
 
 @dataclass
@@ -317,6 +302,7 @@ class PreparedTurn:
     replies: list[str]
     provenance: ReplyProvenance
     writer_trace: GenerationTrace
+    decision_trace: GenerationTrace | None = None
     conversation_core: str = CORE_SEMANTIC_V1
     working_state_before: ConversationalWorkingState | None = None
     state_delta_validation: StateDeltaValidation | None = None
@@ -405,6 +391,74 @@ def _creator_facts(legend: dict[str, Any]) -> list[EvidenceFact]:
             )
         )
     return rows
+
+
+def _creator_voice_view(persona: Persona, history: list[Any]) -> dict[str, Any]:
+    """Keep high-value creator voice fields explicit and independently bounded."""
+    recent_creator_messages = [
+        {
+            "message_id": str(getattr(row, "id", "") or ""),
+            "text": _plain(getattr(row, "content", ""), limit=500),
+        }
+        for row in history
+        if str(getattr(row, "role", "")) == "creator"
+        and str(getattr(row, "content", "")).strip()
+    ][-8:]
+    return {
+        "communication_style": _plain(persona.communication_style, limit=600),
+        "character": _plain(persona.character, limit=600),
+        "vocabulary": [_plain(value, limit=80) for value in persona.vocabulary[:30]],
+        "capitalization": _plain(persona.capitalization, limit=100),
+        "punctuation_style": _plain(persona.punctuation_style, limit=300),
+        "emoji_usage": _plain(persona.emoji_usage, limit=100),
+        "emoji_style": _plain(persona.emoji_style, limit=300),
+        "signature_emojis": [_plain(value, limit=30) for value in persona.signature_emojis[:20]],
+        "example_greetings": [_plain(value, limit=300) for value in persona.example_greetings[:10]],
+        "example_flirts": [_plain(value, limit=300) for value in persona.example_flirts[:10]],
+        "example_phrases": _plain(persona.example_phrases, limit=1_000),
+        "approved_voice_calibration_samples": (
+            [_plain(value, limit=500) for value in persona.voice_calibration_samples[:12]]
+            if persona.voice_calibration_enabled
+            else []
+        ),
+        "creator_do_not": [_plain(value, limit=200) for value in persona.dont_list[:20]],
+        "hard_limits": _plain(persona.hard_limits, limit=600),
+        "recent_creator_messages": recent_creator_messages,
+    }
+
+
+def _raw_message_view(history: list[Any]) -> tuple[dict[str, Any], ...]:
+    return tuple(
+        {
+            "message_id": str(getattr(row, "id", "") or ""),
+            "speaker": str(getattr(row, "role", "") or ""),
+            "text": _plain(getattr(row, "content", ""), limit=1_500),
+            "at": (
+                getattr(row, "sent_at", None).isoformat()
+                if hasattr(getattr(row, "sent_at", None), "isoformat")
+                else getattr(row, "sent_at", None)
+            ),
+        }
+        for row in history[-40:]
+        if str(getattr(row, "content", "")).strip()
+    )
+
+
+def _latest_fan_burst(
+    recent_messages: tuple[dict[str, Any], ...], latest_message: str
+) -> tuple[dict[str, Any], ...]:
+    burst: list[dict[str, Any]] = []
+    for row in reversed(recent_messages):
+        if row.get("speaker") != "fan":
+            break
+        burst.append(row)
+    burst.reverse()
+    latest = _plain(latest_message, limit=MAX_TRIGGER_CHARS)
+    if latest and (not burst or burst[-1].get("text") != latest):
+        burst.append(
+            {"message_id": "", "speaker": "fan", "text": latest, "at": None}
+        )
+    return tuple(burst)
 
 
 def _historical_continuity_facts(raw: dict[str, Any]) -> list[EvidenceFact]:
@@ -633,6 +687,7 @@ def _trim_snapshot(snapshot: EvidenceSnapshot) -> EvidenceSnapshot:
     creator = list(snapshot.creator_facts)
     episodes = list(snapshot.conversation_episodes)
     turns = list(snapshot.recent_turns)
+    raw_messages = list(snapshot.recent_messages)
     truncation = dict(snapshot.truncation)
     while len(snapshot.canonical_json()) > MAX_EVIDENCE_CHARS and historical:
         historical.pop(0)
@@ -654,9 +709,34 @@ def _trim_snapshot(snapshot: EvidenceSnapshot) -> EvidenceSnapshot:
                 "truncation": truncation,
             }
         )
+    while (
+        len(snapshot.canonical_json()) > MAX_EVIDENCE_CHARS
+        and turns
+        and raw_messages
+    ):
+        turns.pop(0)
+        truncation["recent_turns"] = truncation.get("recent_turns", 0) + 1
+        snapshot = EvidenceSnapshot(
+            **{
+                **snapshot.__dict__,
+                "recent_turns": tuple(turns),
+                "truncation": truncation,
+            }
+        )
+    while len(snapshot.canonical_json()) > MAX_EVIDENCE_CHARS and len(raw_messages) > 12:
+        raw_messages.pop(0)
+        truncation["recent_messages"] = truncation.get("recent_messages", 0) + 1
+        snapshot = EvidenceSnapshot(
+            **{
+                **snapshot.__dict__,
+                "recent_messages": tuple(raw_messages),
+                "truncation": truncation,
+            }
+        )
     while len(snapshot.canonical_json()) > MAX_EVIDENCE_CHARS and episodes:
-        # Episodes arrive newest first. Preserve the current exchange before
-        # older, inferred summaries when the shared evidence budget is tight.
+        # Episodes arrive newest first. Raw recent messages still outrank them,
+        # but duplicated grouped turns and older raw messages are cheaper to
+        # drop before continuity memory.
         episodes.pop()
         truncation["conversation_episodes"] = truncation.get("conversation_episodes", 0) + 1
         snapshot = EvidenceSnapshot(
@@ -772,6 +852,8 @@ async def load_evidence(
         }
         for turn in packet.turns
     )
+    recent_messages = _raw_message_view(list(history))
+    latest_fan_burst = _latest_fan_burst(recent_messages, latest_message)
     facts = _fact_rows(fan_intelligence) + _historical_continuity_facts(
         fan_intelligence
     )
@@ -840,7 +922,9 @@ async def load_evidence(
         ),
         state_revision=_revision(material),
         creator_facts=tuple(creator_facts[-MAX_CREATOR_FACTS:]),
-        creator_voice=_bounded_dict(persona.model_dump(mode="json"), chars=3_000),
+        creator_voice=_creator_voice_view(persona, list(history)),
+        latest_fan_burst=latest_fan_burst,
+        recent_messages=recent_messages,
         recent_turns=recent_turns,
         historical_facts=tuple(facts[-MAX_HISTORICAL_FACTS:]),
         conversation_episodes=episode_facts,
@@ -849,15 +933,25 @@ async def load_evidence(
         approved_inventory=tuple(
             [
                 {
-                    **(_offer_view(next_offer) or {}),
-                    "record_kind": "approved_offer",
+                    "candidate_handle": "offer_candidate_1",
+                    "asset_type": next_offer.asset_type,
+                    "legal_description": next_offer.legal_description,
                     "inventory_asset_types": list(inventory_types),
                 }
             ]
             if next_offer
             else []
         ),
-        pending_offer=_offer_view(pending_offer),
+        pending_offer=(
+            {
+                "candidate_handle": "pending_offer_1",
+                "asset_type": pending_offer.asset_type,
+                "legal_description": pending_offer.legal_description,
+                "status": "presented_not_yet_delivered",
+            }
+            if pending_offer
+            else None
+        ),
         confirmed_purchases=tuple(purchases[-MAX_PURCHASES:]),
         confirmed_deliveries=tuple(deliveries[-MAX_PURCHASES:]),
         pending_payment=pending_view,
@@ -920,6 +1014,11 @@ async def load_evidence(
         sent_ppv=list(sent_ppv),
         within_daily_caps=cap_ok,
         stack=stack,
+        candidate_handles={
+            **({"offer_candidate_1": next_offer} if next_offer else {}),
+            **({"pending_offer_1": pending_offer} if pending_offer else {}),
+        },
+        hermes_examples=[],
     )
 
 
@@ -986,7 +1085,13 @@ def validate_decision(
             reasons.append("no approved sellable offer exists")
         else:
             refs = {"offer_id": offer.offer_id, "set_id": offer.set_id}
-            if op.offer_id != offer.offer_id or op.set_id != offer.set_id:
+            handle_matches = (
+                bool(op.candidate_handle)
+                and getattr(loaded, "candidate_handles", {}).get(op.candidate_handle)
+                is offer
+            )
+            legacy_refs_match = op.offer_id == offer.offer_id and op.set_id == offer.set_id
+            if not handle_matches and not legacy_refs_match:
                 reasons.append(
                     "proposed offer references do not match the approved offer"
                 )
@@ -1008,7 +1113,13 @@ def validate_decision(
             reasons.append("there is no exact approved offer to send")
         else:
             refs = {"offer_id": offer.offer_id, "set_id": offer.set_id}
-            if op.offer_id != offer.offer_id or op.set_id != offer.set_id:
+            handle_matches = (
+                bool(op.candidate_handle)
+                and getattr(loaded, "candidate_handles", {}).get(op.candidate_handle)
+                is offer
+            )
+            legacy_refs_match = op.offer_id == offer.offer_id and op.set_id == offer.set_id
+            if not handle_matches and not legacy_refs_match:
                 reasons.append("acceptance does not bind to the exact pending offer")
             ceiling = _hard_ceiling(
                 loaded.snapshot.spending_limits, loaded.commercial_state
@@ -1092,6 +1203,20 @@ def legal_operations(loaded: LoadedEvidence) -> list[str]:
             proposed_operation=ProposedOperation(
                 kind=kind,
                 subject="the evidenced request",
+                candidate_handle=(
+                    next(
+                        (
+                            handle
+                            for handle, candidate in getattr(
+                                loaded, "candidate_handles", {}
+                            ).items()
+                            if candidate is candidate_offer
+                        ),
+                        "",
+                    )
+                    if candidate_offer
+                    else ""
+                ),
                 offer_id=candidate_offer.offer_id if candidate_offer else "",
                 set_id=candidate_offer.set_id if candidate_offer else "",
                 payment_reference=str(
@@ -1372,13 +1497,14 @@ class OwnerAttempt:
     """One conversational-owner call, whatever came back."""
 
     label: str
-    result: OwnerResult
+    result: SemanticDecisionResult
     diagnostics: ModelResponseDiagnostics
     latency_ms: int = 0
     usage: Any = None
     reported_cost_usd: float | None = None
     target: Any = None
     upstream_provider: str = ""
+    served_model: str = ""
 
     @property
     def failure_category(self) -> str:
@@ -1391,7 +1517,7 @@ class OwnerAttempt:
         if self.result.usable:
             return ""
         transport = self.diagnostics.empty_content_category()
-        return transport or self.result.failure_category or FAILURE_EMPTY_UNEXPLAINED
+        return transport or ("invalid_decision" if self.result.failure else FAILURE_EMPTY_UNEXPLAINED)
 
     @property
     def failure_detail(self) -> str:
@@ -1414,7 +1540,7 @@ class OwnerAttempt:
                 f"completion_tokens={self.diagnostics.completion_tokens}, "
                 f"max_tokens={self.diagnostics.max_tokens_requested})"
             )
-        return self.result.failure_detail or "the owner returned no usable answer"
+        return self.result.failure or "the decision model returned no usable answer"
 
 
 def _repair_target(target: Any) -> Any:
@@ -1456,7 +1582,6 @@ async def _call_conversational_owner(
     user_content: str,
     system: str,
     label: str,
-    evidenced_refs: frozenset[str] | None,
     owner_complete: Any = None,
 ) -> OwnerAttempt:
     """One owner call, reduced to components and structural diagnostics.
@@ -1477,9 +1602,8 @@ async def _call_conversational_owner(
         category = classify_transport_error(exc)
         return OwnerAttempt(
             label=label,
-            result=OwnerResult(
-                failure_category=category,
-                failure_detail=f"{type(exc).__name__}: {exc}"[:300],
+            result=SemanticDecisionResult(
+                failure=f"{category}: {type(exc).__name__}: {exc}"[:300]
             ),
             diagnostics=ModelResponseDiagnostics(
                 provider=str(getattr(target, "provider", "") or ""),
@@ -1498,10 +1622,9 @@ async def _call_conversational_owner(
         content_chars=len(result.text or ""),
         latency_ms=int(getattr(result, "latency_ms", 0) or 0),
     )
-    extracted = extract_owner_result(
+    extracted = parse_semantic_decision(
         result.text,
-        source="conversational_owner_v1",
-        evidenced_refs=evidenced_refs,
+        source="conversational_decision_v1",
     )
     return OwnerAttempt(
         label=label,
@@ -1512,19 +1635,16 @@ async def _call_conversational_owner(
         reported_cost_usd=getattr(result, "reported_cost_usd", None),
         target=getattr(result, "target", target),
         upstream_provider=str(getattr(result, "upstream_provider", "") or ""),
+        served_model=str(getattr(result, "served_model", "") or ""),
     )
 
 
 def _record_owner_attempt(trace: GenerationTrace, attempt: OwnerAttempt) -> None:
     extra: dict[str, Any] = {
-        "json_status": attempt.result.json_status,
-        "reply_chars": len(attempt.result.reply),
         "usable": attempt.result.usable,
     }
     if attempt.result.degradations:
         extra["degraded_fields"] = dict(attempt.result.degradations)
-    if attempt.result.operation_discarded:
-        extra["operation_discarded"] = attempt.result.operation_discarded
     if not attempt.result.usable:
         extra["failure_category"] = attempt.failure_category
         extra["failure_detail"] = attempt.failure_detail
@@ -1546,22 +1666,12 @@ async def decide_conversational_v1(
     *,
     owner_complete: Any = None,
 ) -> tuple[ConversationDecision, list[str], GenerationTrace, Any]:
-    """Get one usable owner result, repairing the FORMAT at most once.
+    """Get one semantic GLM decision, repairing its format at most once.
 
-    THE FAILURE MODEL
-    -----------------
-    The reply, the proposed operation and the working-state delta are read
-    independently by ``services.owner_contract``. A rejected operation or an
-    unreadable delta degrades that component alone and the conversation
-    continues. Only an answer with no reply and no stated reason for silence is
-    a failure of the turn.
-
-    When that happens, exactly ONE repair call is made, against the SAME
-    immutable evidence, asking for the minimum object. It cannot introduce an
-    operation reference the evidence never contained
-    (``_evidenced_reference_set``), and it is never retried again: two owner
-    calls is the whole budget, so a provider having a bad minute costs a
-    bounded amount of time rather than an unbounded loop.
+    GLM never writes the fan-facing reply. A response containing copy fields is
+    malformed and receives the same one bounded, same-evidence repair as any
+    other invalid decision. Optional operation/state components may still be
+    rejected independently later without turning the decision call into prose.
 
     ``owner_complete`` replaces the transport, the same way
     ``SemanticDecisionOwner`` already takes one. It exists so
@@ -1573,6 +1683,8 @@ async def decide_conversational_v1(
     target = spec.primary_target()
     max_tokens = _owner_max_tokens(spec)
     payload = {
+        "turn_id": loaded.snapshot.trigger.identity,
+        "conversation_revision": loaded.snapshot.state_revision,
         "evidence_snapshot": loaded.snapshot.as_dict(),
         "evidence_catalog": evidence_catalog_view(loaded.snapshot),
         "working_state": working_state.as_dict(),
@@ -1586,7 +1698,7 @@ async def decide_conversational_v1(
             primary_target=target,
             fallback_target=spec.fallback_target(),
             profile=loaded.stack.profile_id,
-            policy="single_conversational_owner_with_state",
+            policy="glm_semantic_decision_only",
             deadline_seconds=0.0,
         )
 
@@ -1597,7 +1709,6 @@ async def decide_conversational_v1(
         user_content=user_content,
         system=CONVERSATIONAL_V1_SYSTEM,
         label="initial",
-        evidenced_refs=None,
         owner_complete=owner_complete,
     )
     _record_owner_attempt(trace, attempt)
@@ -1616,14 +1727,17 @@ async def decide_conversational_v1(
                 + json.dumps(
                     {
                         "previous_attempt_failed_because": attempt.failure_category,
-                        "required_minimum_object": MINIMUM_OWNER_CONTRACT,
+                        "required_minimum_object": {
+                            "disposition": "reply",
+                            "response_goal": "semantic goal",
+                            "operation_proposal": {"kind": "none"},
+                        },
                     },
                     ensure_ascii=False,
                 )
             ),
             system=CONVERSATIONAL_V1_REPAIR_SYSTEM,
             label="repair",
-            evidenced_refs=_evidenced_reference_set(loaded),
             owner_complete=owner_complete,
         )
         _record_owner_attempt(trace, repair)
@@ -1651,7 +1765,7 @@ async def decide_conversational_v1(
                     disposition=ResponseDisposition.SILENCE,
                     hold=HoldReason.INSUFFICIENT_EVIDENCE,
                     hold_detail="conversational_v1_owner_invalid",
-                    source="conversational_owner_v1",
+                    source="conversational_decision_v1",
                     confidence=0.0,
                 ),
                 [],
@@ -1661,7 +1775,7 @@ async def decide_conversational_v1(
 
     trace.record_success(
         target=attempt.target if attempt.target is not None else target,
-        role="conversational_v1_owner",
+        role="conversational_decision",
         attempt_index=attempts - 1,
         upstream_provider=attempt.upstream_provider,
         outcome=(
@@ -1675,15 +1789,13 @@ async def decide_conversational_v1(
         elapsed_ms=total_latency_ms,
         usage=attempt.usage,
         reported_cost_usd=attempt.reported_cost_usd,
+        served_model=attempt.served_model,
     )
-    if attempt.result.operation_discarded:
-        print(
-            "[CONVERSATIONAL V1 OPERATION DISCARDED] reason="
-            + attempt.result.operation_discarded
-        )
     raw_delta = attempt.result.state_delta
-    replies = [attempt.result.reply] if attempt.result.reply else []
-    return attempt.result.decision, replies, trace, raw_delta
+    # Kept as an empty compatibility slot while call sites migrate from the old
+    # owner-returned-copy signature. Runtime fan-facing text is generated later
+    # and exclusively by the dedicated Kimi writer stage.
+    return attempt.result.decision, [], trace, raw_delta
 
 
 def _validate_single_call_reply(
@@ -1823,6 +1935,12 @@ def _validate_conversational_v1_reply(
         supporting_messages=decision.supporting_messages,
         unresolved_references=decision.unresolved_references,
         must_address=decision.must_address,
+        response_goal=decision.response_goal,
+        contribution_goal=decision.contribution_goal,
+        relevant_thread_ids=decision.relevant_thread_ids,
+        initiative=decision.initiative,
+        pacing=decision.pacing,
+        memory_candidates=decision.memory_candidates,
         proposed_operation=ProposedOperation(),
         response_intent=ResponseIntent.RESPECT_SILENCE,
         disposition=ResponseDisposition.SILENCE,
@@ -2031,6 +2149,170 @@ For Assisted: ["candidate one", "candidate two", "candidate three"]."""
     ]
 
 
+def build_conversational_writer_prompt(
+    loaded: LoadedEvidence,
+    decision: ConversationDecision,
+    execution: ApprovedExecution,
+    working_state: ConversationalWorkingState,
+    *,
+    mode: str,
+) -> list[dict[str, str]]:
+    """Give Kimi the real exchange plus semantics, never GLM-authored copy."""
+    assisted = mode == MODE_ASSISTED
+    system = """You are Kimi, the sole fan-facing writer for this creator. Write every word the fan will see.
+
+The GLM decision is semantic guidance, not draft copy. Use the raw ordered messages as the primary conversational evidence. Resolve pronouns and short replies from the immediate exchange. Working state and memory are interpretations with provenance; they never replace raw conversation and never prove payment, delivery, price, or present-world activity.
+
+Write in THIS creator's voice using the explicit voice fields and recent creator messages. Examples from other conversations, when present, teach conversational behavior and rhythm only. Never copy their facts, identity, wording, slang, punctuation, or emoji habits over the current creator's voice.
+
+React specifically and contribute: a thought, opinion, callback, tease, continuation, direction change, or completed conversational beat. Questions are optional. Do not default to acknowledge + generic compliment + emoji + generic question. Short fan messages may invite creator initiative. Preserve shared imagined scenes as imagined; follow corrections and topic changes cheaply. Pacing can build, hold, continue, cool, redirect, pause, or resume without a fixed ladder. Adult/intimate continuity may continue, hold, cool, redirect, or end according to context; explicitness never forces escalation or a sale.
+
+Commercial and media language stays inside the conversation. Never use catalogue voice, media counts, package/set/inventory terminology, private IDs, URLs, or internal metadata. Use only prepared_operation_facts. The application owns price and transaction truth. Do not claim payment, purchase, send, attachment, or delivery unless the prepared facts state it. After rejection, purchase, or delivery, continue the existing moment; do not automatically discount, reset, upsell, or force a feedback question.
+
+Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assisted: ["candidate one","candidate two","candidate three"]."""
+    if assisted:
+        system += (
+            " Assisted drafts are not executed operations. A human may edit or decline them, "
+            "so never claim an operation already happened."
+        )
+    semantic = decision.as_dict()
+    for key in (
+        "operation_candidate_handle",
+        "operation_offer_id",
+        "operation_set_id",
+        "operation_payment_reference",
+        "operation_purchase_id",
+    ):
+        semantic.pop(key, None)
+    payload = {
+        "raw_conversation": {
+            "latest_fan_message_burst": list(loaded.snapshot.latest_fan_burst),
+            "recent_ordered_messages": list(loaded.snapshot.recent_messages),
+            "trigger": loaded.snapshot.trigger.__dict__,
+        },
+        "creator_voice": loaded.snapshot.creator_voice,
+        "sourced_memory": {
+            "facts": [fact.__dict__ for fact in loaded.snapshot.historical_facts],
+            "episodes": [fact.__dict__ for fact in loaded.snapshot.conversation_episodes],
+            "corrections": list(loaded.snapshot.corrections),
+            "unresolved_threads": list(loaded.snapshot.unresolved_obligations),
+        },
+        "working_context": working_state.as_dict(),
+        "semantic_decision": semantic,
+        "deterministic_facts": {
+            "creator_facts": [fact.__dict__ for fact in loaded.snapshot.creator_facts],
+            "confirmed_purchases": [
+                {"purchased": bool(row.get("purchased")), "at": row.get("purchased_at")}
+                for row in loaded.snapshot.confirmed_purchases
+            ],
+            "confirmed_deliveries": [
+                {"delivered": bool(row.get("delivered")), "at": row.get("sent_at")}
+                for row in loaded.snapshot.confirmed_deliveries
+            ],
+        },
+        "prepared_operation_facts": execution.writer_view(),
+        "hermes_examples": getattr(loaded, "hermes_examples", []),
+        "hermes_examples_notice": (
+            "Examples from OTHER conversations. Use behavior and rhythm only; they are not current-fan evidence."
+            if getattr(loaded, "hermes_examples", [])
+            else "Hermes retrieval is disabled or returned no approved examples."
+        ),
+        "mode": mode,
+    }
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+    ]
+
+
+async def _write_conversational_v1_turn(
+    loaded: LoadedEvidence,
+    decision: ConversationDecision,
+    execution: ApprovedExecution,
+    working_state: ConversationalWorkingState,
+    *,
+    mode: str,
+) -> tuple[list[str], GenerationTrace]:
+    spec = loaded.stack.profile.stage(STAGE_CONVERSATIONAL_WRITER)
+    target = spec.primary_target()
+    trace = GenerationTrace()
+    if "kimi" not in str(target.model).lower():
+        trace.record_request(
+            primary_target=target,
+            fallback_target=None,
+            profile=loaded.stack.profile_id,
+            policy="kimi_only_configuration_guard",
+            deadline_seconds=0.0,
+        )
+        trace.record_failure(
+            outcome="conversational_writer_routing_mismatch",
+            reason=f"configured writer is not a Kimi-family model: {target.model}",
+            attempts=0,
+            pinned_attempts=0,
+            alternate_attempts=0,
+            elapsed_ms=0,
+            deadline_exceeded=False,
+        )
+        return [], trace
+
+    prompt = build_conversational_writer_prompt(
+        loaded, decision, execution, working_state, mode=mode
+    )
+    safe_fallback: tuple[list[str], GenerationTrace] | None = None
+    violations: list[str] = []
+    for output_attempt in range(2):
+        replies = await generate_replies(
+            prompt,
+            loaded.persona,
+            trace=trace,
+            max_candidates=(
+                candidate_count(spec.prompt_version, MODE_ASSISTED)
+                if mode == MODE_ASSISTED
+                else 1
+            ),
+            output_contract=(
+                CONTRACT_CANDIDATES if mode == MODE_ASSISTED else CONTRACT_AUTO_MESSAGES
+            ),
+            retry_policy=PERSISTENT_PRIMARY_RETRY_POLICY,
+            profile_id=loaded.stack.profile_id,
+            telemetry_context={
+                "creator_id": loaded.snapshot.creator_id,
+                "fan_id": loaded.snapshot.fan_id,
+                "feature": "conversational_v1_writer",
+                "conversation_core": CORE_CONVERSATIONAL_V1,
+                "role": "fan_facing_writer" if output_attempt == 0 else "writer_repair",
+                "evidence_fingerprint": loaded.snapshot.fingerprint(),
+                "state_revision": loaded.snapshot.state_revision,
+            },
+            target_override=target,
+            fallback_target_override=None,
+        )
+        if trace.succeeded:
+            trace.role = "fan_facing_writer" if output_attempt == 0 else "writer_repair"
+            if trace.served_model and "kimi" not in trace.served_model.lower():
+                trace.failure_reason = (
+                    "conversational_writer_routing_mismatch: served_model="
+                    + trace.served_model
+                )
+                return [], trace
+        violations = writer_contract_reasons(replies, loaded, execution, mode=mode)
+        if not violations:
+            return (replies, trace) if replies or safe_fallback is None else safe_fallback
+        if replies and set(violations) <= _WRITER_STYLE_REASONS:
+            safe_fallback = (replies, trace)
+        if output_attempt == 0:
+            prompt[0]["content"] += (
+                "\nThe previous Kimi wording was rejected for: "
+                + ", ".join(violations)
+                + ". Rewrite using the same semantic decision and prepared facts."
+            )
+            trace = GenerationTrace()
+    if safe_fallback is not None:
+        return safe_fallback
+    trace.failure_reason = "conversational_writer_contract_rejected: " + ",".join(violations)
+    return [], trace
+
+
 async def _write_turn(
     loaded: LoadedEvidence,
     decision: ConversationDecision,
@@ -2216,6 +2498,7 @@ def _provenance(
     conversation_core: str,
     working_state_before: ConversationalWorkingState | None = None,
     state_delta_validation: StateDeltaValidation | None = None,
+    decision_trace: GenerationTrace | None = None,
 ) -> ReplyProvenance:
     is_v2 = conversation_core == CORE_SEMANTIC_V2
     is_conversational_v1 = conversation_core == CORE_CONVERSATIONAL_V1
@@ -2260,24 +2543,26 @@ def _provenance(
         packet=packet_record,
         stack_profile=loaded.stack.profile_id,
         writer_prompt_version=(
-            CONVERSATIONAL_V1_PROMPT_VERSION
+            loaded.stack.profile.stage(STAGE_CONVERSATIONAL_WRITER).prompt_version
             if is_conversational_v1
             else (SEMANTIC_V2_PROMPT_VERSION if is_v2 else "semantic_writer_v1")
         ),
         live_state={
             (
-                "conversational_owner_v1"
+                "glm_semantic_decision_kimi_writer"
                 if is_conversational_v1
                 else ("semantic_owner_writer" if is_v2 else "semantic_owner")
             ): True,
             "deterministic_validator": True,
             "working_state_validator": state_delta_validation is not None,
             "approved_operation": execution.operation != "none",
+            "hermes_retrieval_enabled": loaded.hermes_retrieval_active,
+            "hermes_examples_used": len(getattr(loaded, "hermes_examples", [])),
         },
     )
     provenance.record_decision(
         source=(
-            "conversational_owner_v1"
+            "conversational_decision_v1"
             if is_conversational_v1
             else ("reply_plus_intent" if is_v2 else "semantic_owner")
         ),
@@ -2296,6 +2581,18 @@ def _provenance(
             "semantic_purchase_id": decision.proposed_operation.purchase_id,
             "semantic_state_revision": loaded.snapshot.state_revision,
             "semantic_approval_required": execution.approval_required,
+            "response_goal": decision.response_goal,
+            "contribution_goal": decision.contribution_goal,
+            "initiative": decision.initiative,
+            "pacing": decision.pacing,
+            "decision_model": (
+                decision_trace.as_metadata() if decision_trace is not None else {}
+            ),
+            "decision_prompt_version": (
+                loaded.stack.profile.stage(STAGE_CONVERSATIONAL_OWNER).prompt_version
+                if is_conversational_v1
+                else ""
+            ),
             "state_validator_accepted": len(
                 state_delta_validation.accepted_fields
             )
@@ -2334,6 +2631,7 @@ def _repair_rejected_core_v1_operation(
         kind=op.kind,
         subject=_strip_price_from_operation_text(op.subject),
         because=_strip_price_from_operation_text(op.because),
+        candidate_handle=op.candidate_handle,
         offer_id=op.offer_id,
         set_id=op.set_id,
         payment_reference=op.payment_reference,
@@ -2344,6 +2642,7 @@ def _repair_rejected_core_v1_operation(
             kind=sanitized.kind,
             subject="the evidenced request",
             because=sanitized.because,
+            candidate_handle=sanitized.candidate_handle,
             offer_id=sanitized.offer_id,
             set_id=sanitized.set_id,
             payment_reference=sanitized.payment_reference,
@@ -2354,6 +2653,13 @@ def _repair_rejected_core_v1_operation(
         supporting_messages=decision.supporting_messages,
         unresolved_references=decision.unresolved_references,
         must_address=decision.must_address,
+        response_goal=decision.response_goal,
+        contribution_goal=decision.contribution_goal,
+        relevant_thread_ids=decision.relevant_thread_ids,
+        initiative=decision.initiative,
+        pacing=decision.pacing,
+        evidence_requests=decision.evidence_requests,
+        memory_candidates=decision.memory_candidates,
         proposed_operation=sanitized,
         response_intent=decision.response_intent,
         disposition=decision.disposition,
@@ -2389,6 +2695,64 @@ class ConversationalV1Settlement:
         return bool(self.operation_rejection_reasons)
 
 
+async def _authorize_conversational_v1_operation(
+    loaded: LoadedEvidence,
+    *,
+    decision: ConversationDecision,
+    execute_operations: bool,
+) -> ConversationalV1Settlement:
+    """Resolve a GLM proposal before Kimi sees operation facts."""
+    execution = await _prepare_execution(
+        decision,
+        loaded,
+        execute_operations=execute_operations,
+    )
+    locally_repaired = False
+    proposed_operation = decision.proposed_operation.kind.value
+    rejection_reasons: tuple[str, ...] = ()
+    if (
+        decision.proposed_operation.kind is not OperationKind.NONE
+        and not execution.validation.approved
+    ):
+        rejection_reasons = tuple(execution.validation.reasons)
+        decision, operation_repaired = _repair_rejected_core_v1_operation(decision)
+        execution = await _prepare_execution(
+            decision, loaded, execute_operations=execute_operations
+        )
+        if not execution.validation.approved:
+            decision = ConversationDecision(
+                active_needs=decision.active_needs,
+                supporting_messages=decision.supporting_messages,
+                unresolved_references=decision.unresolved_references,
+                must_address=decision.must_address,
+                response_goal=decision.response_goal,
+                contribution_goal=decision.contribution_goal,
+                relevant_thread_ids=decision.relevant_thread_ids,
+                initiative=decision.initiative,
+                pacing=decision.pacing,
+                memory_candidates=decision.memory_candidates,
+                proposed_operation=ProposedOperation(),
+                response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
+                disposition=ResponseDisposition.REPLY,
+                hold=HoldReason.NONE,
+                source=decision.source,
+                confidence=decision.confidence,
+            )
+            execution = await _prepare_execution(
+                decision, loaded, execute_operations=execute_operations
+            )
+            operation_repaired = True
+        locally_repaired = operation_repaired
+    return ConversationalV1Settlement(
+        decision=decision,
+        execution=execution,
+        replies=[],
+        locally_repaired=locally_repaired,
+        proposed_operation=proposed_operation,
+        operation_rejection_reasons=rejection_reasons,
+    )
+
+
 async def settle_conversational_v1_turn(
     loaded: LoadedEvidence,
     *,
@@ -2415,61 +2779,11 @@ async def settle_conversational_v1_turn(
     A rejected operation never erases the reply, and a dropped reply never
     re-enables a rejected operation.
     """
-    execution = await _prepare_execution(
-        decision,
-        loaded,
-        execute_operations=execute_operations,
+    authorized = await _authorize_conversational_v1_operation(
+        loaded, decision=decision, execute_operations=execute_operations
     )
-    locally_repaired = False
-    proposed_operation = decision.proposed_operation.kind.value
-    rejection_reasons: tuple[str, ...] = ()
-
-    if (
-        decision.proposed_operation.kind is not OperationKind.NONE
-        and not execution.validation.approved
-    ):
-        rejection_reasons = tuple(execution.validation.reasons)
-        print(
-            "[CONVERSATIONAL V1 OPERATION REJECTED] operation="
-            + proposed_operation
-            + " reasons="
-            + "; ".join(rejection_reasons)
-        )
-        decision, operation_repaired = _repair_rejected_core_v1_operation(decision)
-        execution = await _prepare_execution(
-            decision,
-            loaded,
-            execute_operations=execute_operations,
-        )
-        if not execution.validation.approved:
-            decision = ConversationDecision(
-                active_needs=decision.active_needs,
-                supporting_messages=decision.supporting_messages,
-                unresolved_references=decision.unresolved_references,
-                must_address=decision.must_address,
-                proposed_operation=ProposedOperation(),
-                response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
-                disposition=ResponseDisposition.REPLY,
-                hold=HoldReason.NONE,
-                hold_detail="",
-                source=decision.source,
-                confidence=decision.confidence,
-            )
-            execution = await _prepare_execution(
-                decision,
-                loaded,
-                execute_operations=execute_operations,
-            )
-            operation_repaired = True
-        locally_repaired = locally_repaired or operation_repaired
-        print(
-            "[CONVERSATIONAL V1 OPERATION RECOVERY] original="
-            + proposed_operation
-            + " recovered="
-            + execution.operation
-            + " approved="
-            + str(execution.validation.approved).lower()
-        )
+    decision = authorized.decision
+    execution = authorized.execution
 
     decision, execution, replies, reply_repaired = _validate_conversational_v1_reply(
         decision,
@@ -2482,10 +2796,69 @@ async def settle_conversational_v1_turn(
         decision=decision,
         execution=execution,
         replies=replies,
-        locally_repaired=locally_repaired or reply_repaired,
-        proposed_operation=proposed_operation,
-        operation_rejection_reasons=rejection_reasons,
+        locally_repaired=authorized.locally_repaired or reply_repaired,
+        proposed_operation=authorized.proposed_operation,
+        operation_rejection_reasons=authorized.operation_rejection_reasons,
     )
+
+
+def _unavailable_evidence_requests(
+    decision: ConversationDecision, loaded: LoadedEvidence
+) -> tuple[str, ...]:
+    snapshot = loaded.snapshot
+    available = {
+        "inventory": bool(snapshot.approved_inventory or snapshot.pending_offer),
+        "memory": bool(snapshot.historical_facts or snapshot.conversation_episodes),
+        "continuity": bool(snapshot.recent_messages or snapshot.unresolved_obligations),
+        "transactions": bool(
+            snapshot.pending_payment
+            or snapshot.confirmed_purchases
+            or snapshot.confirmed_deliveries
+        ),
+        "creator_voice": bool(snapshot.creator_voice),
+    }
+    return tuple(
+        category
+        for category in decision.evidence_requests
+        if not available.get(category, False)
+    )
+
+
+def _merge_decision_traces(first: GenerationTrace, second: GenerationTrace) -> GenerationTrace:
+    second.attempts += first.attempts
+    second.pinned_attempts += first.pinned_attempts
+    second.alternate_attempts += first.alternate_attempts
+    second.elapsed_ms += first.elapsed_ms
+    second.input_tokens += first.input_tokens
+    second.output_tokens += first.output_tokens
+    second.cache_read_tokens += first.cache_read_tokens
+    second.cache_write_tokens += first.cache_write_tokens
+    if first.cost_usd is not None:
+        second.cost_usd = (second.cost_usd or 0.0) + first.cost_usd
+    second.owner_attempts = [*first.owner_attempts, *second.owner_attempts]
+    return second
+
+
+def _hermes_tags(
+    decision: ConversationDecision,
+    working_state: ConversationalWorkingState,
+    latest_message: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    behavior: list[str] = []
+    if len(latest_message.split()) <= 3:
+        behavior.append("short_reply_continue")
+    if decision.initiative == "creator":
+        behavior.append("creator_initiative")
+    if decision.contribution_goal:
+        behavior.append("contribution")
+    if decision.pacing == "redirect":
+        behavior.append("direction_change")
+    situation: list[str] = []
+    if working_state.active_scene.has_shared_imagined_scene:
+        situation.append("ongoing_shared_scene")
+    if decision.proposed_operation.kind is not OperationKind.NONE:
+        situation.append("commercial_transition")
+    return tuple(behavior), tuple(situation)
 
 
 async def prepare_turn(
@@ -2499,6 +2872,7 @@ async def prepare_turn(
     mode: str = MODE_AUTO,
     execute_operations: bool = True,
     conversation_core: str = CORE_SEMANTIC_V1,
+    hermes_retrieval_override: bool | None = None,
 ) -> PreparedTurn:
     if conversation_core not in {
         CORE_SEMANTIC_V1,
@@ -2518,14 +2892,45 @@ async def prepare_turn(
     )
     replies: list[str] = []
     trace = GenerationTrace()
+    decision_trace: GenerationTrace | None = None
     working_state_before: ConversationalWorkingState | None = None
     state_delta_validation: StateDeltaValidation | None = None
     if conversation_core == CORE_CONVERSATIONAL_V1:
         working_state_before = await load_working_state(creator_id, fan_id)
-        decision, replies, trace, raw_delta = await decide_conversational_v1(
+        decision, _unused_replies, decision_trace, raw_delta = await decide_conversational_v1(
             loaded,
             working_state_before,
         )
+        unavailable = _unavailable_evidence_requests(decision, loaded)
+        if unavailable:
+            refreshed = await load_evidence(
+                creator_id=creator_id,
+                fan_id=fan_id,
+                trigger_kind=trigger_kind,
+                trigger_identity=trigger_identity,
+                latest_message=latest_message,
+                scheduled_goal=scheduled_goal,
+            )
+            second_decision, _unused, second_trace, second_delta = (
+                await decide_conversational_v1(refreshed, working_state_before)
+            )
+            loaded = refreshed
+            decision_trace = _merge_decision_traces(decision_trace, second_trace)
+            decision = second_decision
+            raw_delta = second_delta
+            still_missing = _unavailable_evidence_requests(decision, loaded)
+            if still_missing:
+                decision = ConversationDecision(
+                    disposition=ResponseDisposition.HANDOFF,
+                    hold=HoldReason.INSUFFICIENT_EVIDENCE,
+                    hold_detail="same_turn_evidence_unavailable: " + ",".join(still_missing),
+                    proposed_operation=ProposedOperation(
+                        kind=OperationKind.HAND_OFF_TO_HUMAN,
+                        subject="missing required evidence",
+                    ),
+                    source="conversational_decision_v1",
+                    confidence=0.0,
+                )
         known_thread_ids = {
             str(thread.get("id"))
             for thread in loaded.snapshot.unresolved_obligations
@@ -2559,17 +2964,44 @@ async def prepare_turn(
     else:
         decision = await decide_turn(loaded)
     if conversation_core == CORE_CONVERSATIONAL_V1:
-        settlement = await settle_conversational_v1_turn(
+        authorized = await _authorize_conversational_v1_operation(
             loaded,
             decision=decision,
-            replies=replies,
-            mode=mode,
             execute_operations=execute_operations,
         )
-        decision = settlement.decision
-        execution = settlement.execution
-        replies = settlement.replies
-        locally_repaired = settlement.locally_repaired
+        decision = authorized.decision
+        execution = authorized.execution
+        locally_repaired = authorized.locally_repaired
+        writer_state = (
+            state_delta_validation.state_after
+            if state_delta_validation is not None
+            else working_state_before
+        )
+        behavior_tags, situation_tags = _hermes_tags(
+            decision, writer_state, latest_message
+        )
+        loaded.hermes_retrieval_active = retrieval_enabled(
+            hermes_retrieval_override
+        )
+        loaded.hermes_examples = retrieve_examples(
+            current_text=latest_message,
+            behavior_tags=behavior_tags,
+            situation_tags=situation_tags,
+            enabled_override=hermes_retrieval_override,
+        )
+        trace = GenerationTrace()
+        if decision.disposition is ResponseDisposition.REPLY:
+            replies, trace = await _write_conversational_v1_turn(
+                loaded,
+                decision,
+                execution,
+                writer_state,
+                mode=mode,
+            )
+            decision, execution, replies, copy_repaired = _validate_conversational_v1_reply(
+                decision, replies, execution, loaded, mode=mode
+            )
+            locally_repaired = locally_repaired or copy_repaired
         provenance = _provenance(
             loaded,
             decision,
@@ -2579,6 +3011,7 @@ async def prepare_turn(
             conversation_core=conversation_core,
             working_state_before=working_state_before,
             state_delta_validation=state_delta_validation,
+            decision_trace=decision_trace,
         )
         if locally_repaired:
             provenance.record_transform("conversational_v1_local_repair")
@@ -2589,6 +3022,7 @@ async def prepare_turn(
             replies=replies,
             provenance=provenance,
             writer_trace=trace,
+            decision_trace=decision_trace,
             conversation_core=conversation_core,
             working_state_before=working_state_before,
             state_delta_validation=state_delta_validation,
@@ -2894,10 +3328,11 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
 
     if (
         prepared.conversation_core == CORE_CONVERSATIONAL_V1
-        and prepared.writer_trace.failure_reason
+        and prepared.decision_trace is not None
+        and prepared.decision_trace.failure_reason
         and not prepared.replies
     ):
-        attempts = prepared.writer_trace.owner_attempts
+        attempts = prepared.decision_trace.owner_attempts
         categories = [
             str(row.get("failure_category") or "")
             for row in attempts
@@ -2905,9 +3340,9 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
         ]
         print(
             "[CONVERSATIONAL V1 OWNER FAILED] "
-            f"fan={fan_id} reason={prepared.writer_trace.failure_reason} "
+            f"fan={fan_id} reason={prepared.decision_trace.failure_reason} "
             f"attempts={len(attempts)} "
-            f"repair_attempted={str(prepared.writer_trace.repair_attempted).lower()} "
+            f"repair_attempted={str(prepared.decision_trace.repair_attempted).lower()} "
             f"categories={','.join(categories) or 'unknown'}"
         )
         for row in attempts:
@@ -2917,9 +3352,21 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
         return {
             "outcome": OUTCOME_OWNER_FAILED,
             "message_ids": [],
-            "reason": prepared.writer_trace.failure_reason,
+            "reason": prepared.decision_trace.failure_reason,
             "owner_failure_categories": categories,
             "owner_attempts": [dict(row) for row in attempts],
+        }
+
+    if (
+        prepared.conversation_core == CORE_CONVERSATIONAL_V1
+        and prepared.writer_trace.failure_reason
+        and not prepared.replies
+    ):
+        return {
+            "outcome": OUTCOME_WRITER_FAILED,
+            "message_ids": [],
+            "reason": prepared.writer_trace.failure_reason,
+            "writer": prepared.writer_trace.as_metadata(),
         }
 
     if prepared.conversation_core == CORE_CONVERSATIONAL_V1:
@@ -3165,7 +3612,7 @@ async def prepare_assisted_approval(
         ),
         disposition=ResponseDisposition.REPLY,
         source=(
-            "conversational_owner_v1"
+            "conversational_decision_v1"
             if recorded_core == CORE_CONVERSATIONAL_V1
             else (
                 "reply_plus_intent"

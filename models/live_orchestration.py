@@ -41,6 +41,8 @@ class EvidenceSnapshot:
     state_revision: str
     creator_facts: tuple[EvidenceFact, ...] = ()
     creator_voice: dict[str, Any] = field(default_factory=dict)
+    latest_fan_burst: tuple[dict[str, Any], ...] = ()
+    recent_messages: tuple[dict[str, Any], ...] = ()
     recent_turns: tuple[dict[str, Any], ...] = ()
     historical_facts: tuple[EvidenceFact, ...] = ()
     conversation_episodes: tuple[EvidenceFact, ...] = ()
@@ -99,12 +101,16 @@ class ApprovedExecution:
     )
 
     def writer_view(self) -> dict[str, Any]:
+        offer = dict(self.offer or {})
+        for key in ("offer_id", "set_id", "label", "media_count", "record_kind"):
+            offer.pop(key, None)
         delivery = dict(self.delivery or {})
         # Media identifiers are executor inputs, not language-model evidence.
-        delivery.pop("media_ids", None)
+        for key in ("media_ids", "set_id", "offer_id", "step_index"):
+            delivery.pop(key, None)
         return {
             "operation": self.operation,
-            "offer": self.offer,
+            "offer": offer or None,
             "delivery": delivery or None,
             "payment_reference": self.payment_reference or None,
             "approval_required": self.approval_required,

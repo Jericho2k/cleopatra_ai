@@ -129,6 +129,9 @@ class ProposedOperation:
     subject: str = ""
     #: Why this turn is proposing it.
     because: str = ""
+    #: Opaque, turn-local handle selected from application-supplied candidates.
+    #: Only application code resolves it to inventory identity and price.
+    candidate_handle: str = ""
     # Exact opaque references copied from the evidence snapshot.  The semantic
     # owner may choose among these values but may not create one.  Prices and
     # media identifiers remain absent: the executor resolves both from the
@@ -170,6 +173,23 @@ class ConversationDecision:
     #: Questions this reply has to answer. The obligations from
     #: services/conversation_continuity.py land here.
     must_address: tuple[str, ...] = ()
+
+    #: Semantic guidance for the writer. These fields describe what the turn
+    #: must accomplish, never how a sentence should be phrased.
+    response_goal: str = ""
+    contribution_goal: str = ""
+    relevant_thread_ids: tuple[str, ...] = ()
+    initiative: str = "shared"
+    pacing: str = "continue"
+
+    #: Application-owned evidence categories the decision layer could not
+    #: resolve from the supplied snapshot. The orchestrator may satisfy these
+    #: once in the same fan turn and ask for a final decision.
+    evidence_requests: tuple[str, ...] = ()
+
+    #: Candidate facts proposed for the provenance-aware memory layer. They are
+    #: still only proposals until deterministic validation accepts them.
+    memory_candidates: tuple[dict[str, Any], ...] = ()
 
     #: The one external thing being asked for, if any.
     proposed_operation: ProposedOperation = field(default_factory=ProposedOperation)
@@ -237,11 +257,19 @@ class ConversationDecision:
             "supporting_messages": list(self.supporting_messages),
             "unresolved_references": list(self.unresolved_references),
             "must_address": list(self.must_address),
+            "response_goal": self.response_goal,
+            "contribution_goal": self.contribution_goal,
+            "relevant_thread_ids": list(self.relevant_thread_ids),
+            "initiative": self.initiative,
+            "pacing": self.pacing,
+            "evidence_requests": list(self.evidence_requests),
+            "memory_candidates": [dict(row) for row in self.memory_candidates],
             "response_intent": self.response_intent.value,
             "disposition": self.disposition.value,
             "operation": self.proposed_operation.kind.value,
             "operation_subject": self.proposed_operation.subject,
             "operation_because": self.proposed_operation.because,
+            "operation_candidate_handle": self.proposed_operation.candidate_handle,
             "operation_offer_id": self.proposed_operation.offer_id,
             "operation_set_id": self.proposed_operation.set_id,
             "operation_payment_reference": self.proposed_operation.payment_reference,

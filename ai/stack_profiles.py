@@ -60,6 +60,7 @@ from models.model_runtime import ModelTarget
 
 STAGE_SITUATION_ANALYZER = "situation_analyzer"
 STAGE_CONVERSATIONAL_OWNER = "conversational_owner"
+STAGE_CONVERSATIONAL_WRITER = "conversational_writer"
 STAGE_WRITER_DEFAULT = "writer_default"
 STAGE_WRITER_COMMERCIAL = "writer_commercial"
 STAGE_WRITER_SAFETY = "writer_safety"
@@ -70,6 +71,7 @@ STAGE_HISTORY_EXTRACTION = "history_extraction"
 STAGE_ORDER: tuple[str, ...] = (
     STAGE_SITUATION_ANALYZER,
     STAGE_CONVERSATIONAL_OWNER,
+    STAGE_CONVERSATIONAL_WRITER,
     STAGE_WRITER_DEFAULT,
     STAGE_WRITER_COMMERCIAL,
     STAGE_WRITER_SAFETY,
@@ -81,6 +83,7 @@ STAGE_ORDER: tuple[str, ...] = (
 STAGE_LABELS: dict[str, str] = {
     STAGE_SITUATION_ANALYZER: "Situation analyzer",
     STAGE_CONVERSATIONAL_OWNER: "Conversational owner",
+    STAGE_CONVERSATIONAL_WRITER: "Conversational fan-facing writer",
     STAGE_WRITER_DEFAULT: "Writer — ordinary conversation",
     STAGE_WRITER_COMMERCIAL: "Writer — commercial expression",
     STAGE_WRITER_SAFETY: "Writer — safety-sensitive",
@@ -282,22 +285,24 @@ _LEGACY_ANALYZER = StageSpec(
     notes="Observation only. Never decides a commercial action.",
 )
 
-# Dedicated owner for the one-call conversational runtimes.  This must not
-# borrow the situation-analyzer slot: the analyzer remains an observation-only
-# legacy stage, while semantic_v2 and conversational_v1 use this model as the
-# actual fan-facing conversational brain.
+# Dedicated semantic decision stage.  This must not borrow the
+# situation-analyzer slot: the analyzer remains an observation-only legacy
+# stage. Conversational v1 uses GLM here only for meaning, state and operation
+# proposals; Kimi owns all fan-facing copy. Semantic v2 keeps its historical
+# one-call behavior as a comparison runtime.
 _CONVERSATIONAL_OWNER = StageSpec(
     stage=STAGE_CONVERSATIONAL_OWNER,
     provider="openrouter",
     model="z-ai/glm-5.3-flash",
-    prompt_version="conversational_owner_v1",
+    prompt_version="conversational_decision_v1",
     reasoning=True,
     output_mode=OUTPUT_JSON_OBJECT,
     max_tokens=8192,
     temperature=None,
     max_tokens_env="CONVERSATIONAL_OWNER_MAX_TOKENS",
     notes=(
-        "Dedicated conversational owner for semantic_v2 and conversational_v1. "
+        "Dedicated GLM semantic decision role for conversational_v1 and the "
+        "legacy one-call semantic_v2 comparison runtime. "
         "GLM-5.3-Flash is routed through OpenRouter and intentionally separate "
         "from the Anthropic analyzer. Reasoning is mandatory for this model and "
         "shares ONE token budget with the visible answer, so the budget is "
@@ -306,6 +311,24 @@ _CONVERSATIONAL_OWNER = StageSpec(
         "message.content=null with finish_reason=length. The catalog caps "
         "reasoning separately; CONVERSATIONAL_OWNER_MAX_TOKENS re-sizes the "
         "total without a deploy."
+    ),
+)
+
+# Conversational Core v1's sole fan-facing model. There is deliberately no
+# different-model fallback: retries may move between OpenRouter providers, but
+# they remain Kimi. Exhaustion becomes a typed writer failure.
+_CONVERSATIONAL_WRITER = StageSpec(
+    stage=STAGE_CONVERSATIONAL_WRITER,
+    provider="openrouter",
+    model="moonshotai/kimi-k2.6",
+    prompt_version="conversational_writer_v1",
+    reasoning=False,
+    output_mode=OUTPUT_JSON_ARRAY,
+    max_tokens=1000,
+    temperature=None,
+    notes=(
+        "Sole fan-facing writer for conversational_v1. Same-model bounded "
+        "provider failover is allowed; no GLM or other-model fallback."
     ),
 )
 
@@ -424,6 +447,7 @@ CLEO_LEGACY_V1 = AIStackProfile(
     stages={
         STAGE_SITUATION_ANALYZER: _LEGACY_ANALYZER,
         STAGE_CONVERSATIONAL_OWNER: _CONVERSATIONAL_OWNER,
+        STAGE_CONVERSATIONAL_WRITER: _CONVERSATIONAL_WRITER,
         STAGE_WRITER_DEFAULT: _LEGACY_WRITER_DEFAULT,
         STAGE_WRITER_COMMERCIAL: _LEGACY_WRITER_COMMERCIAL,
         STAGE_WRITER_SAFETY: _LEGACY_WRITER_SAFETY,
@@ -502,6 +526,7 @@ CLEO_V2 = AIStackProfile(
             _LEGACY_ANALYZER, provider_env=None, model_env=None
         ),
         STAGE_CONVERSATIONAL_OWNER: _CONVERSATIONAL_OWNER,
+        STAGE_CONVERSATIONAL_WRITER: _CONVERSATIONAL_WRITER,
         STAGE_WRITER_DEFAULT: _V2_WRITER_DEFAULT,
         STAGE_WRITER_COMMERCIAL: _V2_WRITER_COMMERCIAL,
         STAGE_WRITER_SAFETY: _V2_WRITER_SAFETY,
@@ -568,6 +593,7 @@ CLEO_V3 = AIStackProfile(
     stages={
         STAGE_SITUATION_ANALYZER: CLEO_V2.stage(STAGE_SITUATION_ANALYZER),
         STAGE_CONVERSATIONAL_OWNER: CLEO_V2.stage(STAGE_CONVERSATIONAL_OWNER),
+        STAGE_CONVERSATIONAL_WRITER: CLEO_V2.stage(STAGE_CONVERSATIONAL_WRITER),
         STAGE_WRITER_DEFAULT: _V3_WRITER_DEFAULT,
         STAGE_WRITER_COMMERCIAL: _V3_WRITER_COMMERCIAL,
         STAGE_WRITER_SAFETY: _V3_WRITER_SAFETY,

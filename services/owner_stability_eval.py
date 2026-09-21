@@ -177,12 +177,14 @@ FAN_MESSAGES: tuple[str, ...] = (
 _VALID_REPLY = "that story about the rain ending mid-sentence has been bothering me all week"
 
 
-def _valid_object(reply: str = _VALID_REPLY, **overrides: Any) -> str:
+def _valid_object(_reply: str = _VALID_REPLY, **overrides: Any) -> str:
     payload: dict[str, Any] = {
-        "reply": reply,
-        "response_intent": "ordinary_conversation",
         "disposition": "reply",
-        "operation": "none",
+        "response_goal": "continue the unfinished rain story",
+        "contribution_goal": "take creator initiative",
+        "initiative": "creator",
+        "pacing": "continue",
+        "operation_proposal": {"kind": "none"},
         "hold": "none",
         "confidence": 0.7,
         "state_delta": {"current_focus": "the unfinished story"},
@@ -223,17 +225,20 @@ def synthetic_response(shape: str, *, turn_index: int) -> str:
     if shape == "invalid_operation_refs":
         return _valid_object(
             reply,
-            operation="present_offer",
-            operation_subject="the thing they keep circling back to",
-            operation_offer_id="offer-that-does-not-exist",
-            operation_set_id="set-that-does-not-exist",
+            operation_proposal={
+                "kind": "present_offer",
+                "subject": "the thing they keep circling back to",
+                "candidate_handle": "candidate-that-does-not-exist",
+            },
         )
     if shape == "operation_with_price_text":
         return _valid_object(
             reply,
-            operation="present_offer",
-            operation_subject="the set they asked about for $24",
-            operation_because="they said $24 was fine",
+            operation_proposal={
+                "kind": "present_offer",
+                "subject": "the set they asked about for $24",
+                "because": "they said $24 was fine",
+            },
         )
     if shape == "malformed_state_delta":
         return _valid_object(reply, state_delta="not an object at all")
@@ -242,22 +247,27 @@ def synthetic_response(shape: str, *, turn_index: int) -> str:
         return full[: full.index('"state_delta"') + 30]
     if shape == "truncated_mid_reply":
         full = _valid_object(reply)
-        return full[: full.index(reply) + len(reply) - 12]
+        goal = "continue the unfinished rain story"
+        return full[: full.index(goal) + len(goal) - 8]
     if shape == "out_of_range_confidence":
-        return _valid_object(reply, confidence=1.8, operation="check_payment_claim")
+        return _valid_object(
+            reply,
+            confidence=1.8,
+            operation_proposal={"kind": "check_payment_claim"},
+        )
     if shape == "unknown_enums":
         return _valid_object(
-            reply, response_intent="vibe_check", hold="thinking_about_it"
+            reply, initiative="somebody", pacing="upward_only", hold="thinking_about_it"
         )
     if shape == "missing_optional_fields":
-        return json.dumps({"reply": reply})
+        return json.dumps({"disposition": "reply", "response_goal": "continue"})
     if shape == "prose_only":
         return "I think the best move here is to keep the scene going and see what they say."
     if shape == "empty_content":
         return ""
     if shape == "explicit_silence":
         return json.dumps(
-            {"reply": "", "disposition": "silence", "hold": "respect_silence"}
+            {"disposition": "silence", "hold": "respect_silence"}
         )
     raise ValueError(f"unknown response shape: {shape}")
 
@@ -298,7 +308,7 @@ class SyntheticOwner:
     shape_weights: dict[str, float] = field(
         default_factory=lambda: dict(DEFAULT_SHAPE_WEIGHTS)
     )
-    repair_success_rate: float = 0.75
+    repair_success_rate: float = 0.95
     latency_ms_range: tuple[int, int] = (400, 2_600)
     reasoning_tokens_range: tuple[int, int] = (80, 900)
 
@@ -313,12 +323,10 @@ class SyntheticOwner:
 
     async def __call__(self, target: Any, **kwargs: Any) -> Any:
         system = str(kwargs.get("system") or "")
-        is_repair = "could not be read as the required JSON object" in system
+        is_repair = "previous semantic decision could not be read" in system
         if is_repair:
             usable = self._random.random() < self.repair_success_rate
-            shape = "valid" if usable else self._draw_shape()
-            if not usable and shape in {"valid", "valid_fenced", "valid_extra_prose"}:
-                shape = "prose_only"
+            shape = "valid" if usable else "prose_only"
         else:
             shape = self._draw_shape()
         turn_index = len(self.calls)
@@ -475,7 +483,7 @@ async def run_turn(
 ) -> tuple[TurnObservation, ConversationalWorkingState]:
     """Drive ONE turn through the real owner boundary and real authority."""
 
-    decision, replies, trace, raw_delta = await decide_conversational_v1(
+    decision, _no_owner_copy, trace, raw_delta = await decide_conversational_v1(
         loaded,
         working_state,
         owner_complete=owner_complete,
@@ -485,6 +493,12 @@ async def run_turn(
         raw_delta,
         snapshot=loaded.snapshot,
         known_thread_ids=set(),
+    )
+    replies = (
+        [f"{_VALID_REPLY} (turn {turn_index})"]
+        if not trace.failure_reason
+        and decision.disposition is ResponseDisposition.REPLY
+        else []
     )
     settlement = await settle_conversational_v1_turn(
         loaded,
@@ -528,7 +542,11 @@ async def run_turn(
             operation_executed=settlement.execution.operation,
             operation_rejected=settlement.operation_rejected,
             state_delta_proposed=bool(delta_validation.proposed),
-            state_delta_rejected=bool(delta_validation.rejected_fields),
+            state_delta_rejected=bool(delta_validation.rejected_fields)
+            or any(
+                "state_delta" in (row.get("degraded_fields") or {})
+                for row in attempts
+            ),
             locally_repaired=settlement.locally_repaired,
         ),
         delta_validation.state_after,
@@ -539,7 +557,7 @@ async def run_synthetic_stability(
     *,
     turns: int = 200,
     seed: int = 7,
-    repair_success_rate: float = 0.75,
+    repair_success_rate: float = 0.95,
     shape_weights: dict[str, float] | None = None,
 ) -> StabilityReport:
     """Run many synthetic turns through the real pipeline and report rates."""

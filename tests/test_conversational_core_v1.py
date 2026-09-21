@@ -487,7 +487,7 @@ def test_local_wording_repair_does_not_handoff_or_freeze(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_owner_returns_reply_intent_and_delta_in_one_call(monkeypatch):
+async def test_glm_returns_semantic_decision_and_delta_without_copy(monkeypatch):
     calls = []
     target = ModelTarget(
         name="test-owner",
@@ -511,7 +511,7 @@ async def test_owner_returns_reply_intent_and_delta_in_one_call(monkeypatch):
     async def complete(_target, **kwargs):
         calls.append(kwargs)
         return SimpleNamespace(
-            text='{"reply":"I can picture the rain starting — stay under the awning with me.","active_needs":[],"supporting_messages":["msg-1"],"unresolved_references":[],"must_address":[],"response_intent":"ordinary_conversation","disposition":"reply","operation":"none","operation_subject":"","operation_because":"","operation_offer_id":"","operation_set_id":"","operation_payment_reference":"","operation_purchase_id":"","hold":"none","hold_detail":"","confidence":0.9,"state_delta":{"initiative_holder":"creator","add_unresolved_possibilities":["whether they step into the rain"]}}',
+            text='{"turn_id":"msg-1","conversation_revision":"authoritative-revision","disposition":"reply","response_goal":"continue the balcony premise while taking initiative","must_address":[],"contribution_goal":"advance the shared scene","initiative":"creator","pacing":"continue","operation_proposal":{"kind":"none"},"confidence":0.9,"state_delta":{"initiative_holder":"creator","add_unresolved_possibilities":["whether they step into the rain"]}}',
             target=target,
             upstream_provider="test",
             latency_ms=12,
@@ -529,12 +529,12 @@ async def test_owner_returns_reply_intent_and_delta_in_one_call(monkeypatch):
     )
 
     assert len(calls) == 1
-    assert decision.source == "conversational_owner_v1"
-    assert replies == [
-        "I can picture the rain starting — stay under the awning with me."
-    ]
+    assert decision.source == "conversational_decision_v1"
+    assert decision.response_goal.startswith("continue the balcony")
+    assert replies == []
     assert delta["initiative_holder"] == "creator"
     assert trace.model == "owner-model"
+    assert trace.role == "conversational_decision"
     assert trace.as_metadata()["usage"] == {
         "input_tokens": 100,
         "output_tokens": 20,

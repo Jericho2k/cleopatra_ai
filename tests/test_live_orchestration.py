@@ -392,7 +392,9 @@ def test_context_ceiling_keeps_latest_trigger_and_transaction_evidence(monkeypat
         for bubble in turn["bubbles"]
     )
     assert snapshot.confirmed_purchases[0]["reference"] == "purchase-1"
-    assert snapshot.approved_inventory[0]["offer_id"] == "offer-1"
+    assert snapshot.approved_inventory[0]["candidate_handle"] == "offer_candidate_1"
+    assert "offer_id" not in snapshot.approved_inventory[0]
+    assert result.candidate_handles["offer_candidate_1"].offer_id == "offer-1"
     assert snapshot.memory_status["historical_backfill_complete"] is False
     assert snapshot.truncation
     assert len(snapshot.canonical_json()) <= live_orchestration.MAX_EVIDENCE_CHARS
@@ -1572,7 +1574,7 @@ def test_core_v1_repairs_price_in_operation_metadata_instead_of_silencing():
         ),
         response_intent=ResponseIntent.PRESENT_OFFER,
         disposition=ResponseDisposition.REPLY,
-        source="conversational_owner_v1",
+        source="conversational_decision_v1",
     )
 
     rejected = live_orchestration.validate_decision(decision, evidence)
@@ -1602,7 +1604,7 @@ def test_core_v1_rejected_operation_can_fall_back_to_safe_conversation():
         ),
         response_intent=ResponseIntent.PRESENT_OFFER,
         disposition=ResponseDisposition.REPLY,
-        source="conversational_owner_v1",
+        source="conversational_decision_v1",
     )
 
     repaired, _ = live_orchestration._repair_rejected_core_v1_operation(decision)
