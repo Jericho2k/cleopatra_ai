@@ -78,3 +78,19 @@ def test_operation_uses_opaque_candidate_handle_not_price_or_inventory_ids():
     assert operation.offer_id == ""
     assert not hasattr(operation, "price")
 
+
+
+
+def test_scalar_engagement_and_intimacy_funnels_are_rejected():
+    for key in (
+        "engagement_score",
+        "fan_engagement",
+        "intimacy_stage",
+        "sexual_stage",
+        "escalation_stage",
+        "spending_power",
+        "conversion_likelihood",
+    ):
+        result = parse(**{key: "high"})
+        assert not result.usable
+        assert "forbidden funnel fields" in result.failure
