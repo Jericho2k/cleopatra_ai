@@ -94,3 +94,42 @@ def test_scalar_engagement_and_intimacy_funnels_are_rejected():
         result = parse(**{key: "high"})
         assert not result.usable
         assert "forbidden funnel fields" in result.failure
+
+
+
+def test_intimate_context_is_multidimensional_not_a_stage():
+    result = parse(
+        intimacy_context={
+            "active": True,
+            "content_register": "explicit",
+            "scene_mode": "shared_imagined",
+            "direction": "hold",
+            "last_beat": "continue the same shared premise without rushing it",
+            "boundaries": ["keep the pace slow", "do not force a sale"],
+        }
+    )
+
+    assert result.usable
+    context = result.decision.intimacy_context
+    assert context.active is True
+    assert context.content_register == "explicit"
+    assert context.scene_mode == "shared_imagined"
+    assert context.direction == "hold"
+    assert context.boundaries == ("keep the pace slow", "do not force a sale")
+
+
+def test_unknown_intimate_dimensions_degrade_locally():
+    result = parse(
+        intimacy_context={
+            "active": True,
+            "content_register": "level_9",
+            "scene_mode": "stage_4",
+            "direction": "up_only",
+        }
+    )
+
+    assert result.usable
+    assert result.decision.intimacy_context.content_register == "none"
+    assert result.decision.intimacy_context.scene_mode == "none"
+    assert result.decision.intimacy_context.direction == "continue"
+    assert "intimacy_context.content_register" in result.degradations
