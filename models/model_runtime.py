@@ -109,6 +109,7 @@ class ModelResponseDiagnostics:
 
     provider: str = ""
     model: str = ""
+    served_model: str = ""
     upstream_provider: str = ""
     response_id: str = ""
     latency_ms: int = 0
@@ -185,6 +186,8 @@ class ModelResponseDiagnostics:
         }
         if self.upstream_provider:
             record["upstream_provider"] = self.upstream_provider
+        if self.served_model:
+            record["served_model"] = self.served_model
         if self.response_id:
             record["response_id"] = self.response_id
         if self.native_finish_reason and self.native_finish_reason != self.finish_reason:
@@ -223,6 +226,7 @@ class ModelResponseDiagnostics:
         """One log line. Safe to print next to a failure reason."""
         parts = [
             f"model={self.model or 'unknown'}",
+            f"served_model={self.served_model or 'unknown'}",
             f"upstream={self.upstream_provider or self.provider or 'unknown'}",
             f"latency_ms={self.latency_ms}",
             f"finish={self.finish_reason or 'none'}",
@@ -259,6 +263,7 @@ class ModelResult:
     # cost is derived from catalog pricing.
     upstream_provider: str | None = None
     reported_cost_usd: float | None = None
+    served_model: str | None = None
 
     # Milliseconds spent waiting for a slot in the global model gate before the
     # provider was called at all. Kept separate from ``latency_ms`` so a

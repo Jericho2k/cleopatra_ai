@@ -1,0 +1,248 @@
+"""Semantic-only contract for the GLM role in Conversational Core v1.
+
+The decision model never owns fan-facing text.  This parser therefore refuses
+reply/caption/copy fields instead of trying to salvage them.  A malformed
+decision may be retried once by the orchestration layer; it is never handed to
+the writer as prose.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass, field
+from typing import Any
+
+from models.conversation_decision import (
+    ConversationDecision,
+    HoldReason,
+    OperationKind,
+    ProposedOperation,
+    ResponseDisposition,
+    ResponseIntent,
+)
+
+FORBIDDEN_PROSE_FIELDS = frozenset(
+    {
+        "reply",
+        "message",
+        "messages",
+        "caption",
+        "copy",
+        "rewrite",
+        "candidate_sentences",
+        "kimi_prompt_instructions",
+        "phrasing",
+        "say_something_like",
+    }
+)
+
+EVIDENCE_CATEGORIES = frozenset(
+    {"inventory", "memory", "continuity", "transactions", "creator_voice"}
+)
+INITIATIVE_VALUES = frozenset({"fan", "creator", "shared"})
+PACING_VALUES = frozenset(
+    {"build", "hold", "continue", "cool", "redirect", "pause", "resume"}
+)
+
+
+@dataclass(frozen=True)
+class SemanticDecisionResult:
+    decision: ConversationDecision | None = None
+    state_delta: dict[str, Any] = field(default_factory=dict)
+    turn_id: str = ""
+    conversation_revision: str = ""
+    failure: str = ""
+    degradations: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def usable(self) -> bool:
+        return self.decision is not None
+
+    def describe(self) -> str:
+        if self.usable:
+            return "semantic_decision=usable"
+        return "semantic_decision=invalid reason=" + (self.failure or "unknown")
+
+
+def _object(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _clean(value: Any, limit: int = 600) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _strings(value: Any, *, limit: int = 12) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        dict.fromkeys(_clean(item) for item in value if _clean(item))
+    )[:limit]
+
+
+def parse_semantic_decision(
+    text: str,
+    *,
+    source: str = "conversational_decision_v1",
+) -> SemanticDecisionResult:
+    payload = _object(text)
+    if payload is None:
+        return SemanticDecisionResult(failure="response is not one JSON object")
+
+    forbidden = sorted(FORBIDDEN_PROSE_FIELDS.intersection(payload))
+    if forbidden:
+        return SemanticDecisionResult(
+            failure="decision model emitted fan-facing prose fields: "
+            + ", ".join(forbidden)
+        )
+
+    degradations: dict[str, str] = {}
+    try:
+        disposition = ResponseDisposition(
+            _clean(payload.get("disposition") or "reply", 40)
+        )
+    except ValueError:
+        return SemanticDecisionResult(failure="unknown disposition")
+
+    response_goal = _clean(payload.get("response_goal"), 800)
+    if disposition is ResponseDisposition.REPLY and not response_goal:
+        return SemanticDecisionResult(failure="reply decision has no response_goal")
+
+    must_address: list[str] = []
+    supporting: list[str] = []
+    raw_must = payload.get("must_address") or []
+    if not isinstance(raw_must, list):
+        degradations["must_address"] = "not a list; dropped"
+        raw_must = []
+    for item in raw_must[:12]:
+        if isinstance(item, dict):
+            need = _clean(item.get("need"), 500)
+            if need:
+                must_address.append(need)
+            supporting.extend(_strings(item.get("source_ids"), limit=8))
+        else:
+            need = _clean(item, 500)
+            if need:
+                must_address.append(need)
+
+    evidence_requests: list[str] = []
+    raw_requests = payload.get("evidence_requests") or []
+    if not isinstance(raw_requests, list):
+        degradations["evidence_requests"] = "not a list; dropped"
+        raw_requests = []
+    for item in raw_requests[:5]:
+        category = _clean(
+            item.get("category") if isinstance(item, dict) else item,
+            40,
+        ).lower()
+        if category in EVIDENCE_CATEGORIES and category not in evidence_requests:
+            evidence_requests.append(category)
+        elif category:
+            degradations[f"evidence_request:{category}"] = "unknown category; dropped"
+
+    initiative = _clean(payload.get("initiative") or "shared", 20).lower()
+    if initiative not in INITIATIVE_VALUES:
+        degradations["initiative"] = "unknown value; assumed shared"
+        initiative = "shared"
+    pacing = _clean(payload.get("pacing") or "continue", 20).lower()
+    if pacing not in PACING_VALUES:
+        degradations["pacing"] = "unknown value; assumed continue"
+        pacing = "continue"
+
+    raw_operation = payload.get("operation_proposal") or {}
+    if raw_operation is None:
+        raw_operation = {}
+    if not isinstance(raw_operation, dict):
+        degradations["operation_proposal"] = "not an object; dropped"
+        raw_operation = {}
+    try:
+        kind = OperationKind(_clean(raw_operation.get("kind") or "none", 80))
+    except ValueError:
+        degradations["operation_proposal.kind"] = "unknown value; dropped"
+        kind = OperationKind.NONE
+
+    try:
+        hold = HoldReason(_clean(payload.get("hold") or "none", 80))
+    except ValueError:
+        degradations["hold"] = "unknown value; assumed none"
+        hold = HoldReason.NONE
+    if disposition is ResponseDisposition.HANDOFF:
+        hold = HoldReason.NEEDS_HUMAN
+        if kind is OperationKind.NONE:
+            kind = OperationKind.HAND_OFF_TO_HUMAN
+    elif disposition is ResponseDisposition.SILENCE and hold is HoldReason.NONE:
+        hold = HoldReason.RESPECT_SILENCE
+
+    raw_confidence = payload.get("confidence", 0.0)
+    confidence = 0.0
+    if isinstance(raw_confidence, (int, float)) and not isinstance(
+        raw_confidence, bool
+    ):
+        candidate = float(raw_confidence)
+        if math.isfinite(candidate) and 0.0 <= candidate <= 1.0:
+            confidence = candidate
+        else:
+            degradations["confidence"] = "outside 0..1; treated as 0"
+    else:
+        degradations["confidence"] = "not numeric; treated as 0"
+
+    state_delta = payload.get("state_delta") or {}
+    if not isinstance(state_delta, dict):
+        degradations["state_delta"] = "not an object; dropped"
+        state_delta = {}
+    memory_candidates = payload.get("memory_candidates") or []
+    if not isinstance(memory_candidates, list):
+        degradations["memory_candidates"] = "not a list; dropped"
+        memory_candidates = []
+
+    decision = ConversationDecision(
+        active_needs=_strings(payload.get("active_needs"), limit=12),
+        supporting_messages=tuple(dict.fromkeys(supporting))[:24],
+        unresolved_references=_strings(
+            payload.get("unresolved_references"), limit=12
+        ),
+        must_address=tuple(dict.fromkeys(must_address))[:12],
+        response_goal=response_goal,
+        contribution_goal=_clean(payload.get("contribution_goal"), 600),
+        relevant_thread_ids=_strings(payload.get("relevant_thread_ids"), limit=12),
+        initiative=initiative,
+        pacing=pacing,
+        evidence_requests=tuple(evidence_requests),
+        memory_candidates=tuple(
+            dict(item) for item in memory_candidates[:12] if isinstance(item, dict)
+        ),
+        proposed_operation=ProposedOperation(
+            kind=kind,
+            subject=_clean(raw_operation.get("subject"), 500),
+            because=_clean(raw_operation.get("because"), 500),
+            candidate_handle=_clean(raw_operation.get("candidate_handle"), 100),
+            payment_reference=_clean(raw_operation.get("payment_reference"), 200),
+            purchase_id=_clean(raw_operation.get("purchase_id"), 200),
+        ),
+        response_intent=ResponseIntent.ORDINARY_CONVERSATION,
+        disposition=disposition,
+        hold=hold,
+        hold_detail=_clean(payload.get("hold_detail"), 500),
+        source=source,
+        confidence=confidence,
+    )
+    return SemanticDecisionResult(
+        decision=decision,
+        state_delta=state_delta,
+        turn_id=_clean(payload.get("turn_id"), 200),
+        conversation_revision=_clean(payload.get("conversation_revision"), 200),
+        degradations=degradations,
+    )

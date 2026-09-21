@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live smoke for the conversational-owner route: is this combination reliable?
+"""Live smoke for the GLM conversational-decision route.
 
 Not part of the automated suite: it spends real credits and needs a real
 provider key, so CI must never run it.
@@ -19,8 +19,8 @@ which is why this runs the same request many times and reports rates.
 For each call it prints the full structural record — finish reason, content
 length, whether content was null, reasoning characters and tokens, completion
 tokens, which message fields were populated, the upstream that served it, the
-response id and the latency — and then whether
-``services.owner_contract`` could read a reply, an operation and a delta out of
+response id and the latency — and then whether the semantic-only decision
+contract could read a disposition, goal, operation proposal and delta out of
 it. Exits non-zero if any call returned unusable content, or if the reasoning
 cap is missing from the resolved target.
 
@@ -52,8 +52,10 @@ from services.conversational_core import (  # noqa: E402
     evidence_catalog_view,
     state_fingerprint,
 )
+from services.conversational_decision_contract import (  # noqa: E402
+    parse_semantic_decision,
+)
 from services.live_orchestration import CONVERSATIONAL_V1_SYSTEM  # noqa: E402
-from services.owner_contract import extract_owner_result  # noqa: E402
 
 SYNTHETIC_MESSAGES: tuple[str, ...] = (
     "i keep thinking about that story you never finished",
@@ -162,8 +164,8 @@ async def main() -> int:
             continue
 
         diagnostics = result.diagnostics
-        extracted = extract_owner_result(
-            result.text, source="conversational_owner_v1"
+        extracted = parse_semantic_decision(
+            result.text, source="conversational_decision_v1"
         )
         latencies.append(diagnostics.latency_ms)
         total_cost += resolve_cost_usd(
@@ -174,7 +176,7 @@ async def main() -> int:
         if not extracted.usable:
             unusable += 1
             failures.append(
-                f"run {index}: {diagnostics.empty_content_category() or extracted.failure_category}"
+                f"run {index}: {diagnostics.empty_content_category() or extracted.failure}"
             )
 
         print(f"run {index}: {diagnostics.describe()}")

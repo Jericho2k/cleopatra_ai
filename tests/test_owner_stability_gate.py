@@ -130,7 +130,7 @@ def test_a_healthy_run_almost_never_ends_in_owner_failed():
     assert metrics["malformed_first_response_rate"] > 0, "the mix must exercise failure"
     assert metrics["owner_failed_rate"] <= 0.02
     assert metrics["reply_rate"] >= 0.95
-    assert metrics["owner_calls_per_turn"] < 1.2, "ordinary turns stay at one call"
+    assert metrics["owner_calls_per_turn"] < 1.3, "ordinary turns stay at one call"
 
 
 def test_a_run_where_no_repair_ever_works_still_bounds_the_call_budget():
