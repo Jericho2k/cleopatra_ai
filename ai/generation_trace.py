@@ -40,7 +40,7 @@ checked against the run that produced it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from models.model_runtime import ModelTarget, resolve_cost_usd
@@ -94,6 +94,16 @@ class GenerationTrace:
     outcome: str = ""
     #: Why the turn ended without usable text. Empty on success.
     failure_reason: str = ""
+
+    #: Per-attempt structural facts about what the provider actually returned:
+    #: finish reason, content length, reasoning token spend, response id. See
+    #: ``models.model_runtime.ModelResponseDiagnostics``. Never conversation
+    #: text — this is persisted next to a message and read by operators.
+    owner_attempts: list[dict[str, Any]] = field(default_factory=list)
+    #: True when one bounded same-evidence repair call was made this turn.
+    repair_attempted: bool = False
+    #: True when that repair produced the usable answer.
+    repaired: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -175,6 +185,27 @@ class GenerationTrace:
                 reported_cost_usd=reported_cost_usd,
             )
         self.failure_reason = ""
+
+    def record_attempt(
+        self,
+        *,
+        label: str,
+        diagnostics: Any = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Append one attempt's structural record, whatever its outcome.
+
+        Success and failure both land here, so "this turn needed a repair" and
+        "this turn's first response was truncated at 4096 tokens" survive to the
+        durable record instead of only reaching a log line.
+        """
+        attempt: dict[str, Any] = {"attempt": label}
+        if diagnostics is not None and hasattr(diagnostics, "as_dict"):
+            attempt.update(diagnostics.as_dict())
+        attempt.update(extra or {})
+        self.owner_attempts.append(attempt)
+        if label == "repair":
+            self.repair_attempted = True
 
     def record_failure(
         self,
@@ -261,6 +292,11 @@ class GenerationTrace:
             record["pinned_attempts"] = self.pinned_attempts
         if self.alternate_attempts:
             record["alternate_attempts"] = self.alternate_attempts
+        if self.owner_attempts:
+            record["owner_attempts"] = [dict(row) for row in self.owner_attempts]
+        if self.repair_attempted:
+            record["repair_attempted"] = True
+            record["repaired"] = self.repaired
         return record
 
     def describe(self) -> str:
