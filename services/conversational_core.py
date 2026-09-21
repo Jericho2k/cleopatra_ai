@@ -391,59 +391,6 @@ def validate_and_apply_delta(
                 "unknown continuity thread ids: " + ", ".join(invalid[:3])
             )
 
-    # Intimate continuity is descriptive state, not an escalation machine.
-    # Each dimension is independently optional and may move in any direction.
-    if delta.intimacy_active is not None:
-        after.intimacy.active = delta.intimacy_active
-        accepted.append("intimacy_active")
-    if delta.intimacy_content_register is not None:
-        after.intimacy.content_register = delta.intimacy_content_register
-        accepted.append("intimacy_content_register")
-    if delta.intimacy_scene_mode is not None:
-        if (
-            delta.intimacy_scene_mode.value == "shared_imagined"
-            and not after.active_scene.has_shared_imagined_scene
-        ):
-            rejected["intimacy_scene_mode"] = (
-                "shared_imagined intimacy requires a supported shared imagined scene"
-            )
-        else:
-            after.intimacy.scene_mode = delta.intimacy_scene_mode
-            accepted.append("intimacy_scene_mode")
-    if delta.intimacy_direction is not None:
-        after.intimacy.direction = delta.intimacy_direction
-        accepted.append("intimacy_direction")
-    if delta.intimacy_last_beat is not None:
-        reason = _unsafe_interpretation(delta.intimacy_last_beat)
-        if reason:
-            rejected["intimacy_last_beat"] = reason
-        else:
-            after.intimacy.last_beat = _plain(delta.intimacy_last_beat, 400)
-            accepted.append("intimacy_last_beat")
-    if delta.intimacy_boundaries is not None:
-        safe_boundaries: list[str] = []
-        invalid_boundary = ""
-        for boundary in delta.intimacy_boundaries:
-            cleaned = _plain(boundary, 240)
-            reason = _unsafe_interpretation(cleaned)
-            if reason:
-                invalid_boundary = reason
-                break
-            if cleaned and cleaned not in safe_boundaries:
-                safe_boundaries.append(cleaned)
-        if invalid_boundary:
-            rejected["intimacy_boundaries"] = invalid_boundary
-        else:
-            after.intimacy.boundaries = safe_boundaries[:8]
-            accepted.append("intimacy_boundaries")
-
-    # Turning intimate context off clears stale scene-specific interpretation
-    # without erasing raw history or evidence-backed established elements.
-    if delta.intimacy_active is False:
-        after.intimacy.content_register = type(after.intimacy.content_register).NONE
-        after.intimacy.scene_mode = type(after.intimacy.scene_mode).NONE
-        after.intimacy.last_beat = ""
-
     if delta.has_shared_imagined_scene is not None:
         has_supported_imagined = any(
             element.status is ElementStatus.ACTIVE
