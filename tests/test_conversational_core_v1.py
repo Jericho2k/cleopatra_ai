@@ -554,3 +554,100 @@ def test_private_runtime_metadata_is_redacted_before_fan_delivery():
     assert changed is True
     assert "offer_id" not in cleaned[0]
     assert "creator_legend:favorite_color" not in cleaned[0]
+
+
+
+def test_intimate_continuity_is_multidimensional_and_can_cool_without_a_stage_ladder():
+    state = ConversationalWorkingState()
+    first = conversational_core.validate_and_apply_delta(
+        state,
+        {
+            "intimacy_active": True,
+            "intimacy_content_register": "explicit",
+            "intimacy_scene_mode": "conversational",
+            "intimacy_direction": "hold",
+            "intimacy_last_beat": "the fan asked to keep the intimate exchange slow",
+            "intimacy_boundaries": ["keep the pace slow"],
+        },
+        snapshot=snapshot(),
+    )
+    after = first.state_after
+
+    assert after.intimacy.active is True
+    assert after.intimacy.content_register.value == "explicit"
+    assert after.intimacy.scene_mode.value == "conversational"
+    assert after.intimacy.direction.value == "hold"
+    assert after.intimacy.last_beat == "the fan asked to keep the intimate exchange slow"
+    assert after.intimacy.boundaries == ["keep the pace slow"]
+
+    cooled = conversational_core.validate_and_apply_delta(
+        after,
+        {
+            "intimacy_content_register": "suggestive",
+            "intimacy_direction": "cool",
+            "intimacy_last_beat": "the fan changed the subject and cooled the exchange",
+        },
+        snapshot=snapshot("msg-2"),
+    ).state_after
+
+    assert cooled.intimacy.active is True
+    assert cooled.intimacy.content_register.value == "suggestive"
+    assert cooled.intimacy.direction.value == "cool"
+    assert cooled.intimacy.last_beat.endswith("cooled the exchange")
+
+
+def test_ending_intimate_context_clears_stale_register_and_scene_interpretation():
+    state = ConversationalWorkingState.model_validate(
+        {
+            "intimacy": {
+                "active": True,
+                "content_register": "explicit",
+                "scene_mode": "conversational",
+                "direction": "continue",
+                "last_beat": "an active intimate conversational beat",
+                "boundaries": ["do not rush"],
+            }
+        }
+    )
+
+    result = conversational_core.validate_and_apply_delta(
+        state,
+        {"intimacy_active": False, "intimacy_direction": "pause"},
+        snapshot=snapshot(),
+    ).state_after
+
+    assert result.intimacy.active is False
+    assert result.intimacy.content_register.value == "none"
+    assert result.intimacy.scene_mode.value == "none"
+    assert result.intimacy.last_beat == ""
+    assert result.intimacy.boundaries == ["do not rush"]
+
+
+def test_old_core_state_without_intimacy_fields_remains_backward_compatible():
+    state = ConversationalWorkingState.model_validate(
+        {
+            "schema_version": "conversational_core_v1",
+            "revision": 4,
+            "active_scene": {},
+            "flow": {},
+        }
+    )
+
+    assert state.revision == 4
+    assert state.intimacy.active is False
+    assert state.intimacy.content_register.value == "none"
+
+
+def test_shared_imagined_intimacy_requires_supported_shared_scene():
+    result = conversational_core.validate_and_apply_delta(
+        ConversationalWorkingState(),
+        {
+            "intimacy_active": True,
+            "intimacy_scene_mode": "shared_imagined",
+        },
+        snapshot=snapshot(),
+    )
+
+    assert result.state_after.intimacy.active is True
+    assert result.state_after.intimacy.scene_mode.value == "none"
+    assert "intimacy_scene_mode" in result.rejected_fields
