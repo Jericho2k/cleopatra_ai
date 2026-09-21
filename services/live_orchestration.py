@@ -235,32 +235,20 @@ Contract:
   "relevant_thread_ids": [],
   "initiative": "fan|creator|shared",
   "pacing": "build|hold|continue|cool|redirect|pause|resume",
+  "intimacy_context": {
+    "active": false,
+    "content_register": "none|flirty|suggestive|explicit",
+    "scene_mode": "none|conversational|shared_imagined",
+    "direction": "build|hold|continue|cool|redirect|pause|resume",
+    "last_beat": "",
+    "boundaries": []
+  },
   "evidence_requests": [{"category":"inventory|memory|continuity|transactions|creator_voice"}],
   "operation_proposal": {"kind":"none|present_offer|send_locked_paid_message|check_payment_claim|repair_content_access|hand_off_to_human", "subject":"", "because":"", "candidate_handle":"", "payment_reference":"", "purchase_id":""},
   "hold": "none|waiting_on_customer|waiting_on_payment|needs_human|respect_silence|insufficient_evidence",
   "hold_detail": "",
   "confidence": 0.0,
-  "state_delta": {
-    "scene_summary": null,
-    "current_action_focus": null,
-    "current_direction": null,
-    "pacing": null,
-    "has_shared_imagined_scene": null,
-    "initiative_holder": null,
-    "current_focus": null,
-    "participation_gist": null,
-    "add_unresolved_possibilities": [],
-    "resolve_unresolved_possibilities": [],
-    "active_thread_ids": null,
-    "intimacy_active": null,
-    "intimacy_content_register": "none|flirty|suggestive|explicit|null",
-    "intimacy_scene_mode": "none|conversational|shared_imagined|null",
-    "intimacy_direction": "build|hold|continue|cool|redirect|pause|resume|null",
-    "intimacy_last_beat": null,
-    "intimacy_boundaries": null,
-    "add_established_elements": [],
-    "corrections": []
-  },
+  "state_delta": {},
   "memory_candidates": []
 }
 
@@ -1962,6 +1950,7 @@ def _validate_conversational_v1_reply(
         relevant_thread_ids=decision.relevant_thread_ids,
         initiative=decision.initiative,
         pacing=decision.pacing,
+        intimacy_context=decision.intimacy_context,
         memory_candidates=decision.memory_candidates,
         proposed_operation=ProposedOperation(),
         response_intent=ResponseIntent.RESPECT_SILENCE,
@@ -2189,7 +2178,7 @@ Write in THIS creator's voice using the explicit voice fields and recent creator
 
 React specifically and contribute: a thought, opinion, callback, tease, continuation, direction change, or completed conversational beat. Questions are optional. Do not default to acknowledge + generic compliment + emoji + generic question. Short fan messages may invite creator initiative. Preserve shared imagined scenes as imagined; follow corrections and topic changes cheaply. Pacing can build, hold, continue, cool, redirect, pause, or resume without a fixed ladder.
 
-For adult/intimate conversation, use working_context.intimacy together with the RAW recent exchange. Preserve the exact current beat, roles, references, and shared premise instead of restarting from generic flirting. The intimate line may build, hold, continue, cool, redirect, pause, resume, or end on any turn. A more explicit register is descriptive context, NOT permission or an instruction to escalate. Short replies can mean continuation or invitation to lead; interpret them from the preceding beat. Do not manufacture a new scenario when one is already active. Do not convert an intimate moment into a commercial pitch merely because it is intimate. If the fan changes direction or cools the interaction, follow immediately. Keep imagined actions inside the imagined/shared-scene scope and never present them as current real-world activity.
+For adult/intimate conversation, use semantic_decision.intimacy_context together with the RAW recent exchange. Preserve the exact current beat, roles, references, and shared premise instead of restarting from generic flirting. The intimate line may build, hold, continue, cool, redirect, pause, resume, or end on any turn. A more explicit register is descriptive context, NOT permission or an instruction to escalate. Short replies can mean continuation or invitation to lead; interpret them from the preceding beat. Do not manufacture a new scenario when one is already active. Do not convert an intimate moment into a commercial pitch merely because it is intimate. If the fan changes direction or cools the interaction, follow immediately. Keep imagined actions inside the imagined/shared-scene scope and never present them as current real-world activity.
 
 Commercial and media language stays inside the conversation. Never use catalogue voice, media counts, package/set/inventory terminology, private IDs, URLs, or internal metadata. Use only prepared_operation_facts. The application owns price and transaction truth. Do not claim payment, purchase, send, attachment, or delivery unless the prepared facts state it. After rejection, purchase, or delivery, continue the existing moment; do not automatically discount, reset, upsell, or force a feedback question.
 
@@ -2682,6 +2671,7 @@ def _repair_rejected_core_v1_operation(
         relevant_thread_ids=decision.relevant_thread_ids,
         initiative=decision.initiative,
         pacing=decision.pacing,
+        intimacy_context=decision.intimacy_context,
         evidence_requests=decision.evidence_requests,
         memory_candidates=decision.memory_candidates,
         proposed_operation=sanitized,
@@ -2754,6 +2744,7 @@ async def _authorize_conversational_v1_operation(
                 relevant_thread_ids=decision.relevant_thread_ids,
                 initiative=decision.initiative,
                 pacing=decision.pacing,
+                intimacy_context=decision.intimacy_context,
                 memory_candidates=decision.memory_candidates,
                 proposed_operation=ProposedOperation(),
                 response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
