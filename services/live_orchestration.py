@@ -2044,15 +2044,12 @@ def _strip_price_from_operation_text(text: str) -> str:
 
 def _repair_rejected_core_v1_operation(
     decision: ConversationDecision,
-    loaded: LoadedEvidence,
-) -> tuple[ConversationDecision, ApprovedExecution, bool]:
-    """Keep a valid conversation alive when only the model-authored operation is bad.
+) -> tuple[ConversationDecision, bool]:
+    """Strip non-authoritative price text from an operation proposal.
 
-    Operation subject/because are descriptive prose, never authority. First
-    strip price text from those fields and revalidate the exact same opaque
-    references. If the operation is still invalid, downgrade only the operation
-    to NONE and keep the fan-facing reply for the existing local copy validator
-    to repair. Deterministic transaction truth remains unchanged.
+    Operation subject/because are descriptive prose, never authority. Opaque
+    refs are preserved exactly; the normal deterministic executor will
+    revalidate and prepare the action after this repair.
     """
     op = decision.proposed_operation
     sanitized = ProposedOperation(
@@ -2074,8 +2071,7 @@ def _repair_rejected_core_v1_operation(
             payment_reference=sanitized.payment_reference,
             purchase_id=sanitized.purchase_id,
         )
-
-    sanitized_decision = ConversationDecision(
+    repaired = ConversationDecision(
         active_needs=decision.active_needs,
         supporting_messages=decision.supporting_messages,
         unresolved_references=decision.unresolved_references,
@@ -2088,41 +2084,7 @@ def _repair_rejected_core_v1_operation(
         source=decision.source,
         confidence=decision.confidence,
     )
-    repaired_validation = validate_decision(sanitized_decision, loaded)
-    if repaired_validation.approved:
-        return (
-            sanitized_decision,
-            ApprovedExecution(
-                operation=sanitized.kind.value,
-                offer=(
-                    _offer_view(loaded.next_offer)
-                    if sanitized.kind is OperationKind.PRESENT_OFFER
-                    else None
-                ),
-                validation=repaired_validation,
-            ),
-            sanitized != op,
-        )
-
-    downgraded = ConversationDecision(
-        active_needs=decision.active_needs,
-        supporting_messages=decision.supporting_messages,
-        unresolved_references=decision.unresolved_references,
-        must_address=decision.must_address,
-        proposed_operation=ProposedOperation(),
-        response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
-        disposition=ResponseDisposition.REPLY,
-        hold=HoldReason.NONE,
-        hold_detail="",
-        source=decision.source,
-        confidence=decision.confidence,
-    )
-    validation = validate_decision(downgraded, loaded)
-    return (
-        downgraded,
-        ApprovedExecution(operation="none", validation=validation),
-        True,
-    )
+    return repaired, repaired.proposed_operation != op
 
 
 async def prepare_turn(
@@ -2202,9 +2164,34 @@ async def prepare_turn(
                 + " reasons="
                 + "; ".join(rejected_reasons)
             )
-            decision, execution, operation_repaired = (
-                _repair_rejected_core_v1_operation(decision, loaded)
+            decision, operation_repaired = _repair_rejected_core_v1_operation(
+                decision
             )
+            execution = await _prepare_execution(
+                decision,
+                loaded,
+                execute_operations=execute_operations,
+            )
+            if not execution.validation.approved:
+                decision = ConversationDecision(
+                    active_needs=decision.active_needs,
+                    supporting_messages=decision.supporting_messages,
+                    unresolved_references=decision.unresolved_references,
+                    must_address=decision.must_address,
+                    proposed_operation=ProposedOperation(),
+                    response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
+                    disposition=ResponseDisposition.REPLY,
+                    hold=HoldReason.NONE,
+                    hold_detail="",
+                    source=decision.source,
+                    confidence=decision.confidence,
+                )
+                execution = await _prepare_execution(
+                    decision,
+                    loaded,
+                    execute_operations=execute_operations,
+                )
+                operation_repaired = True
             if operation_repaired:
                 locally_repaired = True
             print(
