@@ -599,6 +599,45 @@ async def _claim_due_actions_by_cas(limit: int, stale_minutes: int) -> list[dict
     return await asyncio.to_thread(_claim)
 
 
+async def next_due_at() -> datetime | None:
+    """When the nearest queued action becomes due, or None if nothing is queued.
+
+    One indexed read per idle cycle, regardless of how many fans or how many
+    pending bubbles exist. It is what lets the single shared dispatcher sleep
+    until the next thing is actually due instead of either polling every fan or
+    waiting out a flat interval — the difference between a 1.5 second
+    inter-bubble pause landing on time and landing five seconds late.
+    """
+
+    def _read() -> datetime | None:
+        response = (
+            get_supabase()
+            .table("scheduled_actions")
+            .select("execute_at")
+            .eq("status", "PENDING")
+            .order("execute_at")
+            .limit(1)
+            .execute()
+        )
+        rows = response.data or []
+        if not rows:
+            return None
+        raw = rows[0].get("execute_at")
+        if isinstance(raw, datetime):
+            return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    try:
+        return await asyncio.to_thread(_read)
+    except Exception as exc:  # noqa: BLE001 - a missed hint costs one idle poll
+        print(f"[SCHEDULED ACTIONS] next-due probe failed: {exc}")
+        return None
+
+
 async def complete_action(action_id: str) -> None:
     def _done():
         get_supabase().table("scheduled_actions").update(

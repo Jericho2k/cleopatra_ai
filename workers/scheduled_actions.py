@@ -12,6 +12,7 @@ embarrassing message in front of an agency. Every check below is a reason to ski
 import asyncio
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -28,6 +29,7 @@ from db.commercial_queries import (
     get_creator_policy,
     get_fan_state,
     get_followup_obligations,
+    next_due_at,
     reschedule_action,
     save_fan_state,
     schedule_action,
@@ -57,6 +59,15 @@ DEFAULT_POLL_SECONDS = 5
 BUSY_POLL_SECONDS = 0.25
 MAX_CONSECUTIVE_BUSY_CYCLES = 60
 
+# Durable human-like timing made the idle poll's precision matter. An
+# inter-bubble pause is 1-14 seconds; a flat 5 second idle poll turns a planned
+# 1.5 second gap into anything up to 6.5. The fix is deliberately GLOBAL: one
+# indexed "when is the next thing due" probe per idle cycle, and the dispatcher
+# sleeps until then. It costs one query per cycle no matter how many fans,
+# which is the property a per-fan timer could never have.
+MIN_ADAPTIVE_SLEEP_SECONDS = 0.05
+DUE_LOOKAHEAD_SECONDS = 0.1
+
 # Obligation repair is a safety net, not delivery work, so it runs on its own
 # slower cadence rather than once per (now much faster) claim poll.
 REPAIR_INTERVAL_SECONDS = 60
@@ -75,7 +86,16 @@ WRITER_QUALITY_MAX_ATTEMPTS = 2
 
 # Actions whose whole purpose is bookkeeping or ingestion rather than sending a
 # proactive message; the proactive revalidation gate does not apply to them.
-NON_PROACTIVE_ACTIONS = {"PPV_RECONCILE", "OFFER_EXPIRY", "PROCESS_INBOUND_MESSAGE"}
+NON_PROACTIVE_ACTIONS = {
+    "PPV_RECONCILE",
+    "OFFER_EXPIRY",
+    "PROCESS_INBOUND_MESSAGE",
+    # A queued bubble carries its OWN send gate (services/outbound_delivery.py),
+    # which revalidates the conversation generation, the review hold and auto
+    # mode at the moment it would leave. Running the proactive follow-up gate
+    # over it as well would answer a different question with the wrong rules.
+    "DELIVER_OUTBOUND_PART",
+}
 
 # Actions whose whole purpose is putting a message in front of a fan on the
 # remote platform. While APIFANSLY_ENABLED=false these are postponed rather than
@@ -95,7 +115,40 @@ REMOTE_DELIVERY_ACTIONS = {
     "ABANDONED_OFFER_FOLLOWUP",
     "INACTIVITY_REENGAGEMENT",
     "PROCESS_INBOUND_MESSAGE",
+    "DELIVER_OUTBOUND_PART",
+    "CONVERSATIONAL_INTENT",
 }
+
+# Actions that may put words in front of ONE fan, and therefore must not run
+# concurrently with each other for that fan in any process. Per-fan chaining
+# inside one worker (group_actions_by_fan) covers a single process; the durable
+# lease below is what makes the same statement true across two.
+FAN_EXCLUSIVE_ACTIONS = {
+    "AUTO_REPLY",
+    "DELIVER_OUTBOUND_PART",
+    "CONVERSATIONAL_INTENT",
+    "POST_PURCHASE_REACTION",
+    "PAYDAY_REENGAGEMENT",
+    "POST_SESSION_FOLLOWUP",
+    "ABANDONED_PPV_FOLLOWUP",
+    "ABANDONED_OFFER_FOLLOWUP",
+    "INACTIVITY_REENGAGEMENT",
+    "PROCESS_INBOUND_MESSAGE",
+}
+
+# How long one claimed fan-exclusive action may own its fan. Comfortably above a
+# bounded turn (two model calls plus persistence) and comfortably below the
+# ten-minute stale-action reclaim, so a crashed worker frees the fan well before
+# its action becomes re-claimable.
+FAN_LEASE_TTL_SECONDS = 300
+
+# A fan busy in another worker is not an error and not a skip. Retrying shortly
+# costs one row update and keeps the obligation exactly where it was.
+FAN_LEASE_RETRY_SECONDS = 3
+
+# Identity of this worker process, for the lease. Regenerated on restart, which
+# is correct: a restarted process is not the owner of anything it held before.
+WORKER_ID = uuid.uuid4().hex[:12]
 
 # How long a postponed delivery action waits before it is reconsidered. Long
 # enough that a disabled connector costs one cheap read per action per half
@@ -358,6 +411,26 @@ async def _should_still_send(action: dict) -> ActionCheck:
         )
         if awake_at > now:
             return ActionCheck(False, "creator sleep hours are active", retry_at=awake_at)
+        return ActionCheck(True)
+
+    if action_type == "CONVERSATIONAL_INTENT":
+        from services.conversation_generation import current_generation
+        from services.scheduled_intent import activity_cancels
+
+        # cancel_on_activity: "wait right there" is only worth keeping while he
+        # has NOT spoken. The conversation generation answers that across
+        # processes, so a fan reply handled by another worker still cancels it.
+        if activity_cancels(payload):
+            created = int(payload.get("created_generation") or 0)
+            now_generation = int(await current_generation(fan_id))
+            if now_generation != created:
+                return ActionCheck(
+                    False, "live conversation superseded the short continuation"
+                )
+        # revalidate_on_activity intentionally does NOT stop here. Fan activity
+        # is not a reason to silently drop a real future obligation; the due
+        # turn loads the current conversation and decides, which may well be to
+        # say nothing.
         return ActionCheck(True)
 
     if action_type == "POST_PURCHASE_REACTION":
@@ -766,8 +839,60 @@ async def _run_ppv_reconcile(action: dict) -> HandlerResult:
     return HandlerResult(reason=result.reason)
 
 
+async def _run_deliver_outbound_part(action: dict) -> HandlerResult:
+    """Send one durably queued bubble, if it is still legal to send it.
+
+    The whole interruption story lives at this boundary. The part was planned
+    minutes or seconds ago against a known conversation generation; by now the
+    fan may have replied, an operator may have taken over, auto mode may be off,
+    or a newer turn may own the conversation. Every one of those is read from
+    the database here rather than from this process.
+    """
+    from services.outbound_delivery import deliver_due_part
+
+    outcome = await deliver_due_part(action)
+    if outcome.retry_at is not None:
+        return HandlerResult(retry_at=outcome.retry_at, reason=outcome.reason)
+    return HandlerResult(
+        sent_message=outcome.sent,
+        reason=outcome.reason or ("bubble delivered" if outcome.sent else ""),
+    )
+
+
+async def _run_conversational_intent(action: dict) -> HandlerResult:
+    """Re-enter Core v1 for a conversational promise that has come due.
+
+    Deliberately NOT a stored message. The payload carries a semantic goal, and
+    everything the fan will read is decided and written now: GLM sees the
+    current conversation and may decide the intention no longer makes sense, in
+    which case the obligation resolves silently.
+    """
+    from services.proactive import send_proactive_message
+    from services.scheduled_intent import goal_for_due_intent
+
+    payload = action.get("payload") or {}
+    sent = await send_proactive_message(
+        creator_id=action["creator_id"],
+        fan_id=action["fan_id"],
+        goal=goal_for_due_intent(payload),
+        action_id=str(action["id"]),
+        action_payload=payload,
+    )
+    kind = str(payload.get("kind") or "intention")
+    return HandlerResult(
+        sent_message=bool(sent),
+        reason=(
+            f"conversational intention {kind} continued"
+            if sent
+            else f"conversational intention {kind} resolved without sending"
+        ),
+    )
+
+
 HANDLERS = {
     "AUTO_REPLY": _run_auto_reply,
+    "DELIVER_OUTBOUND_PART": _run_deliver_outbound_part,
+    "CONVERSATIONAL_INTENT": _run_conversational_intent,
     "POST_PURCHASE_REACTION": _run_post_purchase_reaction,
     "PAYDAY_REENGAGEMENT": _run_payday_reengagement,
     "POST_SESSION_FOLLOWUP": _run_post_session_followup,
@@ -787,6 +912,10 @@ async def _record_message_action_resolution(action: dict, *, sent: bool) -> None
         "POST_PURCHASE_REACTION",
         "PPV_RECONCILE",
         "PROCESS_INBOUND_MESSAGE",
+        # Neither of these is a lifecycle follow-up obligation, so neither owns
+        # the fan-state next_followup_* slot that this bookkeeping clears.
+        "DELIVER_OUTBOUND_PART",
+        "CONVERSATIONAL_INTENT",
     }:
         return
     state = await get_fan_state(action["fan_id"])
@@ -882,6 +1011,48 @@ async def repair_followup_obligations(
     return len(repairs)
 
 
+async def _acquire_fan_slot(action: dict) -> tuple[bool, str]:
+    """Take the durable per-fan lease, or report that another worker holds it.
+
+    ``group_actions_by_fan`` remains in force and remains the cheap path: inside
+    one process, two actions for one fan are already serialised and this call
+    simply succeeds. What it adds is the case that grouping cannot see — a
+    second worker, a second replica, or a rolling deploy running two versions at
+    once — where two processes each hold a different due action for the same
+    conversation.
+    """
+    from db.outbound_queries import acquire_fan_lease
+
+    fan_id = str(action.get("fan_id") or "")
+    creator_id = str(action.get("creator_id") or "")
+    if not fan_id or not creator_id:
+        return True, ""
+    token = f"{WORKER_ID}:{action.get('id')}"
+    try:
+        acquired = await acquire_fan_lease(
+            fan_id=fan_id,
+            creator_id=creator_id,
+            owner_token=token,
+            ttl_seconds=FAN_LEASE_TTL_SECONDS,
+            purpose=str(action.get("action_type") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        # A lease we cannot take is not a reason to drop durable work. The
+        # in-process chain still serialises this fan, which is exactly the
+        # guarantee that existed before the lease.
+        print(f"[FAN LEASE ERROR] fan={fan_id}: {exc}")
+        return True, ""
+    return bool(acquired), token
+
+
+async def _release_fan_slot(action: dict, token: str) -> None:
+    if not token:
+        return
+    from db.outbound_queries import release_fan_lease
+
+    await release_fan_lease(fan_id=str(action.get("fan_id") or ""), owner_token=token)
+
+
 async def _resolve_action(action: dict, *, sent_counter: list[int]) -> str:
     """Run one claimed action to a terminal state. Never raises.
 
@@ -899,6 +1070,7 @@ async def _resolve_action(action: dict, *, sent_counter: list[int]) -> str:
         creator_id=str(action.get("creator_id") or ""),
         queue_wait_ms=_queue_wait_ms(action),
     )
+    lease_token = ""
     with action_scope(timings):
         try:
             handler = HANDLERS.get(action_type)
@@ -910,6 +1082,16 @@ async def _resolve_action(action: dict, *, sent_counter: list[int]) -> str:
                 )
                 timings.outcome = "no_handler"
                 return "no_handler"
+
+            if action_type in FAN_EXCLUSIVE_ACTIONS:
+                owned, lease_token = await _acquire_fan_slot(action)
+                if not owned:
+                    retry_at = datetime.now(timezone.utc) + timedelta(
+                        seconds=FAN_LEASE_RETRY_SECONDS
+                    )
+                    await reschedule_action(aid, retry_at)
+                    timings.outcome = "fan_busy"
+                    return "fan_busy"
 
             if action_type in REMOTE_DELIVERY_ACTIONS and await _connector_blocks_delivery(action):
                 retry_at = datetime.now(timezone.utc) + timedelta(
@@ -1034,6 +1216,12 @@ async def _resolve_action(action: dict, *, sent_counter: list[int]) -> str:
             timings.outcome = "failed"
             return "failed"
         finally:
+            # Released on every path, including cancellation: a lease held by a
+            # finished action is a fan nobody can answer until it expires.
+            try:
+                await _release_fan_slot(action, lease_token)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[FAN LEASE RELEASE ERROR] {exc}")
             emit(timings)
 
 
@@ -1055,11 +1243,18 @@ def group_actions_by_fan(actions: list[dict]) -> list[list[dict]]:
     sends for one conversation can never be in flight together. It needs no lock,
     no registry, and no distributed coordination — the grouping is the guarantee.
 
+    Grouping is the cheap path and it is enough INSIDE one process. Across
+    processes the same statement is made by the durable per-fan execution lease
+    taken in ``_resolve_action`` (``db/outbound_queries.py``), because two
+    workers each holding a different due action for one fan is precisely the
+    case grouping cannot see.
+
     All the existing per-fan protections (the AUTO_REPLY dedupe key,
-    ``_pending_auto_replies``, ``cancel_actions_for_fan``, the PROCESSING status
-    CAS, ``_should_still_send``, the expected trigger timestamp, the
+    ``cancel_actions_for_fan``, the PROCESSING status CAS,
+    ``_should_still_send``, the expected trigger timestamp, the
     post-generation history re-check, and the PPV/proactive delivery journals)
-    remain in force underneath it.
+    remain in force underneath it, as does the durable conversation generation
+    revalidated at every outbound send boundary.
     """
     chains: dict[str, list[dict]] = {}
     order: list[str] = []
@@ -1152,6 +1347,31 @@ async def process_cycle(
         LAST_RUN_COMPLETED_AT = datetime.now(timezone.utc)
 
 
+async def _idle_sleep_seconds() -> float:
+    """How long the shared dispatcher may sleep before the next thing is due.
+
+    Bounded above by the configured idle poll, so this can only ever make the
+    loop MORE responsive, never less. Bounded below by a small floor so an
+    action that is already overdue (and will be claimed on the next cycle)
+    cannot turn the loop into a spin.
+
+    This is the whole answer to "how do you get 1-14 second inter-bubble
+    precision without waking per fan": one query, one sleep, all conversations.
+    """
+    ceiling = poll_seconds()
+    try:
+        nearest = await next_due_at()
+    except Exception:  # noqa: BLE001 - a missed hint costs one idle poll
+        return ceiling
+    if nearest is None:
+        return ceiling
+    remaining = (nearest - datetime.now(timezone.utc)).total_seconds()
+    return max(
+        MIN_ADAPTIVE_SLEEP_SECONDS,
+        min(ceiling, remaining + DUE_LOOKAHEAD_SECONDS),
+    )
+
+
 async def process_once() -> int:
     """Backwards-compatible single cycle returning the number of messages sent."""
     return (await process_cycle()).sent
@@ -1194,7 +1414,7 @@ async def scheduled_actions_loop() -> None:
         consecutive_busy = 0
         _wakeup.clear()
         try:
-            await asyncio.wait_for(_wakeup.wait(), timeout=poll_seconds())
+            await asyncio.wait_for(_wakeup.wait(), timeout=await _idle_sleep_seconds())
         except (asyncio.TimeoutError, TimeoutError):
             pass
 
