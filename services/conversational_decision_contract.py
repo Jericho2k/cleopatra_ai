@@ -15,6 +15,7 @@ from typing import Any
 
 from models.conversation_decision import (
     ConversationDecision,
+    IntimacyContext,
     HoldReason,
     OperationKind,
     ProposedOperation,
@@ -37,6 +38,20 @@ FORBIDDEN_PROSE_FIELDS = frozenset(
     }
 )
 
+# These fields recreate the linear/scored machinery Core v1 is replacing.
+# Intimacy is represented by independent working-state dimensions instead.
+FORBIDDEN_FUNNEL_FIELDS = frozenset(
+    {
+        "engagement_score",
+        "fan_engagement",
+        "intimacy_stage",
+        "sexual_stage",
+        "escalation_stage",
+        "spending_power",
+        "conversion_likelihood",
+    }
+)
+
 EVIDENCE_CATEGORIES = frozenset(
     {"inventory", "memory", "continuity", "transactions", "creator_voice"}
 )
@@ -44,6 +59,8 @@ INITIATIVE_VALUES = frozenset({"fan", "creator", "shared"})
 PACING_VALUES = frozenset(
     {"build", "hold", "continue", "cool", "redirect", "pause", "resume"}
 )
+INTIMACY_REGISTERS = frozenset({"none", "flirty", "suggestive", "explicit"})
+INTIMACY_SCENE_MODES = frozenset({"none", "conversational", "shared_imagined"})
 
 
 @dataclass(frozen=True)
@@ -108,6 +125,12 @@ def parse_semantic_decision(
             failure="decision model emitted fan-facing prose fields: "
             + ", ".join(forbidden)
         )
+    funnel_fields = sorted(FORBIDDEN_FUNNEL_FIELDS.intersection(payload))
+    if funnel_fields:
+        return SemanticDecisionResult(
+            failure="decision model emitted forbidden funnel fields: "
+            + ", ".join(funnel_fields)
+        )
 
     degradations: dict[str, str] = {}
     try:
@@ -161,6 +184,40 @@ def parse_semantic_decision(
     if pacing not in PACING_VALUES:
         degradations["pacing"] = "unknown value; assumed continue"
         pacing = "continue"
+
+    raw_intimacy = payload.get("intimacy_context") or {}
+    if not isinstance(raw_intimacy, dict):
+        degradations["intimacy_context"] = "not an object; dropped"
+        raw_intimacy = {}
+    intimacy_active = bool(raw_intimacy.get("active", False))
+    content_register = _clean(
+        raw_intimacy.get("content_register") or "none", 30
+    ).lower()
+    if content_register not in INTIMACY_REGISTERS:
+        degradations["intimacy_context.content_register"] = (
+            "unknown value; assumed none"
+        )
+        content_register = "none"
+    scene_mode = _clean(raw_intimacy.get("scene_mode") or "none", 30).lower()
+    if scene_mode not in INTIMACY_SCENE_MODES:
+        degradations["intimacy_context.scene_mode"] = "unknown value; assumed none"
+        scene_mode = "none"
+    intimacy_direction = _clean(
+        raw_intimacy.get("direction") or pacing or "continue", 30
+    ).lower()
+    if intimacy_direction not in PACING_VALUES:
+        degradations["intimacy_context.direction"] = (
+            "unknown value; assumed continue"
+        )
+        intimacy_direction = "continue"
+    intimacy_context = IntimacyContext(
+        active=intimacy_active,
+        content_register=content_register,
+        scene_mode=scene_mode,
+        direction=intimacy_direction,
+        last_beat=_clean(raw_intimacy.get("last_beat"), 500),
+        boundaries=_strings(raw_intimacy.get("boundaries"), limit=8),
+    )
 
     raw_operation = payload.get("operation_proposal") or {}
     if raw_operation is None:
@@ -220,6 +277,7 @@ def parse_semantic_decision(
         relevant_thread_ids=_strings(payload.get("relevant_thread_ids"), limit=12),
         initiative=initiative,
         pacing=pacing,
+        intimacy_context=intimacy_context,
         evidence_requests=tuple(evidence_requests),
         memory_candidates=tuple(
             dict(item) for item in memory_candidates[:12] if isinstance(item, dict)

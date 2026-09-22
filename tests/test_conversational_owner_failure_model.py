@@ -230,6 +230,14 @@ async def test_kimi_is_the_only_writer_and_receives_no_model_fallback(monkeypatc
         prompt_text["raw_conversation"]["latest_fan_message_burst"][0]["text"]
         == "mm"
     )
+    assert prompt_text["semantic_decision"]["intimacy_context"] == {
+        "active": False,
+        "content_register": "none",
+        "scene_mode": "none",
+        "direction": "continue",
+        "last_beat": "",
+        "boundaries": [],
+    }
 
 
 @pytest.mark.asyncio
@@ -376,3 +384,77 @@ async def test_missing_evidence_is_refreshed_in_the_same_fan_turn(monkeypatch):
     assert prepared.replies == ["now i know exactly which moment you mean"]
     assert prepared.decision.response_goal.startswith("continue naturally")
     assert loads == []
+
+
+
+@pytest.mark.asyncio
+async def test_intimate_context_reaches_kimi_and_survives_operation_rejection(monkeypatch):
+    observed = {}
+
+    async def generate(prompt, _persona, **kwargs):
+        observed["payload"] = json.loads(prompt[1]["content"])
+        trace = kwargs["trace"]
+        trace.record_request(
+            primary_target=KIMI_TARGET,
+            fallback_target=None,
+            profile="cleo_v3",
+            policy="test",
+            deadline_seconds=1,
+        )
+        trace.record_success(
+            target=KIMI_TARGET,
+            role="pinned",
+            attempt_index=0,
+            upstream_provider="moonshot",
+            outcome="success",
+            attempts=1,
+            pinned_attempts=1,
+            alternate_attempts=0,
+            elapsed_ms=5,
+            served_model=KIMI_TARGET.model,
+        )
+        return ["keep the same moment going"]
+
+    monkeypatch.setattr(live_orchestration, "generate_replies", generate)
+    evidence = loaded()
+    decision = live_orchestration.parse_semantic_decision(
+        decision_payload(
+            intimacy_context={
+                "active": True,
+                "content_register": "explicit",
+                "scene_mode": "shared_imagined",
+                "direction": "hold",
+                "last_beat": "stay with the same shared premise",
+                "boundaries": ["do not rush"],
+            },
+            operation_proposal={
+                "kind": "present_offer",
+                "subject": "the requested content",
+                "candidate_handle": "missing",
+            },
+        )
+    ).decision
+
+    authorized = await live_orchestration._authorize_conversational_v1_operation(
+        evidence, decision=decision, execute_operations=False
+    )
+    assert authorized.execution.operation == "none"
+    assert authorized.decision.intimacy_context == decision.intimacy_context
+
+    replies, _trace = await live_orchestration._write_conversational_v1_turn(
+        evidence,
+        authorized.decision,
+        authorized.execution,
+        ConversationalWorkingState(),
+        mode="auto",
+    )
+
+    assert replies == ["keep the same moment going"]
+    assert observed["payload"]["semantic_decision"]["intimacy_context"] == {
+        "active": True,
+        "content_register": "explicit",
+        "scene_mode": "shared_imagined",
+        "direction": "hold",
+        "last_beat": "stay with the same shared premise",
+        "boundaries": ["do not rush"],
+    }

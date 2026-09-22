@@ -235,6 +235,14 @@ Contract:
   "relevant_thread_ids": [],
   "initiative": "fan|creator|shared",
   "pacing": "build|hold|continue|cool|redirect|pause|resume",
+  "intimacy_context": {
+    "active": false,
+    "content_register": "none|flirty|suggestive|explicit",
+    "scene_mode": "none|conversational|shared_imagined",
+    "direction": "build|hold|continue|cool|redirect|pause|resume",
+    "last_beat": "",
+    "boundaries": []
+  },
   "evidence_requests": [{"category":"inventory|memory|continuity|transactions|creator_voice"}],
   "operation_proposal": {"kind":"none|present_offer|send_locked_paid_message|check_payment_claim|repair_content_access|hand_off_to_human", "subject":"", "because":"", "candidate_handle":"", "payment_reference":"", "purchase_id":""},
   "hold": "none|waiting_on_customer|waiting_on_payment|needs_human|respect_silence|insufficient_evidence",
@@ -245,6 +253,8 @@ Contract:
 }
 
 Interpret short replies from the immediate raw exchange, not from length. Track initiative and non-linear pacing without a funnel. Direction changes and corrections override an old trajectory. Preserve shared imagined premises as imagined. Purchases, rejection, delivery, and failed operations remain events inside the same conversation rather than reset points.
+
+Adult/intimate conversation is not a separate funnel and not a reason to sell. When it is active, track its independent dimensions only when useful: descriptive content register, whether it is ordinary intimate conversation or a shared imagined scene, the current direction (build/hold/continue/cool/redirect/pause/resume), the last meaningful beat, and any clearly established conversational boundaries. These dimensions may move in ANY direction on the next turn. Do not infer a required escalation from explicitness, short replies, elapsed turns, purchase state, or a prior sale. Preserve the exact active premise/roles/references instead of resetting to generic flirting. If the fan cools, redirects, corrects, or ends the intimate line, follow that change cheaply.
 
 The application alone owns inventory identity, price, recipient, payment, purchase, delivery, permissions, idempotency, persistence, and operation results. Choose at most one supplied opaque candidate_handle. Request missing essential evidence; do not invent it. Omit optional fields when nothing changes.
 """
@@ -1940,6 +1950,7 @@ def _validate_conversational_v1_reply(
         relevant_thread_ids=decision.relevant_thread_ids,
         initiative=decision.initiative,
         pacing=decision.pacing,
+        intimacy_context=decision.intimacy_context,
         memory_candidates=decision.memory_candidates,
         proposed_operation=ProposedOperation(),
         response_intent=ResponseIntent.RESPECT_SILENCE,
@@ -2165,7 +2176,9 @@ The GLM decision is semantic guidance, not draft copy. Use the raw ordered messa
 
 Write in THIS creator's voice using the explicit voice fields and recent creator messages. Examples from other conversations, when present, teach conversational behavior and rhythm only. Never copy their facts, identity, wording, slang, punctuation, or emoji habits over the current creator's voice.
 
-React specifically and contribute: a thought, opinion, callback, tease, continuation, direction change, or completed conversational beat. Questions are optional. Do not default to acknowledge + generic compliment + emoji + generic question. Short fan messages may invite creator initiative. Preserve shared imagined scenes as imagined; follow corrections and topic changes cheaply. Pacing can build, hold, continue, cool, redirect, pause, or resume without a fixed ladder. Adult/intimate continuity may continue, hold, cool, redirect, or end according to context; explicitness never forces escalation or a sale.
+React specifically and contribute: a thought, opinion, callback, tease, continuation, direction change, or completed conversational beat. Questions are optional. Do not default to acknowledge + generic compliment + emoji + generic question. Short fan messages may invite creator initiative. Preserve shared imagined scenes as imagined; follow corrections and topic changes cheaply. Pacing can build, hold, continue, cool, redirect, pause, or resume without a fixed ladder.
+
+For adult/intimate conversation, use semantic_decision.intimacy_context together with the RAW recent exchange. Preserve the exact current beat, roles, references, and shared premise instead of restarting from generic flirting. The intimate line may build, hold, continue, cool, redirect, pause, resume, or end on any turn. A more explicit register is descriptive context, NOT permission or an instruction to escalate. Short replies can mean continuation or invitation to lead; interpret them from the preceding beat. Do not manufacture a new scenario when one is already active. Do not convert an intimate moment into a commercial pitch merely because it is intimate. If the fan changes direction or cools the interaction, follow immediately. Keep imagined actions inside the imagined/shared-scene scope and never present them as current real-world activity.
 
 Commercial and media language stays inside the conversation. Never use catalogue voice, media counts, package/set/inventory terminology, private IDs, URLs, or internal metadata. Use only prepared_operation_facts. The application owns price and transaction truth. Do not claim payment, purchase, send, attachment, or delivery unless the prepared facts state it. After rejection, purchase, or delivery, continue the existing moment; do not automatically discount, reset, upsell, or force a feedback question.
 
@@ -2658,6 +2671,7 @@ def _repair_rejected_core_v1_operation(
         relevant_thread_ids=decision.relevant_thread_ids,
         initiative=decision.initiative,
         pacing=decision.pacing,
+        intimacy_context=decision.intimacy_context,
         evidence_requests=decision.evidence_requests,
         memory_candidates=decision.memory_candidates,
         proposed_operation=sanitized,
@@ -2730,6 +2744,7 @@ async def _authorize_conversational_v1_operation(
                 relevant_thread_ids=decision.relevant_thread_ids,
                 initiative=decision.initiative,
                 pacing=decision.pacing,
+                intimacy_context=decision.intimacy_context,
                 memory_candidates=decision.memory_candidates,
                 proposed_operation=ProposedOperation(),
                 response_intent=ResponseIntent.ANSWER_AND_CONTINUE,

@@ -113,6 +113,33 @@ class HoldReason(str, Enum):
 
 
 @dataclass(frozen=True)
+class IntimacyContext:
+    """Descriptive intimate/adult context for the current turn.
+
+    This is intentionally not a stage machine. Every dimension may move in any
+    direction on the next turn and none of them authorize escalation, media,
+    price, or a sale.
+    """
+
+    active: bool = False
+    content_register: str = "none"
+    scene_mode: str = "none"
+    direction: str = "continue"
+    last_beat: str = ""
+    boundaries: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "active": self.active,
+            "content_register": self.content_register,
+            "scene_mode": self.scene_mode,
+            "direction": self.direction,
+            "last_beat": self.last_beat,
+            "boundaries": list(self.boundaries),
+        }
+
+
+@dataclass(frozen=True)
 class ProposedOperation:
     """Something with an external effect that this turn is asking for.
 
@@ -181,6 +208,10 @@ class ConversationDecision:
     relevant_thread_ids: tuple[str, ...] = ()
     initiative: str = "shared"
     pacing: str = "continue"
+
+    #: Adult/intimate continuity is carried as independent descriptive
+    #: dimensions, never as an escalation stage or scalar engagement score.
+    intimacy_context: IntimacyContext = field(default_factory=IntimacyContext)
 
     #: Application-owned evidence categories the decision layer could not
     #: resolve from the supplied snapshot. The orchestrator may satisfy these
@@ -262,6 +293,7 @@ class ConversationDecision:
             "relevant_thread_ids": list(self.relevant_thread_ids),
             "initiative": self.initiative,
             "pacing": self.pacing,
+            "intimacy_context": self.intimacy_context.as_dict(),
             "evidence_requests": list(self.evidence_requests),
             "memory_candidates": [dict(row) for row in self.memory_candidates],
             "response_intent": self.response_intent.value,
