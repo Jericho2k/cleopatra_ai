@@ -2621,7 +2621,11 @@ def _provenance(
         # Which conversation generation produced this wording. The single
         # question every "why was that bubble cancelled?" investigation starts
         # from, and the reason it is on the record rather than in a log line.
-        "conversation_generation": loaded.conversation_generation,
+            # ``getattr`` for the same reason as candidate_handles and
+            # hermes_examples: orchestration tests deliberately use small
+            # stand-ins, and a provenance field must never be the thing
+            # that decides a turn fails.
+            "conversation_generation": getattr(loaded, "conversation_generation", 0),
         "truncation": loaded.snapshot.truncation,
     }
     if working_state_before is not None and state_delta_validation is not None:
@@ -3455,7 +3459,9 @@ async def _record_scheduled_intent(prepared: PreparedTurn) -> dict[str, Any] | N
             creator_id=prepared.loaded.snapshot.creator_id,
             fan_id=prepared.loaded.fan.id,
             intent=intent,
-            conversation_generation=prepared.loaded.conversation_generation,
+            conversation_generation=getattr(
+                prepared.loaded, "conversation_generation", 0
+            ),
             payday_at=payday_at,
             pending_offer_expires_at=expiry,
         )
@@ -3514,7 +3520,9 @@ async def deliver_reply(
         turn_id=prepared.provenance.turn_id,
         parts=parts,
         schedule=schedule,
-        conversation_generation=prepared.loaded.conversation_generation,
+        conversation_generation=getattr(
+            prepared.loaded, "conversation_generation", 0
+        ),
         metadata=metadata,
     )
     if sequence is None:

@@ -389,3 +389,87 @@ def test_an_intention_that_no_longer_makes_sense_resolves_silently(monkeypatch):
 
 def test_the_intent_handler_is_registered():
     assert worker.HANDLERS["CONVERSATIONAL_INTENT"] is worker._run_conversational_intent
+
+
+# --- the specialised follow-ups are integrated with, not replaced -----------
+
+
+def payday_action(payday_at: datetime) -> dict:
+    return {
+        "id": "action-2",
+        "creator_id": "creator-1",
+        "fan_id": "fan-1",
+        "action_type": "PAYDAY_REENGAGEMENT",
+        "dedupe_key": "payday:fan-1",
+        "payload": {
+            "payday_at": payday_at.isoformat(),
+            "desired_experience": "the set he picked",
+        },
+    }
+
+
+@pytest.fixture
+def payday_world(monkeypatch):
+    from types import SimpleNamespace
+
+    from models.commercial import CreatorPolicy, FanCommercialState, FanStatus
+
+    payday = datetime.now(timezone.utc) - timedelta(minutes=5)
+    state = FanCommercialState(
+        status=FanStatus.PAUSED_UNTIL_PAYDAY,
+        payday_at=payday,
+        next_followup_type="PAYDAY_REENGAGEMENT",
+        next_followup_dedupe_key="payday:fan-1",
+    )
+    holder = {"state": state, "payday": payday}
+
+    async def _fan(_fan_id):
+        return SimpleNamespace(id="fan-1", needs_human_review=False, auto_mode=True)
+
+    async def _fan_state(_fan_id):
+        return holder["state"]
+
+    async def _policy(_creator_id):
+        return CreatorPolicy()
+
+    async def _history(_fan_id, limit=10):
+        return []
+
+    async def _sleep_hours(_creator_id):
+        return 0, 0
+
+    monkeypatch.setattr("db.queries.get_fan_by_id", _fan)
+    monkeypatch.setattr("db.queries.get_conversation_history", _history)
+    monkeypatch.setattr("db.queries.get_creator_sleep_hours", _sleep_hours)
+    monkeypatch.setattr(worker, "get_fan_state", _fan_state)
+    monkeypatch.setattr(worker, "get_creator_policy", _policy)
+    return holder
+
+
+def test_payday_reengagement_still_fires_when_he_is_still_waiting(payday_world):
+    check = run(worker._should_still_send(payday_action(payday_world["payday"])))
+
+    assert check.ok is True
+
+
+def test_payday_reengagement_does_not_chase_a_fan_who_already_bought(payday_world):
+    """Case 10: revalidation, not a stored message, is what makes this safe."""
+    from models.commercial import FanStatus
+
+    payday_world["state"].status = FanStatus.PAID_SESSION_ACTIVE
+
+    check = run(worker._should_still_send(payday_action(payday_world["payday"])))
+
+    assert check.ok is False
+    assert "no longer paused" in check.reason
+
+
+def test_a_newer_payday_replaces_the_one_this_action_was_built_for(payday_world):
+    check = run(
+        worker._should_still_send(
+            payday_action(datetime.now(timezone.utc) - timedelta(days=7))
+        )
+    )
+
+    assert check.ok is False
+    assert "newer payday" in check.reason

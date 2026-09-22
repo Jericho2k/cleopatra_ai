@@ -415,3 +415,99 @@ def test_emoji_repetition_never_blocks_a_send():
     )
 
     assert reasons("you're trouble 😏", evidence) == []
+
+
+# --- 5. What the balance actually permits ----------------------------------
+
+
+def commercial_decision(kind, *, offer_id="", set_id="", handle=""):
+    from models.conversation_decision import (
+        ConversationDecision,
+        OperationKind,
+        ProposedOperation,
+    )
+
+    return ConversationDecision(
+        proposed_operation=ProposedOperation(
+            kind=OperationKind(kind),
+            subject="the set he asked about",
+            candidate_handle=handle,
+            offer_id=offer_id,
+            set_id=set_id,
+        )
+    )
+
+
+def test_a_direct_buying_signal_leaves_the_operation_available():
+    """Not forced, available. GLM still judges the moment; the state permits it."""
+    record = Offer(
+        offer_id="offer-1", set_id="set-1", label="approved set", price_cents=2500
+    )
+    evidence = loaded(
+        latest="I'll pay extra baby",
+        burst=(message("fan", "I'll pay extra baby", "m-1"),),
+        next_offer=record,
+    )
+    evidence.candidate_handles = {"offer_candidate_1": record}
+
+    assert "present_offer" in live_orchestration.legal_operations(evidence)
+    validation = live_orchestration.validate_decision(
+        commercial_decision(
+            "present_offer", offer_id="offer-1", set_id="set-1", handle="offer_candidate_1"
+        ),
+        evidence,
+    )
+    assert validation.approved is True
+
+
+def test_an_intimate_turn_with_no_buying_signal_may_simply_continue():
+    """#68's rule, unchanged: nothing forces a sale."""
+    evidence = loaded(
+        latest="i can't stop thinking about your mouth",
+        burst=(message("fan", "i can't stop thinking about your mouth", "m-1"),),
+        next_offer=Offer(
+            offer_id="offer-1", set_id="set-1", label="approved set", price_cents=2500
+        ),
+    )
+
+    validation = live_orchestration.validate_decision(
+        commercial_decision("none"), evidence
+    )
+
+    assert validation.approved is True
+    assert evidence.snapshot.commercial_opportunity["fan_stated_buying_signal"] is False
+    assert reasons("tell me exactly what you'd do first", evidence) == []
+
+
+def test_no_inventory_means_no_commercial_operation_however_he_asks():
+    evidence = loaded(
+        latest="just tell me the price",
+        burst=(message("fan", "just tell me the price", "m-1"),),
+        next_offer=None,
+    )
+
+    assert "present_offer" not in live_orchestration.legal_operations(evidence)
+    validation = live_orchestration.validate_decision(
+        commercial_decision("present_offer", offer_id="offer-1", set_id="set-1"),
+        evidence,
+    )
+    assert validation.approved is False
+
+
+def test_a_rejection_leaves_the_conversation_running():
+    evidence = loaded(
+        latest="nah I'm good, too rich for me tonight",
+        burst=(message("fan", "nah I'm good, too rich for me tonight", "m-1"),),
+    )
+
+    assert reasons("all good, I'd rather just talk anyway", evidence) == []
+
+
+def test_the_decision_model_is_told_the_opportunity_and_the_rule():
+    """GLM sees what he said, and the sentence that keeps it from being a funnel."""
+    assert "commercial_opportunity" in live_orchestration.CONVERSATIONAL_V1_SYSTEM
+    assert "never state a price" in live_orchestration.CONVERSATIONAL_V1_SYSTEM
+    assert (
+        "NEVER create a commercial opportunity by themselves"
+        in live_orchestration.CONVERSATIONAL_V1_SYSTEM
+    )

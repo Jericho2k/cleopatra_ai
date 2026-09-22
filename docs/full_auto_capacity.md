@@ -245,6 +245,49 @@ Everything else it reports (queue depth, time to first bubble, peak pending
 human-delay actions, model and worker utilisation) exists so a regression in
 shape is visible rather than inferred.
 
+#### Measured results: many conversations at once
+
+100 creators, 1,567 active fans, a two-message burst each, 1–3 bubbles per
+reply, and 382 conversations interrupted *between* bubbles by advancing the
+conversation generation from outside the process. Human-like delays are the real
+`build_delivery_schedule` output scaled by `time_scale` so the run fits in
+seconds; the plan is real, only the clock is small.
+
+| Model latency per call | 50 ms | 200 ms |
+|---|---|---|
+| Conversations planned | 1,567 | 1,567 |
+| Bubbles delivered | 2,799 | 2,853 |
+| **Stale sends** | **0** | **0** |
+| **Duplicate sends** | **0** | **0** |
+| **Same-fan overlaps** | **0** | **0** |
+| Sequences superseded mid-flight | 241 | 216 |
+| Peak queue depth | 3,133 | 3,133 |
+| Peak bubbles mid-pause at once | 3,126 | 3,126 |
+| Peak concurrent model calls | 8 / 8 | 8 / 8 |
+| Peak concurrent actions | 8 / 8 | 8 / 8 |
+| p50 / p95 time to first bubble | 12.0 s / 20.7 s | 41.9 s / 76.8 s |
+| Drain | 23.8 s | 83.0 s |
+| Model utilisation | 0.84 | 0.95 |
+
+Three things this shows, and one it deliberately does not claim:
+
+- **3,126 bubbles are mid-pause while 8 actions run.** Under the previous shape
+  each of those would have been a coroutine holding one of eight slots. Human
+  delivery timing and model capacity are now separate resources.
+- **Time to first bubble scales with MODEL latency, not with delivery timing.**
+  Quadrupling the provider's latency roughly quadruples it; the delivery layer
+  is not what fans queue behind.
+- **Interruption works at scale and from outside the process.** 241 sequences
+  were retired mid-flight with nothing stale escaping.
+- It does **not** claim a production SLA. Providers are stubbed, the database is
+  in memory, and the clock is compressed. What it measures is shape.
+
+The harness also reports `concurrent_generation_bumps` — a fan message that
+landed *during* a send, after its gate had already passed. Those are concurrent
+rather than stale, and they are counted separately rather than folded into
+either number, because conflating them would make "zero stale sends" either
+unmeetable or meaningless.
+
 ### Measured results: one action type draining
 
 Model latency 2.0 s per call (two calls per reply), composition delay 6.8 s (the
