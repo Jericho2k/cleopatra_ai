@@ -14,6 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from models.conversation_decision import (
+    CANCEL_ON_ACTIVITY,
+    INTENT_ACTIVITY_POLICIES,
+    INTENT_KINDS,
+    REVALIDATE_ON_ACTIVITY,
     ConversationDecision,
     IntimacyContext,
     HoldReason,
@@ -21,6 +25,7 @@ from models.conversation_decision import (
     ProposedOperation,
     ResponseDisposition,
     ResponseIntent,
+    ScheduledIntent,
 )
 
 FORBIDDEN_PROSE_FIELDS = frozenset(
@@ -61,6 +66,21 @@ PACING_VALUES = frozenset(
 )
 INTIMACY_REGISTERS = frozenset({"none", "flirty", "suggestive", "explicit"})
 INTIMACY_SCENE_MODES = frozenset({"none", "conversational", "shared_imagined"})
+
+#: Named times the APPLICATION already holds evidence for. A decision may point
+#: at one; it may never state a clock time of its own, because it has no way to
+#: know one and every way to guess.
+INTENT_TIME_REFERENCES = frozenset({"payday", "pending_offer_expiry"})
+
+#: Deterministic bounds on a model-selected relative delay. Thirty seconds is
+#: the shortest pause that reads as "hold on" rather than as a glitch; a day is
+#: the longest a conversational continuation can claim before it is really a
+#: lifecycle follow-up, which has its own machinery.
+MIN_INTENT_DELAY_SECONDS = 30
+MAX_INTENT_DELAY_SECONDS = 24 * 60 * 60
+
+#: Kinds whose natural reading is "unless he speaks first".
+_CANCEL_BY_DEFAULT = frozenset({"short_continuation", "scene_resume"})
 
 
 @dataclass(frozen=True)
@@ -108,6 +128,104 @@ def _strings(value: Any, *, limit: int = 12) -> tuple[str, ...]:
     return tuple(
         dict.fromkeys(_clean(item) for item in value if _clean(item))
     )[:limit]
+
+
+def _parse_scheduled_intent(
+    raw: Any, degradations: dict[str, str]
+) -> ScheduledIntent:
+    """Read a future conversational obligation, or refuse it.
+
+    Everything here is a narrowing. The kind must be in the vocabulary, the goal
+    must exist and must not name a price, the timing must be either a clamped
+    relative delay or one of the application's own evidenced references, and the
+    activity policy must be one of two values. Anything else is dropped with a
+    reason rather than guessed at, because a scheduled intention that is wrong
+    reaches the fan hours later with nobody watching.
+    """
+    if raw in (None, "", {}, []):
+        return ScheduledIntent()
+    if not isinstance(raw, dict):
+        degradations["scheduled_intent"] = "not an object; dropped"
+        return ScheduledIntent()
+
+    prose = sorted(FORBIDDEN_PROSE_FIELDS.intersection(raw))
+    if prose:
+        degradations["scheduled_intent"] = (
+            "carried fan-facing wording (" + ", ".join(prose) + "); dropped"
+        )
+        return ScheduledIntent()
+
+    kind = _clean(raw.get("kind"), 40).lower()
+    if kind not in INTENT_KINDS:
+        degradations["scheduled_intent.kind"] = "unknown kind; dropped"
+        return ScheduledIntent()
+
+    goal = _clean(raw.get("goal"), 400)
+    if not goal:
+        degradations["scheduled_intent.goal"] = "missing; dropped"
+        return ScheduledIntent()
+    if "$" in goal or "€" in goal or "£" in goal:
+        degradations["scheduled_intent.goal"] = "named a price; dropped"
+        return ScheduledIntent()
+
+    timing = raw.get("timing")
+    if not isinstance(timing, dict):
+        timing = {}
+    timing_kind = ""
+    relative_seconds = 0
+    reference = ""
+
+    raw_reference = _clean(timing.get("reference"), 60).lower()
+    if raw_reference:
+        if raw_reference not in INTENT_TIME_REFERENCES:
+            degradations["scheduled_intent.timing"] = (
+                "unknown time reference; dropped"
+            )
+            return ScheduledIntent()
+        timing_kind = "reference"
+        reference = raw_reference
+    else:
+        raw_minutes = timing.get("relative_minutes", timing.get("minutes"))
+        raw_seconds = timing.get("relative_seconds", timing.get("seconds"))
+        candidate: float | None = None
+        for value, multiplier in ((raw_minutes, 60.0), (raw_seconds, 1.0)):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                candidate = float(value) * multiplier
+                break
+        if candidate is None:
+            degradations["scheduled_intent.timing"] = "no usable delay; dropped"
+            return ScheduledIntent()
+        clamped = max(
+            MIN_INTENT_DELAY_SECONDS, min(MAX_INTENT_DELAY_SECONDS, int(candidate))
+        )
+        if int(clamped) != int(candidate):
+            degradations["scheduled_intent.timing"] = (
+                f"delay clamped to {clamped}s from {int(candidate)}s"
+            )
+        timing_kind = "relative"
+        relative_seconds = int(clamped)
+
+    policy = _clean(raw.get("activity_policy"), 40).lower()
+    if policy not in INTENT_ACTIVITY_POLICIES:
+        if policy:
+            degradations["scheduled_intent.activity_policy"] = (
+                "unknown value; using the default for this kind"
+            )
+        policy = (
+            CANCEL_ON_ACTIVITY
+            if kind in _CANCEL_BY_DEFAULT
+            else REVALIDATE_ON_ACTIVITY
+        )
+
+    return ScheduledIntent(
+        kind=kind,
+        goal=goal,
+        timing_kind=timing_kind,
+        relative_seconds=relative_seconds,
+        reference=reference,
+        source_ids=_strings(raw.get("source_ids"), limit=8),
+        activity_policy=policy,
+    )
 
 
 def parse_semantic_decision(
@@ -265,6 +383,10 @@ def parse_semantic_decision(
         degradations["memory_candidates"] = "not a list; dropped"
         memory_candidates = []
 
+    scheduled_intent = _parse_scheduled_intent(
+        payload.get("scheduled_intent"), degradations
+    )
+
     decision = ConversationDecision(
         active_needs=_strings(payload.get("active_needs"), limit=12),
         supporting_messages=tuple(dict.fromkeys(supporting))[:24],
@@ -290,6 +412,7 @@ def parse_semantic_decision(
             payment_reference=_clean(raw_operation.get("payment_reference"), 200),
             purchase_id=_clean(raw_operation.get("purchase_id"), 200),
         ),
+        scheduled_intent=scheduled_intent,
         response_intent=ResponseIntent.ORDINARY_CONVERSATION,
         disposition=disposition,
         hold=hold,
