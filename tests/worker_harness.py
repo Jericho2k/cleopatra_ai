@@ -122,6 +122,31 @@ def install(
         "_should_still_send",
         revalidate or (lambda _action: _ok()),
     )
+    # The durable per-fan lease is a database round trip. These tests are about
+    # the worker's own scheduling shape, so it is replaced by an in-memory
+    # equivalent that still asserts the same invariant: one owner per fan at a
+    # time. The real claim is exercised against its own doubles in
+    # tests/test_fan_execution_lease.py.
+    held: dict[str, str] = {}
+
+    async def _acquire(action: dict):
+        fan_id = str(action.get("fan_id") or "")
+        if not fan_id:
+            return True, ""
+        token = f"harness:{action.get('id')}"
+        owner = held.get(fan_id)
+        if owner is not None and owner != token:
+            return False, ""
+        held[fan_id] = token
+        return True, token
+
+    async def _release(action: dict, token: str) -> None:
+        fan_id = str(action.get("fan_id") or "")
+        if token and held.get(fan_id) == token:
+            held.pop(fan_id, None)
+
+    monkeypatch.setattr(worker, "_acquire_fan_slot", _acquire)
+    monkeypatch.setattr(worker, "_release_fan_slot", _release)
     monkeypatch.setitem(worker.HANDLERS, action_type, handler)
 
 

@@ -108,6 +108,10 @@ from db.commercial_queries import (
 )
 from services.session_planner import plan_session_for_fan
 from core.action_telemetry import record_stage, stage as action_stage
+from services.delivery_mode import (
+    durable_delivery_scope,
+    immediate_delivery_scope,
+)
 from services.human_delivery import (
     build_availability_delay,
     build_delivery_schedule,
@@ -240,6 +244,9 @@ AUTO_OUTCOME_HUMAN_REVIEW = "human_review"
 AUTO_OUTCOME_OWNER_FAILED = "owner_failed"
 AUTO_OUTCOME_STALE_GENERATION = "stale_generation"
 AUTO_OUTCOME_APPROVAL_REQUIRED = "approval_required"
+#: Core v1 authorized the wording and queued its bubbles at human-like times.
+#: The reply exists durably; it simply has not left yet.
+AUTO_OUTCOME_SCHEDULED = "scheduled"
 
 
 class HumanReviewHandoffError(RuntimeError):
@@ -1548,6 +1555,15 @@ async def _debounced_auto_reply(
                 )
                 if result.get("reason"):
                     outcome_sink["reason"] = str(result["reason"])[:2000]
+                # What production WOULD have waited, reported even when this
+                # run did not wait. A simulator that hides the timing plan
+                # cannot tell a fast simulated turn from a robotic live one.
+                if result.get("sequence_id"):
+                    outcome_sink["outbound_sequence_id"] = str(result["sequence_id"])
+                if result.get("planned_timing"):
+                    outcome_sink["planned_timing"] = result["planned_timing"]
+                if result.get("scheduled_intent"):
+                    outcome_sink["scheduled_intent"] = result["scheduled_intent"]
             return
         # Check for a pending tip and clear it atomically before building context
         pending_tip: dict | None = None
@@ -3443,6 +3459,16 @@ async def schedule_auto_reply(
         seconds=wake_jitter + random.uniform(7.0, 12.0) + availability_seconds
     )
     await cancel_actions_for_fan(fan_id, "AUTO_REPLY")
+    # He has spoken, so any bubble still queued from the PREVIOUS turn is stale
+    # by definition. Its own send boundary would refuse it anyway — the
+    # conversation generation has already moved — but retiring it here keeps
+    # the queue from carrying work whose only future is to be rejected.
+    try:
+        from services.outbound_delivery import supersede_active_sequences
+
+        await supersede_active_sequences(fan_id, reason="fan_replied")
+    except Exception as exc:  # noqa: BLE001 - the send gate is the guarantee
+        print(f"[AUTO REPLY] could not retire queued bubbles fan={fan_id}: {exc}")
     dedupe_source = source_message_id or trigger_at.isoformat()
     await schedule_action(
         creator_id=creator_id,
@@ -3492,6 +3518,7 @@ async def deliver_scheduled_auto_reply(action: dict) -> bool:
         if newer:
             return any(message.role == "creator" for message in newer)
 
+    outcome: dict[str, str] = {}
     task = asyncio.create_task(
         _debounced_auto_reply(
             fan_id,
@@ -3499,13 +3526,33 @@ async def deliver_scheduled_auto_reply(action: dict) -> bool:
             skip_debounce=True,
             skip_availability=True,
             expected_trigger_at=trigger_at_raw or None,
+            outcome_sink=outcome,
         )
     )
+    # Still registered, because the LEGACY core's in-process debounce reads it.
+    # It is no longer what makes Core v1 correct: supersession there is the
+    # durable conversation generation, revalidated at every send boundary, which
+    # is why a fan message handled by another process still stops bubble 2.
     _pending_auto_replies[fan_id] = task
     try:
         await task
     except asyncio.CancelledError:
         return False
+    finally:
+        # The slot was never cleared, so a long-lived process accumulated one
+        # finished Task per fan it had ever answered. Harmless at ten fans and
+        # not at ten thousand.
+        if _pending_auto_replies.get(fan_id) is task:
+            _pending_auto_replies.pop(fan_id, None)
+
+    # A durably queued reply IS a reply. Its bubbles are rows in the same queue
+    # this action came from, each with its own due time and its own send gate,
+    # so treating "no creator message yet" as a writer failure would retry a
+    # turn that has already happened.
+    if outcome.get("outcome") == AUTO_OUTCOME_SCHEDULED or outcome.get(
+        "outbound_sequence_id"
+    ):
+        return True
 
     if not trigger_at_raw:
         return False
@@ -3733,7 +3780,12 @@ async def run_simulated_inbound(
         row["id"] for row in await _recent_creator_message_rows(fan_id)
     }
 
-    with simulation_scope(include_mirrored_catalog=include_mirrored_catalog):
+    # A simulated turn executes its planned timing at once. It still PLANS it,
+    # still persists the outbound sequence, still binds it to the conversation
+    # generation and still revalidates at every send boundary — only the
+    # waiting is removed, and the plan it would have waited is reported back.
+    timing_scope = immediate_delivery_scope if fast else durable_delivery_scope
+    with simulation_scope(include_mirrored_catalog=include_mirrored_catalog), timing_scope():
         # Fan intelligence learning is part of the real inbound pipeline, so the
         # simulated turn runs it too. Awaited rather than spawned, so the
         # simulation scope is still active while it runs and the caller's
@@ -3815,4 +3867,11 @@ async def run_simulated_inbound(
         # Internal runner result; persisted behind the owner's diagnostics
         # boundary by simulation_turns, never public message metadata.
         "reason": auto_outcome.get("reason"),
+        # What production WOULD have done with the clock: the availability mode
+        # it inferred, the pause before the first bubble, and the pause before
+        # each following one. Reported rather than waited, so a fast simulator
+        # can still be inspected for robotic timing.
+        "planned_timing": auto_outcome.get("planned_timing"),
+        "outbound_sequence_id": auto_outcome.get("outbound_sequence_id"),
+        "scheduled_intent": auto_outcome.get("scheduled_intent"),
     }

@@ -543,6 +543,52 @@ def check_schema(catalog: Catalog, report: Report) -> None:
         else:
             report.fail(f"function {name}", f"apply {source}")
 
+    # --- Production behaviour sprint: durable supersession + timed delivery ---
+    if catalog.column_exists("fans", "conversation_generation"):
+        report.ok("conversation supersession", "fans.conversation_generation")
+    else:
+        report.fail(
+            "conversation supersession",
+            "a newer fan message cannot invalidate an unsent reply across "
+            "processes; apply db/conversation_supersession_v1.sql",
+        )
+
+    for table, why in (
+        (
+            "outbound_sequences",
+            "human-like reply timing falls back to inline sending and a restart "
+            "between two bubbles loses the rest of the reply",
+        ),
+        (
+            "outbound_sequence_parts",
+            "queued bubbles have nowhere durable to live",
+        ),
+        (
+            "fan_execution_leases",
+            "two worker processes can send to one fan at the same time",
+        ),
+    ):
+        if catalog.table_exists(table):
+            report.ok(f"table {table}")
+        else:
+            report.fail(
+                f"table {table}",
+                f"{why}; apply db/conversation_supersession_v1.sql",
+            )
+
+    for name in (
+        "bump_conversation_generation",
+        "acquire_fan_execution_lease",
+        "release_fan_execution_lease",
+    ):
+        if catalog.function_exists(name):
+            report.ok(f"function {name}")
+        else:
+            report.fail(
+                f"function {name}",
+                "apply db/conversation_supersession_v1.sql",
+            )
+
     if catalog.column_exists("creators", "vault_sync_owner"):
         report.ok("VAULT-003 interruption state", "creators.vault_sync_owner")
     else:

@@ -48,6 +48,37 @@ so a new migration cannot be merged without an explicit position in the order.
 CI never touches production. There is no automatic migration step — applying a
 migration to Supabase is a deliberate manual action.
 
+## Production behaviour sprint (`conversation_supersession_v1.sql`)
+
+One additive migration adds the durable state that replaces process-local
+interruption and per-fan sleeping timers:
+
+| Object | Why |
+|---|---|
+| `fans.conversation_generation` | a monotonic revision; a newly inserted fan message or a human creator reply bumps it, an automated bubble and a duplicate delivery do not |
+| `bump_conversation_generation(uuid)` | one atomic statement, so two concurrent inbound messages cannot both write the same successor |
+| `outbound_sequences` | one planned multi-bubble reply, bound to the generation that produced it; unique on `(fan_id, trigger_identity)` so a retry adopts its plan |
+| `outbound_sequence_parts` | one row per bubble with its own `due_at` and delivery receipt; unique on `(sequence_id, part_index)` |
+| `fan_execution_leases` | cross-worker mutual exclusion for outbound work on one fan, with expiry as the crash-recovery path |
+| `acquire_fan_execution_lease` / `release_fan_execution_lease` | take-or-refuse and owner-scoped release, both single statements |
+
+**Rolling-deploy safety.** Apply it **before** deploying the code. New code
+against an un-migrated database degrades rather than failing: the generation
+reads as unknown (so supersession falls back to the existing state revision),
+durable timed delivery falls back to the previous inline send, and the lease
+falls back to in-process per-fan grouping — which is exactly the guarantee that
+existed before. Each fallback logs once per process, not once per turn. Old code
+against a migrated database is unaffected: the column defaults to 0, the tables
+stay empty and the functions are never called.
+
+**Browser boundary.** All three tables are internal delivery machinery carrying
+`creator_id` and/or `fan_id`, so the two discovery migrations would otherwise
+hand `authenticated` a policy and a SELECT grant on unsent creator copy and on
+the lease that arbitrates sending. They are registered in
+`public.owner_only_tables` and have RLS enabled with no policy; the service role
+bypasses RLS and is unaffected. `tests/test_conversation_supersession_schema.py`
+asserts this against a real PostgreSQL.
+
 ## Migration ordering
 
 The order in `migration_order.txt` is not alphabetical. Three real dependencies

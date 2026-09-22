@@ -153,6 +153,14 @@ assisted_provenance_atomic_consume_v1.sql
 # creator-owned table, so it must precede tenant isolation / least privilege.
 conversational_working_state_v1.sql
 
+# Production behaviour sprint: fans.conversation_generation (durable
+# supersession), outbound_sequences / outbound_sequence_parts (durable
+# human-timed multi-bubble delivery), and fan_execution_leases (cross-worker
+# per-fan mutual exclusion). Must run AFTER owner_only_diagnostics_v1.sql,
+# whose registry it writes to, and before the tenant isolation / least
+# privilege pair, which discover tables at run time.
+conversation_supersession_v1.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each

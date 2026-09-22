@@ -139,6 +139,73 @@ class IntimacyContext:
         }
 
 
+#: What a scheduled conversational intention may be about. A short vocabulary
+#: on purpose: it names the KIND of future obligation, never a stage in a
+#: funnel, and application code reads it only to choose a deterministic timing
+#: policy.
+INTENT_KINDS = (
+    "short_continuation",
+    "scene_resume",
+    "check_back",
+    "commercial_callback",
+    "payday_followup",
+)
+
+#: How a scheduled intention reacts to the fan speaking first.
+CANCEL_ON_ACTIVITY = "cancel_on_activity"
+REVALIDATE_ON_ACTIVITY = "revalidate_on_activity"
+INTENT_ACTIVITY_POLICIES = (CANCEL_ON_ACTIVITY, REVALIDATE_ON_ACTIVITY)
+
+
+@dataclass(frozen=True)
+class ScheduledIntent:
+    """A future conversational obligation, stated semantically and never written.
+
+    "Wait right there" is a promise. Cleopatra could keep several specific ones
+    — payday, post-session, abandoned offer — but had no way to make a general
+    one, so the promise was simply dropped.
+
+    What this object deliberately does NOT carry is the message. Freezing Kimi's
+    wording hours in advance would send copy written against a conversation that
+    has since moved, and it would put fan-facing prose back inside the decision
+    role. It carries the GOAL; the words are written when it comes due, by the
+    same GLM -> Kimi path any other turn uses.
+
+    Timing is a REQUEST, not authority. Application code owns the normalized
+    ``execute_at``: a relative delay is clamped to deterministic bounds, and a
+    named reference such as payday resolves against evidence the application
+    already parsed, never against a time a model invented.
+    """
+
+    kind: str = ""
+    #: What the future turn should accomplish, semantically. Not a sentence to
+    #: say, and never a price.
+    goal: str = ""
+    #: "relative" (a delay this conversation implies) or "reference" (an
+    #: application-owned evidenced time such as payday).
+    timing_kind: str = ""
+    relative_seconds: int = 0
+    reference: str = ""
+    #: Message/event ids that make this obligation real.
+    source_ids: tuple[str, ...] = ()
+    activity_policy: str = CANCEL_ON_ACTIVITY
+
+    @property
+    def requested(self) -> bool:
+        return bool(self.kind and self.goal and self.timing_kind)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "goal": self.goal,
+            "timing_kind": self.timing_kind,
+            "relative_seconds": int(self.relative_seconds),
+            "reference": self.reference,
+            "source_ids": list(self.source_ids),
+            "activity_policy": self.activity_policy,
+        }
+
+
 @dataclass(frozen=True)
 class ProposedOperation:
     """Something with an external effect that this turn is asking for.
@@ -225,6 +292,11 @@ class ConversationDecision:
     #: The one external thing being asked for, if any.
     proposed_operation: ProposedOperation = field(default_factory=ProposedOperation)
 
+    #: An optional future conversational obligation this turn wants to create.
+    #: A request: application code normalizes its timing, validates it against
+    #: evidence, and owns whether it is persisted at all.
+    scheduled_intent: ScheduledIntent = field(default_factory=ScheduledIntent)
+
     #: What the turn means to do and whether it should produce customer text.
     #: Defaults preserve the offline comparison contract that predates the live
     #: migration; the selected live core requires both fields explicitly.
@@ -309,6 +381,7 @@ class ConversationDecision:
             "hold": self.hold.value,
             "hold_detail": self.hold_detail,
             "confidence": self.confidence,
+            "scheduled_intent": self.scheduled_intent.as_dict(),
         }
 
 

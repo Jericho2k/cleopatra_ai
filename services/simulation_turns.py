@@ -636,6 +636,26 @@ async def execute_turn(
         f"outcome={settled.get('outcome')} messages={len(creator_messages)} "
         f"elapsed={time.monotonic() - started:.1f}s"
     )
+    # What production WOULD have waited. A fast simulated turn executes its
+    # timing plan immediately, so without this line there is no way to tell a
+    # deliberately paced reply from a robotic one. Timings and identifiers
+    # only; no message text, and owner-facing like the rest of [SIM TURN].
+    timing = settled.get("planned_timing")
+    if timing:
+        print(
+            f"[SIM TURN TIMING] turn_id={turn_id} "
+            + json.dumps(
+                {
+                    "outbound_sequence_id": settled.get("outbound_sequence_id"),
+                    "planned_timing": timing,
+                    "scheduled_intent": (settled.get("scheduled_intent") or {}).get(
+                        "kind"
+                    ),
+                },
+                sort_keys=True,
+                default=str,
+            )
+        )
 
 
 async def _finalize_after_cancellation(
