@@ -1,9 +1,17 @@
 # Full Auto capacity: concurrency, admission control, durable ingestion
 
-This describes the operating envelope of the **current single-process
-deployment** — one Uvicorn process, no `--workers`, every background scheduler
-in-process. Nothing here prepares for a web/worker split; it removes the first
-practical Full Auto capacity ceiling inside the shape that exists today.
+This describes the operating envelope of the current deployment — one Uvicorn
+process, no `--workers`, every background scheduler in-process — and the
+mechanisms that removed the first practical Full Auto capacity ceiling inside
+that shape.
+
+> **Correctness no longer depends on the single process.** This document
+> originally said that per-fan grouping was "the whole per-fan safety story".
+> That is still true *within* one worker, and grouping is still the cheap path.
+> It is no longer the only mechanism: conversation supersession, timed delivery
+> and per-fan execution leases are all durable database state, so a second
+> worker or a second replica changes throughput and nothing else. See
+> [`docs/durable_conversation_delivery.md`](durable_conversation_delivery.md).
 
 ## 1. Where the ceiling was
 
@@ -35,15 +43,19 @@ claim_due_actions(limit = SCHEDULED_ACTION_CLAIM_LIMIT)
    asyncio.Semaphore(SCHEDULED_ACTION_CONCURRENCY)
 ```
 
-Per-fan grouping is the whole per-fan safety story, and it is deliberately the
-simplest thing that works: actions for one fan share one chain, so two
-conflicting sends to one conversation cannot be in flight together. No lock, no
-registry, no distributed coordination.
+Per-fan grouping keeps two conflicting sends for one conversation out of flight
+together **inside this process**, with no lock, no registry and no distributed
+coordination. Across processes that guarantee comes from the durable per-fan
+execution lease (`fan_execution_leases`), taken for every action that may put
+words in front of one fan and released as soon as that action finishes. A fan
+owned by another worker is rescheduled a few seconds out, never skipped.
 
 Everything that protected a single conversation before is still in force
 underneath it and unchanged:
 
-- the `AUTO_REPLY` dedupe key and `_pending_auto_replies` single-flight registry
+- the `AUTO_REPLY` dedupe key (and, for the legacy core only, the
+  `_pending_auto_replies` single-flight registry — Core v1's supersession is the
+  durable conversation generation instead)
 - `cancel_actions_for_fan` (which cancels PENDING, FAILED **and** PROCESSING)
 - the `PROCESSING` status compare-and-swap on claim, complete, fail and reschedule
 - `_should_still_send`, including the expected-trigger-timestamp check
@@ -56,19 +68,25 @@ underneath it and unchanged:
 - A **full** claim is treated as evidence of backlog: the next cycle starts
   after `BUSY_POLL_SECONDS` (0.25 s), capped at `MAX_CONSECUTIVE_BUSY_CYCLES`
   (60) so an unproductive claim cannot become a busy loop.
-- A **short** claim waits `SCHEDULED_ACTION_POLL_SECONDS` (5 s) on an event, so
-  work enqueued inside this process (an accepted webhook) starts immediately
-  rather than waiting out the interval.
+- A **short** claim waits on an event with a timeout of *whichever is sooner*:
+  `SCHEDULED_ACTION_POLL_SECONDS` (5 s), or the moment the next queued action is
+  actually due. The due time comes from one indexed `next_due_at()` read per
+  idle cycle — O(1) in the number of fans — which is what gives a 1–14 second
+  inter-bubble pause its precision without anything waking per conversation.
+  Work enqueued inside this process (an accepted webhook) still starts
+  immediately via the event.
 - Obligation repair runs on its own 60 s cadence rather than once per claim, so
   a fast poll does not multiply repair cost.
 
 ### Reclaim window
 
-`claim_due_actions(stale_minutes=10)` is **unchanged**. Worst-case action
-duration under concurrency is bounded by: composition delay ≤22 s, up to three
-inter-part delays ≤14 s each, two model calls, and gate wait ≤ roughly one model
-call. That is well under three minutes against a ten-minute window, so a
-legitimately slow action still cannot be reclaimed and run twice.
+`claim_due_actions(stale_minutes=10)` is **unchanged**, and the margin is now
+wider rather than narrower: on Core v1 the composition delay and the inter-part
+delays are no longer spent inside an action at all — each is a separate due
+action — so a claimed action is bounded by two model calls, gate wait, and
+persistence. The per-fan lease TTL (300 s) sits between the two: comfortably
+above one bounded action, comfortably below the reclaim window, so a crashed
+worker frees the fan before its action becomes re-claimable.
 
 ## 3. Model admission control
 
@@ -213,7 +231,21 @@ python scripts/load_test_scheduled_actions.py --sequential   # the pre-sprint sh
 `tests/test_scheduled_action_load_harness.py` runs the same harness at
 compressed latencies on every commit.
 
-### Measured results
+A second harness measures the property that matters once a reply is a planned
+sequence rather than one unit of work — many creators, many fans, multi-bubble
+replies, and fan messages landing *between* bubbles from outside the process:
+
+```
+python scripts/load_test_scheduled_actions.py --scale --creators 100 \
+    --fans-per-creator 12 --interrupt-fraction 0.25
+```
+
+Its two hard requirements are `stale_sends == 0` and `same_fan_overlaps == 0`.
+Everything else it reports (queue depth, time to first bubble, peak pending
+human-delay actions, model and worker utilisation) exists so a regression in
+shape is visible rather than inferred.
+
+### Measured results: one action type draining
 
 Model latency 2.0 s per call (two calls per reply), composition delay 6.8 s (the
 value the audit measured), API send 150 ms, DB 4 ms per round trip.
@@ -247,9 +279,34 @@ Two things the table deliberately does not claim:
 | `SCHEDULED_ACTION_CONCURRENCY` | 8 | Independent fans processed at once |
 | `SCHEDULED_ACTION_CLAIM_LIMIT` | 24 | Actions locked per claim (3× concurrency) |
 | `MODEL_MAX_CONCURRENCY` | 8 | Global simultaneous model calls |
-| `SCHEDULED_ACTION_POLL_SECONDS` | 5 | Idle poll; a full batch re-polls immediately |
+| `SCHEDULED_ACTION_POLL_SECONDS` | 5 | Idle poll **ceiling**; the loop wakes earlier when something is due sooner, and a full batch re-polls immediately |
 | `HEALTH_QUEUE_MAX_AGE_SECONDS` | 900 | Degraded above this oldest-pending age |
 | `HEALTH_QUEUE_MAX_DEPTH` | 500 | Degraded above this pending depth |
 
 Every value is safe to deploy unchanged. An unparseable value falls back to the
 default rather than failing the deploy.
+
+## 10. What durable timed delivery changed here
+
+Nothing in this document's configuration changed, and no new variable was added.
+What changed is what a worker slot is spent on.
+
+Before, one Core v1 reply was one action: two model calls, then the whole reply
+sent inline. Human-like pauses were absent from Core v1 entirely, and in the
+legacy path they were awaited inside the action, so eight replies "typing" was
+eight of eight slots doing nothing.
+
+Now a Core v1 reply is one action that plans, plus one action per bubble:
+
+```
+AUTO_REPLY         GLM + Kimi, plan the sequence, exit        <- holds a slot
+DELIVER_...PART 0  wait as a row, then send bubble 1          <- holds a slot briefly
+DELIVER_...PART 1  wait as a row, then send bubble 2          <- holds a slot briefly
+```
+
+Model capacity and human delivery timing are now separate resources. The model
+gate is released before any waiting, and thousands of pending bubbles are
+thousands of cheap rows indexed by `due_at` rather than thousands of coroutines.
+`tests/test_scheduled_action_load_harness.py::test_human_delay_occupies_queue_rows_rather_than_worker_slots`
+asserts exactly that: far more bubbles are mid-pause at once than there are
+worker slots.
