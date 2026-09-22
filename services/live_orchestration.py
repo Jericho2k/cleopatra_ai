@@ -97,7 +97,17 @@ from services.affordability import get_affordability_context
 from services.ai_stack import resolve_ai_stack
 from services.assisted_provenance import remember as remember_assisted_provenance
 from services.context_packet import ContextPacket, build_context_packet
+from services.conversation_generation import current_generation
 from services.conversation_continuity import open_threads_for, recent_episodes_for
+from services.conversation_signals import (
+    fan_publication_references,
+    publication_evidence,
+    purchase_claim,
+    purchase_intent,
+    recent_creator_emoji,
+    unsupported_publication_claim,
+    unverified_purchase_acknowledgement,
+)
 from services.conversation_core import (
     CORE_CONVERSATIONAL_V1,
     CORE_SEMANTIC_V1,
@@ -116,8 +126,20 @@ from services.conversational_decision_contract import (
     parse_semantic_decision,
 )
 from services.decision_owners import SemanticDecisionOwner, parse_reply_plus_intent
+from services.delivery_mode import is_immediate
 from services.fan_lifecycle import get_fan_lifecycle_context
 from services.hermes_retrieval import retrieve_examples, retrieval_enabled
+from services.human_delivery import DeliverySchedule, build_delivery_schedule
+from services.outbound_delivery import (
+    deliver_sequence_now,
+    schedule_outbound_sequence,
+    sequence_metadata,
+    supersede_active_sequences,
+)
+from services.outbound_settlement import (
+    check_payment_instruction,
+    present_offer_instruction,
+)
 from services.offer_lifecycle import sync_pending_offer_expiry
 from services.payment_claims import verify_ppv_purchase
 from services.ppv_delivery import (
@@ -127,6 +149,7 @@ from services.ppv_delivery import (
 )
 from services.ppv_language import contains_delivery_link_language
 from services.price_learning import get_price_learning_context
+from services.scheduled_intent import persist_scheduled_intent
 from services.reply_provenance import (
     DELIVERY_PPV,
     DELIVERY_TEXT,
@@ -158,6 +181,9 @@ OUTCOME_WRITER_FAILED = "writer_failed"
 OUTCOME_HUMAN_REVIEW = "human_review"
 OUTCOME_STALE = "stale_generation"
 OUTCOME_APPROVAL_REQUIRED = "approval_required"
+#: The wording is authorized and durably queued at human-like times. The
+#: worker returns its slot here; the bubbles leave later, from the queue.
+OUTCOME_SCHEDULED = "scheduled"
 
 # These are presentation preferences, not transaction failures. Try to improve
 # them once, but never freeze a valid delivery solely for repeating its price.
@@ -248,13 +274,22 @@ Contract:
   "hold": "none|waiting_on_customer|waiting_on_payment|needs_human|respect_silence|insufficient_evidence",
   "hold_detail": "",
   "confidence": 0.0,
+  "scheduled_intent": {"kind":"short_continuation|scene_resume|check_back|commercial_callback|payday_followup", "goal":"the semantic outcome a LATER turn should achieve", "timing":{"relative_minutes":2} or {"reference":"payday|pending_offer_expiry"}, "source_ids":[], "activity_policy":"cancel_on_activity|revalidate_on_activity"},
   "state_delta": {},
   "memory_candidates": []
 }
 
+Omit scheduled_intent unless this turn genuinely creates a future obligation — "wait right there", "give me a minute", a moment worth returning to, or a commercially promising point the creator deliberately delayed. It is a GOAL, never words: you are not writing the later message, and the later turn will read the conversation as it is then and may decide to say nothing. Timing is a REQUEST the application normalizes and may refuse: give a relative delay in minutes for a conversational beat, or name an evidenced reference such as payday. Never state a clock time, a date, or a price. Use cancel_on_activity when the intention only makes sense if he has not spoken first; use revalidate_on_activity for a real future obligation that his talking does not cancel.
+
 Interpret short replies from the immediate raw exchange, not from length. Track initiative and non-linear pacing without a funnel. Direction changes and corrections override an old trajectory. Preserve shared imagined premises as imagined. Purchases, rejection, delivery, and failed operations remain events inside the same conversation rather than reset points.
 
 Adult/intimate conversation is not a separate funnel and not a reason to sell. When it is active, track its independent dimensions only when useful: descriptive content register, whether it is ordinary intimate conversation or a shared imagined scene, the current direction (build/hold/continue/cool/redirect/pause/resume), the last meaningful beat, and any clearly established conversational boundaries. These dimensions may move in ANY direction on the next turn. Do not infer a required escalation from explicitness, short replies, elapsed turns, purchase state, or a prior sale. Preserve the exact active premise/roles/references instead of resetting to generic flirting. If the fan cools, redirects, corrects, or ends the intimate line, follow that change cheaply.
+
+Grounding and provenance. Every claim about the world must trace to evidence in the snapshot. publication_evidence states what is known about anything the creator posted; when it says no authoritative posts are available, then NOTHING was posted as far as this system knows. Approved vault inventory is permission to OFFER something privately — it is not evidence of a feed post, a recent upload, current clothing, current activity, or anything a fan could find by refreshing a page. fan_publication_references lists posts the FAN brought up himself; those may be discussed as his context, and doing so is correct, but they never become proof that the creator published anything else.
+
+Commercial judgement runs in both directions. Intimacy, explicitness, elapsed turns and a past purchase NEVER create a commercial opportunity by themselves. But commercial_opportunity records what the fan actually SAID — asking the price, offering to pay, asking what he can buy — and an explicit, fan-created buying opportunity is not cancelled by the conversation being intimate. When such a signal is present, unsent approved inventory exists, and the operation is in legal_operations, seriously consider proposing it; declining is a judgement about THIS moment, not a rule. Never infer wealth, spending power, or a budget from how he writes, and never state a price: the application supplies the exact figure if one may be said at all.
+
+purchase_claim records whether he said he paid and whether anything authoritative agrees. A claim is not a receipt. Until the payment ledger confirms it, do not treat the purchase as real, do not advance a paid session, and propose check_payment_claim when one is legal rather than acting as if he has access.
 
 The application alone owns inventory identity, price, recipient, payment, purchase, delivery, permissions, idempotency, persistence, and operation results. Choose at most one supplied opaque candidate_handle. Request missing essential evidence; do not invent it. Omit optional fields when nothing changes.
 """
@@ -302,6 +337,12 @@ class LoadedEvidence:
     candidate_handles: dict[str, Offer] = field(default_factory=dict)
     hermes_examples: list[dict[str, Any]] = field(default_factory=list)
     hermes_retrieval_active: bool = False
+    #: The durable conversation generation this evidence was read at. Every
+    #: outbound sequence produced from it is bound to exactly this value, and
+    #: every send boundary revalidates the binding. A fan message that lands
+    #: while GLM or Kimi is still running moves the number, which is how the
+    #: resulting wording is recognised as stale without any process-local state.
+    conversation_generation: int = 0
 
 
 @dataclass
@@ -794,6 +835,7 @@ async def load_evidence(
         threads,
         episodes,
         pending_payment,
+        conversation_generation,
     ) = await asyncio.gather(
         get_conversation_history(fan_id),
         get_fan_by_id(fan_id),
@@ -810,6 +852,7 @@ async def load_evidence(
         open_threads_for(creator_id, fan_id),
         recent_episodes_for(creator_id, fan_id),
         _fan_pending_payment(fan_id),
+        current_generation(fan_id),
     )
     if fan is None:
         raise LiveOrchestrationError("fan disappeared while assembling evidence")
@@ -984,6 +1027,21 @@ async def load_evidence(
             "trigger_goal_is_due_event_not_send_permission": bool(scheduled_goal),
             "lifecycle": _bounded_dict(lifecycle or {}, chars=1_000),
         },
+        publication_evidence=publication_evidence(creator_facts),
+        fan_publication_references=fan_publication_references(
+            latest_fan_burst, recent_messages
+        ),
+        commercial_opportunity={
+            **purchase_intent(latest_fan_burst),
+            "unsent_approved_inventory_exists": bool(next_offer),
+            "offer_already_presented": bool(pending_offer),
+        },
+        purchase_claim=purchase_claim(
+            latest_fan_burst,
+            confirmed_purchases=purchases,
+            pending_payment=pending_view,
+        ),
+        voice_rhythm=recent_creator_emoji(recent_messages),
         memory_status={
             "historical_backfill_complete": bool(
                 (fan_intelligence.get("history_continuity") or {}).get(
@@ -1029,6 +1087,7 @@ async def load_evidence(
             **({"pending_offer_1": pending_offer} if pending_offer else {}),
         },
         hermes_examples=[],
+        conversation_generation=int(conversation_generation or 0),
     )
 
 
@@ -2180,7 +2239,13 @@ React specifically and contribute: a thought, opinion, callback, tease, continua
 
 For adult/intimate conversation, use semantic_decision.intimacy_context together with the RAW recent exchange. Preserve the exact current beat, roles, references, and shared premise instead of restarting from generic flirting. The intimate line may build, hold, continue, cool, redirect, pause, resume, or end on any turn. A more explicit register is descriptive context, NOT permission or an instruction to escalate. Short replies can mean continuation or invitation to lead; interpret them from the preceding beat. Do not manufacture a new scenario when one is already active. Do not convert an intimate moment into a commercial pitch merely because it is intimate. If the fan changes direction or cools the interaction, follow immediately. Keep imagined actions inside the imagined/shared-scene scope and never present them as current real-world activity.
 
-Commercial and media language stays inside the conversation. Never use catalogue voice, media counts, package/set/inventory terminology, private IDs, URLs, or internal metadata. Use only prepared_operation_facts. The application owns price and transaction truth. Do not claim payment, purchase, send, attachment, or delivery unless the prepared facts state it. After rejection, purchase, or delivery, continue the existing moment; do not automatically discount, reset, upsell, or force a feedback question.
+Commercial and media language stays inside the conversation. Never use catalogue voice, media counts, package/set/inventory terminology, private IDs, URLs, or internal metadata. Use only prepared_operation_facts. The application owns price and transaction truth. Do not claim payment, purchase, send, attachment, or delivery unless the prepared facts state it. When prepared_operation_facts carries an exact price and the fan asked about price, you may say that exact figure naturally; never invent, round, discount or negotiate one. After rejection, purchase, or delivery, continue the existing moment; do not automatically discount, reset, upsell, or force a feedback question. A fan who directly asks to buy is not being pushy and dodging him is not being classy: answer him.
+
+Grounding. grounding.publication_evidence says what is known about anything this creator has posted. When it reports no authoritative posts, you may not say or imply that anything was posted, that there is something new on a feed or page, that he should check, look, refresh or scroll, or that content exists publicly. Approved inventory is something that can be offered privately; it is not something that was published, not what she is wearing, and not what she is doing now. grounding.fan_publication_references lists posts the FAN mentioned: talk about those as his — "that bikini post" he brought up is fair and natural — but do not extend them into a claim that you posted something else.
+
+grounding.purchase_claim says whether he claimed to have paid and whether anything confirms it. If he claimed it and nothing confirms it, do not thank him for buying, do not say it was worth it, do not tell him to enjoy it, and do not behave as though he has access. Stay warm and keep the conversation moving while the application checks.
+
+Rhythm. voice_rhythm lists what the recent creator bubbles leaned on. If the same emoji or the same closing beat has been used turn after turn, vary it — not by swapping in one different emoji every time, but by letting some bubbles simply end. Repetition is fine when it is natural, and this creator's own voice always wins over this note.
 
 Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assisted: ["candidate one","candidate two","candidate three"]."""
     if assisted:
@@ -2224,6 +2289,15 @@ Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assis
             ],
         },
         "prepared_operation_facts": execution.writer_view(),
+        "grounding": {
+            "publication_evidence": loaded.snapshot.publication_evidence,
+            "fan_publication_references": list(
+                loaded.snapshot.fan_publication_references
+            ),
+            "purchase_claim": loaded.snapshot.purchase_claim,
+            "commercial_opportunity": loaded.snapshot.commercial_opportunity,
+        },
+        "voice_rhythm": loaded.snapshot.voice_rhythm,
         "hermes_examples": getattr(loaded, "hermes_examples", []),
         "hermes_examples_notice": (
             "Examples from OTHER conversations. Use behavior and rhythm only; they are not current-fan evidence."
@@ -2481,6 +2555,21 @@ def writer_contract_reasons(
         if claim.group(0).lower().strip() not in facts:
             reasons.append("unsupported_current_life_claim")
             break
+    # Invented publication. Narrow on purpose: it fires on a CLAIM that
+    # something was posted or an instruction to go and look at a page, never on
+    # the noun. Discussion of a post the FAN raised is legitimate context and
+    # must survive, which is why the fan's own references are passed in.
+    if unsupported_publication_claim(
+        text,
+        evidence=loaded.snapshot.publication_evidence,
+        fan_references=loaded.snapshot.fan_publication_references,
+    ):
+        reasons.append("unsupported_publication_claim")
+    # Treating "I bought it" as settled. Only consulted when the fan has in fact
+    # claimed a purchase that no receipt supports, so ordinary warmth is
+    # untouched in every other conversation.
+    if unverified_purchase_acknowledgement(text, loaded.snapshot.purchase_claim or {}):
+        reasons.append("unverified_purchase_acknowledgement")
     price_record = execution.delivery or execution.offer or {}
     mentioned = _mentioned_prices(text)
     if mentioned and (
@@ -2529,6 +2618,10 @@ def _provenance(
         "version": loaded.snapshot.version,
         "fingerprint": loaded.snapshot.fingerprint(),
         "state_revision": loaded.snapshot.state_revision,
+        # Which conversation generation produced this wording. The single
+        # question every "why was that bubble cancelled?" investigation starts
+        # from, and the reason it is on the record rather than in a log line.
+        "conversation_generation": loaded.conversation_generation,
         "truncation": loaded.snapshot.truncation,
     }
     if working_state_before is not None and state_delta_validation is not None:
@@ -3221,9 +3314,57 @@ async def _commit_locked_plan(prepared: PreparedTurn) -> str:
     return await _current_revision(prepared)
 
 
+def _plain_parts(prepared: PreparedTurn) -> list[str]:
+    return [part.strip() for part in prepared.replies[0].split("|") if part.strip()]
+
+
+def _delivery_schedule(prepared: PreparedTurn, parts: list[str]) -> DeliverySchedule:
+    """The old human-timing mathematics, unchanged, applied to Core v1.
+
+    ``services/human_delivery.py`` already knew how long a person takes: an
+    availability mode inferred from the gap between the creator's last message
+    and the newest fan message, a reading time scaled to the incoming message, a
+    composition time scaled to the first bubble, and jittered inter-bubble
+    pauses scaled to each following bubble. None of that maths is changed here.
+    What changed is where the resulting seconds are SPENT: durable rows instead
+    of a sleeping coroutine.
+
+    The availability phase hint no longer comes from the retired Conversation
+    Director. Core v1 states the same thing descriptively, in
+    ``intimacy_context``, so an active intimate exchange keeps the wider live
+    window it always had.
+    """
+    return build_delivery_schedule(
+        prepared.loaded.snapshot.trigger.latest_message,
+        parts,
+        conversation_history=prepared.loaded.history,
+        conversation_phase=(
+            "TENSION" if prepared.decision.intimacy_context.active else None
+        ),
+        active_session=prepared.loaded.active_session,
+    )
+
+
+def _post_send_operation(prepared: PreparedTurn) -> dict[str, Any]:
+    """The commercial settlement this reply owes once its first bubble lands."""
+    operation = prepared.execution.operation
+    if operation == OperationKind.PRESENT_OFFER.value:
+        return present_offer_instruction(prepared.execution.offer)
+    if operation == OperationKind.CHECK_PAYMENT_CLAIM.value:
+        return check_payment_instruction(prepared.loaded.pending_payment)
+    return {}
+
+
 async def _deliver_plain_parts(
     prepared: PreparedTurn, *, expected_revision: str
 ) -> list[str]:
+    """Send every bubble now, revalidating between each one.
+
+    Retained for ``semantic_v1``/``semantic_v2`` and as the fallback for a
+    deployment whose supersession migration has not been applied. Core v1 uses
+    the durable sequence instead, because this shape holds a worker slot for the
+    whole reply and can only be interrupted from inside this process.
+    """
     fan = prepared.loaded.fan
     creator_id = prepared.loaded.snapshot.creator_id
     parts = [part.strip() for part in prepared.replies[0].split("|") if part.strip()]
@@ -3282,6 +3423,138 @@ async def _deliver_plain_parts(
         if message_id:
             message_ids.append(str(message_id))
     return message_ids
+
+
+async def _record_scheduled_intent(prepared: PreparedTurn) -> dict[str, Any] | None:
+    """Persist any future conversational obligation this turn asked for.
+
+    Only on Core v1, only after the turn's own outcome is settled, and only
+    through application-owned normalization: GLM states a goal and a bounded
+    timing REQUEST, and deterministic code decides the actual ``execute_at``,
+    the dedupe key, and whether it may exist at all.
+    """
+    if prepared.conversation_core != CORE_CONVERSATIONAL_V1:
+        return None
+    intent = prepared.decision.scheduled_intent
+    if not intent.requested:
+        return None
+    state = prepared.loaded.commercial_state
+    payday_at = getattr(state, "payday_at", None)
+    expiry: datetime | None = None
+    if state.pending_offer is not None and getattr(state, "last_offer_at", None):
+        from services.followup_lifecycle import followup_at
+
+        try:
+            expiry = followup_at(
+                state.last_offer_at, prepared.loaded.policy.pending_offer_expiry_hours
+            )
+        except (ValueError, AttributeError):
+            expiry = None
+    try:
+        return await persist_scheduled_intent(
+            creator_id=prepared.loaded.snapshot.creator_id,
+            fan_id=prepared.loaded.fan.id,
+            intent=intent,
+            conversation_generation=prepared.loaded.conversation_generation,
+            payday_at=payday_at,
+            pending_offer_expires_at=expiry,
+        )
+    except Exception as exc:  # noqa: BLE001 - a promise is never worth a turn
+        print(
+            f"[SCHEDULED INTENT ERROR] fan={prepared.loaded.fan.id} "
+            f"kind={intent.kind}: {exc}"
+        )
+        return None
+
+
+async def deliver_reply(
+    prepared: PreparedTurn, *, expected_revision: str
+) -> dict[str, Any]:
+    """Hand this turn's wording to the delivery layer that suits its core.
+
+    Core v1 plans a DURABLE outbound sequence: the composition pause and every
+    inter-bubble pause become rows in the existing scheduled-action queue, bound
+    to the conversation generation that produced them. The worker returns its
+    slot immediately, so a nine-second pause costs a row rather than a scarce
+    generation slot, and a fan message handled by any process stops the
+    remaining bubbles at their own send boundary.
+
+    Everything else keeps the previous inline path unchanged.
+    """
+    parts = _plain_parts(prepared)
+    if not parts:
+        return {"outcome": OUTCOME_NO_SEND, "message_ids": []}
+
+    if prepared.conversation_core != CORE_CONVERSATIONAL_V1:
+        ids = await _deliver_plain_parts(prepared, expected_revision=expected_revision)
+        return {
+            "outcome": OUTCOME_REPLIED if ids else OUTCOME_NO_SEND,
+            "message_ids": ids,
+        }
+
+    schedule = _delivery_schedule(prepared, parts)
+    metadata = sequence_metadata(
+        message_metadata=prepared.provenance.as_metadata(
+            parts=len(parts), delivery_kind=DELIVERY_TEXT
+        ),
+        post_send_operation=_post_send_operation(prepared),
+    )
+    # An older planned reply for this fan is finished business the moment a
+    # newer authorized turn exists. Its own send boundary would refuse it
+    # anyway; retiring it here keeps the queue honest rather than leaving rows
+    # that exist only to be rejected.
+    await supersede_active_sequences(
+        prepared.loaded.fan.id, reason="newer_authorized_turn"
+    )
+    sequence = await schedule_outbound_sequence(
+        creator_id=prepared.loaded.snapshot.creator_id,
+        fan_id=prepared.loaded.fan.id,
+        trigger_identity=prepared.loaded.snapshot.trigger.identity
+        or prepared.provenance.turn_id,
+        turn_id=prepared.provenance.turn_id,
+        parts=parts,
+        schedule=schedule,
+        conversation_generation=prepared.loaded.conversation_generation,
+        metadata=metadata,
+    )
+    if sequence is None:
+        # The durable tables are not deployed yet. Fall back to exactly the
+        # previous behaviour rather than losing the reply.
+        ids = await _deliver_plain_parts(prepared, expected_revision=expected_revision)
+        if ids and prepared.execution.operation == OperationKind.PRESENT_OFFER.value:
+            await _commit_presented_offer(prepared)
+        elif ids and prepared.execution.operation == (
+            OperationKind.CHECK_PAYMENT_CLAIM.value
+        ):
+            await verify_ppv_purchase(
+                prepared.loaded.fan.id,
+                prepared.loaded.snapshot.creator_id,
+                prepared.loaded.pending_payment or {},
+            )
+        return {
+            "outcome": OUTCOME_REPLIED if ids else OUTCOME_NO_SEND,
+            "message_ids": ids,
+            "durable_delivery": False,
+        }
+
+    if is_immediate():
+        ids = await deliver_sequence_now(sequence)
+        return {
+            "outcome": OUTCOME_REPLIED if ids else OUTCOME_NO_SEND,
+            "message_ids": ids,
+            "sequence_id": sequence.id,
+            "planned_timing": sequence.planned_timing,
+            "durable_delivery": True,
+        }
+
+    return {
+        "outcome": OUTCOME_SCHEDULED,
+        "message_ids": [],
+        "sequence_id": sequence.id,
+        "parts": len(sequence.parts),
+        "planned_timing": sequence.planned_timing,
+        "durable_delivery": True,
+    }
 
 
 async def _commit_presented_offer(prepared: PreparedTurn) -> None:
@@ -3394,7 +3667,14 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
             return {"outcome": OUTCOME_STALE, "message_ids": []}
 
     if decision.disposition is ResponseDisposition.SILENCE:
-        return {"outcome": OUTCOME_NO_SEND, "message_ids": []}
+        # Deliberate silence is exactly when a future beat matters most: the
+        # turn is choosing to wait, not to forget.
+        intent = await _record_scheduled_intent(prepared)
+        return {
+            "outcome": OUTCOME_NO_SEND,
+            "message_ids": [],
+            **({"scheduled_intent": intent} if intent else {}),
+        }
     if decision.disposition is ResponseDisposition.HANDOFF or execution.operation in {
         OperationKind.HAND_OFF_TO_HUMAN.value,
         OperationKind.REPAIR_CONTENT_ACCESS.value,
@@ -3470,16 +3750,25 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
 
     if await _current_revision(prepared) != expected_revision:
         return {"outcome": OUTCOME_STALE, "message_ids": []}
-    ids = await _deliver_plain_parts(prepared, expected_revision=expected_revision)
-    if execution.operation == OperationKind.PRESENT_OFFER.value:
-        await _commit_presented_offer(prepared)
-    elif execution.operation == OperationKind.CHECK_PAYMENT_CLAIM.value:
-        await verify_ppv_purchase(
-            fan_id,
-            creator_id,
-            prepared.loaded.pending_payment or {},
-        )
-    return {"outcome": OUTCOME_REPLIED if ids else OUTCOME_NO_SEND, "message_ids": ids}
+    result = await deliver_reply(prepared, expected_revision=expected_revision)
+    intent = await _record_scheduled_intent(prepared)
+    if intent:
+        result["scheduled_intent"] = intent
+    if result.get("durable_delivery"):
+        # PRESENT_OFFER / CHECK_PAYMENT_CLAIM settle when the FIRST bubble is
+        # actually delivered (services/outbound_settlement.py). Committing them
+        # here would leave a pending offer behind a reply the fan never saw.
+        return result
+    if result.get("message_ids"):
+        if execution.operation == OperationKind.PRESENT_OFFER.value:
+            await _commit_presented_offer(prepared)
+        elif execution.operation == OperationKind.CHECK_PAYMENT_CLAIM.value:
+            await verify_ppv_purchase(
+                fan_id,
+                creator_id,
+                prepared.loaded.pending_payment or {},
+            )
+    return result
 
 
 async def run_auto_turn(
@@ -3728,4 +4017,7 @@ async def run_proactive_turn(
     )
     prepared.provenance.mode = PIPELINE_PROACTIVE
     result = await execute_auto_turn(prepared)
-    return result.get("outcome") == OUTCOME_REPLIED
+    # A durably queued reply IS a reply: the wording is authorized and the
+    # bubbles are rows in the queue with their own due times. Reporting it as
+    # "nothing sent" would make the worker retry a turn that already happened.
+    return result.get("outcome") in {OUTCOME_REPLIED, OUTCOME_SCHEDULED}

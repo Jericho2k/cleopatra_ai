@@ -56,6 +56,24 @@ class EvidenceSnapshot:
     spending_limits: dict[str, Any] = field(default_factory=dict)
     operator_constraints: dict[str, Any] = field(default_factory=dict)
     memory_status: dict[str, Any] = field(default_factory=dict)
+    #: What is known — and, today, what is NOT known — about anything the
+    #: creator published. Approved vault inventory is permission to offer
+    #: privately; it has never been evidence that a feed post exists. Stating
+    #: that in evidence is what stops "check my feed" being invented.
+    publication_evidence: dict[str, Any] = field(default_factory=dict)
+    #: Feed/post references the FAN supplied. These may be discussed as his
+    #: context; they are not promoted to creator publication facts.
+    fan_publication_references: tuple[dict[str, Any], ...] = ()
+    #: An explicit, fan-created buying opportunity and the messages that show
+    #: it. A record of what he SAID — never an inference about what he can
+    #: afford, which is the funnel this architecture removed.
+    commercial_opportunity: dict[str, Any] = field(default_factory=dict)
+    #: Whether the fan claimed to have paid, and whether anything authoritative
+    #: agrees. A claim is not a receipt.
+    purchase_claim: dict[str, Any] = field(default_factory=dict)
+    #: Soft rhythm context for the writer: what the recent creator bubbles have
+    #: been leaning on. Never a send-blocking rule.
+    voice_rhythm: dict[str, Any] = field(default_factory=dict)
     truncation: dict[str, int] = field(default_factory=dict)
     version: str = EVIDENCE_VERSION
 
