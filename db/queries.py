@@ -386,6 +386,7 @@ async def save_message_result(
         split_media_context,
         unrecognised_keys,
     )
+    from services.conversation_generation import bumps_generation
 
     diverted = unrecognised_keys(media_context)
     if diverted:
@@ -494,6 +495,24 @@ async def save_message_result(
         return MessageWriteResult(message_id=_existing_id(), inserted=False)
 
     result = await asyncio.to_thread(_save)
+
+    # The durable supersession point. Exactly one place in the codebase decides
+    # that a conversation has moved on, and it is the one place every message
+    # write already funnels through — so the webhook, the poller, the operator
+    # dashboard, the simulator and the history importer cannot disagree about
+    # it. ``inserted`` is what makes a redelivered platform message harmless:
+    # a duplicate resolves to the existing row and moves nothing.
+    if bumps_generation(role, was_ai_suggested=was_ai_suggested, inserted=result.inserted):
+        from services.conversation_generation import bump_generation
+
+        await bump_generation(
+            fan_id,
+            reason=("fan_message" if role == "fan" else "human_creator_reply"),
+            # The same client this write just used, so a substituted client
+            # covers the bump too rather than leaving it to reach the network.
+            client=get_supabase(),
+        )
+
     if owner_only:
         # Deliberately after the message is durable and deliberately unchecked:
         # the sensitive keys have already left the row by this point, so a
