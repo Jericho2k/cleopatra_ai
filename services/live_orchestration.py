@@ -1840,31 +1840,46 @@ def _validate_single_call_reply(
     *,
     mode: str,
 ) -> tuple[ConversationDecision, ApprovedExecution, list[str]]:
+    """Settle legacy one-call copy locally instead of freezing the fan.
+
+    semantic_v2 is retained for comparison/rollback. Its writer contract still
+    protects transaction and grounding truth, but a bad sentence is not a
+    reason to pause the conversation. Strip unsafe clauses; if nothing safe
+    remains, make this one turn silent. External operation authority never
+    becomes more permissive.
+    """
     if decision.disposition is not ResponseDisposition.REPLY:
         return decision, execution, replies
+    replies, _ = _redact_private_metadata(replies, loaded)
     violations = writer_contract_reasons(replies, loaded, execution, mode=mode)
     if not violations:
         return decision, execution, replies
+    repaired = _repair_fan_visible_copy(replies)
+    remaining = writer_contract_reasons(repaired, loaded, execution, mode=mode)
     print(
-        "[SEMANTIC REPLY REJECTED] reason="
+        "[SEMANTIC V2 LOCAL COPY REPAIR] rejected="
         + ",".join(violations)
-        + " operation="
-        + execution.operation
+        + " remaining="
+        + (",".join(remaining) or "none")
     )
-    rejected = ConversationDecision(
-        disposition=ResponseDisposition.HANDOFF,
-        hold=HoldReason.NEEDS_HUMAN,
-        hold_detail="semantic_reply_contract_rejected: " + "; ".join(violations),
-        proposed_operation=ProposedOperation(
-            kind=OperationKind.HAND_OFF_TO_HUMAN,
-            subject="conversational output requires review",
+    if repaired and not remaining:
+        return decision, execution, repaired
+    quiet = dataclasses_replace(
+        decision,
+        proposed_operation=ProposedOperation(),
+        response_intent=ResponseIntent.RESPECT_SILENCE,
+        disposition=ResponseDisposition.SILENCE,
+        hold=HoldReason.INSUFFICIENT_EVIDENCE,
+        hold_detail="semantic_v2_local_output_rejected",
+    )
+    return (
+        quiet,
+        ApprovedExecution(
+            operation="none",
+            validation=validate_decision(quiet, loaded),
         ),
+        [],
     )
-    rejected_execution = ApprovedExecution(
-        operation="hand_off_to_human",
-        validation=validate_decision(rejected, loaded),
-    )
-    return rejected, rejected_execution, []
 
 
 _LOCAL_UNSAFE_COPY = re.compile(
@@ -3266,19 +3281,26 @@ async def prepare_turn(
         conversation_core == CORE_SEMANTIC_V1
         and trace.failure_reason.startswith("semantic_writer_contract_rejected")
     ):
-        decision = ConversationDecision(
-            disposition=ResponseDisposition.HANDOFF,
-            hold=HoldReason.NEEDS_HUMAN,
-            hold_detail=trace.failure_reason,
-            proposed_operation=ProposedOperation(
-                kind=OperationKind.HAND_OFF_TO_HUMAN,
-                subject="writer output requires review",
-            ),
+        # The output contract did its job: unsafe copy did not send. Do not turn
+        # one bad expression into a persistent fan freeze. This legacy runtime
+        # simply skips the turn; a later fan message can trigger a fresh one.
+        print(
+            "[SEMANTIC V1 LOCAL COPY DROP] reason="
+            + trace.failure_reason
+        )
+        decision = dataclasses_replace(
+            decision,
+            proposed_operation=ProposedOperation(),
+            response_intent=ResponseIntent.RESPECT_SILENCE,
+            disposition=ResponseDisposition.SILENCE,
+            hold=HoldReason.INSUFFICIENT_EVIDENCE,
+            hold_detail="semantic_v1_local_output_rejected",
         )
         execution = ApprovedExecution(
-            operation="hand_off_to_human",
+            operation="none",
             validation=validate_decision(decision, loaded),
         )
+        replies = []
     provenance = _provenance(
         loaded,
         decision,
