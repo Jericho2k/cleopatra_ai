@@ -1948,6 +1948,11 @@ def _repair_fan_visible_copy(replies: list[str]) -> list[str]:
             text = _PRICE_MENTION.sub("", text)
             text = _BARE_PRICE_MENTION.sub("", text)
             text = re.sub(r"\s{2,}", " ", text).strip(" ,;:-")
+            if re.fullmatch(
+                r"(?i)(?:to\s+)?(?:unlock|buy|purchase|pay)(?:\s+(?:it|this|that|them))?[.!?]*",
+                text,
+            ):
+                text = ""
             if text:
                 bubbles.append(text)
         if bubbles:
@@ -2770,6 +2775,92 @@ def _repair_rejected_core_v1_operation(
     return repaired, repaired.proposed_operation != op
 
 
+def _state_grounded_recovery_operation(
+    decision: ConversationDecision,
+    loaded: LoadedEvidence,
+) -> ConversationDecision | None:
+    """Recover an exact legal operation from application state, never model prose.
+
+    This is intentionally narrow. It only repairs the model's *choice/ref binding*
+    when the fan's current message clearly asks for the already-pending content,
+    or when the model chose the right operation with bad refs. Exact offer ids,
+    set ids and candidate handles come from loaded state, never from the model.
+    """
+    op = decision.proposed_operation
+    legal = set(legal_operations(loaded))
+    latest = str(loaded.snapshot.trigger.latest_message or "")
+    offer = loaded.commercial_state.pending_offer or loaded.next_offer
+
+    def _handle_for(candidate: Any) -> str:
+        if candidate is None:
+            return ""
+        return next(
+            (
+                handle
+                for handle, value in getattr(loaded, "candidate_handles", {}).items()
+                if value is candidate
+            ),
+            "",
+        )
+
+    if (
+        op.kind is OperationKind.PRESENT_OFFER
+        and OperationKind.PRESENT_OFFER.value in legal
+        and loaded.next_offer is not None
+    ):
+        candidate = loaded.next_offer
+        return dataclasses_replace(
+            decision,
+            proposed_operation=ProposedOperation(
+                kind=OperationKind.PRESENT_OFFER,
+                subject=_strip_price_from_operation_text(op.subject)
+                or "the evidenced offer",
+                because=_strip_price_from_operation_text(op.because),
+                candidate_handle=_handle_for(candidate),
+                offer_id=candidate.offer_id,
+                set_id=candidate.set_id,
+            ),
+        )
+
+    explicit_send_request = bool(
+        re.search(
+            r"\b(?:send\s+(?:it|that|this|them|me)|show\s+me|let\s+me\s+see|"
+            r"give\s+me|where(?:'s|\s+is)\s+(?:it|that|this)|unlock\s+(?:it|that|this))\b",
+            latest,
+            re.IGNORECASE,
+        )
+    )
+    should_bind_locked = (
+        op.kind is OperationKind.SEND_LOCKED_PAID_MESSAGE
+        or (
+            op.kind is OperationKind.CHECK_PAYMENT_CLAIM
+            and not loaded.pending_payment
+            and explicit_send_request
+        )
+    )
+    if (
+        should_bind_locked
+        and OperationKind.SEND_LOCKED_PAID_MESSAGE.value in legal
+        and offer is not None
+    ):
+        return dataclasses_replace(
+            decision,
+            proposed_operation=ProposedOperation(
+                kind=OperationKind.SEND_LOCKED_PAID_MESSAGE,
+                subject="the exact pending content",
+                because=_strip_price_from_operation_text(op.because),
+                candidate_handle=_handle_for(offer),
+                offer_id=offer.offer_id,
+                set_id=offer.set_id,
+            ),
+            response_intent=ResponseIntent.DELIVER_ACCEPTED_OFFER,
+            disposition=ResponseDisposition.REPLY,
+            hold=HoldReason.NONE,
+            hold_detail="",
+        )
+    return None
+
+
 def _operationless_recovery_decision(
     decision: ConversationDecision,
 ) -> ConversationDecision:
@@ -2832,6 +2923,12 @@ def _settle_recoverable_semantic_operation(
         if repaired_validation.approved:
             return repaired, failures, changed
         decision = repaired
+
+        state_recovered = _state_grounded_recovery_operation(decision, loaded)
+        if state_recovered is not None:
+            state_validation = validate_decision(state_recovered, loaded)
+            if state_validation.approved:
+                return state_recovered, failures, True
 
     recovered = _operationless_recovery_decision(decision)
     recovered_validation = validate_decision(recovered, loaded)
