@@ -119,6 +119,7 @@ def world() -> FakeSupabase:
                     "dynamic_pricing_enabled": True,
                     "metadata_version": 3,
                     "status": "approved",
+                    "paid_sellable": False,
                     "source": "ai",
                     "simulation_only": False,
                 },
@@ -213,6 +214,7 @@ def test_the_mirror_carries_the_metadata_the_simulator_needs(db):
     assert photo["explicit_min"] == 2 and photo["explicit_max"] == 3
     assert photo["min_price_cents"] == 1500 and photo["max_price_cents"] == 8000
     assert photo["status"] == "approved"
+    assert photo["paid_sellable"] is False
 
     media = mirrored_media(db)
     assert len(media) == 2
