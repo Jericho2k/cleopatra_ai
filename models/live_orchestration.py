@@ -71,6 +71,9 @@ class EvidenceSnapshot:
     #: Whether the fan claimed to have paid, and whether anything authoritative
     #: agrees. A claim is not a receipt.
     purchase_claim: dict[str, Any] = field(default_factory=dict)
+    #: Current fan-reported inability to access a confirmed purchase.
+    #: This is evidence for support/repair, never authority to charge again.
+    content_access_issue: dict[str, Any] = field(default_factory=dict)
     #: Soft rhythm context for the writer: what the recent creator bubbles have
     #: been leaning on. Never a send-blocking rule.
     voice_rhythm: dict[str, Any] = field(default_factory=dict)

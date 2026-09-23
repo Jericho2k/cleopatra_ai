@@ -20,6 +20,7 @@ from services.media_packages import (
     choose_video_finale,
     plan_progression,
     purchase_probe_bonus_bps,
+    sets_with_sellable_media_evidence,
     split_media_types,
 )
 
@@ -226,3 +227,33 @@ def test_video_finale_prefers_the_coherent_clip():
         {"id": "v-bedroom", "title": "bedroom 4", "location": "bedroom", "outfit": "black lingerie", "explicit_min": 5, "explicit_max": 5, "base_price_cents": 5000, "media_ids": ["vb"], "tags": ["individual_video"]},
     ]
     assert choose_video_finale(sequence, videos)["id"] == "v-bedroom"
+
+
+def test_legacy_set_with_only_teaser_children_is_not_sellable():
+    legacy = {
+        "id": "legacy",
+        "title": "old set",
+        "media_ids": ["m1", "m2"],
+        "tags": [],
+        "suggested_price": 30,
+    }
+    children = [
+        {"media_id": "m1", "content_category": "teaser_clothed"},
+        {"media_id": "m2", "content_category": "teaser_bundle"},
+    ]
+    assert sets_with_sellable_media_evidence([legacy], children) == []
+
+
+def test_mixed_set_with_paid_child_remains_eligible():
+    mixed = {
+        "id": "mixed",
+        "title": "mixed set",
+        "media_ids": ["m1", "m2"],
+        "tags": [],
+        "suggested_price": 30,
+    }
+    children = [
+        {"media_id": "m1", "content_category": "teaser_clothed"},
+        {"media_id": "m2", "content_category": "nude_photo"},
+    ]
+    assert sets_with_sellable_media_evidence([mixed], children) == [mixed]
