@@ -23,12 +23,12 @@ import pytest
 
 from services import conversation_core
 from services.ab_trajectory_eval import (
-    ArmSpec,
     CORE_STATE_KEY,
-    CoreNotAvailable,
-    EvaluationRefused,
     ROLE_BASELINE,
     ROLE_CANDIDATE,
+    ArmSpec,
+    CoreNotAvailable,
+    EvaluationRefused,
     RunSpec,
     UnfairComparison,
     UnsafeEvaluationTarget,
@@ -48,7 +48,12 @@ from services.ab_trajectory_eval import (
     select_trajectories,
     write_artifacts,
 )
-from services.trajectory_eval import Disturbance, Trajectory, TurnRecord, load_trajectories
+from services.trajectory_eval import (
+    Disturbance,
+    Trajectory,
+    TurnRecord,
+    load_trajectories,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = ROOT / "eval" / "conversational_core_scenarios.json"
@@ -134,7 +139,11 @@ class RecordingBackend:
 
     async def run_due_work(self, creator_id: str, fan_id: str) -> dict:
         self.sent.append((fan_id, ""))
-        return {"outcome": "due_work_sent_nothing", "creator_messages": [], "due_worker_ran": True}
+        return {
+            "outcome": "due_work_sent_nothing",
+            "creator_messages": [],
+            "due_worker_ran": True,
+        }
 
 
 def _scenario(name="s", messages=("hello", "again")) -> Trajectory:
@@ -147,7 +156,11 @@ def _scenario(name="s", messages=("hello", "again")) -> Trajectory:
 
 def _fans(*ids: str) -> dict[str, dict]:
     return {
-        fan_id: {"id": fan_id, "creator_id": "creator-1", "platform_fan_id": f"test_{fan_id}"}
+        fan_id: {
+            "id": fan_id,
+            "creator_id": "creator-1",
+            "platform_fan_id": f"test_{fan_id}",
+        }
         for fan_id in ids
     }
 
@@ -334,7 +347,9 @@ def test_arm_order_is_shuffled_per_scenario_and_reproducible_from_the_seed():
 
 
 def test_a_real_fan_is_refused():
-    real = {"fan-a": {"id": "fan-a", "creator_id": "creator-1", "platform_fan_id": "981273"}}
+    real = {
+        "fan-a": {"id": "fan-a", "creator_id": "creator-1", "platform_fan_id": "981273"}
+    }
     with pytest.raises(UnsafeEvaluationTarget):
         assert_safe_targets([BASELINE_ARM], real)
 
@@ -354,7 +369,11 @@ def test_the_live_backend_refuses_a_fan_belonging_to_another_creator(monkeypatch
     backend = LiveSimulatorBackend()
 
     async def _fake_thread(fn, *args, **kwargs):
-        return {"id": "fan-a", "creator_id": "someone-else", "platform_fan_id": "test_x"}
+        return {
+            "id": "fan-a",
+            "creator_id": "someone-else",
+            "platform_fan_id": "test_x",
+        }
 
     monkeypatch.setattr(asyncio, "to_thread", _fake_thread)
     with pytest.raises(UnsafeEvaluationTarget):
@@ -379,7 +398,9 @@ def test_a_turn_with_no_provenance_at_all_is_observed_without_crashing():
 
 
 def test_core_state_is_read_when_a_runtime_records_it_and_partial_blocks_are_kept():
-    turn = TurnRecord(index=3, customer_message="hi", outcome="replied", replies=["hey"])
+    turn = TurnRecord(
+        index=3, customer_message="hi", outcome="replied", replies=["hey"]
+    )
     turn.provenance = [
         {
             "turn_id": "t-1",
@@ -400,7 +421,9 @@ def test_core_state_is_read_when_a_runtime_records_it_and_partial_blocks_are_kep
 
 
 def test_an_unknown_outcome_string_does_not_crash_observation():
-    turn = TurnRecord(index=1, customer_message="hi", outcome="something_invented_later")
+    turn = TurnRecord(
+        index=1, customer_message="hi", outcome="something_invented_later"
+    )
     observed = observe_turn(turn, core_id="conversational_v1")
     assert observed["classified_outcome"] == "unknown"
 
@@ -442,12 +465,16 @@ def test_a_newly_registered_core_id_is_accepted_with_no_evaluator_change(monkeyp
     works — no new enum, no new branch, no new scenario format.
     """
     monkeypatch.setattr(
-        conversation_core, "CORE_IDS", (*conversation_core.CORE_IDS, "conversational_v1")
+        conversation_core,
+        "CORE_IDS",
+        (*conversation_core.CORE_IDS, "conversational_v1"),
     )
     assert "conversational_v1" in known_core_ids()
     assert require_known_core("conversational_v1") == "conversational_v1"
 
-    candidate = ArmSpec(role=ROLE_CANDIDATE, core_id="conversational_v1", fan_id="fan-b")
+    candidate = ArmSpec(
+        role=ROLE_CANDIDATE, core_id="conversational_v1", fan_id="fan-b"
+    )
     backend = RecordingBackend(fans=_fans("fan-a", "fan-b"))
     runs = run(
         run_suite(
@@ -457,7 +484,10 @@ def test_a_newly_registered_core_id_is_accepted_with_no_evaluator_change(monkeyp
             scenario_ids=["s"],
         )
     )
-    assert runs[ROLE_CANDIDATE].conversations[0]["conversation_core"] == "conversational_v1"
+    assert (
+        runs[ROLE_CANDIDATE].conversations[0]["conversation_core"]
+        == "conversational_v1"
+    )
     assert pair_conversations(runs)["fan_inputs_identical"] is True
 
 
@@ -469,12 +499,22 @@ def test_write_artifacts_produces_the_documented_directory(tmp_path):
     spec = _spec(BASELINE_ARM, CANDIDATE_ARM)
     trajectory = _scenario()
     runs = run(
-        run_suite(spec=spec, trajectories=[trajectory], backend=backend, scenario_ids=["s"])
+        run_suite(
+            spec=spec, trajectories=[trajectory], backend=backend, scenario_ids=["s"]
+        )
     )
-    root = write_artifacts(spec=spec, runs=runs, trajectories=[trajectory], results_root=tmp_path)
+    root = write_artifacts(
+        spec=spec, runs=runs, trajectories=[trajectory], results_root=tmp_path
+    )
 
     names = sorted(path.name for path in root.iterdir())
-    assert names == ["metadata.json", "metrics.json", "paired.json", "semantic_v1.json", "semantic_v2.json"]
+    assert names == [
+        "metadata.json",
+        "metrics.json",
+        "paired.json",
+        "semantic_v1.json",
+        "semantic_v2.json",
+    ]
 
     metadata = json.loads((root / "metadata.json").read_text())
     for key in (
@@ -507,7 +547,10 @@ def test_generated_results_are_ignored_by_git():
     """
     probe = "eval/results/some-run-id/semantic_v2.json"
     result = subprocess.run(
-        ["git", "check-ignore", "-q", probe], cwd=ROOT, capture_output=True
+        ["git", "check-ignore", "-q", probe],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
     )
     assert result.returncode == 0, f"{probe} would be committed"
 
@@ -524,11 +567,16 @@ def test_run_ids_are_unique_and_time_ordered():
 def test_the_scenario_suite_loads_and_selects():
     payload = load_scenario_file(SCENARIOS)
     trajectories, ids = select_trajectories(payload)
-    assert len(trajectories) == len(ids) == 12
+    assert len(trajectories) == len(ids) == 13
 
     subset, subset_ids = select_trajectories(payload, suite="commercial")
-    assert subset_ids == ["I_natural_media_interest", "J_commercial_rejection", "K_post_event_continuation"]
-    assert len(subset) == 3
+    assert subset_ids == [
+        "I_natural_media_interest",
+        "J_commercial_rejection",
+        "K_post_event_continuation",
+        "M_paid_platform_media_request",
+    ]
+    assert len(subset) == 4
 
     one, one_id = select_trajectories(payload, scenario_ids=["G_correction"])
     assert one_id == ["G_correction"]
@@ -561,7 +609,8 @@ def test_the_core_state_recorder_is_optional_shape_agnostic_and_total():
     runtime that calls it with rubbish is not punished for it, because a
     recorder must never be able to stop a reply.
     """
-    from services.reply_provenance import CORE_STATE_KEY as KEY, ReplyProvenance
+    from services.reply_provenance import CORE_STATE_KEY as KEY
+    from services.reply_provenance import ReplyProvenance
 
     silent = ReplyProvenance(creator_id="c", fan_id="f", mode="auto")
     assert KEY not in silent.as_metadata()["reply_provenance"]
@@ -602,10 +651,14 @@ def test_a_turn_carrying_recorded_core_state_is_observed_end_to_end():
     from services.reply_provenance import ReplyProvenance
 
     provenance = ReplyProvenance(creator_id="c", fan_id="f", mode="auto")
-    provenance.record_core_state({"state_before": {"topic": "rain"}, "accepted_fields": ["topic"]})
+    provenance.record_core_state(
+        {"state_before": {"topic": "rain"}, "accepted_fields": ["topic"]}
+    )
     metadata = provenance.as_metadata(platform_message_id="pm-1")
 
-    turn = TurnRecord(index=0, customer_message="hi", outcome="replied", replies=["hey"])
+    turn = TurnRecord(
+        index=0, customer_message="hi", outcome="replied", replies=["hey"]
+    )
     turn.provenance = [metadata["reply_provenance"]]
     observed = observe_turn(turn, core_id="conversational_v1")
     assert observed[CORE_STATE_KEY] == {

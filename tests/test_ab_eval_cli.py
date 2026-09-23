@@ -2,7 +2,7 @@
 
 The unit tests cover the pieces. This covers the thing an operator actually
 types: that ``--describe`` works with no backend at all, that a complete run
-over all twelve scenarios produces the documented directory, and that the blind
+over all thirteen scenarios produces the documented directory, and that the blind
 review built from that directory is genuinely blind.
 
 The backend is the recording stand-in rather than the simulator, so this suite
@@ -10,6 +10,9 @@ needs no database and no provider. What it is testing is the harness and the
 artifacts, which is the part that would otherwise only ever be exercised by a
 run that costs money.
 """
+
+# The subprocess return codes are the subject of these CLI tests.
+# ruff: noqa: PLW1510
 
 from __future__ import annotations
 
@@ -20,16 +23,20 @@ import sys
 from pathlib import Path
 
 from services.ab_trajectory_eval import (
-    ArmSpec,
     ROLE_BASELINE,
     ROLE_CANDIDATE,
+    ArmSpec,
     RunSpec,
     load_scenario_file,
     run_suite,
     select_trajectories,
     write_artifacts,
 )
-from services.blind_conversation_review import forbidden_terms, leaked_terms, unblind_all
+from services.blind_conversation_review import (
+    forbidden_terms,
+    leaked_terms,
+    unblind_all,
+)
 from tests.test_ab_trajectory_eval import RecordingBackend, _fans
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,7 +55,7 @@ def test_describe_lists_the_suite_without_a_backend():
     assert result.returncode == 0, result.stderr
     assert "A_ordinary_statement" in result.stdout
     assert "L_long_trajectory" in result.stdout
-    assert "12 scenario(s)" in result.stdout
+    assert "13 scenario(s)" in result.stdout
     # Claims and reach printed together, so a label cannot drift unnoticed.
     assert "NOT COVERED" in result.stdout or "covers:" in result.stdout
 
@@ -118,14 +125,14 @@ def test_a_complete_ab_run_over_the_whole_suite_produces_the_artifacts(tmp_path)
     root, backend = _full_run(tmp_path)
 
     metadata = json.loads((root / "metadata.json").read_text())
-    assert len(metadata["scenario_ids"]) == 12
+    assert len(metadata["scenario_ids"]) == 13
     assert metadata["baseline_core"] == "semantic_v2"
     assert metadata["candidate_core"] == "semantic_v1"
-    assert len(metadata["arm_order_per_scenario"]) == 12
+    assert len(metadata["arm_order_per_scenario"]) == 13
 
     paired = json.loads((root / "paired.json").read_text())
     assert paired["paired"] is True
-    assert paired["scenarios"] == 12
+    assert paired["scenarios"] == 13
     assert paired["fan_inputs_identical"] is True
 
     # Both arms saw every scripted message, and neither saw the other's fan.
@@ -157,7 +164,7 @@ def test_the_blind_review_command_produces_a_blind_document(tmp_path):
 
     mapping = json.loads((root / "blind_mapping.json").read_text())
     by_scenario = unblind_all(mapping)
-    assert len(by_scenario) == 12
+    assert len(by_scenario) == 13
     for labels in by_scenario.values():
         assert set(labels.values()) == {"semantic_v2", "semantic_v1"}
 
