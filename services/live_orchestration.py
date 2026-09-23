@@ -3246,22 +3246,41 @@ async def prepare_turn(
         decision.proposed_operation.kind is not OperationKind.NONE
         and not execution.validation.approved
     ):
-        # Planning can also refuse a validated operation (inventory changed).
-        # It must not fall through into a textual pretend-delivery.
-        decision = ConversationDecision(
-            disposition=ResponseDisposition.HANDOFF,
-            hold=HoldReason.NEEDS_HUMAN,
-            hold_detail="semantic_execution_refused: "
-            + "; ".join(execution.validation.reasons),
-            proposed_operation=ProposedOperation(
-                kind=OperationKind.HAND_OFF_TO_HUMAN,
-                subject="execution requires review",
-            ),
+        # Planning can also refuse an operation after the semantic decision
+        # (inventory changed, an offer expired, another payment appeared). That
+        # is still an operation failure, not a reason to freeze an otherwise
+        # valid conversation. Drop the external action and let the writer answer
+        # from the same evidence. Explicit handoffs remain handoffs.
+        rejected_reasons = tuple(execution.validation.reasons)
+        recovered = _operationless_recovery_decision(decision)
+        recovered_execution = await _prepare_execution(
+            recovered,
+            loaded,
+            execute_operations=execute_operations,
         )
-        execution = ApprovedExecution(
-            operation="hand_off_to_human",
-            validation=validate_decision(decision, loaded),
-        )
+        if recovered_execution.validation.approved:
+            print(
+                "[SEMANTIC EXECUTION LOCAL SETTLEMENT] "
+                f"rejected_operation={decision.proposed_operation.kind.value} "
+                f"reasons={'; '.join(rejected_reasons)} result=downgraded"
+            )
+            decision = recovered
+            execution = recovered_execution
+        else:
+            decision = ConversationDecision(
+                disposition=ResponseDisposition.HANDOFF,
+                hold=HoldReason.NEEDS_HUMAN,
+                hold_detail="semantic_execution_refused: "
+                + "; ".join(rejected_reasons),
+                proposed_operation=ProposedOperation(
+                    kind=OperationKind.HAND_OFF_TO_HUMAN,
+                    subject="execution requires review",
+                ),
+            )
+            execution = ApprovedExecution(
+                operation="hand_off_to_human",
+                validation=validate_decision(decision, loaded),
+            )
     if conversation_core == CORE_SEMANTIC_V2:
         decision, execution, replies = _validate_single_call_reply(
             decision,
