@@ -1341,7 +1341,7 @@ def test_bikini_trajectory_persists_real_ppv_receipt_and_payment_state(
     assert all("sent it" not in r["content"] for r in db.tables["messages"])
 
 
-def test_writer_rejection_suppresses_entire_turn_before_delivery(monkeypatch):
+def test_writer_rejection_repairs_copy_without_freezing_the_fan(monkeypatch):
     evidence = loaded(next_offer=offer())
     owner_world(
         monkeypatch,
@@ -1359,7 +1359,6 @@ def test_writer_rejection_suppresses_entire_turn_before_delivery(monkeypatch):
     monkeypatch.setattr(
         live_orchestration, "load_evidence", lambda **_: value(evidence)
     )
-    monkeypatch.setattr(live_orchestration, "_deliver_plain_parts", _retired)
     frozen = []
 
     async def freeze(*args):
@@ -1376,11 +1375,10 @@ def test_writer_rejection_suppresses_entire_turn_before_delivery(monkeypatch):
             conversation_core="semantic_v2",
         )
     )
-    assert prepared.replies == []
-    assert (
-        run(live_orchestration.execute_auto_turn(prepared))["outcome"] == "human_review"
-    )
-    assert frozen
+    assert prepared.replies == ["knew you would"]
+    assert prepared.execution.operation == "present_offer"
+    assert prepared.decision.disposition is ResponseDisposition.REPLY
+    assert frozen == []
     assert evidence.commercial_state.pending_offer is None
 
 
@@ -1525,7 +1523,7 @@ def test_planner_cannot_change_approved_price(monkeypatch):
     assert evidence.active_session is None
 
 
-def test_production_pending_offer_send_request_repairs_into_exact_locked_delivery(
+def test_production_pending_offer_send_request_recovers_exact_locked_delivery_locally(
     monkeypatch,
 ):
     from dataclasses import replace
@@ -1548,23 +1546,15 @@ def test_production_pending_offer_send_request_repairs_into_exact_locked_deliver
                 operation_subject="the $30 payment",
                 operation_payment_reference="imaginary",
             ),
-            live_payload(
-                operation="send_locked_paid_message",
-                operation_subject="the exact pending content",
-                response_intent="deliver_accepted_offer",
-                operation_offer_id="offer-1",
-                operation_set_id="set-1",
-            ),
         ],
     )
     decision = run(live_orchestration.decide_turn(evidence))
+    assert len(calls) == 1
     assert decision.proposed_operation.kind is OperationKind.SEND_LOCKED_PAID_MESSAGE
+    assert decision.proposed_operation.offer_id == "offer-1"
+    assert decision.proposed_operation.set_id == "set-1"
+    assert "$30" not in decision.proposed_operation.subject
     assert live_orchestration.validate_decision(decision, evidence).approved
-    assert "there is no pending payment to check" in calls[1]["messages"][0]["content"]
-    assert (
-        "semantic owner attempted to state a price"
-        in calls[1]["messages"][0]["content"]
-    )
     assert evidence.commercial_state.model_dump() == before
     assert evidence.pending_payment is None
     evidence.active_session = {"status": "active", "plan": [{"sent": False}]}
@@ -1862,7 +1852,7 @@ def test_legacy_assisted_token_never_enters_semantic_approval():
     ) is None
 
 
-def test_semantic_v2_rejects_the_single_call_reply_deterministically(monkeypatch):
+def test_semantic_v2_rejects_the_single_call_reply_without_freezing(monkeypatch):
     decision, execution, replies = live_orchestration._validate_single_call_reply(
         ConversationDecision(
             proposed_operation=ProposedOperation(kind=OperationKind.NONE),
@@ -1875,11 +1865,12 @@ def test_semantic_v2_rejects_the_single_call_reply_deterministically(monkeypatch
         mode="auto",
     )
     assert replies == []
-    assert execution.operation == "hand_off_to_human"
-    assert decision.hold_detail.startswith("semantic_reply_contract_rejected")
+    assert execution.operation == "none"
+    assert decision.disposition is ResponseDisposition.SILENCE
+    assert decision.hold_detail == "semantic_v2_local_output_rejected"
 
 
-def test_semantic_v2_trace_counts_validation_repair_calls(monkeypatch):
+def test_semantic_v2_trace_records_single_call_local_operation_repair(monkeypatch):
     evidence = loaded()
     calls = []
 
@@ -1897,18 +1888,13 @@ def test_semantic_v2_trace_counts_validation_repair_calls(monkeypatch):
             alternate_attempts=0,
             elapsed_ms=10,
         )
-        operation = (
-            ProposedOperation(
-                kind=OperationKind.CHECK_PAYMENT_CLAIM,
-                subject="fake payment",
-                payment_reference="missing",
-            )
-            if repair is None
-            else ProposedOperation(kind=OperationKind.NONE)
-        )
         return (
             ConversationDecision(
-                proposed_operation=operation,
+                proposed_operation=ProposedOperation(
+                    kind=OperationKind.CHECK_PAYMENT_CLAIM,
+                    subject="fake payment",
+                    payment_reference="missing",
+                ),
                 disposition=ResponseDisposition.REPLY,
                 source="reply_plus_intent",
             ),
@@ -1917,10 +1903,12 @@ def test_semantic_v2_trace_counts_validation_repair_calls(monkeypatch):
         )
 
     monkeypatch.setattr(live_orchestration, "_conversational_answer", answer)
-    _decision, _replies, trace = run(live_orchestration.decide_with_reply(evidence))
-    assert len(calls) == 2
-    assert trace.attempts == 2
-    assert trace.pinned_attempts == 2
-    assert trace.elapsed_ms == 20
-    assert trace.attempt_index == 1
-    assert trace.outcome == "semantic_v2_repair_success"
+    decision, replies, trace = run(live_orchestration.decide_with_reply(evidence))
+    assert calls == [None]
+    assert decision.proposed_operation.kind is OperationKind.NONE
+    assert replies == ["specific reply"]
+    assert trace.attempts == 1
+    assert trace.pinned_attempts == 1
+    assert trace.elapsed_ms == 10
+    assert trace.attempt_index == 0
+    assert trace.outcome == "semantic_v2_local_operation_repair"
