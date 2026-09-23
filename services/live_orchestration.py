@@ -1436,7 +1436,15 @@ async def _conversational_answer(
 
 
 async def decide_turn(loaded: LoadedEvidence) -> ConversationDecision:
-    """Run the semantic_v1 decision owner, including bounded decision repair."""
+    """Run semantic_v1 once, then let deterministic authority settle the operation.
+
+    The old path asked the model to regenerate a whole decision up to two more
+    times when an otherwise usable proposal failed validation. That made
+    recoverable metadata mistakes (for example, a price in operation_subject)
+    capable of freezing the entire fan conversation. Operation prose and refs
+    are not authority: sanitize what is locally repairable, otherwise drop the
+    operation and keep the conversational turn alive.
+    """
     spec = loaded.stack.profile.stage(STAGE_SITUATION_ANALYZER)
     owner = SemanticDecisionOwner(
         complete, target=spec.primary_target(), strict_live=True
@@ -1445,97 +1453,45 @@ async def decide_turn(loaded: LoadedEvidence) -> ConversationDecision:
         "evidence_snapshot": loaded.snapshot,
         "legal_operations": legal_operations(loaded),
     }
-    failures = ()
-    for attempt in range(3):  # initial decision plus at most two repairs
-        if attempt:
-            state["decision_repair"] = {
-                "attempt": attempt,
-                "validation_failures": list(failures),
-                "instruction": "Repair the decision using the SAME immutable evidence. Authoritative state outranks fan wording. Do not invent payment, purchase, offer, media or price. Choose only a state-legal operation with exact evidenced references, or hand_off_to_human. Never put prices in operation_subject or operation_because.",
-            }
-        decision = await owner.decide(loaded.packet, state)
-        validation = validate_decision(decision, loaded)
-        if validation.approved:
-            if attempt:
-                print(
-                    f"[SEMANTIC DECISION REPAIR] attempt={attempt} result=approved operation={validation.operation}"
-                )
-            return decision
-        failures = validation.reasons
-        print(
-            f"[SEMANTIC DECISION REPAIR] attempt={attempt} result=rejected rejected_operation={validation.operation} reasons={'; '.join(failures)}"
-        )
-    print("[SEMANTIC DECISION REPAIR] result=exhausted action=handoff")
-    return ConversationDecision(
-        disposition=ResponseDisposition.HANDOFF,
-        hold=HoldReason.NEEDS_HUMAN,
-        hold_detail="semantic_decision_repair_exhausted: " + "; ".join(failures),
-        proposed_operation=ProposedOperation(
-            kind=OperationKind.HAND_OFF_TO_HUMAN, subject="unresolved semantic decision"
-        ),
-        source="semantic_owner",
-        confidence=0.0,
+    decision = await owner.decide(loaded.packet, state)
+    settled, failures, changed = _settle_recoverable_semantic_operation(
+        decision, loaded
     )
+    if failures:
+        print(
+            "[SEMANTIC DECISION LOCAL SETTLEMENT] "
+            f"rejected_operation={decision.proposed_operation.kind.value} "
+            f"reasons={'; '.join(failures)} "
+            f"result={'repaired_or_downgraded' if changed else 'preserved_handoff'}"
+        )
+    return settled
 
 
 async def decide_with_reply(
     loaded: LoadedEvidence,
 ) -> tuple[ConversationDecision, list[str], GenerationTrace]:
-    """Run semantic_v2 and preserve aggregate one-call/repair attribution."""
-    failures = ()
-    total_attempts = 0
-    total_elapsed_ms = 0
-    last_trace = GenerationTrace()
-    for attempt in range(3):
-        repair = None
-        if attempt:
-            repair = {
-                "attempt": attempt,
-                "validation_failures": list(failures),
-                "instruction": "Repair the reply and decision using the SAME immutable evidence. Keep the strongest specific conversational beat and repair only the invalid operation/reference. Authoritative state outranks fan wording. Do not invent payment, purchase, offer, media or price. Choose only a state-legal operation with exact evidenced references, or hand_off_to_human.",
-            }
-        decision, replies, trace = await _conversational_answer(loaded, repair=repair)
-        total_attempts += max(1, trace.attempts)
-        total_elapsed_ms += trace.elapsed_ms
-        last_trace = trace
-        validation = validate_decision(decision, loaded)
-        if validation.approved:
-            if attempt:
-                print(
-                    f"[SEMANTIC DECISION REPAIR] attempt={attempt} result=approved operation={validation.operation}"
-                )
-            trace.attempts = total_attempts
-            trace.pinned_attempts = total_attempts
-            trace.elapsed_ms = total_elapsed_ms
-            trace.attempt_index = total_attempts - 1
-            if attempt:
-                trace.outcome = "semantic_v2_repair_success"
-            return decision, replies, trace
-        failures = validation.reasons
-        print(
-            f"[SEMANTIC DECISION REPAIR] attempt={attempt} result=rejected rejected_operation={validation.operation} reasons={'; '.join(failures)}"
-        )
-    print("[SEMANTIC DECISION REPAIR] result=exhausted action=handoff")
-    last_trace.attempts = total_attempts
-    last_trace.pinned_attempts = total_attempts
-    last_trace.elapsed_ms = total_elapsed_ms
-    last_trace.outcome = "semantic_v2_repair_exhausted"
-    return (
-        ConversationDecision(
-            disposition=ResponseDisposition.HANDOFF,
-            hold=HoldReason.NEEDS_HUMAN,
-            hold_detail="semantic_decision_repair_exhausted: "
-            + "; ".join(failures),
-            proposed_operation=ProposedOperation(
-                kind=OperationKind.HAND_OFF_TO_HUMAN,
-                subject="unresolved semantic decision",
-            ),
-            source="reply_plus_intent",
-            confidence=0.0,
-        ),
-        [],
-        last_trace,
+    """Run semantic_v2 once and preserve usable copy when its operation is bad.
+
+    semantic_v2 is a legacy comparison runtime whose owner writes the reply and
+    semantic decision together. A bad operation must not erase valid customer
+    copy or trigger two more expensive retries. Deterministic authority settles
+    the operation locally; the normal reply contract then removes any wording
+    that depended on an operation which was refused.
+    """
+    decision, replies, trace = await _conversational_answer(loaded, repair=None)
+    settled, failures, changed = _settle_recoverable_semantic_operation(
+        decision, loaded
     )
+    if failures:
+        print(
+            "[SEMANTIC V2 LOCAL SETTLEMENT] "
+            f"rejected_operation={decision.proposed_operation.kind.value} "
+            f"reasons={'; '.join(failures)} "
+            f"result={'repaired_or_downgraded' if changed else 'preserved_handoff'}"
+        )
+        if changed:
+            trace.outcome = "semantic_v2_local_operation_repair"
+    return settled, replies, trace
 
 
 def _evidenced_reference_set(loaded: LoadedEvidence) -> frozenset[str]:
@@ -2797,6 +2753,94 @@ def _repair_rejected_core_v1_operation(
         confidence=decision.confidence,
     )
     return repaired, repaired.proposed_operation != op
+
+
+def _operationless_recovery_decision(
+    decision: ConversationDecision,
+) -> ConversationDecision:
+    """Drop external authority while preserving the conversational reading."""
+    if decision.disposition is ResponseDisposition.HANDOFF or decision.hold in {
+        HoldReason.NEEDS_HUMAN,
+        HoldReason.INSUFFICIENT_EVIDENCE,
+    }:
+        # A deliberate handoff is not a recoverable formatting error. Normalize
+        # the external action to the one operation that actually means handoff.
+        return dataclasses_replace(
+            decision,
+            proposed_operation=ProposedOperation(
+                kind=OperationKind.HAND_OFF_TO_HUMAN,
+                subject="the evidenced conversation requires human review",
+            ),
+            disposition=ResponseDisposition.HANDOFF,
+            hold=(
+                decision.hold
+                if decision.hold is not HoldReason.NONE
+                else HoldReason.NEEDS_HUMAN
+            ),
+        )
+    if decision.disposition is ResponseDisposition.SILENCE:
+        return dataclasses_replace(
+            decision,
+            proposed_operation=ProposedOperation(),
+            response_intent=ResponseIntent.RESPECT_SILENCE,
+        )
+    return dataclasses_replace(
+        decision,
+        proposed_operation=ProposedOperation(),
+        response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
+        disposition=ResponseDisposition.REPLY,
+        hold=HoldReason.NONE,
+        hold_detail="",
+    )
+
+
+def _settle_recoverable_semantic_operation(
+    decision: ConversationDecision,
+    loaded: LoadedEvidence,
+) -> tuple[ConversationDecision, tuple[str, ...], bool]:
+    """Settle a legacy semantic operation without another model call.
+
+    Deterministic validation remains authoritative. We first strip price text
+    from descriptive operation metadata, then revalidate the exact same refs.
+    If the external action is still invalid, it is dropped while the semantic
+    conversation survives. Only an explicit handoff / insufficient-evidence
+    decision remains a handoff.
+    """
+    validation = validate_decision(decision, loaded)
+    if validation.approved:
+        return decision, (), False
+
+    failures = tuple(validation.reasons)
+    if decision.proposed_operation.kind is not OperationKind.NONE:
+        repaired, changed = _repair_rejected_core_v1_operation(decision)
+        repaired_validation = validate_decision(repaired, loaded)
+        if repaired_validation.approved:
+            return repaired, failures, changed
+        decision = repaired
+
+    recovered = _operationless_recovery_decision(decision)
+    recovered_validation = validate_decision(recovered, loaded)
+    if recovered_validation.approved:
+        return recovered, failures, True
+
+    # Explicit review states intentionally fail the ordinary validator when the
+    # reason is missing evidence. Keep them as review rather than pretending an
+    # ordinary reply became safe.
+    if recovered.disposition is ResponseDisposition.HANDOFF:
+        return recovered, failures, recovered != decision
+
+    # Defensive final normalization for malformed legacy decisions. This still
+    # performs no external action and therefore cannot weaken transaction
+    # authority.
+    fallback = dataclasses_replace(
+        recovered,
+        proposed_operation=ProposedOperation(),
+        response_intent=ResponseIntent.ANSWER_AND_CONTINUE,
+        disposition=ResponseDisposition.REPLY,
+        hold=HoldReason.NONE,
+        hold_detail="",
+    )
+    return fallback, failures, True
 
 
 @dataclass(frozen=True)
