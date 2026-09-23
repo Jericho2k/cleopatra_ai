@@ -77,6 +77,14 @@ class EvidenceSnapshot:
     #: Soft rhythm context for the writer: what the recent creator bubbles have
     #: been leaning on. Never a send-blocking rule.
     voice_rhythm: dict[str, Any] = field(default_factory=dict)
+    #: Application-owned statement of which product surface this conversation
+    #: inhabits. Models consume it as evidence rather than inferring location or
+    #: capabilities from conversational prose.
+    platform_context: dict[str, Any] = field(default_factory=dict)
+    #: A current fan-authored request to see creator-controlled media. This is
+    #: independent of explicitness and willingness to pay, and never forces an
+    #: operation; it makes the real media affordances a conscious decision.
+    media_request: dict[str, Any] = field(default_factory=dict)
     truncation: dict[str, int] = field(default_factory=dict)
     version: str = EVIDENCE_VERSION
 

@@ -28,8 +28,8 @@ from services.trajectory_eval import TrajectoryReport, TurnRecord, coverage_gaps
 ROOT = Path(__file__).resolve().parents[1]
 SCENARIOS = ROOT / "eval" / "conversational_core_scenarios.json"
 
-#: The brief's twelve scenarios, by the letter each one answers to.
-REQUIRED_PREFIXES = tuple("ABCDEFGHIJKL")
+#: The original twelve scenarios plus the paid-platform operating-model case.
+REQUIRED_PREFIXES = tuple("ABCDEFGHIJKLM")
 
 
 def _payload() -> dict:
@@ -76,7 +76,9 @@ def test_every_coverage_claim_is_reachable_by_the_script_that_declares_it():
             clock_injected=True,
             elapsed_days=elapsed,
             due_worker_runs=sum(
-                1 for item in trajectory.disturbances if not str(item.message or "").strip()
+                1
+                for item in trajectory.disturbances
+                if not str(item.message or "").strip()
             ),
             seeded_purchases=list(trajectory.seed.get("purchases") or []),
         )
@@ -85,15 +87,21 @@ def test_every_coverage_claim_is_reachable_by_the_script_that_declares_it():
 
 
 def test_the_long_trajectory_is_actually_long_and_contains_the_named_disturbances():
-    trajectories, ids = select_trajectories(_payload(), scenario_ids=["L_long_trajectory"])
+    trajectories, _ids = select_trajectories(
+        _payload(), scenario_ids=["L_long_trajectory"]
+    )
     long_run = trajectories[0]
     assert len(long_run.disturbances) >= 20
     assert any(item.corrects for item in long_run.disturbances), "no correction"
-    assert any(item.days_since_previous >= 7 for item in long_run.disturbances), "no week gap"
+    assert any(item.days_since_previous >= 7 for item in long_run.disturbances), (
+        "no week gap"
+    )
     assert any(
         len(item.message.split()) <= 3 for item in long_run.disturbances if item.message
     ), "no short reply"
-    assert any(item.raises_obligation for item in long_run.disturbances), "no callback obligation"
+    assert any(item.raises_obligation for item in long_run.disturbances), (
+        "no callback obligation"
+    )
 
 
 def test_the_correction_scenario_states_what_replaced_the_corrected_fact():
@@ -118,10 +126,21 @@ def test_the_post_event_scenario_seeds_an_authoritative_purchase():
     assert not any("i paid" in turn["message"].lower() for turn in row["turns"])
 
 
+def test_the_paid_platform_trajectory_contains_the_failure_milestones():
+    row = next(item for item in _rows() if item["id"].startswith("M_"))
+    messages = [turn["message"].lower() for turn in row["turns"]]
+
+    assert any("need to see more" in message for message in messages)
+    assert any("trust your judgement" in message for message in messages)
+    assert any("show me" in message for message in messages)
+    assert "platform_grounding" in row["rubric_focus"]
+    assert "media_affordance_judgment" in row["rubric_focus"]
+
+
 def test_most_scenarios_are_neither_commercial_nor_explicitly_intimate():
     payload = _payload()
     commercial = set(payload["suites"]["commercial"])
-    assert len(commercial) == 3
+    assert len(commercial) == 4
     assert len(commercial) < len(payload["suites"]["conversational"])
 
 
@@ -152,7 +171,9 @@ def test_the_scenarios_contain_no_identifiers_that_could_come_from_real_data():
 
     text = SCENARIOS.read_text(encoding="utf-8")
     messages = " ".join(
-        turn["message"] for row in json.loads(text)["trajectories"] for turn in row["turns"]
+        turn["message"]
+        for row in json.loads(text)["trajectories"]
+        for turn in row["turns"]
     )
     assert "@" not in messages
     assert "http" not in messages

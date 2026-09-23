@@ -68,10 +68,6 @@ from db.queries import (
     save_message,
 )
 from models.commercial import FanStatus, Offer
-from models.conversational_core import (
-    ConversationalWorkingState,
-    StateDeltaValidation,
-)
 from models.conversation_decision import (
     ConversationDecision,
     HoldReason,
@@ -79,6 +75,10 @@ from models.conversation_decision import (
     ProposedOperation,
     ResponseDisposition,
     ResponseIntent,
+)
+from models.conversational_core import (
+    ConversationalWorkingState,
+    StateDeltaValidation,
 )
 from models.live_orchestration import (
     ApprovedExecution,
@@ -97,11 +97,17 @@ from services.affordability import get_affordability_context
 from services.ai_stack import resolve_ai_stack
 from services.assisted_provenance import remember as remember_assisted_provenance
 from services.context_packet import ContextPacket, build_context_packet
-from services.conversation_generation import current_generation
 from services.conversation_continuity import open_threads_for, recent_episodes_for
+from services.conversation_core import (
+    CORE_CONVERSATIONAL_V1,
+    CORE_SEMANTIC_V1,
+    CORE_SEMANTIC_V2,
+)
+from services.conversation_generation import current_generation
 from services.conversation_signals import (
     content_access_issue,
     fan_publication_references,
+    media_request,
     publication_evidence,
     purchase_claim,
     purchase_intent,
@@ -109,11 +115,6 @@ from services.conversation_signals import (
     unsupported_platform_state_claim,
     unsupported_publication_claim,
     unverified_purchase_acknowledgement,
-)
-from services.conversation_core import (
-    CORE_CONVERSATIONAL_V1,
-    CORE_SEMANTIC_V1,
-    CORE_SEMANTIC_V2,
 )
 from services.conversational_core import (
     CoreStateConflictError,
@@ -130,8 +131,9 @@ from services.conversational_decision_contract import (
 from services.decision_owners import SemanticDecisionOwner, parse_reply_plus_intent
 from services.delivery_mode import is_immediate
 from services.fan_lifecycle import get_fan_lifecycle_context
-from services.hermes_retrieval import retrieve_examples, retrieval_enabled
+from services.hermes_retrieval import retrieval_enabled, retrieve_examples
 from services.human_delivery import DeliverySchedule, build_delivery_schedule
+from services.offer_lifecycle import sync_pending_offer_expiry
 from services.outbound_delivery import (
     deliver_sequence_now,
     schedule_outbound_sequence,
@@ -142,8 +144,19 @@ from services.outbound_settlement import (
     check_payment_instruction,
     present_offer_instruction,
 )
-from services.offer_lifecycle import sync_pending_offer_expiry
 from services.payment_claims import verify_ppv_purchase
+from services.platform_operating_model import (
+    CLEOPATRA_MISSION,
+    PLATFORM_OPERATING_MODEL,
+    SCHEDULED_INTENT_EFFECT,
+    claims_media_delivery,
+    operation_affordances,
+    platform_context,
+    prepared_execution_reality,
+    redirects_to_other_chat,
+    repair_present_action_as_imagined,
+    unsupported_present_creator_action,
+)
 from services.ppv_delivery import (
     PPVDeliveryError,
     create_ppv_approval_request,
@@ -151,7 +164,6 @@ from services.ppv_delivery import (
 )
 from services.ppv_language import contains_delivery_link_language
 from services.price_learning import get_price_learning_context
-from services.scheduled_intent import persist_scheduled_intent
 from services.reply_provenance import (
     DELIVERY_PPV,
     DELIVERY_TEXT,
@@ -161,6 +173,7 @@ from services.reply_provenance import (
     ReplyProvenance,
     fingerprint,
 )
+from services.scheduled_intent import persist_scheduled_intent
 from services.session_planner import plan_session_for_fan
 
 #: Two owner calls is the whole budget for one turn: the answer, and at most
@@ -248,6 +261,10 @@ Authority and safety:
 
 CONVERSATIONAL_V1_SYSTEM = """You are GLM, the semantic decision role for one private creator/fan conversation. You interpret the situation; you NEVER write words for the fan.
 
+__PLATFORM_OPERATING_MODEL__
+
+__CLEOPATRA_MISSION__
+
 Return ONE JSON object only. Never include reply, message, caption, copy, rewrite, phrasing, candidate sentences, or "say something like" prose. Do not expose hidden reasoning.
 
 Contract:
@@ -283,6 +300,8 @@ Contract:
 
 Omit scheduled_intent unless this turn genuinely creates a future obligation — "wait right there", "give me a minute", a moment worth returning to, or a commercially promising point the creator deliberately delayed. It is a GOAL, never words: you are not writing the later message, and the later turn will read the conversation as it is then and may decide to say nothing. Timing is a REQUEST the application normalizes and may refuse: give a relative delay in minutes for a conversational beat, or name an evidenced reference such as payday. Never state a clock time, a date, or a price. Use cancel_on_activity when the intention only makes sense if he has not spoken first; use revalidate_on_activity for a real future obligation that his talking does not cancel.
 
+Scheduled-intent affordance: __SCHEDULED_INTENT_EFFECT__
+
 Interpret short replies from the immediate raw exchange, not from length. Track initiative and non-linear pacing without a funnel. Direction changes and corrections override an old trajectory. Preserve shared imagined premises as imagined. Purchases, rejection, delivery, and failed operations remain events inside the same conversation rather than reset points.
 
 Adult/intimate conversation is not a separate funnel and not a reason to sell. When it is active, track its independent dimensions only when useful: descriptive content register, whether it is ordinary intimate conversation or a shared imagined scene, the current direction (build/hold/continue/cool/redirect/pause/resume), the last meaningful beat, and any clearly established conversational boundaries. These dimensions may move in ANY direction on the next turn. Do not infer a required escalation from explicitness, short replies, elapsed turns, purchase state, or a prior sale. Preserve the exact active premise/roles/references instead of resetting to generic flirting. If the fan cools, redirects, corrects, or ends the intimate line, follow that change cheaply.
@@ -291,12 +310,22 @@ Grounding and provenance. Every claim about the world must trace to evidence in 
 
 Commercial judgement runs in both directions. Intimacy, explicitness, elapsed turns and a past purchase NEVER create a commercial opportunity by themselves. But commercial_opportunity records what the fan actually SAID — asking the price, offering to pay, asking what he can buy — and an explicit, fan-created buying opportunity is not cancelled by the conversation being intimate. When such a signal is present, unsent approved inventory exists, and the operation is in legal_operations, seriously consider proposing it; declining is a judgement about THIS moment, not a rule. Never infer wealth, spending power, or a budget from how he writes, and never state a price: the application supplies the exact figure if one may be said at all.
 
+media_request separately records a current fan-authored request to SEE creator-controlled content. It is not inferred from explicitness and it does not prove willingness to pay or force a sale. When present, consciously choose among: continue text/shared imagination with operation none; present an authorized offer; send an exact accepted locked message when legal; or another genuinely legal action. A visual request may not be "satisfied" by narrating that media or present-world creator activity appeared through prose.
+
 purchase_claim records whether he said he paid and whether anything authoritative agrees. A claim is not a receipt. Until the payment ledger confirms it, do not treat the purchase as real, do not advance a paid session, and propose check_payment_claim when one is legal rather than acting as if he has access.
 
 content_access_issue records a CURRENT fan report that already-confirmed paid content is blurred, locked, missing, or inaccessible. When it says both fan_reported_access_problem=true and confirmed_purchase_exists=true, this is support for the EXISTING purchase, never a new sale. Do not invent a teaser/full-version distinction, another unlock, a second paywall, or another charge. Use repair_content_access tied to the evidenced purchase when legal, otherwise hand off.
 
 The application alone owns inventory identity, price, recipient, payment, purchase, delivery, permissions, idempotency, persistence, and operation results. Choose at most one supplied opaque candidate_handle. Request missing essential evidence; do not invent it. Omit optional fields when nothing changes.
 """
+
+CONVERSATIONAL_V1_SYSTEM = (
+    CONVERSATIONAL_V1_SYSTEM.replace(
+        "__PLATFORM_OPERATING_MODEL__", PLATFORM_OPERATING_MODEL
+    )
+    .replace("__CLEOPATRA_MISSION__", CLEOPATRA_MISSION)
+    .replace("__SCHEDULED_INTENT_EFFECT__", SCHEDULED_INTENT_EFFECT)
+)
 
 #: The one bounded repair. It asks for the MINIMUM object and nothing else,
 #: from the same evidence, so a model that lost the format has the smallest
@@ -467,16 +496,27 @@ def _creator_voice_view(persona: Persona, history: list[Any]) -> dict[str, Any]:
         "punctuation_style": _plain(persona.punctuation_style, limit=300),
         "emoji_usage": _plain(persona.emoji_usage, limit=100),
         "emoji_style": _plain(persona.emoji_style, limit=300),
-        "signature_emojis": [_plain(value, limit=30) for value in persona.signature_emojis[:20]],
-        "example_greetings": [_plain(value, limit=300) for value in persona.example_greetings[:10]],
-        "example_flirts": [_plain(value, limit=300) for value in persona.example_flirts[:10]],
+        "signature_emojis": [
+            _plain(value, limit=30) for value in persona.signature_emojis[:20]
+        ],
+        "example_greetings": [
+            _plain(value, limit=300) for value in persona.example_greetings[:10]
+        ],
+        "example_flirts": [
+            _plain(value, limit=300) for value in persona.example_flirts[:10]
+        ],
         "example_phrases": _plain(persona.example_phrases, limit=1_000),
         "approved_voice_calibration_samples": (
-            [_plain(value, limit=500) for value in persona.voice_calibration_samples[:12]]
+            [
+                _plain(value, limit=500)
+                for value in persona.voice_calibration_samples[:12]
+            ]
             if persona.voice_calibration_enabled
             else []
         ),
-        "creator_do_not": [_plain(value, limit=200) for value in persona.dont_list[:20]],
+        "creator_do_not": [
+            _plain(value, limit=200) for value in persona.dont_list[:20]
+        ],
         "hard_limits": _plain(persona.hard_limits, limit=600),
         "recent_creator_messages": recent_creator_messages,
     }
@@ -510,9 +550,7 @@ def _latest_fan_burst(
     burst.reverse()
     latest = _plain(latest_message, limit=MAX_TRIGGER_CHARS)
     if latest and (not burst or burst[-1].get("text") != latest):
-        burst.append(
-            {"message_id": "", "speaker": "fan", "text": latest, "at": None}
-        )
+        burst.append({"message_id": "", "speaker": "fan", "text": latest, "at": None})
     return tuple(burst)
 
 
@@ -765,9 +803,7 @@ def _trim_snapshot(snapshot: EvidenceSnapshot) -> EvidenceSnapshot:
             }
         )
     while (
-        len(snapshot.canonical_json()) > MAX_EVIDENCE_CHARS
-        and turns
-        and raw_messages
+        len(snapshot.canonical_json()) > MAX_EVIDENCE_CHARS and turns and raw_messages
     ):
         turns.pop(0)
         truncation["recent_turns"] = truncation.get("recent_turns", 0) + 1
@@ -778,7 +814,9 @@ def _trim_snapshot(snapshot: EvidenceSnapshot) -> EvidenceSnapshot:
                 "truncation": truncation,
             }
         )
-    while len(snapshot.canonical_json()) > MAX_EVIDENCE_CHARS and len(raw_messages) > 12:
+    while (
+        len(snapshot.canonical_json()) > MAX_EVIDENCE_CHARS and len(raw_messages) > 12
+    ):
         raw_messages.pop(0)
         truncation["recent_messages"] = truncation.get("recent_messages", 0) + 1
         snapshot = EvidenceSnapshot(
@@ -793,7 +831,9 @@ def _trim_snapshot(snapshot: EvidenceSnapshot) -> EvidenceSnapshot:
         # but duplicated grouped turns and older raw messages are cheaper to
         # drop before continuity memory.
         episodes.pop()
-        truncation["conversation_episodes"] = truncation.get("conversation_episodes", 0) + 1
+        truncation["conversation_episodes"] = (
+            truncation.get("conversation_episodes", 0) + 1
+        )
         snapshot = EvidenceSnapshot(
             **{
                 **snapshot.__dict__,
@@ -1051,6 +1091,8 @@ async def load_evidence(
             pending_payment=pending_view,
         ),
         voice_rhythm=recent_creator_emoji(recent_messages),
+        platform_context=platform_context(),
+        media_request=media_request(latest_fan_burst),
         memory_status={
             "historical_backfill_complete": bool(
                 (fan_intelligence.get("history_continuity") or {}).get(
@@ -1111,7 +1153,9 @@ def _resumable_locked_session(loaded: LoadedEvidence, offer: Offer | None) -> bo
     plan = session.get("plan") or []
     if (
         not str(loaded.fan.platform_fan_id or "").startswith("test_")
-        or offer is None or loaded.pending_payment or not plan
+        or offer is None
+        or loaded.pending_payment
+        or not plan
         or session.get("status") != "active"
         or int(session.get("current_index") or 0) != 0
         or session.get("awaiting_purchase_index") is not None
@@ -1122,7 +1166,8 @@ def _resumable_locked_session(loaded: LoadedEvidence, offer: Offer | None) -> bo
         return False
     step = plan[0]
     return bool(
-        step.get("media_ids") and step.get("set_id") == offer.set_id
+        step.get("media_ids")
+        and step.get("set_id") == offer.set_id
         and int(step.get("price_cents") or 0) == offer.price_cents
     )
 
@@ -1168,7 +1213,9 @@ def validate_decision(
                 and getattr(loaded, "candidate_handles", {}).get(op.candidate_handle)
                 is offer
             )
-            legacy_refs_match = op.offer_id == offer.offer_id and op.set_id == offer.set_id
+            legacy_refs_match = (
+                op.offer_id == offer.offer_id and op.set_id == offer.set_id
+            )
             if not handle_matches and not legacy_refs_match:
                 reasons.append(
                     "proposed offer references do not match the approved offer"
@@ -1196,7 +1243,9 @@ def validate_decision(
                 and getattr(loaded, "candidate_handles", {}).get(op.candidate_handle)
                 is offer
             )
-            legacy_refs_match = op.offer_id == offer.offer_id and op.set_id == offer.set_id
+            legacy_refs_match = (
+                op.offer_id == offer.offer_id and op.set_id == offer.set_id
+            )
             if not handle_matches and not legacy_refs_match:
                 reasons.append("acceptance does not bind to the exact pending offer")
             ceiling = _hard_ceiling(
@@ -1366,7 +1415,7 @@ async def _conversational_answer(
             max_tokens=_owner_max_tokens(spec),
             response_format={"type": "json_object"},
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - model transport must fail closed
         trace.record_failure(
             outcome="semantic_v2_owner_unreachable",
             reason=f"the one-call conversational owner could not be reached: {exc}",
@@ -1517,7 +1566,7 @@ def _evidenced_reference_set(loaded: LoadedEvidence) -> frozenset[str]:
         if not isinstance(record, dict):
             continue
         for key, value in record.items():
-            if key.endswith("_id") or key.endswith("_reference") or key == "reference":
+            if key.endswith(("_id", "_reference")) or key == "reference":
                 refs.add(str(value or ""))
     offer = loaded.commercial_state.pending_offer or loaded.next_offer
     if offer is not None:
@@ -1551,7 +1600,9 @@ class OwnerAttempt:
         if self.result.usable:
             return ""
         transport = self.diagnostics.empty_content_category()
-        return transport or ("invalid_decision" if self.result.failure else FAILURE_EMPTY_UNEXPLAINED)
+        return transport or (
+            "invalid_decision" if self.result.failure else FAILURE_EMPTY_UNEXPLAINED
+        )
 
     @property
     def failure_detail(self) -> str:
@@ -1716,6 +1767,7 @@ async def decide_conversational_v1(
     spec = loaded.stack.profile.stage(STAGE_CONVERSATIONAL_OWNER)
     target = spec.primary_target()
     max_tokens = _owner_max_tokens(spec)
+    legal = legal_operations(loaded)
     payload = {
         "turn_id": loaded.snapshot.trigger.identity,
         "conversation_revision": loaded.snapshot.state_revision,
@@ -1723,7 +1775,9 @@ async def decide_conversational_v1(
         "evidence_catalog": evidence_catalog_view(loaded.snapshot),
         "working_state": working_state.as_dict(),
         "working_state_fingerprint": state_fingerprint(working_state),
-        "legal_operations": legal_operations(loaded),
+        "platform_context": loaded.snapshot.platform_context or platform_context(),
+        "legal_operations": operation_affordances(legal),
+        "scheduled_intent_affordance": SCHEDULED_INTENT_EFFECT,
     }
     user_content = json.dumps(payload, ensure_ascii=False, default=str)
     trace = GenerationTrace()
@@ -1854,7 +1908,9 @@ def _validate_single_call_reply(
     violations = writer_contract_reasons(replies, loaded, execution, mode=mode)
     if not violations:
         return decision, execution, replies
-    repaired = _repair_fan_visible_copy(replies)
+    repaired = _repair_fan_visible_copy(
+        replies, scene_mode=decision.intimacy_context.scene_mode
+    )
     remaining = writer_contract_reasons(repaired, loaded, execution, mode=mode)
     print(
         "[SEMANTIC V2 LOCAL COPY REPAIR] rejected="
@@ -1886,7 +1942,7 @@ _LOCAL_UNSAFE_COPY = re.compile(
     r"\b(?:you (?:paid|purchased|unlocked)|payment (?:confirmed|received)|"
     r"got your payment|sent|delivered|attached|uploaded|in your inbox|"
     r"\d+\s+(?:photos?|pics?|pictures?|videos?)|here(?: is|['’]s) a set of|"
-    r"dm|delivery link|click (?:the|a) link|i(?:['’]m| am)\s+(?:currently\s+|"
+    r"delivery link|click (?:the|a) link|i(?:['’]m| am)\s+(?:currently\s+|"
     r"right now\s+|just\s+)?(?:wearing|sitting|lying|cooking|driving|working|"
     r"shopping|showering|heading|at home|at work|in bed))\b",
     re.IGNORECASE,
@@ -1916,9 +1972,7 @@ def _redact_private_metadata(
         if not isinstance(record, dict):
             continue
         for key, value in record.items():
-            if (key.endswith("_id") or key.endswith("_reference")) and len(
-                str(value or "")
-            ) >= 4:
+            if key.endswith(("_id", "_reference")) and len(str(value or "")) >= 4:
                 private_values.add(str(value))
     changed = False
     redacted: list[str] = []
@@ -1934,14 +1988,28 @@ def _redact_private_metadata(
     return redacted, changed
 
 
-def _repair_fan_visible_copy(replies: list[str]) -> list[str]:
+def _repair_fan_visible_copy(
+    replies: list[str], *, scene_mode: str = "none"
+) -> list[str]:
     """Strip unsafe clauses locally; never turn presentation into a freeze."""
     repaired: list[str] = []
     for reply in replies:
         bubbles: list[str] = []
         for bubble in str(reply or "").split("|"):
             sentences = re.split(r"(?<=[.!?])\s+", bubble.strip())
-            safe = [sentence for sentence in sentences if sentence and not _LOCAL_UNSAFE_COPY.search(sentence)]
+            safe: list[str] = []
+            for sentence in sentences:
+                if not sentence or redirects_to_other_chat(sentence):
+                    continue
+                if unsupported_present_creator_action(sentence):
+                    if scene_mode != "shared_imagined":
+                        continue
+                    sentence = repair_present_action_as_imagined(sentence)
+                    if unsupported_present_creator_action(sentence):
+                        continue
+                if _LOCAL_UNSAFE_COPY.search(sentence):
+                    continue
+                safe.append(sentence)
             text = " ".join(safe).strip()
             # An exact amount is removable private/commercial metadata unless
             # the validator has already established that this turn may say it.
@@ -1974,7 +2042,9 @@ def _validate_conversational_v1_reply(
     violations = writer_contract_reasons(replies, loaded, execution, mode=mode)
     if not violations:
         return decision, execution, replies, metadata_redacted
-    repaired = _repair_fan_visible_copy(replies)
+    repaired = _repair_fan_visible_copy(
+        replies, scene_mode=decision.intimacy_context.scene_mode
+    )
     remaining = writer_contract_reasons(repaired, loaded, execution, mode=mode)
     print(
         "[CONVERSATIONAL V1 LOCAL REPAIR] rejected="
@@ -2214,7 +2284,14 @@ def build_conversational_writer_prompt(
 ) -> list[dict[str, str]]:
     """Give Kimi the real exchange plus semantics, never GLM-authored copy."""
     assisted = mode == MODE_ASSISTED
-    system = """You are Kimi, the sole fan-facing writer for this creator. Write every word the fan will see.
+    system = (
+        """You are Kimi, the sole fan-facing writer for this creator. Write every word the fan will see.
+
+"""
+        + PLATFORM_OPERATING_MODEL
+        + "\n\n"
+        + CLEOPATRA_MISSION
+        + """
 
 The GLM decision is semantic guidance, not draft copy. Use the raw ordered messages as the primary conversational evidence. Resolve pronouns and short replies from the immediate exchange. Working state and memory are interpretations with provenance; they never replace raw conversation and never prove payment, delivery, price, or present-world activity.
 
@@ -2224,7 +2301,9 @@ React specifically and contribute: a thought, opinion, callback, tease, continua
 
 For adult/intimate conversation, use semantic_decision.intimacy_context together with the RAW recent exchange. Preserve the exact current beat, roles, references, and shared premise instead of restarting from generic flirting. The intimate line may build, hold, continue, cool, redirect, pause, resume, or end on any turn. A more explicit register is descriptive context, NOT permission or an instruction to escalate. Short replies can mean continuation or invitation to lead; interpret them from the preceding beat. Do not manufacture a new scenario when one is already active. Do not convert an intimate moment into a commercial pitch merely because it is intimate. If the fan changes direction or cools the interaction, follow immediately. Keep imagined actions inside the imagined/shared-scene scope and never present them as current real-world activity.
 
-Commercial and media language stays inside the conversation. Never use catalogue voice, media counts, package/set/inventory terminology, private IDs, URLs, or internal metadata. Use only prepared_operation_facts. The application owns price and transaction truth. Do not claim payment, purchase, send, attachment, or delivery unless the prepared facts state it. When prepared_operation_facts carries an exact price and the fan asked about price, you may say that exact figure naturally; never invent, round, discount or negotiate one. After rejection, purchase, or delivery, continue the existing moment; do not automatically discount, reset, upsell, or force a feedback question. A fan who directly asks to buy is not being pushy and dodging him is not being classy: answer him.
+Commercial and media language stays inside the conversation. Never use catalogue voice, media counts, package/set/inventory terminology, private IDs, URLs, or internal metadata. Use only prepared_operation_facts and execution_reality. operation=none means nothing external happened. present_offer presents an offer but does not deliver it. send_locked_paid_message is actual same-chat attachment only when execution_reality.new_media_attached_to_this_message=true. With no prepared delivery, never imply that newly sent media is visible. A repair or handoff request does not prove its result. The application owns price and transaction truth. Do not claim payment, purchase, send, attachment, or delivery unless the prepared facts state it. When prepared_operation_facts carries an exact price and the fan asked about price, you may say that exact figure naturally; never invent, round, discount or negotiate one. After rejection, purchase, or delivery, continue the existing moment; do not automatically discount, reset, upsell, or force a feedback question. A fan who directly asks to buy is not being pushy and dodging him is not being classy: answer him.
+
+grounding.media_request says when the fan asked to see creator-controlled content. If the approved operation remains none, continue honestly in text or explicit shared imagination; never substitute prose that pretends a picture appeared or that the creator is physically performing now.
 
 Grounding. grounding.publication_evidence says what is known about anything this creator has posted. When it reports no authoritative posts, you may not say or imply that anything was posted, that there is something new on a feed or page, that he should check, look, refresh or scroll, or that content exists publicly. Approved inventory is something that can be offered privately; it is not something that was published, not what she is wearing, and not what she is doing now. grounding.fan_publication_references lists posts the FAN mentioned: talk about those as his — "that bikini post" he brought up is fair and natural — but do not extend them into a claim that you posted something else.
 
@@ -2235,6 +2314,7 @@ grounding.content_access_issue is different: it is a complaint about content the
 Rhythm. voice_rhythm lists what the recent creator bubbles leaned on. If the same emoji or the same closing beat has been used turn after turn, vary it — not by swapping in one different emoji every time, but by letting some bubbles simply end. Repetition is fine when it is natural, and this creator's own voice always wins over this note.
 
 Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assisted: ["candidate one","candidate two","candidate three"]."""
+    )
     if assisted:
         system += (
             " Assisted drafts are not executed operations. A human may edit or decline them, "
@@ -2258,12 +2338,15 @@ Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assis
         "creator_voice": loaded.snapshot.creator_voice,
         "sourced_memory": {
             "facts": [fact.__dict__ for fact in loaded.snapshot.historical_facts],
-            "episodes": [fact.__dict__ for fact in loaded.snapshot.conversation_episodes],
+            "episodes": [
+                fact.__dict__ for fact in loaded.snapshot.conversation_episodes
+            ],
             "corrections": list(loaded.snapshot.corrections),
             "unresolved_threads": list(loaded.snapshot.unresolved_obligations),
         },
         "working_context": working_state.as_dict(),
         "semantic_decision": semantic,
+        "platform_context": loaded.snapshot.platform_context or platform_context(),
         "deterministic_facts": {
             "creator_facts": [fact.__dict__ for fact in loaded.snapshot.creator_facts],
             "confirmed_purchases": [
@@ -2276,6 +2359,7 @@ Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assis
             ],
         },
         "prepared_operation_facts": execution.writer_view(),
+        "execution_reality": prepared_execution_reality(execution.writer_view()),
         "grounding": {
             "publication_evidence": loaded.snapshot.publication_evidence,
             "fan_publication_references": list(
@@ -2284,6 +2368,7 @@ Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assis
             "purchase_claim": loaded.snapshot.purchase_claim,
             "content_access_issue": loaded.snapshot.content_access_issue,
             "commercial_opportunity": loaded.snapshot.commercial_opportunity,
+            "media_request": loaded.snapshot.media_request,
         },
         "voice_rhythm": loaded.snapshot.voice_rhythm,
         "hermes_examples": getattr(loaded, "hermes_examples", []),
@@ -2296,7 +2381,10 @@ Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assis
     }
     return [
         {"role": "system", "content": system},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False, default=str)},
+        {
+            "role": "user",
+            "content": json.dumps(payload, ensure_ascii=False, default=str),
+        },
     ]
 
 
@@ -2372,7 +2460,9 @@ async def _write_conversational_v1_turn(
                 return [], trace
         violations = writer_contract_reasons(replies, loaded, execution, mode=mode)
         if not violations:
-            return (replies, trace) if replies or safe_fallback is None else safe_fallback
+            return (
+                (replies, trace) if replies or safe_fallback is None else safe_fallback
+            )
         if replies and set(violations) <= _WRITER_STYLE_REASONS:
             safe_fallback = (replies, trace)
         if output_attempt == 0:
@@ -2384,7 +2474,9 @@ async def _write_conversational_v1_turn(
             trace = GenerationTrace()
     if safe_fallback is not None:
         return safe_fallback
-    trace.failure_reason = "conversational_writer_contract_rejected: " + ",".join(violations)
+    trace.failure_reason = "conversational_writer_contract_rejected: " + ",".join(
+        violations
+    )
     return [], trace
 
 
@@ -2432,7 +2524,9 @@ async def _write_turn(
         )
         violations = writer_contract_reasons(replies, loaded, execution, mode=mode)
         if not violations:
-            return (replies, trace) if replies or safe_fallback is None else safe_fallback
+            return (
+                (replies, trace) if replies or safe_fallback is None else safe_fallback
+            )
         if replies and set(violations) <= _WRITER_STYLE_REASONS:
             # Keep the successful attempt's attribution, even if a rewrite
             # later fails. This never changes the approved operation or price.
@@ -2489,35 +2583,23 @@ def writer_contract_reasons(
     # The retired prompt's platform contract was missing from semantic_v1.
     # Do not repair this into a claim of delivery: regenerate against the same
     # approved operation. Explicit DM redirects are invalid even for op=none.
-    redirect = re.search(
-        r"\b(?:dm|message|text)\s+me\s+(?:for|to (?:get|see|receive|unlock))\s+"
-        r"(?:(?:the|a|your|that|this|those|these|my)\s+)?"
-        r"(?:links?|photos?|pics?|videos?|content|media|set|access)\b"
-        r"|\b(?:send|sent|sending)\s+(?:you\s+)?(?:the|a|that|this)\s+link\b",
-        text, re.IGNORECASE,
-    )
     delivery_turn = execution.operation in {
         OperationKind.PRESENT_OFFER.value,
         OperationKind.SEND_LOCKED_PAID_MESSAGE.value,
     }
-    if redirect or (delivery_turn and contains_delivery_link_language(text)):
+    if redirects_to_other_chat(text) or (
+        delivery_turn and contains_delivery_link_language(text)
+    ):
         reasons.append("unsupported_delivery_route")
     # Completion/access language is only legal inside the same atomic locked
     # delivery; a planned plain-text offer cannot make a delivery true.
-    completion = re.search(
-        r"\b(?:(?:sent|delivered|attached|dropped|shared|uploaded)\s+(?:you\s+)?(?:it|this|that|them|something|(?:the|your|those|these)\s+(?:photos?|pics?|videos?|content|media))|"
-        r"(?:check|open|look in)\s+(?:it|that|your (?:inbox|messages))|"
-        r"(?:it['’]?s|its|they['’]?re|it is|they are|should be)\s+(?:there|in your inbox|waiting for you))\b",
-        text,
-        re.IGNORECASE,
-    )
     attached = (
         mode == MODE_AUTO
         and execution.operation == OperationKind.SEND_LOCKED_PAID_MESSAGE.value
         and bool((execution.delivery or {}).get("media_ids"))
         and not execution.approval_required
     )
-    if completion and not attached:
+    if claims_media_delivery(text) and not attached:
         reasons.append("false_delivery_claim")
     if re.search(
         r"\b(?:you (?:paid|purchased|unlocked)|payment (?:confirmed|received)|got your payment)\b",
@@ -2543,6 +2625,10 @@ def writer_contract_reasons(
         if claim.group(0).lower().strip() not in facts:
             reasons.append("unsupported_current_life_claim")
             break
+    if unsupported_present_creator_action(
+        text, creator_facts=loaded.snapshot.creator_facts
+    ):
+        reasons.append("unsupported_present_creator_action")
     # Invented publication. Narrow on purpose: it fires on a CLAIM that
     # something was posted or an instruction to go and look at a page, never on
     # the noun. Discussion of a post the FAN raised is legitimate context and
@@ -2565,9 +2651,7 @@ def writer_contract_reasons(
         reasons.append("unsupported_platform_state_claim")
     price_record = execution.delivery or execution.offer or {}
     mentioned = _mentioned_prices(text)
-    if mentioned and (
-        not delivery_turn or price_record.get("price_cents") is None
-    ):
+    if mentioned and (not delivery_turn or price_record.get("price_cents") is None):
         reasons.append("unapproved_price_claim")
     elif mentioned:
         approved = Decimal(str(price_record["price_cents"])) / 100
@@ -2579,7 +2663,11 @@ def writer_contract_reasons(
         if mentioned - allowed:
             reasons.append("unapproved_price_claim")
         if not discussing_price and approved in mentioned:
-            reasons.append("redundant_locked_price" if execution.delivery else "unsolicited_offer_price")
+            reasons.append(
+                "redundant_locked_price"
+                if execution.delivery
+                else "unsolicited_offer_price"
+            )
     return reasons
 
 
@@ -2614,11 +2702,11 @@ def _provenance(
         # Which conversation generation produced this wording. The single
         # question every "why was that bubble cancelled?" investigation starts
         # from, and the reason it is on the record rather than in a log line.
-            # ``getattr`` for the same reason as candidate_handles and
-            # hermes_examples: orchestration tests deliberately use small
-            # stand-ins, and a provenance field must never be the thing
-            # that decides a turn fails.
-            "conversation_generation": getattr(loaded, "conversation_generation", 0),
+        # ``getattr`` for the same reason as candidate_handles and
+        # hermes_examples: orchestration tests deliberately use small
+        # stand-ins, and a provenance field must never be the thing
+        # that decides a turn fails.
+        "conversation_generation": getattr(loaded, "conversation_generation", 0),
         "truncation": loaded.snapshot.truncation,
     }
     if working_state_before is not None and state_delta_validation is not None:
@@ -2629,12 +2717,8 @@ def _provenance(
                     working_state_before
                 ),
                 "proposed_state_delta": state_delta_validation.proposed,
-                "accepted_state_fields": list(
-                    state_delta_validation.accepted_fields
-                ),
-                "rejected_state_fields": dict(
-                    state_delta_validation.rejected_fields
-                ),
+                "accepted_state_fields": list(state_delta_validation.accepted_fields),
+                "rejected_state_fields": dict(state_delta_validation.rejected_fields),
                 "working_state_after": state_delta_validation.state_after.as_dict(),
                 "working_state_after_fingerprint": state_fingerprint(
                     state_delta_validation.state_after
@@ -2696,14 +2780,10 @@ def _provenance(
                 if is_conversational_v1
                 else ""
             ),
-            "state_validator_accepted": len(
-                state_delta_validation.accepted_fields
-            )
+            "state_validator_accepted": len(state_delta_validation.accepted_fields)
             if state_delta_validation is not None
             else 0,
-            "state_validator_rejected": len(
-                state_delta_validation.rejected_fields
-            )
+            "state_validator_rejected": len(state_delta_validation.rejected_fields)
             if state_delta_validation is not None
             else 0,
         },
@@ -2830,13 +2910,10 @@ def _state_grounded_recovery_operation(
             re.IGNORECASE,
         )
     )
-    should_bind_locked = (
-        op.kind is OperationKind.SEND_LOCKED_PAID_MESSAGE
-        or (
-            op.kind is OperationKind.CHECK_PAYMENT_CLAIM
-            and not loaded.pending_payment
-            and explicit_send_request
-        )
+    should_bind_locked = op.kind is OperationKind.SEND_LOCKED_PAID_MESSAGE or (
+        op.kind is OperationKind.CHECK_PAYMENT_CLAIM
+        and not loaded.pending_payment
+        and explicit_send_request
     )
     if (
         should_bind_locked
@@ -3131,7 +3208,9 @@ def _unavailable_evidence_requests(
     )
 
 
-def _merge_decision_traces(first: GenerationTrace, second: GenerationTrace) -> GenerationTrace:
+def _merge_decision_traces(
+    first: GenerationTrace, second: GenerationTrace
+) -> GenerationTrace:
     second.attempts += first.attempts
     second.pinned_attempts += first.pinned_attempts
     second.alternate_attempts += first.alternate_attempts
@@ -3204,7 +3283,12 @@ async def prepare_turn(
     state_delta_validation: StateDeltaValidation | None = None
     if conversation_core == CORE_CONVERSATIONAL_V1:
         working_state_before = await load_working_state(creator_id, fan_id)
-        decision, _unused_replies, decision_trace, raw_delta = await decide_conversational_v1(
+        (
+            decision,
+            _unused_replies,
+            decision_trace,
+            raw_delta,
+        ) = await decide_conversational_v1(
             loaded,
             working_state_before,
         )
@@ -3218,9 +3302,12 @@ async def prepare_turn(
                 latest_message=latest_message,
                 scheduled_goal=scheduled_goal,
             )
-            second_decision, _unused, second_trace, second_delta = (
-                await decide_conversational_v1(refreshed, working_state_before)
-            )
+            (
+                second_decision,
+                _unused,
+                second_trace,
+                second_delta,
+            ) = await decide_conversational_v1(refreshed, working_state_before)
             loaded = refreshed
             decision_trace = _merge_decision_traces(decision_trace, second_trace)
             decision = second_decision
@@ -3230,7 +3317,8 @@ async def prepare_turn(
                 decision = ConversationDecision(
                     disposition=ResponseDisposition.HANDOFF,
                     hold=HoldReason.INSUFFICIENT_EVIDENCE,
-                    hold_detail="same_turn_evidence_unavailable: " + ",".join(still_missing),
+                    hold_detail="same_turn_evidence_unavailable: "
+                    + ",".join(still_missing),
                     proposed_operation=ProposedOperation(
                         kind=OperationKind.HAND_OFF_TO_HUMAN,
                         subject="missing required evidence",
@@ -3287,9 +3375,7 @@ async def prepare_turn(
         behavior_tags, situation_tags = _hermes_tags(
             decision, writer_state, latest_message
         )
-        loaded.hermes_retrieval_active = retrieval_enabled(
-            hermes_retrieval_override
-        )
+        loaded.hermes_retrieval_active = retrieval_enabled(hermes_retrieval_override)
         loaded.hermes_examples = retrieve_examples(
             current_text=latest_message,
             behavior_tags=behavior_tags,
@@ -3305,8 +3391,10 @@ async def prepare_turn(
                 writer_state,
                 mode=mode,
             )
-            decision, execution, replies, copy_repaired = _validate_conversational_v1_reply(
-                decision, replies, execution, loaded, mode=mode
+            decision, execution, replies, copy_repaired = (
+                _validate_conversational_v1_reply(
+                    decision, replies, execution, loaded, mode=mode
+                )
             )
             locally_repaired = locally_repaired or copy_repaired
         provenance = _provenance(
@@ -3393,17 +3481,13 @@ async def prepare_turn(
             execution,
             mode=mode,
         )
-    if (
-        conversation_core == CORE_SEMANTIC_V1
-        and trace.failure_reason.startswith("semantic_writer_contract_rejected")
+    if conversation_core == CORE_SEMANTIC_V1 and trace.failure_reason.startswith(
+        "semantic_writer_contract_rejected"
     ):
         # The output contract did its job: unsafe copy did not send. Do not turn
         # one bad expression into a persistent fan freeze. This legacy runtime
         # simply skips the turn; a later fan message can trigger a fresh one.
-        print(
-            "[SEMANTIC V1 LOCAL COPY DROP] reason="
-            + trace.failure_reason
-        )
+        print("[SEMANTIC V1 LOCAL COPY DROP] reason=" + trace.failure_reason)
         decision = dataclasses_replace(
             decision,
             proposed_operation=ProposedOperation(),
@@ -3741,9 +3825,7 @@ async def deliver_reply(
         turn_id=prepared.provenance.turn_id,
         parts=parts,
         schedule=schedule,
-        conversation_generation=getattr(
-            prepared.loaded, "conversation_generation", 0
-        ),
+        conversation_generation=getattr(prepared.loaded, "conversation_generation", 0),
         metadata=metadata,
     )
     if sequence is None:
@@ -3841,7 +3923,11 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
     creator_id = prepared.loaded.snapshot.creator_id
 
     if prepared.loaded.fan.needs_human_review or prepared.loaded.fan.auto_mode is False:
-        return {"outcome": OUTCOME_HUMAN_REVIEW, "message_ids": [], "reason": "existing_review_hold_or_auto_disabled"}
+        return {
+            "outcome": OUTCOME_HUMAN_REVIEW,
+            "message_ids": [],
+            "reason": "existing_review_hold_or_auto_disabled",
+        }
 
     if (
         prepared.conversation_core == CORE_CONVERSATIONAL_V1

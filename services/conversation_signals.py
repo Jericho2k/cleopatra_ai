@@ -15,7 +15,11 @@ does not support, so the models filled the gap.
    opportunities. A fan saying "just tell me the price" is a fact about the
    conversation, not an inference about his wallet, and it belongs in evidence.
 
-3. **Purchase claims read as receipts.** "I bought it" is something a fan said.
+3. **Visual requests treated as prose prompts.** "Show me" is meaningful even
+   before it becomes an explicit offer to pay. It should make the semantic
+   owner consider real media affordances, never hallucinate an attachment.
+
+4. **Purchase claims read as receipts.** "I bought it" is something a fan said.
    It becomes true when the payment ledger says so and not before.
 
 Everything here is computed from text the fan actually wrote, and every reading
@@ -27,7 +31,8 @@ architecture removed.
 from __future__ import annotations
 
 import re
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 
 def _speaker(row: dict[str, Any]) -> str:
@@ -239,6 +244,65 @@ def purchase_intent(
     }
 
 
+# --- 2b. Direct requests to see creator-controlled media -------------------
+
+_DIRECT_MEDIA_REQUEST = re.compile(
+    r"\b(?:show|send)\s+me(?:\s+(?:something|some|more|one|it|that|this|"
+    r"pics?|photos?|videos?|content))?\b"
+    r"|\blet\s+me\s+see\b"
+    r"|\bi\s+(?:really\s+)?(?:want|need)\s+(?:to\s+)?see\s+more\b"
+    r"|\bi\s+(?:really\s+)?(?:want|need)\s+(?:something|more)\s+to\s+look\s+at\b"
+    r"|\bwhat\s+(?:do\s+)?you\s+(?:have|got)\b"
+    r"|\bi\s+(?:want|need)\s+(?:something\s+)?new\b"
+    r"|\bi\s+trust\s+your\s+judg(?:e)?ment\b[^.!?\n|]*\bpick\b"
+    r"|\bpick\s+(?:one|something)\s+for\s+me\b",
+    re.IGNORECASE,
+)
+
+_IMPLICIT_MEDIA_REQUEST = re.compile(
+    r"\b(?:wish|hope)\s+i\s+could\s+see\s+more\b"
+    r"|\bi\s+bet\s+you(?:['’]?ve|\s+have)\s+more\b"
+    r"|\bthere(?:['’]?s|\s+is)\s+more\s+of\s+you\b",
+    re.IGNORECASE,
+)
+
+
+def media_request(latest_burst: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """A semantic request to see media, independent of explicitness or spend.
+
+    This is deliberately not a funnel score. It records only the strongest
+    current fan-authored request and its provenance. The model may still choose
+    text, an offer, or a legal delivery based on the actual conversation.
+    """
+    strength = "none"
+    sources: list[str] = []
+    for row in latest_burst:
+        text = _text(row)
+        matched = (
+            "direct"
+            if _DIRECT_MEDIA_REQUEST.search(text)
+            else ("implicit" if _IMPLICIT_MEDIA_REQUEST.search(text) else "none")
+        )
+        if matched == "none":
+            continue
+        if matched == "direct" or strength == "none":
+            strength = matched
+        reference = _reference(row)
+        if reference and reference not in sources:
+            sources.append(reference)
+    return {
+        "present": strength != "none",
+        "strength": strength,
+        "source_ids": sources[:8],
+        "rule": (
+            "The fan asked to see creator-controlled media. This is not inferred "
+            "from explicitness, does not prove willingness to pay, and forces no "
+            "sale. Choose honest text/shared imagination or a legal media "
+            "operation; narration cannot deliver media."
+        ),
+    }
+
+
 # --- 3. Purchase claims are claims -----------------------------------------
 
 _PURCHASE_CLAIM = re.compile(
@@ -273,9 +337,7 @@ def purchase_claim(
 ) -> dict[str, Any]:
     """Whether the fan said he paid, and whether anything authoritative agrees."""
     sources = [
-        _reference(row)
-        for row in latest_burst
-        if _PURCHASE_CLAIM.search(_text(row))
+        _reference(row) for row in latest_burst if _PURCHASE_CLAIM.search(_text(row))
     ]
     claimed = bool(sources)
     return {
@@ -298,7 +360,6 @@ def unverified_purchase_acknowledgement(text: str, claim: dict[str, Any]) -> boo
     if claim.get("authoritative_confirmation"):
         return False
     return bool(_PURCHASE_ACKNOWLEDGEMENT.search(str(text or "")))
-
 
 
 # --- 4. Confirmed-purchase access complaints -------------------------------
@@ -423,20 +484,16 @@ def unsupported_platform_state_claim(
     if _PLATFORM_UI_CLAIM.search(value):
         return True
     issue = access_issue or {}
-    if (
+    return bool(
         issue.get("fan_reported_access_problem")
         and issue.get("confirmed_purchase_exists")
         and _AFTER_PURCHASE_RESELL_STORY.search(value)
-    ):
-        return True
-    return False
+    )
 
 
 # --- 4. Voice rhythm (soft) ------------------------------------------------
 
-_EMOJI = re.compile(
-    "[\U0001F300-\U0001FAFF←-⇿☀-➿️⬀-⯿]"
-)
+_EMOJI = re.compile("[\U0001f300-\U0001faff←-⇿☀-➿️⬀-⯿]")
 
 
 def recent_creator_emoji(
@@ -450,11 +507,9 @@ def recent_creator_emoji(
     """
     counts: dict[str, int] = {}
     consecutive: list[str] = []
-    creator_rows = [
-        row
-        for row in recent_messages
-        if _speaker(row) == "creator"
-    ][-limit:]
+    creator_rows = [row for row in recent_messages if _speaker(row) == "creator"][
+        -limit:
+    ]
     for row in creator_rows:
         found = _EMOJI.findall(_text(row))
         unique = list(dict.fromkeys(found))

@@ -193,10 +193,11 @@ email or long digit run appears in any of them.
 | `J_commercial_rejection` | A decline mid-conversation. No pressure loop, no immediate re-offer, natural continuation. |
 | `K_post_event_continuation` | Starts from a seeded authoritative purchase. Transaction truth, staying in the moment, no automatic next sale. |
 | `L_long_trajectory` | 22 fan turns over 8 simulated days: ordinary talk, two topic changes, a shared scene, short replies, a 19-turn callback, a correction, a cooldown and a delayed return. |
+| `M_paid_platform_media_request` | Repeated direct requests to see content inside the private paid chat. Same-chat affordance judgment, narration vs delivery, and imagined vs present-world action. |
 
-Suites: `all`, `conversational` (A–H, L), `commercial` (I, J, K), `smoke`
-(A, C). Three of twelve scenarios are commercial, deliberately — the first Core
-v1 increment is a conversational change.
+Suites: `all`, `conversational` (A–H, L), `commercial` (I, J, K, M), `smoke`
+(A, C). Four of thirteen scenarios are commercial; M specifically measures the
+paid-platform operating model without making every intimate turn a sale.
 
 `I_natural_media_interest` measures the *proposal and the fan-visible wording*.
 Whether the full media flow executes depends on the creator's catalog fixtures;

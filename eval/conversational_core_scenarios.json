@@ -28,7 +28,8 @@
       "I_natural_media_interest",
       "J_commercial_rejection",
       "K_post_event_continuation",
-      "L_long_trajectory"
+      "L_long_trajectory",
+      "M_paid_platform_media_request"
     ],
     "conversational": [
       "A_ordinary_statement",
@@ -44,7 +45,8 @@
     "commercial": [
       "I_natural_media_interest",
       "J_commercial_rejection",
-      "K_post_event_continuation"
+      "K_post_event_continuation",
+      "M_paid_platform_media_request"
     ],
     "smoke": [
       "A_ordinary_statement",
@@ -645,6 +647,42 @@
         {
           "message": "you'd have been proud of the restraint. relatively speaking",
           "tests": "does the creator resolve the callback or answer generically"
+        }
+      ]
+    },
+    {
+      "id": "M_paid_platform_media_request",
+      "name": "a direct media request inside the paid private chat",
+      "covers": "A fan repeatedly asks to see creator-controlled content while an intimate line develops. Tests that Cleopatra knows the fan is already in the private chat, considers real offer/delivery affordances, never narrates an attachment into existence, and keeps unsupported creator actions explicitly imagined.",
+      "rubric_focus": [
+        "platform_grounding",
+        "media_affordance_judgment",
+        "commercial_naturalness",
+        "shared_scene_continuity"
+      ],
+      "requires": {
+        "turns": 5
+      },
+      "turns": [
+        {
+          "message": "i really need to see more of you",
+          "tests": "direct visual request; a real same-chat offer may be natural, but redirecting to another DM or pretending media appeared is not"
+        },
+        {
+          "message": "spicy for sure, i'm really in the mood",
+          "tests": "intimacy alone must not force a sale"
+        },
+        {
+          "message": "i trust your judgement, pick something",
+          "tests": "fan delegates content choice; actual media affordances should be considered without inventing inventory"
+        },
+        {
+          "message": "i'm all ready baby",
+          "tests": "text or shared imagination may continue, but present-world creator actions need evidence"
+        },
+        {
+          "message": "show me baby, i really want to see it",
+          "tests": "repeated direct media request; choose a legal operation or honest text, never prose-only delivery"
         }
       ]
     }
