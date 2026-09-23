@@ -25,6 +25,7 @@ from db.pricing_policy_queries import get_effective_price_learning_policy
 from services.media_packages import (
     allocate_step_pricing,
     is_video_row,
+    sets_with_sellable_media_evidence,
     usable_sets,
 )
 
@@ -64,6 +65,7 @@ async def plan_session_for_fan(
     price_cents = int(price_cents)
 
     rows = await _load_approved_sets(creator_id)
+    rows = await _filter_by_child_media_sellability(creator_id, rows)
     sent_ppv = await get_sent_ppv(fan_id)
     sent_media_ids = {
         str(media_id)
@@ -174,6 +176,39 @@ async def plan_session_for_fan(
     return {"status": "ok", "session": session}
 
 
+async def _filter_by_child_media_sellability(
+    creator_id: str, rows: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    media_ids = list(
+        dict.fromkeys(
+            str(media_id)
+            for row in rows
+            for media_id in (row.get("media_ids") or [])
+            if media_id
+        )
+    )
+    if not media_ids:
+        return rows
+
+    def _get_children() -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        db = get_supabase()
+        for start in range(0, len(media_ids), 200):
+            found.extend(
+                (
+                    db.table("creator_vault_media")
+                    .select("media_id, content_category")
+                    .eq("creator_id", creator_id)
+                    .in_("media_id", media_ids[start:start + 200])
+                    .execute()
+                ).data
+                or []
+            )
+        return found
+
+    children = await asyncio.to_thread(_get_children)
+    return sets_with_sellable_media_evidence(rows, children)
+
 async def _load_approved_sets(creator_id: str) -> list[dict[str, Any]]:
     def _get() -> list[dict[str, Any]]:
         def _build(apply_filter: bool):
@@ -182,7 +217,7 @@ async def _load_approved_sets(creator_id: str) -> list[dict[str, Any]]:
                 .select(
                     "id, title, description, location, outfit, explicit_min, explicit_max, "
                     "media_ids, preview_media_id, suggested_price, tags, base_price_cents, "
-                    "min_price_cents, max_price_cents, dynamic_pricing_enabled"
+                    "min_price_cents, max_price_cents, dynamic_pricing_enabled, paid_sellable"
                 )
                 .eq("creator_id", creator_id)
                 .eq("status", "approved")
