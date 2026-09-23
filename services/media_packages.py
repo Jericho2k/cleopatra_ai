@@ -206,6 +206,42 @@ def usable_sets(rows: Iterable[dict[str, Any]], sent_set_ids: set[str] | None = 
     return result
 
 
+
+def sets_with_sellable_media_evidence(
+    sets: Iterable[dict[str, Any]],
+    media_rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Reject legacy sets whose actual child media is known to be free-only.
+
+    Set-level metadata remains the primary authority and explicit
+    paid_sellable=false still wins in usable_sets. This second check closes the
+    legacy gap where an old set has weak/missing tags but every media item
+    inside it is classified as teaser/free-only.
+
+    We fail closed only when child evidence is present AND every matched child
+    is clearly free-only. A mixed set with at least one priced child remains
+    eligible, and a hand-curated set with no child classification evidence keeps
+    its existing behavior rather than being silently disabled.
+    """
+    media_by_id = {
+        str(row.get("media_id") or ""): row
+        for row in media_rows
+        if str(row.get("media_id") or "")
+    }
+    result: list[dict[str, Any]] = []
+    for row in sets:
+        ids = [str(value) for value in (row.get("media_ids") or []) if value]
+        children = [media_by_id[mid] for mid in ids if mid in media_by_id]
+        if children and all(paid_sellable_block_reason(child) for child in children):
+            print(
+                f"[SELLABILITY] set={row.get('id')} excluded "
+                "reason=all_child_media_free_only"
+            )
+            continue
+        result.append(row)
+    return result
+
+
 def is_video_row(row: dict[str, Any]) -> bool:
     tags = {str(tag).strip().lower() for tag in (row.get("tags") or [])}
     if "individual_video" in tags:
