@@ -854,44 +854,30 @@ def owner_world(monkeypatch, evidence, outputs):
     return calls
 
 
-@pytest.mark.parametrize(
-    "bad",
-    [
-        dict(
-            operation="check_payment_claim",
-            operation_subject="claimed payment",
-            operation_payment_reference="imaginary-payment",
-        ),
-        dict(
-            operation="present_offer",
-            operation_subject="the $30 set",
-            operation_offer_id="offer-1",
-            operation_set_id="set-1",
-        ),
-        dict(disposition="handoff", operation="none", hold="needs_human"),
-    ],
-)
-def test_rejected_owner_decisions_repair_using_same_snapshot(monkeypatch, bad):
+def test_semantic_v1_price_in_operation_metadata_is_repaired_locally(monkeypatch):
     evidence = loaded(pending_offer=offer(cents=3000), next_offer=offer(cents=3000))
-    before = evidence.snapshot.canonical_json()
-    state_before = evidence.commercial_state.model_dump()
-    calls = owner_world(monkeypatch, evidence, [live_payload(**bad), live_payload()])
-    decision = run(live_orchestration.decide_turn(evidence))
-    assert decision.proposed_operation.kind is OperationKind.NONE
-    assert len(calls) == 2
-    assert before in calls[0]["messages"][0]["content"]
-    assert before in calls[1]["messages"][0]["content"]
-    repair = calls[1]["messages"][0]["content"]
-    assert (
-        "validation_failures" in repair
-        and "Authoritative state outranks fan wording" in repair
+    calls = owner_world(
+        monkeypatch,
+        evidence,
+        [
+            live_payload(
+                operation="present_offer",
+                operation_subject="the $30 set",
+                operation_offer_id="offer-1",
+                operation_set_id="set-1",
+            )
+        ],
     )
-    assert "check_payment_claim" not in live_orchestration.legal_operations(evidence)
-    assert evidence.commercial_state.model_dump() == state_before
-    assert evidence.active_session is None
+
+    decision = run(live_orchestration.decide_turn(evidence))
+
+    assert len(calls) == 1
+    assert decision.proposed_operation.kind is OperationKind.PRESENT_OFFER
+    assert "$30" not in decision.proposed_operation.subject
+    assert live_orchestration.validate_decision(decision, evidence).approved
 
 
-def test_repeated_invalid_owner_decisions_handoff_without_execution(monkeypatch):
+def test_semantic_v1_invalid_operation_downgrades_without_retry_or_handoff(monkeypatch):
     from models.conversation_decision import ResponseDisposition
 
     evidence = loaded(pending_offer=offer())
@@ -904,37 +890,33 @@ def test_repeated_invalid_owner_decisions_handoff_without_execution(monkeypatch)
                 operation_subject="claimed payment",
                 operation_payment_reference="fake",
             )
-            for _ in range(3)
         ],
     )
-    monkeypatch.setattr(
-        live_orchestration, "load_evidence", lambda **_: value(evidence)
-    )
-    monkeypatch.setattr(live_orchestration, "_write_turn", _retired)
-    monkeypatch.setattr(live_orchestration, "send_locked_ppv", _retired)
-    frozen = []
 
-    async def freeze(fan_id, reason):
-        frozen.append((fan_id, reason))
+    decision = run(live_orchestration.decide_turn(evidence))
 
-    monkeypatch.setattr(live_orchestration, "freeze_fan_for_review", freeze)
-    prepared = run(
-        live_orchestration.prepare_turn(
-            creator_id="creator-1",
-            fan_id="fan-1",
-            trigger_kind="fan_message",
-            trigger_identity="message-1",
-            latest_message="i dont see it",
-        )
-    )
-    assert prepared.decision.disposition is ResponseDisposition.HANDOFF
-    result = run(live_orchestration.execute_auto_turn(prepared))
-    assert len(calls) == 3
-    assert result["outcome"] == "human_review" and result["message_ids"] == []
-    assert "no pending payment" in frozen[0][1]
-    assert "repair_exhausted" in frozen[0][1]
-    assert result["reason"] == frozen[0][1]
+    assert len(calls) == 1
+    assert decision.disposition is ResponseDisposition.REPLY
+    assert decision.proposed_operation.kind is OperationKind.NONE
+    assert decision.hold is HoldReason.NONE
     assert evidence.commercial_state.accepted_offer_id is None
+
+
+def test_semantic_v1_explicit_handoff_stays_a_handoff(monkeypatch):
+    from models.conversation_decision import ResponseDisposition
+
+    evidence = loaded()
+    calls = owner_world(
+        monkeypatch,
+        evidence,
+        [live_payload(disposition="handoff", operation="none", hold="needs_human")],
+    )
+
+    decision = run(live_orchestration.decide_turn(evidence))
+
+    assert len(calls) == 1
+    assert decision.disposition is ResponseDisposition.HANDOFF
+    assert decision.proposed_operation.kind is OperationKind.HAND_OFF_TO_HUMAN
 
 
 @pytest.mark.parametrize(
@@ -956,22 +938,49 @@ def test_missing_delivery_never_manufactures_access_or_payment(monkeypatch, mess
                 operation="repair_content_access",
                 operation_subject="missing content",
                 operation_purchase_id="fake",
-            ),
-            live_payload(
-                operation="check_payment_claim",
-                operation_subject="payment",
-                operation_payment_reference="fake",
-            ),
-            live_payload(),
+            )
         ],
     )
-    assert (
-        run(live_orchestration.decide_turn(evidence)).proposed_operation.kind
-        is OperationKind.NONE
-    )
-    assert len(calls) == 3
+
+    decision = run(live_orchestration.decide_turn(evidence))
+
+    assert decision.proposed_operation.kind is OperationKind.NONE
+    assert len(calls) == 1
     assert evidence.snapshot.confirmed_purchases == ()
     assert evidence.pending_payment is None
+
+
+def test_semantic_v2_keeps_reply_when_operation_is_invalid(monkeypatch):
+    evidence = loaded(pending_offer=offer())
+    calls = []
+
+    async def answer(_loaded, repair=None):
+        calls.append(repair)
+        trace = GenerationTrace()
+        return (
+            ConversationDecision(
+                proposed_operation=ProposedOperation(
+                    kind=OperationKind.CHECK_PAYMENT_CLAIM,
+                    subject="claimed payment",
+                    payment_reference="fake",
+                ),
+                disposition=ResponseDisposition.REPLY,
+                response_intent=ResponseIntent.ACKNOWLEDGE_PAYMENT_CHECK,
+                source="reply_plus_intent",
+            ),
+            ["cmon, tell me what you wanted me to do 😏"],
+            trace,
+        )
+
+    monkeypatch.setattr(live_orchestration, "_conversational_answer", answer)
+
+    decision, replies, _trace = run(live_orchestration.decide_with_reply(evidence))
+
+    assert calls == [None]
+    assert decision.proposed_operation.kind is OperationKind.NONE
+    assert decision.disposition is ResponseDisposition.REPLY
+    assert replies == ["cmon, tell me what you wanted me to do 😏"]
+
 
 
 def test_delivered_unpaid_content_can_check_payment_but_not_repair_purchase():
