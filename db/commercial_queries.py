@@ -7,7 +7,11 @@ from core.simulation_catalog import exclude_simulation_only, run_live_catalog_qu
 from core import clock
 from core.supabase import get_supabase
 from models.commercial import CreatorPolicy, FanCommercialState, Offer
-from services.media_packages import build_next_offer, usable_sets
+from services.media_packages import (
+    build_next_offer,
+    sets_with_sellable_media_evidence,
+    usable_sets,
+)
 
 
 async def get_creator_policy(creator_id: str) -> CreatorPolicy:
@@ -268,7 +272,7 @@ async def get_next_offer_with_inventory(
                 .select(
                     "id, title, description, location, outfit, suggested_price, tags, "
                     "explicit_min, explicit_max, media_ids, base_price_cents, "
-                    "min_price_cents, max_price_cents, dynamic_pricing_enabled"
+                    "min_price_cents, max_price_cents, dynamic_pricing_enabled, paid_sellable"
                 )
                 .eq("creator_id", creator_id)
                 .eq("status", "approved")
@@ -336,6 +340,32 @@ async def get_next_offer_with_inventory(
         confirmed_purchases = max(
             confirmed_purchases, len(fan_row.get("sales_log") or [])
         )
+
+        # Validate old set metadata against the actual classified children too.
+        # This catches legacy sets whose set-level tags are weak/missing while
+        # every contained media item is classified as teaser/free-only.
+        all_media_ids = list(
+            dict.fromkeys(
+                str(media_id)
+                for row in rows
+                for media_id in (row.get("media_ids") or [])
+                if media_id
+            )
+        )
+        child_rows: list[dict] = []
+        for start in range(0, len(all_media_ids), 200):
+            ids = all_media_ids[start:start + 200]
+            child_rows.extend(
+                (
+                    db.table("creator_vault_media")
+                    .select("media_id, content_category")
+                    .eq("creator_id", creator_id)
+                    .in_("media_id", ids)
+                    .execute()
+                ).data
+                or []
+            )
+        rows = sets_with_sellable_media_evidence(rows, child_rows)
 
         available = usable_sets(rows, sent_set_ids)
         for row in available:
