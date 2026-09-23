@@ -100,11 +100,13 @@ from services.context_packet import ContextPacket, build_context_packet
 from services.conversation_generation import current_generation
 from services.conversation_continuity import open_threads_for, recent_episodes_for
 from services.conversation_signals import (
+    content_access_issue,
     fan_publication_references,
     publication_evidence,
     purchase_claim,
     purchase_intent,
     recent_creator_emoji,
+    unsupported_platform_state_claim,
     unsupported_publication_claim,
     unverified_purchase_acknowledgement,
 )
@@ -290,6 +292,8 @@ Grounding and provenance. Every claim about the world must trace to evidence in 
 Commercial judgement runs in both directions. Intimacy, explicitness, elapsed turns and a past purchase NEVER create a commercial opportunity by themselves. But commercial_opportunity records what the fan actually SAID — asking the price, offering to pay, asking what he can buy — and an explicit, fan-created buying opportunity is not cancelled by the conversation being intimate. When such a signal is present, unsent approved inventory exists, and the operation is in legal_operations, seriously consider proposing it; declining is a judgement about THIS moment, not a rule. Never infer wealth, spending power, or a budget from how he writes, and never state a price: the application supplies the exact figure if one may be said at all.
 
 purchase_claim records whether he said he paid and whether anything authoritative agrees. A claim is not a receipt. Until the payment ledger confirms it, do not treat the purchase as real, do not advance a paid session, and propose check_payment_claim when one is legal rather than acting as if he has access.
+
+content_access_issue records a CURRENT fan report that already-confirmed paid content is blurred, locked, missing, or inaccessible. When it says both fan_reported_access_problem=true and confirmed_purchase_exists=true, this is support for the EXISTING purchase, never a new sale. Do not invent a teaser/full-version distinction, another unlock, a second paywall, or another charge. Use repair_content_access tied to the evidenced purchase when legal, otherwise hand off.
 
 The application alone owns inventory identity, price, recipient, payment, purchase, delivery, permissions, idempotency, persistence, and operation results. Choose at most one supplied opaque candidate_handle. Request missing essential evidence; do not invent it. Omit optional fields when nothing changes.
 """
@@ -1037,6 +1041,11 @@ async def load_evidence(
             "offer_already_presented": bool(pending_offer),
         },
         purchase_claim=purchase_claim(
+            latest_fan_burst,
+            confirmed_purchases=purchases,
+            pending_payment=pending_view,
+        ),
+        content_access_issue=content_access_issue(
             latest_fan_burst,
             confirmed_purchases=purchases,
             pending_payment=pending_view,
@@ -2245,6 +2254,8 @@ Grounding. grounding.publication_evidence says what is known about anything this
 
 grounding.purchase_claim says whether he claimed to have paid and whether anything confirms it. If he claimed it and nothing confirms it, do not thank him for buying, do not say it was worth it, do not tell him to enjoy it, and do not behave as though he has access. Stay warm and keep the conversation moving while the application checks.
 
+grounding.content_access_issue is different: it is a complaint about content the transaction ledger already confirms was purchased. Never turn that into a new sale. Do not invent "teaser style", "unlock the full version", another paywall, another preview, "check your unlocks", or any platform/UI state the prepared facts do not explicitly establish. Treat it as support for the existing purchase.
+
 Rhythm. voice_rhythm lists what the recent creator bubbles leaned on. If the same emoji or the same closing beat has been used turn after turn, vary it — not by swapping in one different emoji every time, but by letting some bubbles simply end. Repetition is fine when it is natural, and this creator's own voice always wins over this note.
 
 Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assisted: ["candidate one","candidate two","candidate three"]."""
@@ -2295,6 +2306,7 @@ Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assis
                 loaded.snapshot.fan_publication_references
             ),
             "purchase_claim": loaded.snapshot.purchase_claim,
+            "content_access_issue": loaded.snapshot.content_access_issue,
             "commercial_opportunity": loaded.snapshot.commercial_opportunity,
         },
         "voice_rhythm": loaded.snapshot.voice_rhythm,
@@ -2570,6 +2582,11 @@ def writer_contract_reasons(
     # untouched in every other conversation.
     if unverified_purchase_acknowledgement(text, loaded.snapshot.purchase_claim or {}):
         reasons.append("unverified_purchase_acknowledgement")
+    if unsupported_platform_state_claim(
+        text,
+        access_issue=loaded.snapshot.content_access_issue,
+    ):
+        reasons.append("unsupported_platform_state_claim")
     price_record = execution.delivery or execution.offer or {}
     mentioned = _mentioned_prices(text)
     if mentioned and (
@@ -2813,6 +2830,28 @@ async def _authorize_conversational_v1_operation(
     execute_operations: bool,
 ) -> ConversationalV1Settlement:
     """Resolve a GLM proposal before Kimi sees operation facts."""
+    access = loaded.snapshot.content_access_issue or {}
+    if (
+        access.get("fan_reported_access_problem")
+        and access.get("confirmed_purchase_exists")
+        and access.get("purchase_reference")
+    ):
+        # A confirmed buyer saying paid content is still blurred/locked/missing
+        # is not a fresh commercial turn. Force the existing, verified support
+        # path before Kimi can improvise a second paywall or sell the set again.
+        decision = dataclasses_replace(
+            decision,
+            proposed_operation=ProposedOperation(
+                kind=OperationKind.REPAIR_CONTENT_ACCESS,
+                subject="the confirmed purchase the fan cannot access",
+                because="fan reported an access problem after confirmed purchase",
+                purchase_id=str(access["purchase_reference"]),
+            ),
+            disposition=ResponseDisposition.HANDOFF,
+            hold=HoldReason.NEEDS_HUMAN,
+            hold_detail="confirmed_purchase_access_issue",
+            response_intent=ResponseIntent.SUPPORT_HANDOFF,
+        )
     execution = await _prepare_execution(
         decision,
         loaded,
