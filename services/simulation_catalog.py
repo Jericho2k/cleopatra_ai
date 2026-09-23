@@ -94,6 +94,7 @@ _SET_COLUMNS = (
     "dynamic_pricing_enabled",
     "metadata_version",
     "status",
+    "paid_sellable",
 )
 
 _INSERT_CHUNK = 100
