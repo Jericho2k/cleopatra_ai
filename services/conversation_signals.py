@@ -300,6 +300,138 @@ def unverified_purchase_acknowledgement(text: str, claim: dict[str, Any]) -> boo
     return bool(_PURCHASE_ACKNOWLEDGEMENT.search(str(text or "")))
 
 
+
+# --- 4. Confirmed-purchase access complaints -------------------------------
+
+#: Fan-authored language that says content they expected to have access to is
+#: unavailable, still obscured, or cannot be opened. This is deliberately
+#: narrower than generic disappointment: "I don't like it" is not an access
+#: problem, while "these are still blurred" is.
+_CONTENT_ACCESS_SIGNALS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "blurred_or_preview_only",
+        re.compile(
+            r"\b(?:still\s+)?blur(?:red|ry)\b"
+            r"|\b(?:only|just)\s+(?:a\s+)?preview\b"
+            r"|\bpreview\s+(?:only|instead)\b"
+            r"|\b(?:teaser|thumbnail)s?\s+(?:only|instead)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "locked_after_purchase",
+        re.compile(
+            r"\b(?:still\s+)?locked\b|\b(?:won['’]?t|doesn['’]?t|can['’]?t)\s+unlock\b"
+            r"|\bwhere(?:['’]?s|\s+is)\s+(?:the\s+)?(?:unlock|full|clear)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "cannot_open_or_view",
+        re.compile(
+            r"\b(?:can['’]?t|cannot|won['’]?t|doesn['’]?t)\s+(?:open|see|view|load|access)\b"
+            r"|\b(?:not|isn['’]?t)\s+(?:opening|loading|showing)\b"
+            r"|\bno\s+access\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def content_access_issue(
+    latest_burst: Sequence[dict[str, Any]],
+    *,
+    confirmed_purchases: Sequence[dict[str, Any]] = (),
+    pending_payment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A current access complaint tied to authoritative purchase evidence.
+
+    The fan's complaint is evidence that something may be wrong, not authority
+    to resend or charge again. When there is a confirmed purchase we expose the
+    most recent purchase reference as the only repair candidate; deterministic
+    operation validation still decides whether a repair may proceed.
+    """
+    kinds: list[str] = []
+    sources: list[str] = []
+    for row in latest_burst:
+        text = _text(row)
+        if not text:
+            continue
+        for name, pattern in _CONTENT_ACCESS_SIGNALS:
+            if not pattern.search(text):
+                continue
+            if name not in kinds:
+                kinds.append(name)
+            reference = _reference(row)
+            if reference and reference not in sources:
+                sources.append(reference)
+
+    latest_purchase = dict(confirmed_purchases[-1]) if confirmed_purchases else {}
+    purchase_reference = str(
+        latest_purchase.get("reference")
+        or latest_purchase.get("payment_reference")
+        or ""
+    )
+    return {
+        "fan_reported_access_problem": bool(kinds),
+        "signal_kinds": kinds,
+        "source_ids": sources[:8],
+        "confirmed_purchase_exists": bool(confirmed_purchases),
+        "purchase_reference": purchase_reference,
+        "pending_payment_exists": bool(pending_payment),
+        "rule": (
+            "A confirmed buyer reporting blurred, locked, missing or inaccessible "
+            "content is an access problem, not a new sales opportunity. Do not "
+            "invent a teaser/full-version split, a second paywall, another unlock, "
+            "or another charge. Resolve or hand off the existing purchase."
+        ),
+    }
+
+
+#: Unsupported platform/UI state invented by the writer. There is currently no
+#: authoritative 'unlocks screen' / paywall-placement evidence in the snapshot,
+#: so these statements are never safe as factual instructions.
+_PLATFORM_UI_CLAIM = re.compile(
+    r"\bcheck\s+(?:your\s+)?unlocks?\b"
+    r"|\b(?:in|under)\s+(?:your\s+)?unlocks?\b"
+    r"|\bpaywall\s+(?:hit|show|showing|there|up|should|is)\b"
+    r"|\b(?:hit|go\s+through|open)\s+(?:the\s+)?paywall\b"
+    r"|\b(?:i\s+)?(?:just\s+)?sent\s+(?:you\s+)?(?:the\s+|a\s+)?preview\b"
+    r"|\bpreview\s+(?:is|should\s+be)\s+(?:there|in\s+your\s+unlocks?)\b",
+    re.IGNORECASE,
+)
+
+#: A second-paywall story after the application already knows there was a
+#: confirmed purchase. These phrases are not globally banned: before a purchase
+#: a legitimate locked offer can of course be described as something to unlock.
+_AFTER_PURCHASE_RESELL_STORY = re.compile(
+    r"\b(?:they(?:['’]?re|\s+are)|it(?:['’]?s|\s+is))\s+teaser\s+style\b"
+    r"|\b(?:gotta|have\s+to|need\s+to)\s+unlock\s+(?:the\s+)?(?:full|clear)\b"
+    r"|\bunlock\s+(?:the\s+)?(?:full|clear)\s+(?:ones?|version|stuff|content)\b"
+    r"|\b(?:full|clear)\s+version\s+(?:is\s+)?(?:behind|after)\s+(?:the\s+)?paywall\b",
+    re.IGNORECASE,
+)
+
+
+def unsupported_platform_state_claim(
+    text: str,
+    *,
+    access_issue: dict[str, Any] | None = None,
+) -> bool:
+    """Whether copy invents UI/paywall state that application evidence lacks."""
+    value = str(text or "")
+    if _PLATFORM_UI_CLAIM.search(value):
+        return True
+    issue = access_issue or {}
+    if (
+        issue.get("fan_reported_access_problem")
+        and issue.get("confirmed_purchase_exists")
+        and _AFTER_PURCHASE_RESELL_STORY.search(value)
+    ):
+        return True
+    return False
+
+
 # --- 4. Voice rhythm (soft) ------------------------------------------------
 
 _EMOJI = re.compile(
