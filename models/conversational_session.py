@@ -48,6 +48,14 @@ MAX_PREVIOUS_SESSIONS = 8
 
 
 class SessionStatus(str, Enum):
+    """Lifecycle of a longer interaction.
+
+    ``PROPOSED`` covers both directions: the fan suggested one, or the creator
+    (the semantic owner) recognised a fitting moment and invited him into one.
+    Either way it is an offer awaiting his answer, not an agreement; a declined
+    proposal moves to ``ABANDONED``.
+    """
+
     INACTIVE = "inactive"
     PROPOSED = "proposed"
     PLANNING = "planning"

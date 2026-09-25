@@ -605,6 +605,50 @@ def test_replan_without_reason_is_refused_and_completed_beats_are_unreachable():
     assert [beat.beat_id for beat in refused.state_after.session.tentative_trajectory] == ["one"]
 
 
+
+@pytest.mark.asyncio
+async def test_creator_may_propose_a_session_the_fan_did_not_ask_for(world):
+    """A skilled chatter can invite; the fan's answer decides; nothing is sold."""
+    await world.turn("haha that story about your commute was great", owner_json(), ["right? chaos"])
+    result = await world.turn(
+        "honestly i'm free all evening",
+        owner_json(
+            move={"kind": "invite_participation", "intent": "lightly invite him into a longer shared date scenario"},
+            session_delta={
+                "status": "proposed",
+                "interaction_goal": "see whether he wants a longer shared scenario tonight",
+            },
+        ),
+        ["then how about a proper date night, you and me, starting now?"],
+    )
+    assert result["outcome"] == "replied"
+    state = world.session_state()
+    assert state.session.status is SessionStatus.PROPOSED
+    assert state.session.session_id
+    assert state.session.next_experience_move.kind.value == "invite_participation"
+    # Proposing implies no content and no commercial state.
+    assert state.session.tentative_trajectory == []
+    assert world.pending_offer is None and world.sent_ppv == []
+    assert world.transcript[-1]["operation"] == "none"
+
+    # He declines: the proposal is abandoned and the conversation simply goes on.
+    await world.turn(
+        "maybe another night, i'm pretty tired",
+        owner_json(move="react", session_delta={"status": "abandoned"}),
+        ["fair, rest up"],
+    )
+    assert world.session_state().session.status is SessionStatus.ABANDONED
+
+
+def test_owner_prompt_allows_creator_proposals_without_a_funnel_or_padding():
+    system = conversational_v2.CONVERSATIONAL_V2_SYSTEM
+    assert "You propose it" in system
+    assert "never a routine step" in system
+    assert "Intimacy, explicitness, elapsed turns or a past purchase are not by themselves a session opportunity" in system
+    assert "merely because another candidate exists" in system
+    assert "Never add turns just to create distance" in system
+    assert "Several conversational turns between content events is normal" not in system
+
 # ---------------------------------------------------------------------------
 # 8 + 9. No funnel; discovery only when it materially matters
 # ---------------------------------------------------------------------------
@@ -1044,7 +1088,8 @@ async def test_long_session_reads_as_one_interaction_with_media_removed(world):
     assert report.media_events == 3  # offer A, send A, offer C
     assert report.post_event_sales == 0
     assert report.premise_continuity == 1.0
-    assert report.min_conversational_turns_between_media >= 2
+    # Reported for analysis, not enforced: pacing owns the gap.
+    assert report.min_conversational_turns_between_media is not None
     # With media cards removed every fan line still has its creator line.
     assert len(report.dialogue_without_media) == 2 * len(records)
 
@@ -1053,6 +1098,33 @@ async def test_long_session_reads_as_one_interaction_with_media_removed(world):
         "arrive", "order", "view", "after",
     ]
     assert state.session.completed_beats[2].source is BeatSource.APPLICATION
+
+
+def test_short_gap_is_a_diagnostic_not_a_failure_when_the_fan_asks():
+    records = [
+        TurnRecord("tell me about the view", "it's gorgeous tonight", premise_given_to_writer="date"),
+        TurnRecord("show me?", "here it is", operation="present_offer",
+                   premise_given_to_writer="date", fan_asked=True),
+        TurnRecord("yes", "sent", operation="send_locked_paid_message",
+                   premise_given_to_writer="date", content_was_planned_earlier=True),
+        TurnRecord("and the walk home too, now", "the walk, just us", operation="present_offer",
+                   premise_given_to_writer="date", fan_asked=True),
+    ]
+    report = score_session_trajectory(records)
+    assert report.passed, report.as_dict()
+    assert report.min_conversational_turns_between_media == 0
+    assert report.diagnostics  # still visible for analysis
+
+
+def test_content_that_advances_only_because_a_candidate_exists_fails():
+    records = [
+        TurnRecord("hi", "hey you", premise_given_to_writer="date"),
+        TurnRecord("nice evening", "it is", premise_given_to_writer="date"),
+        TurnRecord("mm", "want this?", operation="present_offer", premise_given_to_writer="date"),
+    ]
+    report = score_session_trajectory(records)
+    assert not report.passed
+    assert report.unexplained_media_events == 1
 
 
 def test_immersion_scorer_rejects_a_chain_of_ppvs():

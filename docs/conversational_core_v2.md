@@ -68,6 +68,12 @@ purchases, deliveries, permissions and persistence.
   (purchases recorded after it was stated count against it).
 * No funnel: nothing requires a session, constraint or budget before a legal
   operation. A direct request is handled directly.
+* A session may be opened by the fan or PROPOSED by the creator when the
+  moment genuinely suits one; a proposal is an offer awaiting his answer, never
+  a routine step, and intimacy alone is not an opportunity.
+* Content never advances merely because another candidate exists or the plan
+  lists it next; the interaction must make that beat appropriate. There is no
+  minimum number of turns between content events.
 * An imagined premise must cite the fan's participation and is handed to Kimi
   explicitly as imagined. Real-world claims stay forbidden: the v1 writer
   contract (present-activity, publication, delivery, price checks) applies
@@ -102,9 +108,11 @@ shared validator's `next_offer`; a pending offer is never rebound.
 
 * Deterministic acceptance and a long immersion trajectory:
   `tests/test_conversational_core_v2.py`, scored by
-  `services/session_immersion_eval.py` (premise continuity, conversational gaps
-  between content events, no post-purchase sales, every media event set up by
-  the interaction, a creator line for every fan line once media is removed).
+  `services/session_immersion_eval.py` (premise continuity, no post-purchase
+  sales, every content event made appropriate by the interaction rather than by
+  a remaining candidate, a creator line for every fan line once media is
+  removed). Turns between content events are a diagnostic only — natural pacing
+  owns that gap.
 * Live A/B against v1 through the real simulator:
   `python scripts/run_ab_trajectory_eval.py --baseline conversational_v1 --candidate conversational_v2 …`
   (see `docs/conversational_core_v1_evaluation.md`), followed by blind review of

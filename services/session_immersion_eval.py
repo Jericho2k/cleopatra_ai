@@ -10,11 +10,16 @@ structural properties that make that outcome possible and that a
 "chain of PPVs" transcript visibly lacks:
 
 * the interaction premise the writer is given persists across turns;
-* content events are separated by conversational beats;
 * the turn after a purchase is not another sale;
-* every media event was set up by the interaction (a planned content beat or
-  the fan's own ask) before it happened;
+* every media event was made appropriate by the interaction (a content beat
+  planned on an earlier turn, or the fan's own ask) — content never advances
+  merely because another candidate exists;
 * the transcript without media still has a creator line for every fan line.
+
+The number of conversational turns between content events is reported as a
+DIAGNOSTIC only. Natural pacing owns that gap: sometimes many turns pass,
+sometimes one is right because the fan redirects or asks. A short gap is never
+a failure by itself, so the metric cannot teach filler.
 
 Live-model runs (``scripts/run_trajectory_eval.py --core conversational_v2``)
 feed the same records; blind human/LLM review of ``dialogue_without_media``
@@ -48,12 +53,15 @@ class TurnRecord:
 class ImmersionReport:
     turns: int
     media_events: int
+    #: Diagnostic only; never a failure (natural pacing owns the gap).
     min_conversational_turns_between_media: int | None
     post_event_sales: int
     premise_continuity: float
     unexplained_media_events: int
     dialogue_without_media: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
+    #: Observations for analysis (e.g. short gaps between content events).
+    diagnostics: list[str] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
@@ -70,6 +78,7 @@ class ImmersionReport:
             "premise_continuity": round(self.premise_continuity, 3),
             "unexplained_media_events": self.unexplained_media_events,
             "failures": list(self.failures),
+            "diagnostics": list(self.diagnostics),
             "passed": self.passed,
         }
 
@@ -77,7 +86,7 @@ class ImmersionReport:
 def score_session_trajectory(
     records: list[TurnRecord],
     *,
-    min_gap: int = 2,
+    diagnostic_gap: int = 2,
     min_premise_continuity: float = 0.9,
 ) -> ImmersionReport:
     media_indexes = [
@@ -134,16 +143,23 @@ def score_session_trajectory(
         unexplained_media_events=unexplained,
         dialogue_without_media=dialogue,
     )
-    if event_gaps and min(event_gaps) < min_gap:
-        report.failures.append(
-            f"content events separated by fewer than {min_gap} conversational turns"
+    short = sum(1 for gap in event_gaps if gap < diagnostic_gap)
+    if short:
+        # Not a failure: a fan who redirects or asks can make the very next
+        # turn the right one. Kept so a live run can be inspected for chains.
+        report.diagnostics.append(
+            f"{short} content event(s) followed another within fewer than "
+            f"{diagnostic_gap} conversational turns"
         )
     if post_event_sales:
         report.failures.append("a purchase or delivery was followed straight by a sale")
     if continuity < min_premise_continuity:
         report.failures.append("the interaction premise did not persist across turns")
     if unexplained:
-        report.failures.append("a media event was not set up by the interaction")
+        report.failures.append(
+            "a content event advanced without the interaction making it "
+            "appropriate (not planned earlier, not asked for)"
+        )
     if any(row.fan_text and not row.creator_text for row in records):
         report.failures.append("a fan line has no creator line once media is removed")
     return report
