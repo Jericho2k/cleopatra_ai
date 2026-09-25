@@ -1689,6 +1689,7 @@ async def save_reply(req: ReplyRequest, request: Request) -> dict:
                 "semantic_v1",
                 "semantic_v2",
                 "conversational_v1",
+                "conversational_v2",
             }:
                 provenance.decision["operator_chosen_index"] = str(
                     req.suggestion_index
@@ -8584,16 +8585,15 @@ def _require_conversation_core_owner(request: Request) -> None:
 @app.get("/conversation-cores")
 async def read_conversation_cores(request: Request) -> dict:
     _require_conversation_core_owner(request)
-    from services.conversation_core import CORE_ENV_VAR, CORE_IDS, environment_core_id
+    from services.conversation_core import (
+        CORE_ENV_VAR,
+        CORE_IDS,
+        CORE_LABELS,
+        environment_core_id,
+    )
 
-    labels = {
-        "legacy": "Legacy controller stack",
-        "semantic_v1": "Semantic owner v1",
-        "semantic_v2": "One-call conversational owner",
-        "conversational_v1": "Conversational Core v1",
-    }
     return {
-        "cores": [{"id": value, "name": labels[value]} for value in CORE_IDS],
+        "cores": [{"id": value, "name": CORE_LABELS[value]} for value in CORE_IDS],
         "environment_core": environment_core_id(),
         "environment_variable": CORE_ENV_VAR,
     }

@@ -589,6 +589,17 @@ def check_schema(catalog: Catalog, report: Report) -> None:
                 "apply db/conversation_supersession_v1.sql",
             )
 
+    # --- Conversational Core v2 (session-aware). Only a v2-selected turn reads
+    # it, so absence is a warning: v2 turns fail visibly, nothing else changes.
+    if catalog.table_exists("conversational_session_states"):
+        report.ok("table conversational_session_states")
+    else:
+        report.warn(
+            "table conversational_session_states",
+            "selecting conversational_v2 fails every turn until "
+            "db/conversational_session_state_v2.sql is applied",
+        )
+
     if catalog.column_exists("creators", "vault_sync_owner"):
         report.ok("VAULT-003 interruption state", "creators.vault_sync_owner")
     else:

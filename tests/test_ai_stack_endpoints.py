@@ -213,7 +213,11 @@ def test_only_the_platform_owner_can_read_conversation_cores(client):
         "semantic_v1",
         "semantic_v2",
         "conversational_v1",
+        "conversational_v2",
     }
+    names = {row["id"]: row["name"] for row in owner.json()["cores"]}
+    assert names["conversational_v2"] == "Conversational Core v2 — Session-aware"
+    assert names["conversational_v1"] == "Conversational Core v1"
     assert agency.status_code == 403
 
 
@@ -277,6 +281,37 @@ def test_owner_can_select_conversational_v1_for_a_test_fan(client, store):
     assert selected.json()["effective"]["conversation_core"] == "conversational_v1"
     assert store.fans["fan-test"]["conversation_core"] == "conversational_v1"
 
+
+
+def test_owner_can_select_conversational_v2_and_switch_back_to_v1_immediately(
+    client, store
+):
+    """Acceptance 10: v2 is selectable per test fan and rollback is one write."""
+    path = "/creator/creator-1/fan/fan-test/conversation-core"
+    to_v2 = client.put(path, headers=headers(OWNER), json={"conversation_core": "conversational_v2"})
+    assert to_v2.status_code == 200, to_v2.text
+    assert to_v2.json()["effective"]["conversation_core"] == "conversational_v2"
+    assert store.fans["fan-test"]["conversation_core"] == "conversational_v2"
+
+    back = client.put(path, headers=headers(OWNER), json={"conversation_core": "conversational_v1"})
+    assert back.status_code == 200, back.text
+    # No cache window: the very next resolution is v1.
+    assert back.json()["effective"]["conversation_core"] == "conversational_v1"
+    assert store.fans["fan-test"]["conversation_core"] == "conversational_v1"
+
+    cleared = client.put(path, headers=headers(OWNER), json={"conversation_core": None})
+    assert cleared.status_code == 200, cleared.text
+    assert store.fans["fan-test"]["conversation_core"] is None
+
+
+def test_conversational_v2_can_never_be_pinned_on_a_real_fan(client, store):
+    refused = client.put(
+        "/creator/creator-1/fan/fan-real/conversation-core",
+        headers=headers(OWNER),
+        json={"conversation_core": "conversational_v2"},
+    )
+    assert refused.status_code in {403, 404}
+    assert store.fans["fan-real"]["conversation_core"] is None
 
 # --- who may change a creator's brain --------------------------------------
 

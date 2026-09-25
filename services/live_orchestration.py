@@ -51,6 +51,7 @@ from core.supabase import get_supabase
 from db.commercial_queries import (
     get_creator_policy,
     get_fan_state,
+    get_next_offer_with_candidates,
     get_next_offer_with_inventory,
     save_fan_state,
 )
@@ -100,6 +101,7 @@ from services.context_packet import ContextPacket, build_context_packet
 from services.conversation_continuity import open_threads_for, recent_episodes_for
 from services.conversation_core import (
     CORE_CONVERSATIONAL_V1,
+    CORE_CONVERSATIONAL_V2,
     CORE_SEMANTIC_V1,
     CORE_SEMANTIC_V2,
 )
@@ -199,6 +201,11 @@ OUTCOME_APPROVAL_REQUIRED = "approval_required"
 #: The wording is authorized and durably queued at human-like times. The
 #: worker returns its slot here; the bubbles leave later, from the queue.
 OUTCOME_SCHEDULED = "scheduled"
+
+#: The GLM-decides / Kimi-writes runtimes. They share the execution path
+#: (durable timed delivery, scheduled intents, stale-state checks, owner and
+#: writer failure reporting); each owns its own durable interpretation state.
+CONVERSATIONAL_CORES = frozenset({CORE_CONVERSATIONAL_V1, CORE_CONVERSATIONAL_V2})
 
 # These are presentation preferences, not transaction failures. Try to improve
 # them once, but never freeze a valid delivery solely for repeating its price.
@@ -391,6 +398,10 @@ class PreparedTurn:
     working_state_before: ConversationalWorkingState | None = None
     state_delta_validation: StateDeltaValidation | None = None
     state_persisted: bool = False
+    #: conversational_v2 only: the durable session document as loaded, and the
+    #: validated result (reconciliation + accepted/rejected owner fields).
+    session_state_before: Any = None
+    session_validation: Any = None
 
 
 def _plain(value: Any, *, limit: int = 1_000) -> str:
@@ -862,7 +873,16 @@ async def load_evidence(
     trigger_identity: str,
     latest_message: str,
     scheduled_goal: str = "",
+    content_candidates: bool = False,
+    desired_experience_hint: str | None = None,
+    extra_ceiling_cents: int | None = None,
 ) -> LoadedEvidence:
+    """Assemble one turn's evidence.
+
+    ``content_candidates`` and the two hints are used only by
+    ``conversational_v2``. With their defaults this function reads and returns
+    exactly what it always has.
+    """
     (
         history,
         fan,
@@ -911,7 +931,35 @@ async def load_evidence(
     pending_offer = commercial_state.pending_offer
     next_offer: Offer | None = pending_offer
     inventory_types: tuple[str, ...] = ()
-    if next_offer is None and not pending_payment:
+    alternatives: list[Offer] = []
+    if next_offer is None and not pending_payment and content_candidates:
+        ceilings = [
+            value
+            for value in (
+                _hard_ceiling(affordability, commercial_state),
+                extra_ceiling_cents,
+            )
+            if value is not None
+        ]
+        if not any(value <= 0 for value in ceilings):
+            next_offer, inventory_types, found = await get_next_offer_with_candidates(
+                creator_id,
+                fan_id,
+                policy,
+                price_learning=price_learning,
+                desired_experience=(
+                    desired_experience_hint or commercial_state.desired_experience
+                ),
+                hard_ceiling_cents=min(ceilings) if ceilings else None,
+                scene=None,
+            )
+            alternatives = [
+                offer
+                for offer in found
+                if offer is not None
+                and (next_offer is None or offer.set_id != next_offer.set_id)
+            ]
+    elif next_offer is None and not pending_payment:
         next_offer, inventory_types = await get_next_offer_with_inventory(
             creator_id,
             fan_id,
@@ -1028,16 +1076,26 @@ async def load_evidence(
         unresolved_obligations=tuple(obligations[:MAX_OBLIGATIONS]),
         corrections=tuple(corrections[:MAX_CORRECTIONS]),
         approved_inventory=tuple(
-            [
+            (
+                [
+                    {
+                        "candidate_handle": "offer_candidate_1",
+                        "asset_type": next_offer.asset_type,
+                        "legal_description": next_offer.legal_description,
+                        "inventory_asset_types": list(inventory_types),
+                    }
+                ]
+                if next_offer
+                else []
+            )
+            + [
                 {
-                    "candidate_handle": "offer_candidate_1",
-                    "asset_type": next_offer.asset_type,
-                    "legal_description": next_offer.legal_description,
-                    "inventory_asset_types": list(inventory_types),
+                    "candidate_handle": f"offer_candidate_{index}",
+                    "asset_type": offer.asset_type,
+                    "legal_description": offer.legal_description,
                 }
+                for index, offer in enumerate(alternatives, start=2)
             ]
-            if next_offer
-            else []
         ),
         pending_offer=(
             {
@@ -1135,6 +1193,10 @@ async def load_evidence(
         stack=stack,
         candidate_handles={
             **({"offer_candidate_1": next_offer} if next_offer else {}),
+            **{
+                f"offer_candidate_{index}": offer
+                for index, offer in enumerate(alternatives, start=2)
+            },
             **({"pending_offer_1": pending_offer} if pending_offer else {}),
         },
         hermes_examples=[],
@@ -1668,6 +1730,7 @@ async def _call_conversational_owner(
     system: str,
     label: str,
     owner_complete: Any = None,
+    parser: Any = None,
 ) -> OwnerAttempt:
     """One owner call, reduced to components and structural diagnostics.
 
@@ -1707,9 +1770,13 @@ async def _call_conversational_owner(
         content_chars=len(result.text or ""),
         latency_ms=int(getattr(result, "latency_ms", 0) or 0),
     )
-    extracted = parse_semantic_decision(
-        result.text,
-        source="conversational_decision_v1",
+    extracted = (
+        parser(result.text)
+        if parser is not None
+        else parse_semantic_decision(
+            result.text,
+            source="conversational_decision_v1",
+        )
     )
     return OwnerAttempt(
         label=label,
@@ -1724,7 +1791,12 @@ async def _call_conversational_owner(
     )
 
 
-def _record_owner_attempt(trace: GenerationTrace, attempt: OwnerAttempt) -> None:
+def _record_owner_attempt(
+    trace: GenerationTrace,
+    attempt: OwnerAttempt,
+    *,
+    log_tag: str = "CONVERSATIONAL V1 OWNER CALL",
+) -> None:
     extra: dict[str, Any] = {
         "usable": attempt.result.usable,
     }
@@ -1739,7 +1811,7 @@ def _record_owner_attempt(trace: GenerationTrace, attempt: OwnerAttempt) -> None
         extra=extra,
     )
     print(
-        f"[CONVERSATIONAL V1 OWNER CALL] attempt={attempt.label} "
+        f"[{log_tag}] attempt={attempt.label} "
         f"{attempt.diagnostics.describe()} {attempt.result.describe()} "
         f"resolved_failure={attempt.failure_category or 'none'}"
     )
@@ -2281,8 +2353,15 @@ def build_conversational_writer_prompt(
     working_state: ConversationalWorkingState,
     *,
     mode: str,
+    extra_system: str = "",
+    extra_payload: dict[str, Any] | None = None,
 ) -> list[dict[str, str]]:
-    """Give Kimi the real exchange plus semantics, never GLM-authored copy."""
+    """Give Kimi the real exchange plus semantics, never GLM-authored copy.
+
+    ``extra_system`` / ``extra_payload`` are empty for Core v1, which therefore
+    receives exactly the prompt it always has. Core v2 uses them to add its
+    validated session view without Kimi ever re-planning the session.
+    """
     assisted = mode == MODE_ASSISTED
     system = (
         """You are Kimi, the sole fan-facing writer for this creator. Write every word the fan will see.
@@ -2320,6 +2399,8 @@ Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assis
             " Assisted drafts are not executed operations. A human may edit or decline them, "
             "so never claim an operation already happened."
         )
+    if extra_system:
+        system += "\n\n" + extra_system
     semantic = decision.as_dict()
     for key in (
         "operation_candidate_handle",
@@ -2379,6 +2460,8 @@ Return JSON only. Full Auto: {"messages":["one or more natural bubbles"]}. Assis
         ),
         "mode": mode,
     }
+    if extra_payload:
+        payload.update(extra_payload)
     return [
         {"role": "system", "content": system},
         {
@@ -2395,6 +2478,10 @@ async def _write_conversational_v1_turn(
     working_state: ConversationalWorkingState,
     *,
     mode: str,
+    extra_system: str = "",
+    extra_payload: dict[str, Any] | None = None,
+    feature: str = "conversational_v1_writer",
+    conversation_core: str = CORE_CONVERSATIONAL_V1,
 ) -> tuple[list[str], GenerationTrace]:
     spec = loaded.stack.profile.stage(STAGE_CONVERSATIONAL_WRITER)
     target = spec.primary_target()
@@ -2419,7 +2506,13 @@ async def _write_conversational_v1_turn(
         return [], trace
 
     prompt = build_conversational_writer_prompt(
-        loaded, decision, execution, working_state, mode=mode
+        loaded,
+        decision,
+        execution,
+        working_state,
+        mode=mode,
+        extra_system=extra_system,
+        extra_payload=extra_payload,
     )
     safe_fallback: tuple[list[str], GenerationTrace] | None = None
     violations: list[str] = []
@@ -2441,8 +2534,8 @@ async def _write_conversational_v1_turn(
             telemetry_context={
                 "creator_id": loaded.snapshot.creator_id,
                 "fan_id": loaded.snapshot.fan_id,
-                "feature": "conversational_v1_writer",
-                "conversation_core": CORE_CONVERSATIONAL_V1,
+                "feature": feature,
+                "conversation_core": conversation_core,
                 "role": "fan_facing_writer" if output_attempt == 0 else "writer_repair",
                 "evidence_fingerprint": loaded.snapshot.fingerprint(),
                 "state_revision": loaded.snapshot.state_revision,
@@ -2684,7 +2777,10 @@ def _provenance(
     decision_trace: GenerationTrace | None = None,
 ) -> ReplyProvenance:
     is_v2 = conversation_core == CORE_SEMANTIC_V2
-    is_conversational_v1 = conversation_core == CORE_CONVERSATIONAL_V1
+    # Both conversational cores share the GLM-decides / Kimi-writes shape, so
+    # they share its provenance labels; the decision source keeps them apart.
+    is_conversational_v1 = conversation_core in CONVERSATIONAL_CORES
+    is_conversational_v2 = conversation_core == CORE_CONVERSATIONAL_V2
     provenance = ReplyProvenance(
         creator_id=loaded.snapshot.creator_id,
         fan_id=loaded.snapshot.fan_id,
@@ -2749,9 +2845,13 @@ def _provenance(
     )
     provenance.record_decision(
         source=(
-            "conversational_decision_v1"
-            if is_conversational_v1
-            else ("reply_plus_intent" if is_v2 else "semantic_owner")
+            "conversational_decision_v2"
+            if is_conversational_v2
+            else (
+                "conversational_decision_v1"
+                if is_conversational_v1
+                else ("reply_plus_intent" if is_v2 else "semantic_owner")
+            )
         ),
         action=decision.proposed_operation.kind,
         reason=decision.proposed_operation.because or decision.hold_detail,
@@ -3264,9 +3364,26 @@ async def prepare_turn(
         CORE_SEMANTIC_V1,
         CORE_SEMANTIC_V2,
         CORE_CONVERSATIONAL_V1,
+        CORE_CONVERSATIONAL_V2,
     }:
         raise LiveOrchestrationError(
             f"live orchestration cannot execute conversation core {conversation_core!r}"
+        )
+    if conversation_core == CORE_CONVERSATIONAL_V2:
+        # An alternative runtime, not a layer on v1: its own state, its own
+        # owner contract, the same deterministic authority and execution path.
+        from services.conversational_v2 import prepare_conversational_v2_turn
+
+        return await prepare_conversational_v2_turn(
+            creator_id=creator_id,
+            fan_id=fan_id,
+            trigger_kind=trigger_kind,
+            trigger_identity=trigger_identity,
+            latest_message=latest_message,
+            scheduled_goal=scheduled_goal,
+            mode=mode,
+            execute_operations=execute_operations,
+            hermes_retrieval_override=hermes_retrieval_override,
         )
     loaded = await load_evidence(
         creator_id=creator_id,
@@ -3560,6 +3677,11 @@ async def _expected_execution_revision(prepared: PreparedTurn) -> str:
 
 
 async def _persist_core_state(prepared: PreparedTurn) -> None:
+    if prepared.conversation_core == CORE_CONVERSATIONAL_V2:
+        from services.conversational_v2 import persist_session_state
+
+        await persist_session_state(prepared)
+        return
     if (
         prepared.conversation_core != CORE_CONVERSATIONAL_V1
         or prepared.state_persisted
@@ -3742,7 +3864,7 @@ async def _record_scheduled_intent(prepared: PreparedTurn) -> dict[str, Any] | N
     timing REQUEST, and deterministic code decides the actual ``execute_at``,
     the dedupe key, and whether it may exist at all.
     """
-    if prepared.conversation_core != CORE_CONVERSATIONAL_V1:
+    if prepared.conversation_core not in CONVERSATIONAL_CORES:
         return None
     intent = prepared.decision.scheduled_intent
     if not intent.requested:
@@ -3796,7 +3918,7 @@ async def deliver_reply(
     if not parts:
         return {"outcome": OUTCOME_NO_SEND, "message_ids": []}
 
-    if prepared.conversation_core != CORE_CONVERSATIONAL_V1:
+    if prepared.conversation_core not in CONVERSATIONAL_CORES:
         ids = await _deliver_plain_parts(prepared, expected_revision=expected_revision)
         return {
             "outcome": OUTCOME_REPLIED if ids else OUTCOME_NO_SEND,
@@ -3930,7 +4052,7 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
         }
 
     if (
-        prepared.conversation_core == CORE_CONVERSATIONAL_V1
+        prepared.conversation_core in CONVERSATIONAL_CORES
         and prepared.decision_trace is not None
         and prepared.decision_trace.failure_reason
         and not prepared.replies
@@ -3941,8 +4063,13 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
             for row in attempts
             if row.get("failure_category")
         ]
+        core_tag = (
+            "CONVERSATIONAL V2"
+            if prepared.conversation_core == CORE_CONVERSATIONAL_V2
+            else "CONVERSATIONAL V1"
+        )
         print(
-            "[CONVERSATIONAL V1 OWNER FAILED] "
+            f"[{core_tag} OWNER FAILED] "
             f"fan={fan_id} reason={prepared.decision_trace.failure_reason} "
             f"attempts={len(attempts)} "
             f"repair_attempted={str(prepared.decision_trace.repair_attempted).lower()} "
@@ -3951,7 +4078,7 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
         for row in attempts:
             # The structural record of each call, so an operator can see WHY the
             # content was empty rather than only that no JSON was found.
-            print("[CONVERSATIONAL V1 OWNER ATTEMPT] " + json.dumps(row, default=str))
+            print(f"[{core_tag} OWNER ATTEMPT] " + json.dumps(row, default=str))
         return {
             "outcome": OUTCOME_OWNER_FAILED,
             "message_ids": [],
@@ -3961,7 +4088,7 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
         }
 
     if (
-        prepared.conversation_core == CORE_CONVERSATIONAL_V1
+        prepared.conversation_core in CONVERSATIONAL_CORES
         and prepared.writer_trace.failure_reason
         and not prepared.replies
     ):
@@ -3972,7 +4099,7 @@ async def execute_auto_turn(prepared: PreparedTurn) -> dict[str, Any]:
             "writer": prepared.writer_trace.as_metadata(),
         }
 
-    if prepared.conversation_core == CORE_CONVERSATIONAL_V1:
+    if prepared.conversation_core in CONVERSATIONAL_CORES:
         expected = await _expected_execution_revision(prepared)
         if await _current_revision(prepared) != expected:
             return {"outcome": OUTCOME_STALE, "message_ids": []}
@@ -4163,8 +4290,15 @@ async def prepare_assisted_approval(
         CORE_SEMANTIC_V1,
         CORE_SEMANTIC_V2,
         CORE_CONVERSATIONAL_V1,
+        CORE_CONVERSATIONAL_V2,
     }:
         return None
+    if recorded_core == CORE_CONVERSATIONAL_V2:
+        from services.conversational_v2 import prepare_v2_assisted_approval
+
+        return await prepare_v2_assisted_approval(
+            provenance, creator_id=creator_id, fan_id=fan_id
+        )
     if provenance.creator_id != str(creator_id) or provenance.fan_id != str(fan_id):
         raise LiveOrchestrationError("the Assisted approval token is out of scope")
 

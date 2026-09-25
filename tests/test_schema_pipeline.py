@@ -174,6 +174,7 @@ def test_the_whole_pipeline_applies_to_a_fresh_database(pipeline):
         "reengagement_log",
         "reengagement_settings",
         "conversational_core_states",
+        "conversational_session_states",
     ):
         assert required in tables, f"{required} is missing after the full pipeline"
 
@@ -220,6 +221,71 @@ def test_conversational_core_v1_schema_and_runtime_ids(pipeline):
             (creator_id, fan_id),
         )
 
+
+def test_conversational_core_v2_schema_is_separate_owner_only_and_selectable(pipeline):
+    connection, name = pipeline
+    columns = _columns(connection, name, "conversational_session_states")
+    assert {"creator_id", "fan_id", "schema_version", "revision", "state"} <= columns
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f'insert into "{name}".creators (id, name, conversation_core) '
+            "values (gen_random_uuid(), 'Core v2 creator', 'conversational_v2') "
+            "returning id"
+        )
+        creator_id = cursor.fetchone()[0]
+        cursor.execute(
+            f'insert into "{name}".fans '
+            "(id, creator_id, display_name, conversation_core) "
+            "values (gen_random_uuid(), %s, 'Core v2 fan', 'conversational_v2') "
+            "returning id",
+            (creator_id,),
+        )
+        fan_id = cursor.fetchone()[0]
+        # Immediate rollback is a plain update back to v1 (or NULL).
+        cursor.execute(
+            f'update "{name}".fans set conversation_core = %s where id = %s',
+            ("conversational_v1", fan_id),
+        )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            cursor.execute(
+                f'update "{name}".fans set conversation_core = %s where id = %s',
+                ("conversational_v3", fan_id),
+            )
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f'insert into "{name}".conversational_session_states '
+            "(creator_id, fan_id, schema_version, revision, state) "
+            "values (%s, %s, 'conversational_session_v2', 1, "
+            '\'{"schema_version":"conversational_session_v2","revision":1}\'::jsonb)',
+            (creator_id, fan_id),
+        )
+        with pytest.raises(psycopg.errors.CheckViolation):
+            cursor.execute(
+                f'insert into "{name}".conversational_session_states '
+                "(creator_id, fan_id, schema_version, revision, state) "
+                "values (%s, %s, 'conversational_core_v1', 1, '{}'::jsonb)",
+                (creator_id, fan_id),
+            )
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f'select table_name from "{name}".owner_only_tables'
+        )
+        assert "conversational_session_states" in {row[0] for row in cursor.fetchall()}
+        cursor.execute(
+            "select count(*) from information_schema.role_table_grants "
+            "where table_schema = %s and table_name = 'conversational_session_states' "
+            "and grantee in ('anon', 'authenticated')",
+            (name,),
+        )
+        assert cursor.fetchone()[0] == 0
+        cursor.execute(
+            "select relrowsecurity from pg_class c "
+            "join pg_namespace n on n.oid = c.relnamespace "
+            "where n.nspname = %s and c.relname = 'conversational_session_states'",
+            (name,),
+        )
+        assert cursor.fetchone()[0] is True
 
 def test_assisted_provenance_consume_has_one_winner_across_connections(pipeline):
     """The database, not a process cache, arbitrates concurrent replicas."""
