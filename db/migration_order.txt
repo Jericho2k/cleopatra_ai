@@ -161,6 +161,13 @@ conversational_working_state_v1.sql
 # privilege pair, which discover tables at run time.
 conversation_supersession_v1.sql
 
+# Conversational Core v2 (session-aware): conversational_session_states and the
+# conversation_core constraint widening for conversational_v2. Must run AFTER
+# conversational_working_state_v1.sql (whose constraint list it supersedes) and
+# owner_only_diagnostics_v1.sql (whose registry it writes to), and — being a
+# new creator-owned table — before the tenant isolation / least privilege pair.
+conversational_session_state_v2.sql
+
 # Always last, and always as a PAIR, in this order.
 #
 # tenant_isolation_v1 discovers creator-owned tables at run time and gives each

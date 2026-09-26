@@ -27,12 +27,25 @@ CORE_LEGACY = "legacy"
 CORE_SEMANTIC_V1 = "semantic_v1"
 CORE_SEMANTIC_V2 = "semantic_v2"
 CORE_CONVERSATIONAL_V1 = "conversational_v1"
+#: Session-aware alternative to v1 (not a layer on it): same GLM owner / Kimi
+#: writer / deterministic authority, plus durable longer-interaction state.
+CORE_CONVERSATIONAL_V2 = "conversational_v2"
 CORE_IDS = (
     CORE_LEGACY,
     CORE_SEMANTIC_V1,
     CORE_SEMANTIC_V2,
     CORE_CONVERSATIONAL_V1,
+    CORE_CONVERSATIONAL_V2,
 )
+
+#: Operator-facing names, served by ``GET /conversation-cores``.
+CORE_LABELS = {
+    CORE_LEGACY: "Legacy controller stack",
+    CORE_SEMANTIC_V1: "Semantic owner v1",
+    CORE_SEMANTIC_V2: "One-call conversational owner",
+    CORE_CONVERSATIONAL_V1: "Conversational Core v1",
+    CORE_CONVERSATIONAL_V2: "Conversational Core v2 — Session-aware",
+}
 CORE_ENV_VAR = "CONVERSATION_CORE"
 
 SOURCE_SIMULATION_FAN = "simulation_fan"
@@ -60,6 +73,7 @@ class ConversationCoreResolution:
             CORE_SEMANTIC_V1,
             CORE_SEMANTIC_V2,
             CORE_CONVERSATIONAL_V1,
+            CORE_CONVERSATIONAL_V2,
         }
 
     @property
@@ -73,6 +87,15 @@ class ConversationCoreResolution:
     @property
     def is_conversational_v1(self) -> bool:
         return self.core_id == CORE_CONVERSATIONAL_V1
+
+    @property
+    def is_conversational_v2(self) -> bool:
+        return self.core_id == CORE_CONVERSATIONAL_V2
+
+    @property
+    def is_conversational(self) -> bool:
+        """GLM semantic owner + Kimi writer (v1 or v2)."""
+        return self.core_id in {CORE_CONVERSATIONAL_V1, CORE_CONVERSATIONAL_V2}
 
     def to_dict(self) -> dict[str, str]:
         return {

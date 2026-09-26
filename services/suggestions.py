@@ -1538,7 +1538,7 @@ async def _debounced_auto_reply(
                 conversation_core=core.core_id,
                 trigger_identity=(
                     latest.id
-                    if core.is_conversational_v1 and latest.id
+                    if core.is_conversational and latest.id
                     else (
                         expected_trigger_at
                         or (

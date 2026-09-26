@@ -144,6 +144,7 @@ def test_runtime_registry_keeps_all_controls_and_adds_core_v1():
         "semantic_v1",
         "semantic_v2",
         "conversational_v1",
+        "conversational_v2",
     )
     semantic_v2 = conversation_core.ConversationCoreResolution(
         "semantic_v2", conversation_core.SOURCE_CREATOR

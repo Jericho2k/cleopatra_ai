@@ -584,3 +584,100 @@ def _offer_label(row: dict[str, Any]) -> str:
         return "private video"
     count = len(row.get("media_ids") or [])
     return "private photo set" if count != 1 else "private photo"
+
+
+def build_candidate_offers(
+    rows: list[dict[str, Any]],
+    *,
+    next_offer: Offer | None,
+    preferred_tags: list[str] | None = None,
+    price_learning: dict[str, Any] | None = None,
+    desired_experience: str | None = None,
+    hard_ceiling_cents: int | None = None,
+    pricing_policy: PriceLearningPolicy | None = None,
+    last_unlocked: dict[str, Any] | None = None,
+    confirmed_purchase_count: int = 0,
+    scene: dict[str, Any] | None = None,
+    max_candidates: int = 4,
+) -> list[Offer]:
+    """A small set of eligible approved offers a longer interaction MAY use.
+
+    Used only by ``conversational_v2``, where the interaction decides whether it
+    needs content at all and content does not dictate the interaction. The
+    first entry is always ``next_offer`` unchanged (the exact offer every other
+    runtime sees). The rest are the continuation of the same progression ladder
+    and, when the ladder has none, one coherent alternative per asset type, so
+    a fan who redirects ("actually, a video") can be served from real inventory
+    without the owner ever seeing a catalogue.
+
+    Every candidate is priced here, inside its own approved bounds and under the
+    explicit ceiling, exactly as the next offer is. A row that cannot be priced
+    is not a candidate. Nothing here is presented, reserved or promised.
+    """
+    candidates: list[Offer] = [next_offer] if next_offer is not None else []
+    if not rows or max_candidates <= len(candidates):
+        return candidates[: max(0, max_candidates)]
+    pricing_policy = pricing_policy or PriceLearningPolicy()
+    bonus = purchase_probe_bonus_bps(confirmed_purchase_count)
+    taken = {str(offer.set_id) for offer in candidates}
+
+    def _offer(row: dict[str, Any]) -> Offer | None:
+        return offer_from_row(
+            row,
+            label=_offer_label(row),
+            price_learning=price_learning,
+            pricing_policy=pricing_policy,
+            hard_ceiling_cents=hard_ceiling_cents,
+            probe_bonus_bps=bonus,
+        )
+
+    ladder = plan_progression(
+        rows,
+        desired_experience=desired_experience,
+        preferred_tags=preferred_tags,
+        last_unlocked=last_unlocked,
+        scene=scene,
+    )
+    rungs = [row for row in ladder if str(row.get("id")) not in taken]
+    # One further rung of the same progression, then one coherent alternative
+    # per asset type the list does not yet contain, then further rungs. The
+    # alternative is what lets a redirect be served without a catalogue.
+    head = rungs[:1]
+    represented = {offer.asset_type for offer in candidates} | {
+        "video" if is_video_row(row) else "photo_set" for row in head
+    }
+    ladder_ids = {str(row.get("id")) for row in ladder}
+    photo_rows, video_rows = split_media_types(
+        [
+            row
+            for row in rows
+            if str(row.get("id")) not in ladder_ids
+            and str(row.get("id")) not in taken
+            and row.get("media_ids")
+        ]
+    )
+    alternatives = []
+    for asset_type, pool in (("video", video_rows), ("photo_set", photo_rows)):
+        if pool and asset_type not in represented:
+            alternatives.append(
+                max(
+                    pool,
+                    key=lambda row: (
+                        sequence_intent_score([row], desired_experience),
+                        -price_cents(row),
+                        str(row.get("id")),
+                    ),
+                )
+            )
+    ordered = [*head, *alternatives, *rungs[1:]]
+    for row in ordered:
+        if len(candidates) >= max_candidates:
+            break
+        if str(row.get("id")) in taken:
+            continue
+        offer = _offer(row)
+        if offer is None:
+            continue
+        candidates.append(offer)
+        taken.add(str(offer.set_id))
+    return candidates

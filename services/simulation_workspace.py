@@ -141,6 +141,7 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
     from services.ai_stack import resolve_ai_stack
     from services.conversation_core import resolve_conversation_core
     from services.conversational_core import load_working_state
+    from services.conversational_session import load_session_state
 
     fan = await require_simulation_fan(fan_id, creator_id)
 
@@ -162,6 +163,7 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
         stack,
         conversation_core,
         conversational_working_state,
+        conversational_session_state,
         scene,
     ) = await asyncio.gather(
         _safe("commercial_state", get_fan_state(fan_id)),
@@ -183,6 +185,10 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
         _safe(
             "conversational_working_state",
             load_working_state(creator_id, fan_id),
+        ),
+        _safe(
+            "conversational_session_state",
+            load_session_state(creator_id, fan_id),
         ),
         _safe("scene", get_scene(fan_id)),
     )
@@ -209,6 +215,13 @@ async def simulation_state(*, creator_id: str, fan_id: str) -> dict[str, Any]:
         "conversational_working_state": (
             conversational_working_state.as_dict()
             if conversational_working_state is not None
+            else None
+        ),
+        # Core v2's own durable session document (independent of v1's working
+        # state above). Present for any test fan that has ever run on v2.
+        "conversational_session_state": (
+            conversational_session_state.as_dict()
+            if conversational_session_state is not None
             else None
         ),
         # Confirmed money only. This is simulated spend on a simulated fan and

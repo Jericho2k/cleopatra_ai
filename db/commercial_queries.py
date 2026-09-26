@@ -8,6 +8,7 @@ from core import clock
 from core.supabase import get_supabase
 from models.commercial import CreatorPolicy, FanCommercialState, Offer
 from services.media_packages import (
+    build_candidate_offers,
     build_next_offer,
     sets_with_sellable_media_evidence,
     usable_sets,
@@ -245,6 +246,127 @@ async def get_approved_asset_types(creator_id: str) -> tuple[str, ...]:
     return asset_types_from_rows(row for row in rows if row.get("media_ids"))
 
 
+def _offerable_inventory_rows(
+    creator_id: str, fan_id: str
+) -> tuple[list[dict], list[str], dict | None, int]:
+    """Approved, sellable, unsent sets for one fan, plus the context ranking reads.
+
+    Shared by the single-next-offer path and the v2 candidate path so both
+    read exactly the same rows with exactly the same exclusions.
+    """
+    db = get_supabase()
+    def _build_sets(apply_filter: bool):
+        query = (
+            db.table("vault_sets")
+            .select(
+                "id, title, description, location, outfit, suggested_price, tags, "
+                "explicit_min, explicit_max, media_ids, base_price_cents, "
+                "min_price_cents, max_price_cents, dynamic_pricing_enabled, paid_sellable"
+            )
+            .eq("creator_id", creator_id)
+            .eq("status", "approved")
+        )
+        # Owner-only mirrored test content never reaches a live offer.
+        if apply_filter:
+            query = exclude_simulation_only(query)
+        return query.execute()
+
+    rows = (
+        run_live_catalog_query(_build_sets, label="commercial.offerable_sets").data
+        or []
+    )
+
+    # Paginated: this set is the "never offer this again" list. Truncated at
+    # 1,000 creator messages it silently forgets older sends, and Cleopatra
+    # re-offers content the fan already received. Ordered by id, which is
+    # unique, so a page boundary cannot drop or repeat a row.
+    sent_rows = fetch_all_rows(
+        lambda start, end: db.table("messages")
+        .select("media_context")
+        .eq("fan_id", fan_id)
+        .eq("role", "creator")
+        .not_.is_("media_context", "null")
+        .order("id")
+        .range(start, end)
+        .execute()
+    )
+    sent_set_ids: set[str] = set()
+    sent_media_ids: set[str] = set()
+    for row in sent_rows:
+        ppv = (row.get("media_context") or {}).get("ppv") or {}
+        if ppv.get("set_id"):
+            sent_set_ids.add(str(ppv["set_id"]))
+        for media_id in (ppv.get("media_ids") or [ppv.get("media_id")]):
+            if media_id:
+                sent_media_ids.add(str(media_id))
+
+    # The last thing he actually unlocked. It is what makes the NEXT offer a
+    # step up in the same scene rather than an unrelated set, and it is the
+    # only reason purchase history is read here at all.
+    last_unlocked: dict | None = None
+    confirmed_purchases = 0
+    purchased_set_ids: list[str] = []
+    for row in sent_rows:
+        ppv = (row.get("media_context") or {}).get("ppv") or {}
+        if ppv.get("purchased") and ppv.get("set_id"):
+            confirmed_purchases += 1
+            purchased_set_ids.append(str(ppv["set_id"]))
+    if purchased_set_ids:
+        by_id = {str(row.get("id")): row for row in rows}
+        last_unlocked = by_id.get(purchased_set_ids[-1])
+
+    fan_row = (
+        db.table("fans").select("ai_summary, preferences, sales_log")
+        .eq("id", fan_id).single().execute()
+    ).data or {}
+    summary = fan_row.get("ai_summary") or {}
+    preferences = fan_row.get("preferences") or {}
+    preferred_tags = list(summary.get("kinks") or [])
+    if isinstance(preferences, dict):
+        preferred_tags.extend(str(value) for value in preferences.values() if isinstance(value, str))
+    elif isinstance(preferences, list):
+        preferred_tags.extend(str(value) for value in preferences)
+    confirmed_purchases = max(
+        confirmed_purchases, len(fan_row.get("sales_log") or [])
+    )
+
+    # Validate old set metadata against the actual classified children too.
+    # This catches legacy sets whose set-level tags are weak/missing while
+    # every contained media item is classified as teaser/free-only.
+    all_media_ids = list(
+        dict.fromkeys(
+            str(media_id)
+            for row in rows
+            for media_id in (row.get("media_ids") or [])
+            if media_id
+        )
+    )
+    child_rows: list[dict] = []
+    for start in range(0, len(all_media_ids), 200):
+        ids = all_media_ids[start:start + 200]
+        child_rows.extend(
+            (
+                db.table("creator_vault_media")
+                .select("media_id, content_category")
+                .eq("creator_id", creator_id)
+                .in_("media_id", ids)
+                .execute()
+            ).data
+            or []
+        )
+    rows = sets_with_sellable_media_evidence(rows, child_rows)
+
+    available = usable_sets(rows, sent_set_ids)
+    for row in available:
+        row["media_ids"] = [
+            str(media_id)
+            for media_id in (row.get("media_ids") or [])
+            if str(media_id) not in sent_media_ids
+        ]
+    available = [row for row in available if row.get("media_ids")]
+    return available, preferred_tags, last_unlocked, confirmed_purchases
+
+
 async def get_next_offer_with_inventory(
     creator_id: str,
     fan_id: str,
@@ -264,120 +386,9 @@ async def get_next_offer_with_inventory(
     progression incremental: the next unlock is by construction something he has
     not had yet.
     """
-    def _get():
-        db = get_supabase()
-        def _build_sets(apply_filter: bool):
-            query = (
-                db.table("vault_sets")
-                .select(
-                    "id, title, description, location, outfit, suggested_price, tags, "
-                    "explicit_min, explicit_max, media_ids, base_price_cents, "
-                    "min_price_cents, max_price_cents, dynamic_pricing_enabled, paid_sellable"
-                )
-                .eq("creator_id", creator_id)
-                .eq("status", "approved")
-            )
-            # Owner-only mirrored test content never reaches a live offer.
-            if apply_filter:
-                query = exclude_simulation_only(query)
-            return query.execute()
-
-        rows = (
-            run_live_catalog_query(_build_sets, label="commercial.offerable_sets").data
-            or []
-        )
-
-        # Paginated: this set is the "never offer this again" list. Truncated at
-        # 1,000 creator messages it silently forgets older sends, and Cleopatra
-        # re-offers content the fan already received. Ordered by id, which is
-        # unique, so a page boundary cannot drop or repeat a row.
-        sent_rows = fetch_all_rows(
-            lambda start, end: db.table("messages")
-            .select("media_context")
-            .eq("fan_id", fan_id)
-            .eq("role", "creator")
-            .not_.is_("media_context", "null")
-            .order("id")
-            .range(start, end)
-            .execute()
-        )
-        sent_set_ids: set[str] = set()
-        sent_media_ids: set[str] = set()
-        for row in sent_rows:
-            ppv = (row.get("media_context") or {}).get("ppv") or {}
-            if ppv.get("set_id"):
-                sent_set_ids.add(str(ppv["set_id"]))
-            for media_id in (ppv.get("media_ids") or [ppv.get("media_id")]):
-                if media_id:
-                    sent_media_ids.add(str(media_id))
-
-        # The last thing he actually unlocked. It is what makes the NEXT offer a
-        # step up in the same scene rather than an unrelated set, and it is the
-        # only reason purchase history is read here at all.
-        last_unlocked: dict | None = None
-        confirmed_purchases = 0
-        purchased_set_ids: list[str] = []
-        for row in sent_rows:
-            ppv = (row.get("media_context") or {}).get("ppv") or {}
-            if ppv.get("purchased") and ppv.get("set_id"):
-                confirmed_purchases += 1
-                purchased_set_ids.append(str(ppv["set_id"]))
-        if purchased_set_ids:
-            by_id = {str(row.get("id")): row for row in rows}
-            last_unlocked = by_id.get(purchased_set_ids[-1])
-
-        fan_row = (
-            db.table("fans").select("ai_summary, preferences, sales_log")
-            .eq("id", fan_id).single().execute()
-        ).data or {}
-        summary = fan_row.get("ai_summary") or {}
-        preferences = fan_row.get("preferences") or {}
-        preferred_tags = list(summary.get("kinks") or [])
-        if isinstance(preferences, dict):
-            preferred_tags.extend(str(value) for value in preferences.values() if isinstance(value, str))
-        elif isinstance(preferences, list):
-            preferred_tags.extend(str(value) for value in preferences)
-        confirmed_purchases = max(
-            confirmed_purchases, len(fan_row.get("sales_log") or [])
-        )
-
-        # Validate old set metadata against the actual classified children too.
-        # This catches legacy sets whose set-level tags are weak/missing while
-        # every contained media item is classified as teaser/free-only.
-        all_media_ids = list(
-            dict.fromkeys(
-                str(media_id)
-                for row in rows
-                for media_id in (row.get("media_ids") or [])
-                if media_id
-            )
-        )
-        child_rows: list[dict] = []
-        for start in range(0, len(all_media_ids), 200):
-            ids = all_media_ids[start:start + 200]
-            child_rows.extend(
-                (
-                    db.table("creator_vault_media")
-                    .select("media_id, content_category")
-                    .eq("creator_id", creator_id)
-                    .in_("media_id", ids)
-                    .execute()
-                ).data
-                or []
-            )
-        rows = sets_with_sellable_media_evidence(rows, child_rows)
-
-        available = usable_sets(rows, sent_set_ids)
-        for row in available:
-            row["media_ids"] = [
-                str(media_id)
-                for media_id in (row.get("media_ids") or [])
-                if str(media_id) not in sent_media_ids
-            ]
-        available = [row for row in available if row.get("media_ids")]
-        return available, preferred_tags, last_unlocked, confirmed_purchases
-
-    rows, preferred_tags, last_unlocked, confirmed_purchases = await asyncio.to_thread(_get)
+    rows, preferred_tags, last_unlocked, confirmed_purchases = await asyncio.to_thread(
+        _offerable_inventory_rows, creator_id, fan_id
+    )
     from db.pricing_policy_queries import get_effective_price_learning_policy
     from services.inventory_authority import asset_types_from_rows
 
@@ -395,6 +406,57 @@ async def get_next_offer_with_inventory(
         scene=scene,
     )
     return offer, asset_types_from_rows(rows)
+
+
+async def get_next_offer_with_candidates(
+    creator_id: str,
+    fan_id: str,
+    policy: CreatorPolicy,
+    price_learning: dict | None = None,
+    desired_experience: str | None = None,
+    hard_ceiling_cents: int | None = None,
+    scene: dict | None = None,
+    max_candidates: int = 4,
+) -> tuple[Offer | None, tuple[str, ...], list[Offer]]:
+    """The same next offer as :func:`get_next_offer_with_inventory`, plus
+    bounded eligible alternatives for ``conversational_v2`` trajectory planning.
+
+    One read. The first candidate IS the next offer; the alternatives come from
+    the same unsent, approved, sellable rows and are priced the same way.
+    """
+    rows, preferred_tags, last_unlocked, confirmed_purchases = await asyncio.to_thread(
+        _offerable_inventory_rows, creator_id, fan_id
+    )
+    from db.pricing_policy_queries import get_effective_price_learning_policy
+    from services.inventory_authority import asset_types_from_rows
+
+    pricing_policy = await get_effective_price_learning_policy(creator_id)
+    offer = build_next_offer(
+        rows,
+        policy,
+        preferred_tags=preferred_tags,
+        price_learning=price_learning,
+        desired_experience=desired_experience,
+        hard_ceiling_cents=hard_ceiling_cents,
+        pricing_policy=pricing_policy,
+        last_unlocked=last_unlocked,
+        confirmed_purchase_count=confirmed_purchases,
+        scene=scene,
+    )
+    candidates = build_candidate_offers(
+        rows,
+        next_offer=offer,
+        preferred_tags=preferred_tags,
+        price_learning=price_learning,
+        desired_experience=desired_experience,
+        hard_ceiling_cents=hard_ceiling_cents,
+        pricing_policy=pricing_policy,
+        last_unlocked=last_unlocked,
+        confirmed_purchase_count=confirmed_purchases,
+        scene=scene,
+        max_candidates=max_candidates,
+    )
+    return offer, asset_types_from_rows(rows), candidates
 
 
 async def schedule_action(

@@ -629,3 +629,19 @@ SUPABASE_DB_URL=... python scripts/production_preflight.py
 
 See `docs/historical_memory_and_credits.md` for the rollout sequence and the
 cost model.
+
+## Conversational Core v2 (`conversational_session_state_v2.sql`)
+
+Additive. Creates `conversational_session_states` (one versioned session
+document per creator/fan, `schema_version = 'conversational_session_v2'`),
+registers it in `public.owner_only_tables` with RLS enabled and no browser
+policy, and widens `creators_conversation_core_known` /
+`fans_conversation_core_known` to accept `conversational_v2`. It supersedes the
+constraint list in `conversational_working_state_v1.sql` without editing that
+file, so already-applied environments do not drift.
+
+**Rolling-deploy safety.** Apply before selecting `conversational_v2` anywhere.
+Old code ignores the table. New code touches it only on a v2-selected turn; a v2
+turn against an unmigrated database fails visibly and never falls through to
+another runtime. Rollback is selecting another core; rows are kept so
+re-selecting v2 resumes where it stopped. See `docs/conversational_core_v2.md`.
